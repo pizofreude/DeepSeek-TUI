@@ -6,7 +6,8 @@
 //! keybinding list from [`crate::tui::keybindings::KEYBINDINGS`] so neither
 //! can drift from the wired-up handlers.
 //!
-//! Keys: any printable character extends the filter, `Backspace` shrinks it,
+//! Keys: any printable character extends the filter, `Backspace` (or `Ctrl+H`)
+//! shrinks it,
 //! `↑`/`↓` (or `Ctrl+P`/`Ctrl+N`) move the selection, `PgUp`/`PgDn` jump by
 //! ten rows, `Home`/`End` jump to ends, and `Esc` closes. Pressing `?` again
 //! at the call-site (`tui::ui`) also toggles the overlay closed.
@@ -186,7 +187,7 @@ fn build_entries(locale: Locale) -> Vec<HelpEntry> {
         let description = format!(
             "[{}] {}",
             binding.section.label(locale),
-            binding.description
+            tr(locale, binding.description_id)
         );
         let haystack = format!(
             "{} {}",
@@ -280,6 +281,14 @@ impl ModalView for HelpView {
                 ViewAction::None
             }
             KeyCode::Backspace => {
+                self.query.pop();
+                self.refilter();
+                ViewAction::None
+            }
+            // Terminals where stty erase == ^H send Ctrl+H instead of
+            // Backspace (DEL). Treat it identically so the filter input
+            // works across all platforms (#958).
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.query.pop();
                 self.refilter();
                 ViewAction::None
@@ -548,6 +557,19 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_h_widens_match_set() {
+        let mut view = HelpView::new();
+        type_filter(&mut view, "yolox");
+        let narrow = view.filtered.len();
+        view.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        let wider = view.filtered.len();
+        assert!(
+            wider > narrow,
+            "Ctrl+H must behave as Backspace, broadening the matching set (was {narrow}, now {wider})"
+        );
+    }
+
+    #[test]
     fn esc_closes_overlay() {
         let mut view = HelpView::new();
         let action = view.handle_key(key(KeyCode::Esc));
@@ -636,6 +658,27 @@ mod tests {
             !dump.contains("MISSING"),
             "missing-key marker leaked:\n{dump}"
         );
+    }
+
+    #[test]
+    fn localized_help_keybinding_descriptions_use_zh_hans() {
+        let entries = build_entries(Locale::ZhHans);
+        let kb_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.section == HelpSection::Keybinding)
+            .collect();
+        assert!(!kb_entries.is_empty(), "no keybinding entries found");
+
+        for entry in &kb_entries {
+            assert!(
+                entry
+                    .description
+                    .chars()
+                    .any(|c| { ('\u{4e00}'..='\u{9fff}').contains(&c) }),
+                "keybinding description not localized: {}",
+                entry.description
+            );
+        }
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

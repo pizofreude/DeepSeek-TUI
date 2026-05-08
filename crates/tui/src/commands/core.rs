@@ -3,8 +3,9 @@
 use std::fmt::Write;
 
 use crate::config::{COMMON_DEEPSEEK_MODELS, normalize_model_name};
-use crate::tui::app::{App, AppAction, AppMode};
-use crate::tui::views::{HelpView, ModalKind, SubAgentsView};
+use crate::localization::{MessageId, tr};
+use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
+use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
 use super::CommandResult;
 
@@ -14,17 +15,25 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
         // Show help for specific command
         if let Some(cmd) = super::get_command_info(topic) {
             let mut help = format!(
-                "{}\n\n  {}\n\n  Usage: {}",
+                "{}\n\n  {}\n\n  {} {}",
                 cmd.name,
                 cmd.description_for(app.ui_locale),
+                tr(app.ui_locale, MessageId::HelpUsageLabel),
                 cmd.usage
             );
             if !cmd.aliases.is_empty() {
-                let _ = write!(help, "\n  Aliases: {}", cmd.aliases.join(", "));
+                let _ = write!(
+                    help,
+                    "\n  {} {}",
+                    tr(app.ui_locale, MessageId::HelpAliasesLabel),
+                    cmd.aliases.join(", ")
+                );
             }
             return CommandResult::message(help);
         }
-        return CommandResult::error(format!("Unknown command: {topic}"));
+        return CommandResult::error(
+            tr(app.ui_locale, MessageId::HelpUnknownCommand).replace("{topic}", topic),
+        );
     }
 
     // Show help overlay
@@ -40,10 +49,13 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.mark_history_updated();
     app.api_messages.clear();
     app.system_prompt = None;
-    app.transcript_selection.clear();
+    app.viewport.transcript_selection.clear();
     app.queued_messages.clear();
     app.queued_draft = None;
-    app.total_conversation_tokens = 0;
+    app.session.total_tokens = 0;
+    app.session.total_conversation_tokens = 0;
+    app.session.session_cost = 0.0;
+    app.session.session_cost_cny = 0.0;
     let todos_cleared = app.clear_todos();
     app.tool_log.clear();
     app.tool_cells.clear();
@@ -52,13 +64,17 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
     app.last_exec_wait_command = None;
-    app.last_prompt_tokens = None;
-    app.last_completion_tokens = None;
+    app.session.last_prompt_tokens = None;
+    app.session.last_completion_tokens = None;
+    app.session.last_prompt_cache_hit_tokens = None;
+    app.session.last_prompt_cache_miss_tokens = None;
+    app.session.turn_cache_history.clear();
     app.current_session_id = None;
+    let locale = app.ui_locale;
     let message = if todos_cleared {
-        "Conversation cleared".to_string()
+        tr(locale, MessageId::ClearConversation).to_string()
     } else {
-        "Conversation cleared (plan state busy; run /clear again if needed)".to_string()
+        tr(locale, MessageId::ClearConversationBusy).to_string()
     };
     CommandResult::with_message_and_action(
         message,
@@ -81,19 +97,50 @@ pub fn exit() -> CommandResult {
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
     if let Some(name) = model_name {
+        if name.trim().eq_ignore_ascii_case("auto") {
+            let old_model = app.model_display_label();
+            let model_changed = !app.auto_model || app.model != "auto";
+            app.auto_model = true;
+            app.model = "auto".to_string();
+            app.last_effective_model = None;
+            app.reasoning_effort = ReasoningEffort::Auto;
+            app.last_effective_reasoning_effort = None;
+            app.update_model_compaction_budget();
+            if model_changed {
+                app.clear_model_scoped_telemetry();
+            } else {
+                app.session.last_prompt_tokens = None;
+                app.session.last_completion_tokens = None;
+            }
+            return CommandResult::with_message_and_action(
+                tr(app.ui_locale, MessageId::ModelChanged)
+                    .replace("{old}", &old_model)
+                    .replace("{new}", "auto"),
+                AppAction::UpdateCompaction(app.compaction_config()),
+            );
+        }
         let Some(model_id) = normalize_model_name(name) else {
             return CommandResult::error(format!(
-                "Invalid model '{name}'. Expected a DeepSeek model ID. Common models: {}",
+                "Invalid model '{name}'. Expected auto or a DeepSeek model ID. Common models: {}",
                 COMMON_DEEPSEEK_MODELS.join(", ")
             ));
         };
-        let old_model = app.model.clone();
+        let old_model = app.model_display_label();
+        let model_changed = app.auto_model || app.model != model_id;
+        app.auto_model = false;
         app.model = model_id.clone();
+        app.last_effective_model = None;
         app.update_model_compaction_budget();
-        app.last_prompt_tokens = None;
-        app.last_completion_tokens = None;
+        if model_changed {
+            app.clear_model_scoped_telemetry();
+        } else {
+            app.session.last_prompt_tokens = None;
+            app.session.last_completion_tokens = None;
+        }
         CommandResult::with_message_and_action(
-            format!("Model changed: {old_model} → {model_id}"),
+            tr(app.ui_locale, MessageId::ModelChanged)
+                .replace("{old}", &old_model)
+                .replace("{new}", &model_id),
             AppAction::UpdateCompaction(app.compaction_config()),
         )
     } else {
@@ -109,92 +156,150 @@ pub fn models(_app: &mut App) -> CommandResult {
 /// List sub-agent status from the engine
 pub fn subagents(app: &mut App) -> CommandResult {
     if app.view_stack.top_kind() != Some(ModalKind::SubAgents) {
-        app.view_stack
-            .push(SubAgentsView::new(app.subagent_cache.clone()));
+        let agents = subagent_view_agents(app, &app.subagent_cache);
+        app.view_stack.push(SubAgentsView::new(agents));
     }
-    app.status_message = Some("Fetching sub-agent status...".to_string());
+    app.status_message = Some(tr(app.ui_locale, MessageId::SubagentsFetching).to_string());
     CommandResult::action(AppAction::ListSubAgents)
 }
 
-/// Show `DeepSeek` dashboard and docs links
-pub fn deepseek_links() -> CommandResult {
-    CommandResult::message(
-        "DeepSeek Links:\n\
-─────────────────────────────\n\
-Dashboard: https://platform.deepseek.com\n\
-Docs:      https://platform.deepseek.com/docs\n\n\
-Tip: API keys are available in the dashboard console.",
+/// Switch to a configured profile.
+pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
+    let profile_name = match arg {
+        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => {
+            return CommandResult::error(
+                "Usage: /profile <name>\n\nSwitch to a named config profile. Profiles are defined in ~/.deepseek/config.toml under [profiles] sections.",
+            );
+        }
+    };
+    CommandResult::with_message_and_action(
+        format!("Switching to profile '{profile_name}'..."),
+        AppAction::SwitchProfile {
+            profile: profile_name,
+        },
     )
+}
+
+/// Show `DeepSeek` dashboard and docs links
+pub fn deepseek_links(app: &mut App) -> CommandResult {
+    let locale = app.ui_locale;
+    CommandResult::message(format!(
+        "{}\n\
+─────────────────────────────\n\
+{} https://platform.deepseek.com\n\
+{}      https://platform.deepseek.com/docs\n\n\
+{}",
+        tr(locale, MessageId::LinksTitle),
+        tr(locale, MessageId::LinksDashboard),
+        tr(locale, MessageId::LinksDocs),
+        tr(locale, MessageId::LinksTip),
+    ))
 }
 
 /// Show home dashboard with stats and quick actions
 pub fn home_dashboard(app: &mut App) -> CommandResult {
+    let locale = app.ui_locale;
     let mut stats = String::new();
 
     // Basic info
-    let _ = writeln!(stats, "DeepSeek TUI Home Dashboard");
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeDashboardTitle));
     let _ = writeln!(stats, "============================================");
 
     // Model & mode
-    let _ = writeln!(stats, "Model:      {}", app.model);
-    let _ = writeln!(stats, "Mode:       {}", app.mode.label());
-    let _ = writeln!(stats, "Workspace:  {}", app.workspace.display());
+    let _ = writeln!(
+        stats,
+        "{}      {}",
+        tr(locale, MessageId::HomeModel),
+        app.model
+    );
+    let _ = writeln!(
+        stats,
+        "{}       {}",
+        tr(locale, MessageId::HomeMode),
+        app.mode.label()
+    );
+    let _ = writeln!(
+        stats,
+        "{}  {}",
+        tr(locale, MessageId::HomeWorkspace),
+        app.workspace.display()
+    );
 
     // Session stats
     let history_count = app.history.len();
-    let total_tokens = app.total_conversation_tokens;
+    let total_tokens = app.session.total_conversation_tokens;
     let queued_messages = app.queued_messages.len();
-    let _ = writeln!(stats, "History:    {} messages", history_count);
-    let _ = writeln!(stats, "Tokens:     {} (session)", total_tokens);
+    let _ = writeln!(
+        stats,
+        "{}    {} messages",
+        tr(locale, MessageId::HomeHistory),
+        history_count
+    );
+    let _ = writeln!(
+        stats,
+        "{}     {} (session)",
+        tr(locale, MessageId::HomeTokens),
+        total_tokens
+    );
     if queued_messages > 0 {
-        let _ = writeln!(stats, "Queued:     {} messages", queued_messages);
+        let _ = writeln!(
+            stats,
+            "{}     {} messages",
+            tr(locale, MessageId::HomeQueued),
+            queued_messages
+        );
     }
 
     // Sub-agents
     let subagent_count = app.subagent_cache.len();
     if subagent_count > 0 {
-        let _ = writeln!(stats, "Sub-agents: {} active", subagent_count);
+        let _ = writeln!(
+            stats,
+            "{} {} active",
+            tr(locale, MessageId::HomeSubagents),
+            subagent_count
+        );
     }
 
     // Active skill
     if let Some(skill) = &app.active_skill {
-        let _ = writeln!(stats, "Skill:      {} (active)", skill);
+        let _ = writeln!(
+            stats,
+            "{}      {} (active)",
+            tr(locale, MessageId::HomeSkill),
+            skill
+        );
     }
 
     // Quick actions section
-    let _ = writeln!(stats, "\nQuick Actions");
+    let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeQuickActions));
     let _ = writeln!(stats, "--------------------------------------------");
-    let _ = writeln!(stats, "/links      - Dashboard & API links");
-    let _ = writeln!(stats, "/skills      - List available skills");
-    let _ = writeln!(
-        stats,
-        "/config      - Open interactive configuration editor"
-    );
-    let _ = writeln!(stats, "/settings    - Show persistent settings");
-    let _ = writeln!(stats, "/model       - Switch or view model");
-    let _ = writeln!(stats, "/subagents   - List sub-agent status");
-    let _ = writeln!(stats, "/task list   - Show background task queue");
-    let _ = writeln!(stats, "/help        - Show help");
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickLinks));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSkills));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickConfig));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSettings));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickModel));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSubagents));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickTaskList));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickHelp));
 
     // Mode-specific tips
-    let _ = writeln!(stats, "\nMode Tips");
+    let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeModeTips));
     let _ = writeln!(stats, "--------------------------------------------");
     match app.mode {
         AppMode::Agent => {
-            let _ = writeln!(stats, "Agent mode - Use tools for autonomous tasks");
-            let _ = writeln!(
-                stats,
-                "  Use Ctrl+X to review in Plan mode before executing"
-            );
-            let _ = writeln!(stats, "  Type /yolo to enable full tool access");
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeTip));
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeReviewTip));
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeAgentModeYoloTip));
         }
         AppMode::Yolo => {
-            let _ = writeln!(stats, "YOLO mode - Full tool access, no approvals");
-            let _ = writeln!(stats, "  Be careful with destructive operations!");
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeYoloModeTip));
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeYoloModeCaution));
         }
         AppMode::Plan => {
-            let _ = writeln!(stats, "Plan mode - Design before implementing");
-            let _ = writeln!(stats, "  Use /plan to create structured checklists");
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomePlanModeTip));
+            let _ = writeln!(stats, "{}", tr(locale, MessageId::HomePlanModeChecklistTip));
         }
     }
 
@@ -206,14 +311,17 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::models::Message;
-    use crate::tui::app::{App, AppMode, TuiOptions};
+    use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     fn create_test_app() -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("/tmp/test-workspace"),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -228,8 +336,12 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        app.ui_locale = crate::localization::Locale::En;
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app
     }
 
     #[test]
@@ -274,6 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn test_help_memory_topic_shows_usage_and_description() {
+        let mut app = create_test_app();
+        let result = help(&mut app, Some("memory"));
+        let msg = result.message.expect("help topic should return message");
+        assert!(msg.contains("memory"));
+        assert!(msg.contains("persistent user-memory file"));
+        assert!(msg.contains("Usage: /memory [show|path|clear|edit|help]"));
+    }
+
+    #[test]
     fn test_help_pushes_overlay() {
         let mut app = create_test_app();
         assert_ne!(app.view_stack.top_kind(), Some(ModalKind::Help));
@@ -303,7 +425,7 @@ mod tests {
             role: "user".to_string(),
             content: vec![],
         });
-        app.total_conversation_tokens = 100;
+        app.session.total_conversation_tokens = 100;
         app.tool_log.push("test".to_string());
         app.current_session_id = Some("existing-session".to_string());
 
@@ -311,12 +433,41 @@ mod tests {
         assert!(result.message.is_some());
         assert!(app.history.is_empty());
         assert!(app.api_messages.is_empty());
-        assert_eq!(app.total_conversation_tokens, 0);
+        assert_eq!(app.session.total_conversation_tokens, 0);
         assert!(app.tool_log.is_empty());
         assert!(app.tool_cells.is_empty());
         assert!(app.tool_details_by_cell.is_empty());
         assert!(app.current_session_id.is_none());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn clear_resets_session_telemetry() {
+        let mut app = create_test_app();
+        app.session.total_tokens = 234;
+        app.session.total_conversation_tokens = 123;
+        app.session.session_cost = 0.42;
+        app.session.session_cost_cny = 3.05;
+        app.session.last_prompt_cache_hit_tokens = Some(70);
+        app.session.last_prompt_cache_miss_tokens = Some(30);
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        clear(&mut app);
+
+        assert_eq!(app.session.total_tokens, 0);
+        assert_eq!(app.session.total_conversation_tokens, 0);
+        assert_eq!(app.session.session_cost, 0.0);
+        assert_eq!(app.session.session_cost_cny, 0.0);
+        assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
+        assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
+        assert!(app.session.turn_cache_history.is_empty());
     }
 
     #[test]
@@ -340,8 +491,59 @@ mod tests {
             Some(AppAction::UpdateCompaction(_))
         ));
         assert_eq!(app.model, "deepseek-v4-flash");
-        assert_eq!(app.last_prompt_tokens, None);
-        assert_eq!(app.last_completion_tokens, None);
+        assert_eq!(app.session.last_prompt_tokens, None);
+        assert_eq!(app.session.last_completion_tokens, None);
+    }
+
+    #[test]
+    fn model_switch_clears_turn_cache_history() {
+        let mut app = create_test_app();
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        let result = model(&mut app, Some("deepseek-v4-flash"));
+
+        assert!(result.message.is_some());
+        assert!(app.session.turn_cache_history.is_empty());
+    }
+
+    #[test]
+    fn model_reset_same_model_keeps_turn_cache_history() {
+        let mut app = create_test_app();
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 100,
+            output_tokens: 25,
+            cache_hit_tokens: Some(70),
+            cache_miss_tokens: Some(30),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        let result = model(&mut app, Some("deepseek-v4-pro"));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.session.turn_cache_history.len(), 1);
+    }
+
+    #[test]
+    fn test_model_auto_enables_auto_thinking() {
+        let mut app = create_test_app();
+        app.reasoning_effort = ReasoningEffort::Off;
+
+        let result = model(&mut app, Some("auto"));
+
+        assert!(result.message.is_some());
+        assert!(app.auto_model);
+        assert_eq!(app.model, "auto");
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Auto);
+        assert!(app.last_effective_model.is_none());
+        assert!(app.last_effective_reasoning_effort.is_none());
     }
 
     #[test]
@@ -402,7 +604,8 @@ mod tests {
 
     #[test]
     fn test_deepseek_links() {
-        let result = deepseek_links();
+        let mut app = create_test_app();
+        let result = deepseek_links(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("DeepSeek Links"));
@@ -413,7 +616,7 @@ mod tests {
     #[test]
     fn test_home_dashboard_includes_all_sections() {
         let mut app = create_test_app();
-        app.total_conversation_tokens = 1234;
+        app.session.total_conversation_tokens = 1234;
         let result = home_dashboard(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
@@ -467,5 +670,26 @@ mod tests {
                 .any(|line| line.trim_start().starts_with("/set "))
         );
         assert!(!msg.contains("/deepseek"));
+    }
+
+    #[test]
+    fn home_dashboard_localizes_in_zh_hans() {
+        use crate::localization::Locale;
+        let mut app = create_test_app();
+        app.ui_locale = Locale::ZhHans;
+        let result = home_dashboard(&mut app);
+        let msg = result
+            .message
+            .expect("home dashboard should return message");
+        assert!(msg.contains("主面板"), "missing zh-Hans title:\n{msg}");
+        assert!(msg.contains("模型"), "missing zh-Hans model label:\n{msg}");
+        assert!(
+            msg.contains("快捷操作"),
+            "missing zh-Hans quick actions:\n{msg}"
+        );
+        assert!(
+            msg.contains("模式提示"),
+            "missing zh-Hans mode tips:\n{msg}"
+        );
     }
 }

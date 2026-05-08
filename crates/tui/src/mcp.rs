@@ -4,16 +4,12 @@
 //! - Connection pooling for server reuse
 //! - Automatic tool discovery via `tools/list`
 //! - Configurable timeouts per-server and globally
-//! - Backward compatibility with existing sync API
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -21,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use crate::network_policy::{Decision, NetworkPolicyDecider, host_from_url};
+use crate::utils::write_atomic;
 
 // === Error diagnostics helpers (#71) ===
 
@@ -263,12 +260,49 @@ pub enum ConnectionState {
 pub trait McpTransport: Send + Sync {
     async fn send(&mut self, msg: serde_json::Value) -> Result<()>;
     async fn recv(&mut self) -> Result<serde_json::Value>;
+
+    /// Graceful shutdown — stdio transports send SIGTERM to the child and
+    /// give it a brief window to exit before tokio's `kill_on_drop` fires
+    /// SIGKILL as the backstop. Default is a no-op for non-stdio transports
+    /// that have no child process. Whalescale#420.
+    async fn shutdown(&mut self) {}
 }
 
 pub struct StdioTransport {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     reader: tokio::io::BufReader<ChildStdout>,
+}
+
+/// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
+/// before `kill_on_drop` fires SIGKILL. Tuned short so a hung MCP server
+/// can't stall TUI exit; well-behaved servers almost always exit within
+/// a few hundred ms.
+const STDIO_SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
+
+/// Best-effort SIGTERM. On Unix uses `libc::kill`; on Windows there's no
+/// equivalent so we let `kill_on_drop` (TerminateProcess) handle it via the
+/// subsequent Drop. Returns whether a signal was actually sent.
+fn send_sigterm(child: &Child) -> bool {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: pid was just obtained from `child.id()`. `libc::kill`
+            // with `SIGTERM` is async-signal-safe and never observes invalid
+            // memory. Worst case (pid wrap / process already gone) returns
+            // ESRCH, which we deliberately ignore.
+            unsafe {
+                let _ = libc::kill(pid as i32, libc::SIGTERM);
+            }
+            return true;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        false
+    }
 }
 
 #[async_trait::async_trait]
@@ -298,6 +332,25 @@ impl McpTransport for StdioTransport {
                 return Ok(value);
             }
         }
+    }
+
+    /// Send SIGTERM and wait up to `STDIO_SHUTDOWN_GRACE` for graceful exit
+    /// before letting Drop / `kill_on_drop` fire SIGKILL as the backstop.
+    async fn shutdown(&mut self) {
+        send_sigterm(&self.child);
+        // Give the child a window to exit cleanly. Discard the result —
+        // either it exits (success) or the timeout fires (Drop will SIGKILL).
+        let _ = tokio::time::timeout(STDIO_SHUTDOWN_GRACE, self.child.wait()).await;
+    }
+}
+
+/// Drop fallback (#420): if `shutdown` was never called explicitly, still
+/// fire SIGTERM before tokio's `kill_on_drop` sends SIGKILL. The two
+/// signals arrive back-to-back so well-behaved servers at least see the
+/// SIGTERM first; misbehaving ones get SIGKILL'd anyway.
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        send_sigterm(&self.child);
     }
 }
 
@@ -555,7 +608,7 @@ impl McpConnection {
             let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
 
             Box::new(StdioTransport {
-                _child: child,
+                child,
                 stdin,
                 reader: tokio::io::BufReader::new(stdout),
             })
@@ -1416,6 +1469,25 @@ impl McpPool {
         self.connections.clear();
     }
 
+    /// Graceful shutdown of every connection in the pool: send SIGTERM to
+    /// each stdio child and give them a short grace period before drop
+    /// fires SIGKILL. Whalescale#420.
+    ///
+    /// Call from the TUI exit path *before* dropping the pool to give
+    /// MCP servers a chance to flush state. The fallback Drop on
+    /// `StdioTransport` still sends SIGTERM if this never runs, so even
+    /// abnormal exits avoid leaking PIDs without a signal.
+    #[allow(dead_code)] // Wired in by callers that want graceful shutdown
+    pub async fn shutdown_all(&mut self) {
+        let names: Vec<String> = self.connections.keys().cloned().collect();
+        for name in names {
+            if let Some(conn) = self.connections.get_mut(&name) {
+                conn.transport.shutdown().await;
+            }
+        }
+        self.connections.clear();
+    }
+
     /// Get the underlying configuration
     #[allow(dead_code)] // Public API for MCP consumers
     pub fn config(&self) -> &McpConfig {
@@ -1488,7 +1560,7 @@ pub fn save_config(path: &Path, cfg: &McpConfig) -> Result<()> {
         })?;
     }
     let rendered = serde_json::to_string_pretty(cfg).context("Failed to serialize MCP config")?;
-    fs::write(path, rendered)
+    write_atomic(path, rendered.as_bytes())
         .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
     Ok(())
 }
@@ -1529,7 +1601,8 @@ pub fn init_config(path: &Path, force: bool) -> Result<McpWriteStatus> {
             format!("Failed to create MCP config directory {}", parent.display())
         })?;
     }
-    fs::write(path, mcp_template_json()?)
+    let template = mcp_template_json()?;
+    write_atomic(path, template.as_bytes())
         .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
     Ok(status)
 }
@@ -1767,315 +1840,6 @@ pub fn format_tool_result(result: &serde_json::Value) -> String {
     }
 }
 
-// === Backward Compatibility - Sync API (Legacy) ===
-// TODO(integrate): Wire legacy sync API into CLI subcommands or remove
-
-/// Legacy input struct for adding MCP servers
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Legacy sync API, not yet wired into CLI subcommands
-pub struct McpServerInput {
-    pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-}
-
-/// Legacy MCP server struct for internal use
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[allow(dead_code)] // Legacy sync API
-struct LegacyMcpServer {
-    command: String,
-    args: Vec<String>,
-    env: HashMap<String, String>,
-    #[serde(default)]
-    connect_timeout: Option<u64>,
-    #[serde(default)]
-    execute_timeout: Option<u64>,
-    #[serde(default)]
-    read_timeout: Option<u64>,
-}
-
-/// Legacy config wrapper for backward compatibility
-#[derive(Debug, Serialize, Deserialize, Default)]
-#[allow(dead_code)] // Legacy sync API
-struct LegacyMcpConfig {
-    #[serde(default, alias = "mcpServers")]
-    servers: HashMap<String, LegacyMcpServer>,
-    #[serde(default)]
-    timeouts: McpTimeouts,
-}
-
-/// List configured MCP servers (sync, for CLI)
-#[allow(dead_code)] // Legacy sync API, not yet wired into CLI subcommands
-pub fn list(path: &Path) -> Result<()> {
-    let config = load_legacy(path)?;
-    if config.servers.is_empty() {
-        println!("No MCP servers configured.");
-        return Ok(());
-    }
-
-    for (name, server) in config.servers {
-        println!("{} -> {} {}", name, server.command, server.args.join(" "));
-    }
-    Ok(())
-}
-
-/// Add an MCP server to configuration (sync, for CLI)
-#[allow(dead_code)] // Legacy sync API
-pub fn add(path: &Path, input: McpServerInput) -> Result<()> {
-    let mut config = load_legacy(path)?;
-    let env = parse_env(&input.env)?;
-    config.servers.insert(
-        input.name.clone(),
-        LegacyMcpServer {
-            command: input.command,
-            args: input.args,
-            env,
-            connect_timeout: None,
-            execute_timeout: None,
-            read_timeout: None,
-        },
-    );
-    save_legacy(path, &config)?;
-    println!("Added MCP server: {}", input.name);
-    Ok(())
-}
-
-/// Remove an MCP server from configuration (sync, for CLI)
-#[allow(dead_code)] // Legacy sync API
-pub fn remove(path: &Path, name: &str) -> Result<()> {
-    let mut config = load_legacy(path)?;
-    if config.servers.remove(name).is_some() {
-        save_legacy(path, &config)?;
-        println!("Removed MCP server: {name}");
-    } else {
-        println!("No MCP server named {name}.");
-    }
-    Ok(())
-}
-
-/// Call an MCP tool (sync, for backward compatibility)
-#[allow(dead_code)] // Legacy sync API
-pub fn call_tool(
-    path: &Path,
-    server: &str,
-    tool: &str,
-    args: &serde_json::Value,
-) -> Result<String> {
-    let config = load_legacy(path)?;
-    let Some(server_cfg) = config.servers.get(server) else {
-        anyhow::bail!("Failed to find MCP server: {server}");
-    };
-    let timeouts = config.timeouts;
-    let connect_timeout = server_cfg
-        .connect_timeout
-        .unwrap_or(timeouts.connect_timeout);
-    let execute_timeout = server_cfg
-        .execute_timeout
-        .unwrap_or(timeouts.execute_timeout);
-    let read_timeout = server_cfg.read_timeout.unwrap_or(timeouts.read_timeout);
-
-    let mut cmd = Command::new(&server_cfg.command);
-    cmd.args(&server_cfg.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    for (key, value) in &server_cfg.env {
-        cmd.env(key, value);
-    }
-
-    let mut child = cmd.spawn().with_context(|| "Failed to spawn MCP server")?;
-    let mut stdin = child.stdin.take().context("Failed to open MCP stdin")?;
-    let stdout = child.stdout.take().context("Failed to open MCP stdout")?;
-    let reader = Arc::new(Mutex::new(BufReader::new(stdout)));
-    let child = Arc::new(Mutex::new(child));
-
-    let init_id = next_id();
-    let init_payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": init_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "clientInfo": { "name": "deepseek-tui", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": {}
-        }
-    });
-    send_request_sync(&mut stdin, &init_payload)?;
-    if let Err(e) = read_response_with_timeout(
-        &reader,
-        &child,
-        init_id,
-        Duration::from_secs(connect_timeout),
-        read_timeout,
-    ) {
-        if let Ok(mut child_guard) = child.lock() {
-            let _ = child_guard.kill();
-        }
-        return Err(e);
-    }
-    let initialized_payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    });
-    send_request_sync(&mut stdin, &initialized_payload)?;
-
-    let call_id = next_id();
-    let call_payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": call_id,
-        "method": "tools/call",
-        "params": {
-            "name": tool,
-            "arguments": args
-        }
-    });
-    send_request_sync(&mut stdin, &call_payload)?;
-    let response = match read_response_with_timeout(
-        &reader,
-        &child,
-        call_id,
-        Duration::from_secs(execute_timeout),
-        read_timeout,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            if let Ok(mut child_guard) = child.lock() {
-                let _ = child_guard.kill();
-            }
-            return Err(e);
-        }
-    };
-
-    if let Ok(mut child_guard) = child.lock() {
-        let _ = child_guard.kill();
-    }
-
-    if let Some(result) = response.get("result") {
-        return Ok(serde_json::to_string_pretty(result)?);
-    }
-    if let Some(error) = response.get("error") {
-        return Ok(serde_json::to_string_pretty(error)?);
-    }
-    Ok(serde_json::to_string_pretty(&response)?)
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn load_legacy(path: &Path) -> Result<LegacyMcpConfig> {
-    if path.exists() {
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        Ok(config)
-    } else {
-        Ok(LegacyMcpConfig::default())
-    }
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn save_legacy(path: &Path, config: &LegacyMcpConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let contents = serde_json::to_string_pretty(config)?;
-    fs::write(path, contents)?;
-    Ok(())
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn parse_env(items: &[String]) -> Result<HashMap<String, String>> {
-    let mut env = HashMap::new();
-    for item in items {
-        let parts: Vec<&str> = item.splitn(2, '=').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("Failed to parse MCP env var '{item}': expected KEY=VALUE");
-        }
-        env.insert(parts[0].to_string(), parts[1].to_string());
-    }
-    Ok(env)
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn send_request_sync(stdin: &mut impl Write, payload: &serde_json::Value) -> Result<()> {
-    let line = serde_json::to_string(payload)?;
-    stdin
-        .write_all(format!("{line}\n").as_bytes())
-        .with_context(|| "Failed to write MCP request")?;
-    stdin.flush()?;
-    Ok(())
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn read_response_with_timeout(
-    reader: &Arc<Mutex<BufReader<std::process::ChildStdout>>>,
-    child: &Arc<Mutex<std::process::Child>>,
-    id: u64,
-    timeout: Duration,
-    read_timeout: u64,
-) -> Result<serde_json::Value> {
-    let effective_timeout = Duration::from_secs(timeout.as_secs().min(read_timeout));
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let reader_clone = Arc::clone(reader);
-    std::thread::spawn(move || {
-        let result = read_response_sync(&reader_clone, id);
-        let _ = tx.send(result);
-    });
-
-    if let Ok(result) = rx.recv_timeout(effective_timeout) {
-        result
-    } else {
-        if let Ok(mut child_guard) = child.lock() {
-            let _ = child_guard.kill();
-        }
-        anyhow::bail!(
-            "Failed to read MCP response: timed out after {}s",
-            effective_timeout.as_secs()
-        )
-    }
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn read_response_sync(
-    reader: &Arc<Mutex<BufReader<std::process::ChildStdout>>>,
-    id: u64,
-) -> Result<serde_json::Value> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = {
-            let mut guard = reader
-                .lock()
-                .map_err(|_| anyhow::anyhow!("MCP reader lock poisoned"))?;
-            guard.read_line(&mut line)?
-        };
-        if read == 0 {
-            anyhow::bail!("Failed to read MCP response: server closed output before responding.");
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && value.get("id").and_then(serde_json::Value::as_u64) == Some(id)
-        {
-            return Ok(value);
-        }
-    }
-}
-
-#[allow(dead_code)] // Legacy sync API
-fn next_id() -> u64 {
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
-    u64::try_from(micros).unwrap_or(u64::MAX)
-}
-
 // === Unit Tests ===
 
 #[cfg(test)]
@@ -2251,33 +2015,6 @@ mod tests {
         assert!(formatted.contains("[image content]"));
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn test_read_response_timeout_kills_child() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 5")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn sleep");
-        let stdout = child.stdout.take().expect("stdout");
-        let reader = Arc::new(Mutex::new(BufReader::new(stdout)));
-        let child = Arc::new(Mutex::new(child));
-
-        let result = read_response_with_timeout(&reader, &child, 1, Duration::from_secs(1), 1);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("timed out"));
-
-        let status = child
-            .lock()
-            .expect("lock child")
-            .wait()
-            .expect("wait child");
-        assert!(!status.success());
-    }
-
     #[tokio::test]
     async fn test_mcp_pool_empty_config() {
         let pool = McpPool::new(McpConfig::default());
@@ -2316,6 +2053,53 @@ mod tests {
         assert!(
             redacted.contains("other=val"),
             "non-secret preserved: {redacted}"
+        );
+    }
+
+    /// #420: `StdioTransport::shutdown` reaps the child process by sending
+    /// SIGTERM and giving it a brief grace period before drop fires SIGKILL.
+    /// The test spawns `cat` (which exits immediately on stdin EOF / SIGTERM)
+    /// and verifies the transport tears down cleanly. Unix-only because
+    /// SIGTERM doesn't exist on Windows; on Windows the test would just
+    /// duplicate the kill_on_drop path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_transport_shutdown_terminates_child() {
+        use tokio::process::Command as TokioCommand;
+        let mut cmd = TokioCommand::new("cat");
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn cat");
+        let pid = child.id().expect("child pid");
+        let stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut transport = StdioTransport {
+            child,
+            stdin,
+            reader: tokio::io::BufReader::new(stdout),
+        };
+
+        // shutdown() should send SIGTERM and complete within the grace window.
+        let start = std::time::Instant::now();
+        transport.shutdown().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < STDIO_SHUTDOWN_GRACE + Duration::from_millis(500),
+            "shutdown blocked beyond grace window: {elapsed:?}"
+        );
+
+        // The child should be reaped — kill(pid, 0) returning ESRCH means
+        // the pid is gone. If it's still alive, kill(0) returns 0, which
+        // means our shutdown didn't terminate it.
+        // SAFETY: pid was just collected from a tokio Child we spawned.
+        // libc::kill with signal 0 only checks pid existence and is
+        // async-signal-safe.
+        let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(
+            !still_alive,
+            "child {pid} survived StdioTransport::shutdown — SIGTERM not delivered"
         );
     }
 }

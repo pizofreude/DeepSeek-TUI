@@ -112,6 +112,8 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace,
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -126,6 +128,7 @@ mod tests {
             skip_onboarding: true,
             yolo,
             resume_session_id: None,
+            initial_input: None,
         };
         App::new(options, &Config::default())
     }
@@ -134,6 +137,7 @@ mod tests {
     /// crate-wide env mutex.
     struct ScopedHome {
         prev: Option<std::ffi::OsString>,
+        _home: TempDir,
         _guard: MutexGuard<'static, ()>,
     }
     impl Drop for ScopedHome {
@@ -147,15 +151,17 @@ mod tests {
             }
         }
     }
-    fn scoped_home(tmp: &TempDir) -> ScopedHome {
+    fn scoped_home(_workspace: &TempDir) -> ScopedHome {
         let guard = lock_test_env();
         let prev = std::env::var_os("HOME");
+        let home = TempDir::new().expect("home tempdir");
         // SAFETY: serialised by the global env lock.
         unsafe {
-            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("HOME", home.path());
         }
         ScopedHome {
             prev,
+            _home: home,
             _guard: guard,
         }
     }

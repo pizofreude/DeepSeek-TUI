@@ -1,12 +1,12 @@
 //! TUI rendering helpers for chat history and tool output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::deepseek_theme::active_theme;
 use crate::models::{ContentBlock, Message};
@@ -18,6 +18,7 @@ use crate::tui::markdown_render;
 
 // === Constants ===
 
+use std::process::Command;
 const TOOL_COMMAND_LINE_LIMIT: usize = 3;
 const TOOL_OUTPUT_LINE_LIMIT: usize = 6;
 const TOOL_TEXT_LIMIT: usize = 180;
@@ -36,6 +37,11 @@ const USER_GLYPH: &str = "\u{258E}"; // ▎
 /// Visual marker for the assistant role. Solid bullet that pulses at 2s
 /// cycle while the response is streaming, holds full brightness when idle.
 const ASSISTANT_GLYPH: &str = "\u{25CF}"; // ●
+/// Transcript body left rail. Solid 1/8 block (`▏`) followed by a space —
+/// used as a visual left-margin anchor for continuation lines, tool-card
+/// detail rows, and affordance lines. Dimmed so it guides the eye without
+/// competing with content.
+const TRANSCRIPT_RAIL: &str = "\u{258F} "; // ▏ + space
 /// Reasoning header opener. Replaces the spinner glyph on thinking cells —
 /// reasoning is a slow exhale, not a tool spin.
 const REASONING_OPENER: &str = "\u{2026}"; // …
@@ -175,7 +181,7 @@ impl HistoryCell {
             HistoryCell::User { content } => render_message(
                 USER_GLYPH,
                 user_label_style(),
-                message_body_style(),
+                user_body_style(),
                 content,
                 width,
             ),
@@ -186,13 +192,19 @@ impl HistoryCell {
                 content,
                 width,
             ),
-            HistoryCell::System { content } => render_message(
-                "Note",
-                system_label_style(),
-                system_body_style(),
-                content,
-                width,
-            ),
+            HistoryCell::System { content } => {
+                if is_cycle_boundary(content) {
+                    render_cycle_boundary(content, width)
+                } else {
+                    render_message(
+                        "Note",
+                        system_label_style(),
+                        system_body_style(),
+                        content,
+                        width,
+                    )
+                }
+            }
             HistoryCell::Error { message, severity } => render_message(
                 error_label_text(*severity),
                 error_label_style(*severity),
@@ -256,7 +268,7 @@ impl HistoryCell {
             HistoryCell::User { content } => render_message(
                 USER_GLYPH,
                 user_label_style(),
-                message_body_style(),
+                user_body_style(),
                 content,
                 width,
             ),
@@ -288,7 +300,7 @@ impl HistoryCell {
             HistoryCell::User { content } => render_message(
                 USER_GLYPH,
                 user_label_style(),
-                message_body_style(),
+                user_body_style(),
                 content,
                 width,
             ),
@@ -471,7 +483,10 @@ fn render_archived_context(
     let rendered = crate::tui::markdown_render::render_markdown(&body, content_width, body_style);
     for (idx, line) in rendered.into_iter().enumerate() {
         if idx == 0 {
-            let mut spans = vec![Span::styled("▏ ", Style::default().fg(palette::TEXT_DIM))];
+            let mut spans = vec![Span::styled(
+                TRANSCRIPT_RAIL.to_string(),
+                Style::default().fg(palette::TEXT_DIM),
+            )];
             spans.extend(line.spans);
             lines.push(Line::from(spans));
         } else {
@@ -1178,6 +1193,13 @@ pub struct GenericToolCell {
     /// fan-out tool), each prompt is shown on its own indented row instead
     /// of the inline `args:` summary. `None` for ordinary tools.
     pub prompts: Option<Vec<String>>,
+    /// Filesystem path to the full output's spillover file (#422/#423).
+    /// Set by the tool-routing layer when `ToolResult.metadata` carried a
+    /// `spillover_path` field. The truncation affordance includes the
+    /// path so the user can `read_file` it (or Cmd+click in
+    /// OSC 8-aware terminals — the path renders as a hyperlink when
+    /// `tui.osc8_links` is enabled).
+    pub spillover_path: Option<std::path::PathBuf>,
 }
 
 impl GenericToolCell {
@@ -1198,6 +1220,18 @@ impl GenericToolCell {
         if let Some(lines) = self.try_render_as_checklist(width, low_motion, mode) {
             return lines;
         }
+
+        // Issue #409: `agent_spawn` already gets a dedicated `DelegateCard`
+        // that owns the live action tree, status, and final summary. The
+        // generic tool block for the same call duplicates that signal at
+        // 3-4 lines per spawn — N parallel spawns multiply the noise. In
+        // live mode, render one compact summary line and let the
+        // DelegateCard be the source of truth. Transcript mode keeps the
+        // full block so session replay remains complete.
+        if matches!(mode, RenderMode::Live) && self.name == "agent_spawn" {
+            return self.render_agent_spawn_compact(low_motion);
+        }
+
         let mut lines = Vec::new();
         // Map the actual tool name (e.g. `agent_spawn`, `apply_patch`) to a
         // family rather than the catch-all `"Tool"` title — this is what
@@ -1254,19 +1288,74 @@ impl GenericToolCell {
         }
 
         if let Some(output) = self.output.as_ref() {
-            // Multi-line outputs (diff stats, file lists, todo snapshots) used
-            // to be crushed into one line by `render_compact_kv` because its
-            // wrapper joined the entire string before wrapping. Route through
-            // `render_tool_output_mode` so each `\n` becomes a real row, with
-            // a `+N more lines` affordance in live mode (#80).
-            lines.extend(render_tool_output_mode(
-                output,
-                width,
-                TOOL_OUTPUT_LINE_LIMIT,
-                mode,
-            ));
+            // If the output looks like a unified diff (contains hunk headers),
+            // use the full diff renderer with line numbers and colored gutters
+            // instead of the generic output path (#380).
+            if output_looks_like_diff(output) {
+                let diff_summary = diff_render::diff_summary_label(output);
+                lines.push(render_tool_header_with_summary(
+                    "Diff",
+                    diff_summary.as_deref(),
+                    tool_status_label(self.status),
+                    self.status,
+                    None,
+                    low_motion,
+                ));
+                lines.extend(diff_render::render_diff(output, width));
+            } else {
+                // Multi-line outputs (diff stats, file lists, todo snapshots) used
+                // to be crushed into one line by `render_compact_kv` because its
+                // wrapper joined the entire string before wrapping. Route through
+                // `render_tool_output_mode` so each `\n` becomes a real row, with
+                // a `+N more lines` affordance in live mode (#80).
+                lines.extend(render_tool_output_mode(
+                    output,
+                    width,
+                    TOOL_OUTPUT_LINE_LIMIT,
+                    mode,
+                ));
+            }
+
+            // #423: surface the spillover-file path inline so the user
+            // (and the model) can find the elided tail. Only emitted in
+            // live mode — transcript replay already has the full output
+            // verbatim. The path is OSC 8-wrapped when the feature is
+            // enabled so terminals that support hyperlinks make it
+            // Cmd+click-openable; the clipboard / selection path
+            // strips the escape on copy.
+            if matches!(mode, RenderMode::Live)
+                && let Some(path) = self.spillover_path.as_ref()
+            {
+                lines.push(render_spillover_annotation(path, width));
+            }
         }
         lines
+    }
+
+    /// Render `agent_spawn` as a single compact summary line for live
+    /// mode (#409). The companion `DelegateCard` already carries the
+    /// live action tree, status, and final summary; this line is just
+    /// the pointer that says "a spawn happened, here's the agent id".
+    ///
+    /// Output shape (header):
+    ///   `◐ delegate · agent_spawn  agent-abc12  [running]`
+    /// Falls back to a placeholder when the spawn is still pending and
+    /// no agent id has been assigned yet.
+    fn render_agent_spawn_compact(&self, low_motion: bool) -> Vec<Line<'static>> {
+        let family = crate::tui::widgets::tool_card::ToolFamily::Delegate;
+        let agent_id = self
+            .output
+            .as_deref()
+            .and_then(extract_agent_id)
+            .unwrap_or("…");
+        vec![render_tool_header_with_family_and_summary(
+            family,
+            Some(agent_id),
+            tool_status_label(self.status),
+            self.status,
+            None,
+            low_motion,
+        )]
     }
 
     /// If this cell is a checklist/todo write/add/update and the output is
@@ -1283,6 +1372,27 @@ impl GenericToolCell {
         }
         let output = self.output.as_ref()?;
         let snapshot = parse_checklist_snapshot(output)?;
+
+        // Concise update rendering (#403). When the tool emits an
+        // "Updated todo #N to STATUS" prefix line — which `todo_update` /
+        // `checklist_update` always do on a successful match — render
+        // only the changed item plus a `M/N · pct%` summary instead of
+        // dumping the full list every time. The full list is still
+        // reachable via Alt+V on the tool detail record. This keeps the
+        // transcript scannable in long sessions.
+        if matches!(mode, RenderMode::Live)
+            && let Some(change) = parse_update_prefix(output)
+        {
+            return Some(render_checklist_change_card(
+                &self.name,
+                self.status,
+                &snapshot,
+                &change,
+                width,
+                low_motion,
+            ));
+        }
+
         Some(render_checklist_card(
             &self.name,
             self.status,
@@ -1292,6 +1402,51 @@ impl GenericToolCell {
             mode,
         ))
     }
+}
+
+/// Render the inline annotation for a tool cell whose full output was
+/// spilled to disk (#422 + #423). Produces a one-line muted hint:
+///
+/// ```text
+///   full output: /Users/you/.deepseek/tool_outputs/call-abc12.txt
+/// ```
+///
+/// Path is plain text on this branch; the OSC 8 hyperlink-wrap that
+/// makes it Cmd+click-openable lives on the OSC 8 branch (PR #515)
+/// and merges in once both PRs land on `main`. The clipboard /
+/// selection path already strips OSC 8 there, so a future enhancement
+/// stays backward-compatible.
+fn render_spillover_annotation(path: &std::path::Path, width: u16) -> Line<'static> {
+    let display = path.display().to_string();
+    let prefix = "  full output: ";
+    let budget = usize::from(width).saturating_sub(prefix.len()).max(8);
+    let truncated = truncate_text(&display, budget);
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(palette::TEXT_MUTED)),
+        Span::styled(truncated, Style::default().fg(palette::TEXT_MUTED).italic()),
+    ])
+}
+
+/// Pull the `agent_id` field out of an `agent_spawn` tool output. The
+/// tool emits structured JSON shaped like
+/// `{"agent_id": "agent-abc12", "nickname": "...", "model": "..."}` so we
+/// look for the `agent_id` key and return its string value.
+///
+/// Returns `None` for outputs we can't parse as JSON or that lack the
+/// expected key — the caller falls back to a placeholder so a still-pending
+/// spawn renders cleanly.
+fn extract_agent_id(output: &str) -> Option<&str> {
+    // Cheap, deterministic, no allocations: scan for the literal key.
+    // Avoids dragging serde_json into a render hot path on every frame.
+    let key = "\"agent_id\"";
+    let key_idx = output.find(key)?;
+    let rest = &output[key_idx + key.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    let after_colon = after_colon.strip_prefix('"')?;
+    let end = after_colon.find('"')?;
+    let id = &after_colon[..end];
+    (!id.is_empty()).then_some(id)
 }
 
 fn is_checklist_tool_name(name: &str) -> bool {
@@ -1304,6 +1459,22 @@ fn is_checklist_tool_name(name: &str) -> bool {
             | "todo_add"
             | "todo_update"
     )
+}
+
+/// Heuristic: does the output look like a unified diff? Returns true when
+/// the output contains at least one hunk header (`@@`) or a `diff --git`
+/// line, which are reliable markers of unified diff content (#380).
+fn output_looks_like_diff(output: &str) -> bool {
+    let mut lines = output.lines();
+    // Check first 5 lines for diff markers
+    for _ in 0..5 {
+        let Some(line) = lines.next() else { break };
+        let trimmed = line.trim();
+        if trimmed.starts_with("@@") || trimmed.starts_with("diff --git") {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -1373,6 +1544,119 @@ fn parse_checklist_snapshot(output: &str) -> Option<ChecklistSnapshot> {
     })
 }
 
+/// One parsed "Updated todo #N to STATUS" prefix line emitted by
+/// `todo_update` / `checklist_update`. Used by [`render_checklist_change_card`]
+/// to show a compact state-change line instead of the full item list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChecklistChange {
+    id: u32,
+    status: String,
+}
+
+/// Parse the leading line of a checklist-update tool output. Returns
+/// `None` for non-update outputs (e.g. `todo_write` snapshots, errors,
+/// or an unexpected format) so the caller falls back to the full-list
+/// renderer.
+fn parse_update_prefix(output: &str) -> Option<ChecklistChange> {
+    // The tool output shape is `Updated todo #3 to in_progress\n{ ... }`.
+    // We tolerate `checklist` or `todo` as the noun and any reasonable
+    // status word (the snapshot lookup in the renderer is the source of
+    // truth for the title — we just need the id+status pair).
+    let first = output.lines().next()?.trim();
+    let rest = first
+        .strip_prefix("Updated todo #")
+        .or_else(|| first.strip_prefix("Updated checklist #"))?;
+    let (id_str, after) = rest.split_once(' ')?;
+    let id: u32 = id_str.parse().ok()?;
+    let status = after.strip_prefix("to ")?.trim().to_string();
+    if status.is_empty() {
+        return None;
+    }
+    Some(ChecklistChange { id, status })
+}
+
+/// Render a compact one-line state-change card for `todo_update` /
+/// `checklist_update` calls (#403). Shows the changed item's marker,
+/// title, and old → new status, with a `M/N · pct%` progress summary
+/// in the header. The full list is still available via Alt+V on the
+/// detail record.
+fn render_checklist_change_card(
+    name: &str,
+    status: ToolStatus,
+    snapshot: &ChecklistSnapshot,
+    change: &ChecklistChange,
+    width: u16,
+    low_motion: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let header_summary = format!(
+        "{}/{} \u{00B7} {}%",
+        snapshot.completed, snapshot.total, snapshot.completion_pct
+    );
+    let family = crate::tui::widgets::tool_card::tool_family_for_name(name);
+    lines.push(render_tool_header_with_family_and_summary(
+        family,
+        Some(&header_summary),
+        tool_status_label(status),
+        status,
+        None,
+        low_motion,
+    ));
+
+    // Look up the title from the snapshot. `id` in tool input is
+    // 1-indexed; `items` is 0-indexed.
+    let item = (change.id as usize)
+        .checked_sub(1)
+        .and_then(|idx| snapshot.items.get(idx));
+    let title = item
+        .map(|i| i.content.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(missing title)".to_string());
+
+    let (marker, marker_color) = checklist_status_marker(&change.status);
+    let prefix = format!("{marker} ");
+    let prefix_width =
+        UnicodeWidthStr::width(TRANSCRIPT_RAIL) + UnicodeWidthStr::width(prefix.as_str());
+    let id_label = format!("Todo #{}", change.id);
+    let arrow = " \u{2192} ";
+    let status_label = change.status.clone();
+    let title_budget = usize::from(width)
+        .saturating_sub(prefix_width)
+        .saturating_sub(UnicodeWidthStr::width(id_label.as_str()))
+        .saturating_sub(UnicodeWidthStr::width(arrow))
+        .saturating_sub(UnicodeWidthStr::width(status_label.as_str()))
+        .saturating_sub(2)
+        .max(8);
+    let title_truncated = truncate_text(title.as_str(), title_budget);
+
+    let spans = vec![
+        Span::styled(
+            "\u{258F} ".to_string(),
+            Style::default().fg(palette::TEXT_DIM),
+        ),
+        Span::styled(prefix, Style::default().fg(marker_color)),
+        Span::styled(id_label, Style::default().fg(palette::TEXT_DIM)),
+        Span::styled(": ".to_string(), Style::default().fg(palette::TEXT_DIM)),
+        Span::styled(title_truncated, tool_value_style()),
+        Span::styled(arrow.to_string(), Style::default().fg(palette::TEXT_DIM)),
+        Span::styled(status_label, Style::default().fg(marker_color)),
+    ];
+    lines.push(Line::from(spans));
+
+    // Tease that the full list is still available without leaving the
+    // transcript. Mirrors the same affordance used by other tool cells.
+    lines.push(render_card_detail_line_single(
+        None,
+        &format!(
+            "{} item{} (Alt+V for full list)",
+            snapshot.total,
+            if snapshot.total == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(palette::TEXT_MUTED),
+    ));
+    lines
+}
+
 fn checklist_status_marker(status: &str) -> (&'static str, Color) {
     match status.to_ascii_lowercase().as_str() {
         "completed" | "done" => ("\u{2611}", palette::STATUS_SUCCESS), // ☑
@@ -1426,7 +1710,7 @@ fn render_checklist_card(
         let prefix = format!("{marker} ");
         // Reserve room for the rail + marker prefix when wrapping content.
         let prefix_width =
-            UnicodeWidthStr::width("\u{258F} ") + UnicodeWidthStr::width(prefix.as_str());
+            UnicodeWidthStr::width(TRANSCRIPT_RAIL) + UnicodeWidthStr::width(prefix.as_str());
         let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
         for (idx, part) in wrap_text(item.content.trim(), content_width)
             .into_iter()
@@ -1768,7 +2052,7 @@ fn render_thinking(
     // 12% reasoning surface tint over the app ink — the only deliberately
     // warm element in the transcript. Dropped on Ansi-16 terminals where the
     // tint would distort the named palette.
-    let depth = palette::ColorDepth::detect();
+    let depth = cached_color_depth();
     let body_bg = palette::reasoning_surface_tint(depth);
     let body_style = match body_bg {
         Some(bg) => style.italic().bg(bg),
@@ -1877,9 +2161,13 @@ fn render_message(
             let indent = if prefix.is_empty() {
                 String::new()
             } else {
-                " ".repeat(prefix_width + 1)
+                let mut s = String::with_capacity(prefix_width + 1);
+                s.push('\u{258F}');
+                s.extend(std::iter::repeat_n(' ', prefix_width));
+                s
             };
-            let mut spans = vec![Span::raw(indent)];
+            let rail_style = Style::default().fg(palette::TEXT_DIM);
+            let mut spans = vec![Span::styled(indent, rail_style)];
             spans.extend(line.spans);
             lines.push(Line::from(spans));
         }
@@ -2046,15 +2334,18 @@ fn render_preserved_output_mode(
 fn output_rows(output: &str, width: u16) -> Vec<OutputRow> {
     let wrap_width = width.saturating_sub(4).max(1) as usize;
     let mut rows = Vec::new();
+    let mut sanitized = String::with_capacity(output.len());
     for line in output.lines() {
-        let intact = is_path_or_url_like(line);
+        sanitized.clear();
+        crate::tui::osc8::strip_ansi_into(line, &mut sanitized);
+        let intact = is_path_or_url_like(&sanitized);
         if intact {
             rows.push(OutputRow {
-                text: line.to_string(),
+                text: sanitized.clone(),
                 intact: true,
             });
         } else {
-            for wrapped in wrap_text(line, wrap_width) {
+            for wrapped in wrap_text(&sanitized, wrap_width) {
                 rows.push(OutputRow {
                     text: wrapped,
                     intact: false,
@@ -2145,23 +2436,108 @@ fn is_path_or_url_like(line: &str) -> bool {
     has_separator && has_extension
 }
 
+/// Detect whether a system message is a cycle-boundary announcement
+/// (e.g. `─── cycle 0 → 1  (briefing: 2500 tokens) ───`).
+fn is_cycle_boundary(content: &str) -> bool {
+    content.contains("cycle")
+}
+
+/// Render a cycle-boundary system message with distinct visual styling (#395):
+/// full-width line with DEEPSEEK_BLUE text and bold weight, plus a thin
+/// horizontal rule above for visual separation.
+fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(palette::DEEPSEEK_BLUE)
+        .add_modifier(Modifier::BOLD);
+    let rule_style = Style::default().fg(palette::TEXT_DIM);
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    let mut lines = Vec::new();
+    // Thin horizontal rule above for visual separation
+    if width >= 4 {
+        let rule = "\u{2500}".repeat(content_width);
+        lines.push(Line::from(Span::styled(format!("  {rule}"), rule_style)));
+    }
+    // Cycle boundary text — just the content, full-width
+    let rendered =
+        crate::tui::markdown_render::render_markdown(content, content_width as u16, style);
+    for line in rendered {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+    if lines.len() == 1 && width >= 4 {
+        // Only the rule was added (unlikely), but add at least a spacer
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+/// Detect whether a line contains a `path:line` pattern that could be
+/// opened by `try_open_file_at_line`. Returns a distinctive style
+/// (underline + blue) when the pattern matches, or `None` otherwise.
+/// The style is applied over the existing value style so the line
+/// remains readable.
+fn file_line_style(text: &str) -> Option<Style> {
+    let trimmed = text.trim();
+    if let Some((before, after)) = trimmed.rsplit_once(':')
+        && !before.is_empty()
+        && after.chars().all(|c| c.is_ascii_digit())
+        && looks_like_file_path(before)
+    {
+        Some(
+            Style::default()
+                .fg(palette::DEEPSEEK_SKY)
+                .add_modifier(Modifier::UNDERLINED),
+        )
+    } else {
+        None
+    }
+}
+
+/// Apply inline diff highlighting to a single text line.
+///
+/// Returns the appropriate style for the line based on its prefix:
+/// - Lines starting with `+` (after trimming) => `palette::DIFF_ADDED` (green)
+/// - Lines starting with `-` (after trimming) => `palette::STATUS_ERROR` (red)
+/// - Lines starting with `@@` => `palette::DEEPSEEK_SKY` (cyan/blue)
+/// - All other lines => None (use default style)
+fn diff_line_style(text: &str) -> Option<Style> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("@@") {
+        Some(Style::default().fg(palette::DEEPSEEK_BLUE))
+    } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        Some(Style::default().fg(palette::DIFF_ADDED))
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        Some(Style::default().fg(palette::STATUS_ERROR))
+    } else {
+        None
+    }
+}
+
 fn render_output_row(
     lines: &mut Vec<Line<'static>>,
     label: Option<&str>,
     row: &OutputRow,
     width: u16,
 ) {
+    // #374: apply file:line highlighting when the row text contains
+    // a `path:line` pattern. Diff style takes precedence (colored
+    // prefix lines should stay colored), but if no diff style matched,
+    // check for a file:line pattern and highlight it distinctively.
+    let diff_style = diff_line_style(&row.text);
+    let file_style = file_line_style(&row.text);
+    let value_style = diff_style.or(file_style).unwrap_or_else(tool_value_style);
     if row.intact {
         lines.push(render_card_detail_line_single(
             label,
             &row.text,
-            tool_value_style(),
+            value_style,
         ));
     } else {
         lines.extend(render_card_detail_line(
             label,
             &row.text,
-            tool_value_style(),
+            value_style,
             width,
         ));
     }
@@ -2185,22 +2561,21 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current = String::new();
-    let mut current_width = 0usize;
 
     for ch in text.chars() {
-        let ch_width = if ch == '\t' {
-            4
+        let tentative = if current.is_empty() {
+            ch.to_string()
         } else {
-            UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
+            let mut t = current.clone();
+            t.push(ch);
+            t
         };
 
-        if current_width + ch_width > width && !current.is_empty() {
+        if UnicodeWidthStr::width(tentative.as_str()) > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
-            current_width = 0;
         }
 
         current.push(ch);
-        current_width = current_width.saturating_add(ch_width);
     }
 
     lines.push(current);
@@ -2239,7 +2614,10 @@ fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bo
 
 fn details_affordance_line(text: &str, style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled("▏ ", Style::default().fg(palette::TEXT_DIM)),
+        Span::styled(
+            TRANSCRIPT_RAIL.to_string(),
+            Style::default().fg(palette::TEXT_DIM),
+        ),
         Span::styled(text.to_string(), style),
     ])
 }
@@ -2258,6 +2636,10 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 
 fn user_label_style() -> Style {
     Style::default().fg(palette::TEXT_MUTED)
+}
+
+fn user_body_style() -> Style {
+    Style::default().fg(palette::USER_BODY)
 }
 
 /// Style for the assistant glyph (`●`). When the cell is streaming and
@@ -2326,7 +2708,7 @@ fn error_body_style(severity: crate::error_taxonomy::ErrorSeverity) -> Style {
 }
 
 fn thinking_style() -> Style {
-    Style::default().fg(palette::TEXT_TOOL_OUTPUT)
+    Style::default().fg(palette::TEXT_REASONING)
 }
 
 fn render_tool_header(
@@ -2448,14 +2830,17 @@ fn render_card_detail_line(
     width: u16,
 ) -> Vec<Line<'static>> {
     let label_text = label.map(|text| format!("{text}:"));
-    let prefix_width = UnicodeWidthStr::width("▏ ")
+    let prefix_width = UnicodeWidthStr::width(TRANSCRIPT_RAIL)
         + label_text.as_deref().map_or(0, UnicodeWidthStr::width)
         + usize::from(label.is_some());
     let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
 
     let mut lines = Vec::new();
     for (idx, part) in wrap_text(value, content_width).into_iter().enumerate() {
-        let mut spans = vec![Span::styled("▏ ", Style::default().fg(palette::TEXT_DIM))];
+        let mut spans = vec![Span::styled(
+            TRANSCRIPT_RAIL.to_string(),
+            Style::default().fg(palette::TEXT_DIM),
+        )];
         if idx == 0 {
             if let Some(label_text) = label_text.as_deref() {
                 spans.push(Span::styled(
@@ -2481,7 +2866,10 @@ fn render_card_detail_line_single(
     value_style: Style,
 ) -> Line<'static> {
     let label_text = label.map(|text| format!("{text}:"));
-    let mut spans = vec![Span::styled("▏ ", Style::default().fg(palette::TEXT_DIM))];
+    let mut spans = vec![Span::styled(
+        TRANSCRIPT_RAIL.to_string(),
+        Style::default().fg(palette::TEXT_DIM),
+    )];
     if let Some(label_text) = label_text {
         spans.push(Span::styled(label_text, tool_detail_label_style()));
         spans.push(Span::raw(" "));
@@ -2562,6 +2950,128 @@ fn thinking_state_accent(state: ThinkingVisualState) -> Color {
     }
 }
 
+// === Cached colour depth ===
+
+/// Once-initialised colour depth for the terminal session. Avoids re-reading
+/// `COLORTERM` / `TERM` env vars on every frame.
+static COLOR_DEPTH: std::sync::OnceLock<palette::ColorDepth> = std::sync::OnceLock::new();
+
+fn cached_color_depth() -> palette::ColorDepth {
+    *COLOR_DEPTH.get_or_init(palette::ColorDepth::detect)
+}
+
+/// Parse `path:line` patterns from `text` and open the file at the given line
+/// in the user's preferred editor (`$VISUAL` / `$EDITOR` / `vim`).
+///
+/// Scans lines of `text` for patterns like `src/main.rs:42`. Resolves the path
+/// relative to `workspace` (if not absolute) and opens the editor. Returns
+/// `true` if at least one file was opened successfully.
+pub fn try_open_file_at_line(text: &str, workspace: &Path) -> bool {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vim".to_string());
+
+    let mut any_opened = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((before, after)) = trimmed.rsplit_once(':')
+            && after.chars().all(|c| c.is_ascii_digit())
+        {
+            let line_num: u32 = after.parse().unwrap_or(1);
+            let path_str = before.trim();
+            if !path_str.is_empty() && looks_like_file_path(path_str) {
+                let abs_path = if Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    workspace.join(path_str)
+                };
+                if abs_path.is_file()
+                    && Command::new(&editor)
+                        .arg(format!("+{line_num}"))
+                        .arg(&abs_path)
+                        .spawn()
+                        .is_ok()
+                {
+                    any_opened = true;
+                }
+            }
+        }
+    }
+    any_opened
+}
+
+/// Heuristic check whether a string looks like a file path (contains a
+/// directory separator or a known source file extension).
+fn looks_like_file_path(s: &str) -> bool {
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    // Check for a known file extension
+    if let Some((_, ext)) = s.rsplit_once('.') {
+        let ext = ext.trim();
+        matches!(
+            ext,
+            "rs" | "toml"
+                | "md"
+                | "sh"
+                | "py"
+                | "js"
+                | "ts"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "css"
+                | "html"
+                | "go"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "java"
+                | "kt"
+                | "swift"
+                | "rb"
+                | "php"
+                | "lua"
+                | "zig"
+                | "mod"
+                | "sum"
+                | "lock"
+                | "txt"
+                | "ini"
+                | "cfg"
+                | "conf"
+                | "env"
+                | "gitignore"
+                | "dockerfile"
+                | "sql"
+                | "r"
+                | "ex"
+                | "exs"
+                | "vue"
+                | "svelte"
+                | "tsx"
+                | "jsx"
+                | "scss"
+                | "sass"
+                | "less"
+                | "gradle"
+                | "properties"
+                | "xml"
+                | "proto"
+                | "nix"
+        )
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2582,6 +3092,400 @@ mod tests {
     // Below 3s the label stays "running" — quick reads/greps shouldn't
     // visually churn. From 3s onward the badge appears and ticks each
     // second so the user can tell the call hasn't hung.
+    // ---- #423 spillover-path UI annotation ----
+    //
+    // When a tool result carries a `spillover_path` (set by the
+    // tool-routing layer when the tool's `metadata.spillover_path` is
+    // populated), the live render appends a one-line muted hint
+    // pointing at the file. Transcript-mode replay leaves the hint
+    // off because the full output is already inline.
+
+    #[test]
+    fn render_spillover_annotation_shows_path() {
+        use std::path::PathBuf;
+        let cell = GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("cmd: cargo build --release".to_string()),
+            output: Some("very large output...".to_string()),
+            prompts: None,
+            spillover_path: Some(PathBuf::from(
+                "/Users/dev/.deepseek/tool_outputs/call-abc12.txt",
+            )),
+        };
+        let lines = cell.lines_with_mode(120, true, super::RenderMode::Live);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            joined.contains("full output:"),
+            "expected annotation prefix: {joined:?}"
+        );
+        assert!(
+            joined.contains("/Users/dev/.deepseek/tool_outputs/call-abc12.txt"),
+            "expected the spillover path: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn render_spillover_annotation_omitted_in_transcript_mode() {
+        use std::path::PathBuf;
+        // Transcript mode is for replay; the full output is already
+        // inline so the annotation would just be redundant.
+        let cell = GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some("output".to_string()),
+            prompts: None,
+            spillover_path: Some(PathBuf::from("/tmp/spill.txt")),
+        };
+        let lines = cell.lines_with_mode(120, true, super::RenderMode::Transcript);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            !joined.contains("full output:"),
+            "annotation should be omitted in transcript mode: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn render_spillover_annotation_omitted_when_no_path_set() {
+        // The common case: most tool results don't trigger spillover.
+        let cell = GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some("contents".to_string()),
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(!joined.contains("full output:"), "{joined:?}");
+    }
+
+    #[test]
+    fn render_spillover_annotation_truncates_to_width() {
+        use std::path::PathBuf;
+        let long_path = "/Users/dev/.deepseek/tool_outputs/this-is-a-very-long-tool-call-id-that-will-not-fit-in-narrow-widths.txt";
+        let cell = GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some("output".to_string()),
+            prompts: None,
+            spillover_path: Some(PathBuf::from(long_path)),
+        };
+        let lines = cell.lines_with_mode(40, true, super::RenderMode::Live);
+        let annotation_line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("full output:"))
+            })
+            .expect("annotation line present");
+        let rendered: String = annotation_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Width budget is 40; annotation line should be at most ~40 chars.
+        // (Some slack for the prefix; the truncate_text ellipsis costs
+        // 3 cols.)
+        assert!(
+            rendered.chars().count() <= 60,
+            "annotation overflowed at width 40: {} chars: {rendered:?}",
+            rendered.chars().count()
+        );
+    }
+
+    // ---- #409 compact agent_spawn rendering ----
+    //
+    // The DelegateCard owns live state for spawned sub-agents; the
+    // generic tool block previously duplicated that signal at 3-4 lines
+    // per spawn. In live mode we now render a single compact line that
+    // points at the spawned agent id; transcript-mode replay keeps the
+    // full block so debug history is intact.
+
+    #[test]
+    fn extract_agent_id_pulls_id_from_json_output() {
+        let output =
+            r#"{"agent_id": "agent-abc12", "nickname": "Beluga", "model": "deepseek-v4-flash"}"#;
+        assert_eq!(super::extract_agent_id(output), Some("agent-abc12"));
+    }
+
+    #[test]
+    fn extract_agent_id_handles_extra_whitespace() {
+        let output = r#"{
+            "agent_id"   :    "agent-xyz",
+            "model": "x"
+        }"#;
+        assert_eq!(super::extract_agent_id(output), Some("agent-xyz"));
+    }
+
+    #[test]
+    fn extract_agent_id_returns_none_when_missing() {
+        let output = r#"{"nickname": "Orca", "model": "x"}"#;
+        assert!(super::extract_agent_id(output).is_none());
+        assert!(super::extract_agent_id("(not json)").is_none());
+        assert!(super::extract_agent_id("").is_none());
+    }
+
+    #[test]
+    fn extract_agent_id_returns_none_for_empty_id() {
+        let output = r#"{"agent_id": "", "model": "x"}"#;
+        assert!(super::extract_agent_id(output).is_none());
+    }
+
+    #[test]
+    fn agent_spawn_renders_single_compact_line_in_live_mode() {
+        let cell = GenericToolCell {
+            name: "agent_spawn".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("prompt: do thing".to_string()),
+            output: Some(
+                r#"{"agent_id": "agent-abc12", "nickname": "Beluga", "model": "deepseek-v4-flash"}"#
+                    .to_string(),
+            ),
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+        // One header line, no details/args/output expansion.
+        assert_eq!(lines.len(), 1, "expected exactly 1 line, got {:?}", lines);
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // Header carries the agent id and the running status.
+        assert!(
+            rendered.contains("agent-abc12"),
+            "expected agent id in header: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("running"),
+            "expected status in header: {rendered:?}"
+        );
+        // No verbose `args:` / `name:` rows.
+        assert!(
+            !rendered.contains("args"),
+            "args should be hidden: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn agent_spawn_pending_render_uses_placeholder_id() {
+        // No output yet → use the … placeholder so the user still sees a
+        // header line during the brief gap between tool-call-started and
+        // the spawn returning the agent_id.
+        let cell = GenericToolCell {
+            name: "agent_spawn".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("prompt: do thing".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains('\u{2026}'), "{rendered:?}"); // …
+    }
+
+    #[test]
+    fn agent_spawn_transcript_mode_keeps_full_block() {
+        // Transcript mode is for replay/debug — preserve the full block
+        // so session export still carries the args/output verbatim.
+        let cell = GenericToolCell {
+            name: "agent_spawn".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("prompt: do thing".to_string()),
+            output: Some(
+                r#"{"agent_id": "agent-abc12", "model": "deepseek-v4-flash"}"#.to_string(),
+            ),
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Transcript);
+        // Transcript mode emits header + name kv + (no args, output present)
+        // + output rows. At minimum more than the live one-liner.
+        assert!(lines.len() > 1, "expected verbose transcript render");
+    }
+
+    #[test]
+    fn other_tools_are_unaffected_by_agent_spawn_compact_path() {
+        // Only `agent_spawn` is collapsed — `read_file` and friends
+        // continue to render their normal multi-line block in live mode.
+        let cell = GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("path: foo.rs".to_string()),
+            output: Some("first line\nsecond line\nthird line".to_string()),
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+        assert!(
+            lines.len() > 1,
+            "non-spawn tools should keep their full block"
+        );
+    }
+
+    // ---- #403 concise todo / checklist update rendering ----
+    //
+    // The tool emits an "Updated todo #N to STATUS" leading line plus a
+    // JSON snapshot. The renderer should detect the prefix and produce
+    // a compact one-line state-change card instead of dumping the full
+    // item list every time.
+
+    #[test]
+    fn parse_update_prefix_recognises_todo_form() {
+        let parsed =
+            super::parse_update_prefix("Updated todo #3 to in_progress\n{ \"items\": [...] }");
+        assert_eq!(
+            parsed,
+            Some(super::ChecklistChange {
+                id: 3,
+                status: "in_progress".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_update_prefix_recognises_checklist_form() {
+        let parsed =
+            super::parse_update_prefix("Updated checklist #7 to completed\n{ \"items\": [] }");
+        assert_eq!(
+            parsed,
+            Some(super::ChecklistChange {
+                id: 7,
+                status: "completed".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_update_prefix_returns_none_for_writes() {
+        // `todo_write` / `checklist_write` outputs don't start with
+        // "Updated …" — they should fall through to the full-card path.
+        assert!(super::parse_update_prefix("{ \"items\": [] }").is_none());
+        assert!(super::parse_update_prefix("Wrote 5 todos\n{}").is_none());
+    }
+
+    #[test]
+    fn parse_update_prefix_returns_none_for_malformed() {
+        // Missing arrow/status → fall through.
+        assert!(super::parse_update_prefix("Updated todo #3\n").is_none());
+        // Non-numeric id → fall through.
+        assert!(super::parse_update_prefix("Updated todo #foo to done\n").is_none());
+    }
+
+    #[test]
+    fn render_checklist_change_card_shows_only_changed_item() {
+        // Build a snapshot with three items; render the change for #2.
+        let snapshot = super::ChecklistSnapshot {
+            items: vec![
+                super::ChecklistItemSnapshot {
+                    content: "Read the spec".to_string(),
+                    status: "completed".to_string(),
+                },
+                super::ChecklistItemSnapshot {
+                    content: "Write the test".to_string(),
+                    status: "in_progress".to_string(),
+                },
+                super::ChecklistItemSnapshot {
+                    content: "Land the PR".to_string(),
+                    status: "pending".to_string(),
+                },
+            ],
+            completion_pct: 33,
+            completed: 1,
+            total: 3,
+        };
+        let change = super::ChecklistChange {
+            id: 2,
+            status: "in_progress".to_string(),
+        };
+        let lines = super::render_checklist_change_card(
+            "todo_update",
+            ToolStatus::Success,
+            &snapshot,
+            &change,
+            80,
+            true,
+        );
+        // Header + change line + summary affordance = 3 lines.
+        assert!(lines.len() >= 3, "expected ≥3 lines, got {}", lines.len());
+
+        // The change line should mention the title and the new status,
+        // and should NOT include the other two item titles (that's the
+        // whole point — concise rendering).
+        let change_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(change_line.contains("#2"), "missing id: {change_line:?}");
+        assert!(
+            change_line.contains("Write the test"),
+            "missing title: {change_line:?}"
+        );
+        assert!(
+            change_line.contains("in_progress"),
+            "missing status: {change_line:?}"
+        );
+        assert!(
+            !change_line.contains("Land the PR"),
+            "should not show other items: {change_line:?}"
+        );
+        assert!(
+            !change_line.contains("Read the spec"),
+            "should not show other items: {change_line:?}"
+        );
+
+        // The summary line carries the count + Alt+V hint.
+        let summary_line: String = lines
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(summary_line.contains("3 items"), "{summary_line:?}");
+        assert!(summary_line.contains("Alt+V"), "{summary_line:?}");
+    }
+
+    #[test]
+    fn render_checklist_change_card_handles_missing_title_gracefully() {
+        // If the change targets an out-of-range id, the title falls
+        // back to a placeholder rather than crashing.
+        let snapshot = super::ChecklistSnapshot {
+            items: vec![super::ChecklistItemSnapshot {
+                content: "only item".to_string(),
+                status: "pending".to_string(),
+            }],
+            completion_pct: 0,
+            completed: 0,
+            total: 1,
+        };
+        let change = super::ChecklistChange {
+            id: 99,
+            status: "completed".to_string(),
+        };
+        let lines = super::render_checklist_change_card(
+            "todo_update",
+            ToolStatus::Success,
+            &snapshot,
+            &change,
+            80,
+            true,
+        );
+        let change_line: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(change_line.contains("#99"));
+        assert!(change_line.contains("(missing title)"));
+    }
+
     #[test]
     fn running_status_label_omits_elapsed_below_threshold() {
         assert_eq!(running_status_label_with_elapsed(0), "running");
@@ -2845,6 +3749,7 @@ mod tests {
             input_summary: Some("foo".to_string()),
             output: None,
             prompts: None,
+            spillover_path: None,
         };
         let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
         let header_visible: String = lines[0]
@@ -2860,6 +3765,33 @@ mod tests {
         assert!(
             header_visible.contains(" delegate "),
             "verb label `delegate`: {header_visible:?}"
+        );
+    }
+
+    #[test]
+    fn generic_tool_cell_renders_rlm_with_rlm_label_not_swarm() {
+        let cell = GenericToolCell {
+            name: "rlm".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("task: compare source trees".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+        };
+        let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+        let header_visible: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+
+        assert!(
+            header_visible.contains(" rlm "),
+            "RLM card should identify RLM work: {header_visible:?}"
+        );
+        assert!(
+            !header_visible.contains("swarm"),
+            "RLM card must not use removed swarm wording: {header_visible:?}"
         );
     }
 
@@ -3280,6 +4212,7 @@ mod tests {
                 "List the public types in client.rs".to_string(),
                 "Diff this commit against main".to_string(),
             ]),
+            spillover_path: None,
         }));
         let text = lines_text(&cell.lines(80));
 
@@ -3304,6 +4237,7 @@ mod tests {
             input_summary: Some("query: foo".to_string()),
             output: None,
             prompts: None,
+            spillover_path: None,
         }));
         let text = lines_text(&cell.lines(80));
         assert!(text.contains("query: foo"));
@@ -3326,6 +4260,7 @@ mod tests {
             input_summary: Some("command: git diff --stat".to_string()),
             output: Some(diff_stat.to_string()),
             prompts: None,
+            spillover_path: None,
         }));
 
         let transcript_text = lines_text(&cell.transcript_lines(80));
@@ -3375,6 +4310,7 @@ mod tests {
             input_summary: Some("command: ls".to_string()),
             output: Some(output),
             prompts: None,
+            spillover_path: None,
         }));
 
         let live = cell.lines_with_options(80, TranscriptRenderOptions::default());
@@ -3409,6 +4345,7 @@ mod tests {
             input_summary: Some("command: noisy".to_string()),
             output: Some(output),
             prompts: None,
+            spillover_path: None,
         }));
 
         let live_text =
@@ -3443,6 +4380,7 @@ mod tests {
             input_summary: Some("command: tool".to_string()),
             output: Some(output),
             prompts: None,
+            spillover_path: None,
         }));
 
         let live_text =

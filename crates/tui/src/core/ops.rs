@@ -6,6 +6,7 @@
 use crate::compaction::CompactionConfig;
 use crate::models::{Message, SystemPrompt};
 use crate::tui::app::AppMode;
+use crate::tui::approval::ApprovalMode;
 use std::path::PathBuf;
 
 /// Operations that can be submitted to the engine.
@@ -16,12 +17,19 @@ pub enum Op {
         content: String,
         mode: AppMode,
         model: String,
+        goal_objective: Option<String>,
         /// Reasoning-effort tier: `"off" | "low" | "medium" | "high" | "max"`.
         /// `None` lets the provider apply its default.
         reasoning_effort: Option<String>,
+        /// True when the user selected auto thinking, even though the UI sends
+        /// a concrete per-turn value to the model API.
+        reasoning_effort_auto: bool,
+        /// True when the user selected auto model routing.
+        auto_model: bool,
         allow_shell: bool,
         trust_mode: bool,
         auto_approve: bool,
+        approval_mode: ApprovalMode,
     },
 
     /// Cancel the current request
@@ -80,29 +88,11 @@ pub enum Op {
         max_depth: u32,
     },
 
+    /// Edit the last user message: remove the last user+assistant exchange
+    /// from the session, then re-send with the new content.
+    #[allow(dead_code)]
+    EditLastTurn { new_message: String },
+
     /// Shutdown the engine
     Shutdown,
-}
-
-impl Op {
-    /// Create a send message operation
-    pub fn send(
-        content: impl Into<String>,
-        mode: AppMode,
-        model: impl Into<String>,
-        reasoning_effort: Option<String>,
-        allow_shell: bool,
-        trust_mode: bool,
-        auto_approve: bool,
-    ) -> Self {
-        Op::SendMessage {
-            content: content.into(),
-            mode,
-            model: model.into(),
-            reasoning_effort,
-            allow_shell,
-            trust_mode,
-            auto_approve,
-        }
-    }
 }

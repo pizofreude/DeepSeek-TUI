@@ -3,7 +3,7 @@
 //! These events flow from the engine to the TUI via a channel,
 //! enabling non-blocking, real-time updates.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use serde_json::Value;
 
@@ -200,13 +200,6 @@ pub enum Event {
         message: crate::tools::subagent::MailboxMessage,
     },
 
-    /// Authoritative swarm progress/outcome snapshot. Nonblocking
-    /// `agent_swarm` returns before child agents finish, so the UI cannot
-    /// rely on the original tool result as the final lifecycle state.
-    SwarmProgress {
-        outcome: crate::tools::swarm::SwarmOutcome,
-    },
-
     // === System Events ===
     /// An error occurred
     Error {
@@ -218,8 +211,12 @@ pub enum Event {
     /// Status message for UI display
     Status { message: String },
 
-    /// Pause terminal input events (for interactive subprocesses)
-    PauseEvents,
+    /// Pause terminal input events (for interactive subprocesses).
+    PauseEvents {
+        /// Optional one-shot notification fired after the UI has actually
+        /// released the terminal to the child process.
+        ack: Option<Arc<tokio::sync::Notify>>,
+    },
 
     /// Resume terminal input events after subprocess completion
     ResumeEvents,

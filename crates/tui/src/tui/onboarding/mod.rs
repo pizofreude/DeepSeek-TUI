@@ -1,6 +1,7 @@
 //! Onboarding flow rendering and helpers.
 
 pub mod api_key;
+pub mod language;
 pub mod trust_directory;
 pub mod welcome;
 
@@ -32,6 +33,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let lines = match app.onboarding {
         OnboardingState::Welcome => welcome::lines(),
+        OnboardingState::Language => language::lines(app),
         OnboardingState::ApiKey => api_key::lines(app),
         OnboardingState::TrustDirectory => trust_directory::lines(app),
         OnboardingState::Tips => tips_lines(),
@@ -39,24 +41,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     };
 
     if !lines.is_empty() {
-        let (step, total) = onboarding_step(app);
-        let panel = Block::default()
+        let mut panel = Block::default()
             .title(Line::from(Span::styled(
                 " DeepSeek TUI ",
                 Style::default()
                     .fg(palette::DEEPSEEK_BLUE)
                     .add_modifier(Modifier::BOLD),
             )))
-            .title_bottom(Line::from(Span::styled(
-                format!(" Step {step}/{total} "),
-                Style::default()
-                    .fg(palette::TEXT_MUTED)
-                    .add_modifier(Modifier::BOLD),
-            )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
             .style(Style::default().bg(palette::DEEPSEEK_SLATE))
             .padding(Padding::new(2, 2, 1, 1));
+        if !app.onboarding_workspace_trust_gate {
+            let (step, total) = onboarding_step(app);
+            panel = panel.title_bottom(Line::from(Span::styled(
+                format!(" Step {step}/{total} "),
+                Style::default()
+                    .fg(palette::TEXT_MUTED)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         let inner = panel.inner(content_area);
         f.render_widget(panel, content_area);
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -66,7 +70,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
 fn onboarding_step(app: &App) -> (usize, usize) {
     let needs_trust = !app.trust_mode && needs_trust(&app.workspace);
-    let mut total = 2; // Welcome + Tips
+    // Welcome + Language + Tips are always shown.
+    let mut total = 3;
     if app.onboarding_needs_api_key {
         total += 1;
     }
@@ -76,13 +81,11 @@ fn onboarding_step(app: &App) -> (usize, usize) {
 
     let step = match app.onboarding {
         OnboardingState::Welcome => 1,
-        OnboardingState::ApiKey => 2,
+        OnboardingState::Language => 2,
+        OnboardingState::ApiKey => 3,
         OnboardingState::TrustDirectory => {
-            if app.onboarding_needs_api_key {
-                3
-            } else {
-                2
-            }
+            // Welcome (1) + Language (2) + optional ApiKey
+            if app.onboarding_needs_api_key { 4 } else { 3 }
         }
         OnboardingState::Tips => total,
         OnboardingState::None => total,
@@ -151,6 +154,10 @@ pub fn mark_onboarded() -> std::io::Result<PathBuf> {
 }
 
 pub fn needs_trust(workspace: &Path) -> bool {
+    if crate::config::is_workspace_trusted(workspace) {
+        return false;
+    }
+
     let markers = [
         workspace.join(".deepseek").join("trusted"),
         workspace.join(".deepseek").join("trust.json"),
@@ -158,10 +165,6 @@ pub fn needs_trust(workspace: &Path) -> bool {
     !markers.iter().any(|path| path.exists())
 }
 
-pub fn mark_trusted(workspace: &Path) -> std::io::Result<PathBuf> {
-    let dir = workspace.join(".deepseek");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("trusted");
-    std::fs::write(&path, "")?;
-    Ok(path)
+pub fn mark_trusted(workspace: &Path) -> anyhow::Result<PathBuf> {
+    crate::config::save_workspace_trust(workspace)
 }

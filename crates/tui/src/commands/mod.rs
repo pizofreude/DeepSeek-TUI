@@ -3,22 +3,31 @@
 //! This module provides a modular command system inspired by Codex-rs.
 //! Commands are organized by category and dispatched through a central registry.
 
+mod anchor;
 mod attachment;
 mod config;
 mod core;
 mod cycle;
 mod debug;
+mod goal;
+mod hooks;
 mod init;
 mod jobs;
 mod mcp;
+mod memory;
+mod network;
 mod note;
 mod provider;
 mod queue;
+mod rename;
 mod restore;
 mod review;
 mod session;
+pub mod share;
 mod skills;
+mod stash;
 mod task;
+mod user_commands;
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction};
@@ -30,6 +39,8 @@ pub struct CommandResult {
     pub message: Option<String>,
     /// Optional action for the app to take
     pub action: Option<AppAction>,
+    /// Whether the command failed.
+    pub is_error: bool,
 }
 
 impl CommandResult {
@@ -38,6 +49,7 @@ impl CommandResult {
         Self {
             message: None,
             action: None,
+            is_error: false,
         }
     }
 
@@ -46,6 +58,7 @@ impl CommandResult {
         Self {
             message: Some(msg.into()),
             action: None,
+            is_error: false,
         }
     }
 
@@ -54,6 +67,7 @@ impl CommandResult {
         Self {
             message: None,
             action: Some(action),
+            is_error: false,
         }
     }
 
@@ -63,6 +77,7 @@ impl CommandResult {
         Self {
             message: Some(msg.into()),
             action: Some(action),
+            is_error: false,
         }
     }
 
@@ -71,6 +86,7 @@ impl CommandResult {
         Self {
             message: Some(format!("Error: {}", msg.into())),
             action: None,
+            is_error: true,
         }
     }
 }
@@ -120,6 +136,12 @@ impl CommandInfo {
 pub const COMMANDS: &[CommandInfo] = &[
     // Core commands
     CommandInfo {
+        name: "anchor",
+        aliases: &[],
+        usage: "/anchor <text> | /anchor list | /anchor remove <n>",
+        description_id: MessageId::CmdAnchorDescription,
+    },
+    CommandInfo {
         name: "help",
         aliases: &["?"],
         usage: "/help [command]",
@@ -162,6 +184,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         description_id: MessageId::CmdQueueDescription,
     },
     CommandInfo {
+        name: "stash",
+        aliases: &["park"],
+        usage: "/stash [list|pop|clear]",
+        description_id: MessageId::CmdStashDescription,
+    },
+    CommandInfo {
+        name: "hooks",
+        aliases: &["hook"],
+        usage: "/hooks [list|events]",
+        description_id: MessageId::CmdHooksDescription,
+    },
+    CommandInfo {
         name: "subagents",
         aliases: &["agents"],
         usage: "/subagents",
@@ -184,6 +218,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         aliases: &[],
         usage: "/note <text>",
         description_id: MessageId::CmdNoteDescription,
+    },
+    CommandInfo {
+        name: "memory",
+        aliases: &[],
+        usage: "/memory [show|path|clear|edit|help]",
+        description_id: MessageId::CmdMemoryDescription,
     },
     CommandInfo {
         name: "attach",
@@ -209,7 +249,19 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/mcp [init|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|validate|reload]",
         description_id: MessageId::CmdMcpDescription,
     },
+    CommandInfo {
+        name: "network",
+        aliases: &[],
+        usage: "/network [list|allow <host>|deny <host>|remove <host>|default <allow|deny|prompt>]",
+        description_id: MessageId::CmdNetworkDescription,
+    },
     // Session commands
+    CommandInfo {
+        name: "rename",
+        aliases: &[],
+        usage: "/rename <new title>",
+        description_id: MessageId::CmdRenameDescription,
+    },
     CommandInfo {
         name: "save",
         aliases: &[],
@@ -219,7 +271,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "sessions",
         aliases: &["resume"],
-        usage: "/sessions",
+        usage: "/sessions [show|prune <days>]",
         description_id: MessageId::CmdSessionsDescription,
     },
     CommandInfo {
@@ -290,6 +342,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         description_id: MessageId::CmdPlanDescription,
     },
     CommandInfo {
+        name: "theme",
+        aliases: &[],
+        usage: "/theme",
+        description_id: MessageId::CmdThemeDescription,
+    },
+    CommandInfo {
         name: "trust",
         aliases: &[],
         usage: "/trust [on|off|add <path>|remove <path>|list]",
@@ -315,6 +373,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         description_id: MessageId::CmdSystemDescription,
     },
     CommandInfo {
+        name: "edit",
+        aliases: &[],
+        usage: "/edit",
+        description_id: MessageId::CmdEditDescription,
+    },
+    CommandInfo {
+        name: "diff",
+        aliases: &[],
+        usage: "/diff",
+        description_id: MessageId::CmdDiffDescription,
+    },
+    CommandInfo {
         name: "undo",
         aliases: &[],
         usage: "/undo",
@@ -333,6 +403,24 @@ pub const COMMANDS: &[CommandInfo] = &[
         description_id: MessageId::CmdInitDescription,
     },
     CommandInfo {
+        name: "lsp",
+        aliases: &[],
+        usage: "/lsp [on|off|status]",
+        description_id: MessageId::CmdLspDescription,
+    },
+    CommandInfo {
+        name: "share",
+        aliases: &[],
+        usage: "/share",
+        description_id: MessageId::CmdShareDescription,
+    },
+    CommandInfo {
+        name: "goal",
+        aliases: &[],
+        usage: "/goal [objective] [budget: N]",
+        description_id: MessageId::CmdGoalDescription,
+    },
+    CommandInfo {
         name: "settings",
         aliases: &[],
         usage: "/settings",
@@ -348,7 +436,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "skills",
         aliases: &[],
-        usage: "/skills [--remote]",
+        usage: "/skills [--remote|sync]",
         description_id: MessageId::CmdSkillsDescription,
     },
     CommandInfo {
@@ -383,6 +471,13 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/cost",
         description_id: MessageId::CmdCostDescription,
     },
+    // Profile switching (#390)
+    CommandInfo {
+        name: "profile",
+        aliases: &[],
+        usage: "/profile <name>",
+        description_id: MessageId::CmdHelpDescription, // reuse for now
+    },
     // Cache telemetry (#263)
     CommandInfo {
         name: "cache",
@@ -399,9 +494,15 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
     let command = command.strip_prefix('/').unwrap_or(&command);
     let arg = parts.get(1).map(|s| s.trim());
 
+    // Check user-defined commands FIRST so they can override built-ins.
+    if let Some(result) = user_commands::try_dispatch_user_command(app, cmd.trim()) {
+        return result;
+    }
+
     // Match command or alias
     match command {
         // Core commands
+        "anchor" => anchor::anchor(app, arg),
         "help" | "?" => core::help(app, arg),
         "clear" => core::clear(app),
         "exit" | "quit" | "q" => core::exit(),
@@ -409,18 +510,23 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "models" => core::models(app),
         "provider" => provider::provider(app, arg),
         "queue" | "queued" => queue::queue(app, arg),
+        "stash" | "park" => stash::stash(app, arg),
+        "hooks" | "hook" => hooks::hooks(app, arg),
         "subagents" | "agents" => core::subagents(app),
-        "links" | "dashboard" | "api" => core::deepseek_links(),
+        "links" | "dashboard" | "api" => core::deepseek_links(app),
         "home" | "stats" | "overview" => core::home_dashboard(app),
         "note" => note::note(app, arg),
+        "memory" => memory::memory(app, arg),
         "attach" | "image" | "media" => attachment::attach(app, arg),
         "task" | "tasks" => task::task(app, arg),
         "jobs" | "job" => jobs::jobs(app, arg),
         "mcp" => mcp::mcp(app, arg),
+        "network" => network::network(app, arg),
 
         // Session commands
+        "rename" => rename::rename(app, arg),
         "save" => session::save(app, arg),
-        "sessions" | "resume" => session::sessions(app),
+        "sessions" | "resume" => session::sessions(app, arg),
         "load" => session::load(app, arg),
         "compact" => session::compact(app),
         "cycles" => cycle::list_cycles(app),
@@ -429,12 +535,13 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "export" => session::export(app, arg),
 
         // Config commands
-        "config" => config::show_config(app),
+        "config" => config::config_command(app, arg),
         "settings" => config::show_settings(app),
         "statusline" | "status" => config::status_line(app),
         "yolo" => config::yolo(app),
         "agent" => config::agent_mode(app),
         "plan" => config::plan_mode(app),
+        "theme" => config::theme(app),
         "trust" => config::trust(app, arg),
         "logout" => config::logout(app),
 
@@ -444,17 +551,39 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "cache" => debug::cache(app, arg),
         "system" => debug::system_prompt(app),
         "context" | "ctx" => debug::context(app),
-        "undo" => debug::undo(app),
+        "edit" => debug::edit(app),
+        "diff" => debug::diff(app),
+        "undo" => {
+            // Try surgical patch-undo first; fall back to conversation undo
+            // if no snapshots are available or if the snapshot undo couldn't
+            // find anything useful.
+            let result = debug::patch_undo(app);
+            if result.message.as_deref().is_none_or(|m| {
+                m.starts_with("No snapshots found")
+                    || m.starts_with("No tool or pre-turn")
+                    || m.starts_with("Snapshot repo")
+            }) {
+                debug::undo_conversation(app)
+            } else {
+                result
+            }
+        }
         "retry" => debug::retry(app),
 
         // Project commands
         "init" => init::init(app),
+        "lsp" => config::lsp_command(app, arg),
+        "share" => share::share(app, arg),
+        "goal" => goal::goal(app, arg),
 
         // Skills commands
         "skills" => skills::list_skills(app, arg),
         "skill" => skills::run_skill(app, arg),
         "review" => review::review(app, arg),
         "restore" => restore::restore(app, arg),
+
+        // Profile switch (#390)
+        "profile" => core::profile_switch(app, arg),
 
         // RLM command
         "rlm" | "recursive" => rlm(app, arg),
@@ -469,6 +598,11 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         ),
 
         _ => {
+            // Third source: skills (lowest precedence after native and user-config).
+            // Try to run a skill whose name matches the command.
+            if skills::run_skill_by_name(app, command, arg).is_some() {
+                return skills::run_skill_by_name(app, command, arg).unwrap();
+            }
             let suggestions = suggest_command_names(command, 3);
             if suggestions.is_empty() {
                 CommandResult::error(format!(
@@ -500,6 +634,21 @@ pub fn persist_status_items(
 ) -> anyhow::Result<std::path::PathBuf> {
     config::persist_status_items(items)
 }
+
+/// Persist a root-level string key in `config.toml`.
+pub fn persist_root_string_key(key: &str, value: &str) -> anyhow::Result<std::path::PathBuf> {
+    config::persist_root_string_key(key, value)
+}
+
+/// Auto-select a model based on request complexity.
+pub fn auto_model_heuristic(input: &str, current_model: &str) -> String {
+    config::auto_model_heuristic(input, current_model)
+}
+
+pub use config::{
+    AutoRouteRecommendation, AutoRouteSelection, normalize_auto_route_effort,
+    parse_auto_route_recommendation, resolve_auto_route_with_flash,
+};
 
 /// Execute a Recursive Language Model (RLM) turn — Algorithm 1 from
 /// Zhang et al. (arXiv:2512.24601).
@@ -559,6 +708,26 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
     COMMANDS
         .iter()
         .find(|cmd| cmd.name == name || cmd.aliases.contains(&name))
+}
+
+/// Get all command names matching a prefix, including both built-in
+/// static commands and user-defined commands, formatted as `/name`.
+pub fn all_command_names_matching(prefix: &str) -> Vec<String> {
+    let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
+    let mut result: Vec<String> = COMMANDS
+        .iter()
+        .filter(|cmd| {
+            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
+        })
+        .map(|cmd| format!("/{}", cmd.name))
+        .collect();
+
+    // Add user-defined commands
+    result.extend(user_commands::user_commands_matching(&prefix));
+
+    result.sort();
+    result.dedup();
+    result
 }
 
 /// Get all commands matching a prefix (for autocomplete)
@@ -665,6 +834,8 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -679,6 +850,7 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
         App::new(options, &Config::default())
     }
@@ -687,6 +859,7 @@ mod tests {
     fn command_registry_contains_config_and_links_but_not_set_or_deepseek() {
         assert!(COMMANDS.iter().any(|cmd| cmd.name == "config"));
         assert!(COMMANDS.iter().any(|cmd| cmd.name == "links"));
+        assert!(COMMANDS.iter().any(|cmd| cmd.name == "memory"));
         assert!(!COMMANDS.iter().any(|cmd| cmd.name == "set"));
         assert!(!COMMANDS.iter().any(|cmd| cmd.name == "deepseek"));
     }
@@ -792,6 +965,8 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: workspace.clone(),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -806,6 +981,7 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
         let app = App::new(options, &Config::default());
         (app, tmpdir)

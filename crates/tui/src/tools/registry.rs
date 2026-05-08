@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::client::DeepSeekClient;
 use crate::models::Tool;
 
+use super::schema_sanitize;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -119,6 +120,7 @@ impl ToolRegistry {
     /// Execute a tool with an optional context override.
     ///
     /// This is used for retrying tools with elevated sandbox policies.
+    /// After execution, large results are routed through the workshop (#548).
     pub async fn execute_full_with_context(
         &self,
         name: &str,
@@ -130,7 +132,58 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
         let ctx = context_override.unwrap_or(&self.context);
-        tool.execute(input, ctx).await
+        let result = tool.execute(input.clone(), ctx).await?;
+
+        // Large-output routing (#548): if the result exceeds the threshold and
+        // the caller did not request `raw=true`, synthesise via the workshop.
+        let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        if let Some(router) = ctx.large_output_router.as_ref() {
+            use crate::tools::large_output_router::{LargeOutputRouter, RouteDecision};
+            match router.route(name, &result, raw_bypass) {
+                RouteDecision::PassThrough => {}
+                RouteDecision::Synthesise {
+                    estimated_tokens,
+                    threshold,
+                } => {
+                    // Store the raw output in the workshop variable store.
+                    if let Some(vars_arc) = ctx.workshop_vars.as_ref() {
+                        let mut vars = vars_arc.lock().await;
+                        vars.store_raw(name, &result.content);
+                    }
+
+                    // Build a terse synthesis using the same model the registry
+                    // was constructed for (workshop Flash model). For now we
+                    // produce a structured header + truncated preview without
+                    // a live API call so the engine stays dependency-free at
+                    // the registry layer. A follow-up can wire in the Flash
+                    // client when the async LLM call is safe here.
+                    let preview_chars = 1_200usize;
+                    let preview: String = result.content.chars().take(preview_chars).collect();
+                    let ellipsis = if result.content.chars().count() > preview_chars {
+                        "\n… [output truncated — full text in workshop variable `last_tool_result`]"
+                    } else {
+                        ""
+                    };
+                    let synthesis = format!("{preview}{ellipsis}");
+                    let wrapped = LargeOutputRouter::wrap_synthesis(
+                        name,
+                        &synthesis,
+                        estimated_tokens,
+                        threshold,
+                    );
+                    tracing::debug!(
+                        tool = name,
+                        estimated_tokens,
+                        threshold,
+                        "large-output routed through workshop"
+                    );
+                    return Ok(ToolResult::success(wrapped));
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get the current tool context.
@@ -166,16 +219,20 @@ impl ToolRegistry {
         tools.sort_by(|a, b| a.name().cmp(b.name()));
         tools
             .into_iter()
-            .map(|tool| Tool {
-                tool_type: None,
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                input_schema: tool.input_schema(),
-                allowed_callers: Some(vec!["direct".to_string()]),
-                defer_loading: Some(tool.defer_loading()),
-                input_examples: None,
-                strict: None,
-                cache_control: None,
+            .map(|tool| {
+                let mut schema = tool.input_schema();
+                schema_sanitize::sanitize(&mut schema);
+                Tool {
+                    tool_type: None,
+                    name: tool.name().to_string(),
+                    description: tool.description().to_string(),
+                    input_schema: schema,
+                    allowed_callers: Some(vec!["direct".to_string()]),
+                    defer_loading: Some(tool.defer_loading()),
+                    input_examples: None,
+                    strict: None,
+                    cache_control: None,
+                }
             })
             .collect()
     }
@@ -186,7 +243,6 @@ impl ToolRegistry {
 
     /// Convert tools to API Tool format with optional cache control on the last tool.
     #[must_use]
-    #[allow(dead_code)]
     pub fn to_api_tools_with_cache(&self, enable_cache: bool) -> Vec<Tool> {
         let mut tools = self.to_api_tools();
         if enable_cache && let Some(last) = tools.last_mut() {
@@ -270,6 +326,62 @@ impl ToolRegistry {
         removed
     }
 
+    /// Resolve a non-canonical tool name to a registered canonical name.
+    ///
+    /// Runs a deterministic ladder against the registered tool names:
+    /// 1. Lowercase exact match.
+    /// 2. Hyphens/spaces → underscores (read-file → read_file).
+    /// 3. CamelCase → snake_case (ReadFile → read_file).
+    /// 4. Strip trailing `_tool` / `-tool` suffix (twice).
+    /// 5. Fuzzy match via simple prefix/suffix similarity.
+    ///
+    /// Returns `None` when no resolution is found (let the caller surface
+    /// "Unknown tool").
+    #[must_use]
+    pub fn resolve(&self, requested: &str) -> Option<&str> {
+        let names: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+        let lower = requested.to_lowercase();
+
+        // 1. lowercase exact
+        if let Some(n) = names.iter().find(|n| n.to_lowercase() == lower) {
+            return Some(n);
+        }
+        // 2. hyphen/space → underscore
+        let snaked = lower.replace(['-', ' '], "_");
+        if let Some(n) = names.iter().find(|n| **n == snaked) {
+            return Some(n);
+        }
+        // 3. CamelCase → snake_case
+        let cc = to_snake_case(requested);
+        if let Some(n) = names.iter().find(|n| **n == cc) {
+            return Some(n);
+        }
+        // 4. strip _tool/-tool/tool suffix, twice
+        let mut stripped = cc.clone();
+        for _ in 0..2 {
+            for suf in ["_tool", "-tool", "tool"] {
+                if let Some(s) = stripped.strip_suffix(suf) {
+                    stripped = s.to_string();
+                    break;
+                }
+            }
+        }
+        if !stripped.is_empty()
+            && let Some(n) = names.iter().find(|n| **n == stripped)
+        {
+            return Some(n);
+        }
+        // 5. fuzzy: simple prefix match (at least 3 chars)
+        if lower.len() >= 3 {
+            for n in &names {
+                if n.len() >= 3 && (n.starts_with(&lower) || lower.starts_with(n)) {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
     /// Clear all tools from the registry.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
@@ -313,6 +425,9 @@ impl ToolRegistryBuilder {
         use super::file::{ListDirTool, ReadFileTool};
         self.with_tool(Arc::new(ReadFileTool))
             .with_tool(Arc::new(ListDirTool))
+            .with_tool(Arc::new(
+                super::tool_result_retrieval::RetrieveToolResultTool,
+            ))
     }
 
     /// Include shell execution tool.
@@ -360,6 +475,16 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(DiagnosticsTool))
     }
 
+    /// Include the `load_skill` tool (#434) so the model can pull a
+    /// SKILL.md body + companion file list into context with one
+    /// call instead of `read_file` + `list_dir` against the path
+    /// shown in the system prompt's `## Skills` section.
+    #[must_use]
+    pub fn with_skill_tools(self) -> Self {
+        use super::skill::LoadSkillTool;
+        self.with_tool(Arc::new(LoadSkillTool))
+    }
+
     /// Include project mapping tools.
     #[must_use]
     pub fn with_project_tools(self) -> Self {
@@ -379,6 +504,13 @@ impl ToolRegistryBuilder {
     pub fn with_validation_tools(self) -> Self {
         use super::validate_data::ValidateDataTool;
         self.with_tool(Arc::new(ValidateDataTool))
+    }
+
+    /// Include retrieval for spilled historical tool results.
+    #[must_use]
+    pub fn with_tool_result_retrieval_tool(self) -> Self {
+        use super::tool_result_retrieval::RetrieveToolResultTool;
+        self.with_tool(Arc::new(RetrieveToolResultTool))
     }
 
     /// Include durable task, gate, PR-attempt, GitHub, and automation tools.
@@ -504,6 +636,23 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(NoteTool))
     }
 
+    /// Include the FIM (Fill-in-the-Middle) edit tool.
+    #[must_use]
+    pub fn with_fim_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+        use super::fim::FimEditTool;
+        self.with_tool(Arc::new(FimEditTool::new(client, model)))
+    }
+
+    /// Include the `remember` tool — model-callable bullet-add into the
+    /// user memory file (#489). Only register when the user has opted
+    /// in to the memory feature; without that, the tool would surface
+    /// in the model's catalog but always fail with "memory disabled".
+    #[must_use]
+    pub fn with_remember_tool(self) -> Self {
+        use super::remember::RememberTool;
+        self.with_tool(Arc::new(RememberTool))
+    }
+
     /// Include MCP tools from a connected pool as first-class registry
     /// citizens. Each MCP tool is wrapped in a lightweight adapter that
     /// implements `ToolSpec`, so the unified `ToolRegistryBuilder` flow
@@ -547,8 +696,10 @@ impl ToolRegistryBuilder {
             .with_git_history_tools()
             .with_diagnostics_tool()
             .with_project_tools()
+            .with_skill_tools()
             .with_test_runner_tool()
             .with_validation_tools()
+            .with_tool_result_retrieval_tool()
             .with_runtime_task_tools()
             .with_revert_turn_tool();
 
@@ -621,9 +772,8 @@ impl ToolRegistryBuilder {
         use super::subagent::{
             AgentAssignTool, AgentCancelTool, AgentCloseTool, AgentListTool, AgentResultTool,
             AgentResumeTool, AgentSendInputTool, AgentSpawnTool, AgentWaitTool,
-            DelegateToAgentTool, ReportAgentJobResultTool, SpawnAgentsOnCsvTool,
+            DelegateToAgentTool,
         };
-        use super::swarm::{AgentSwarmTool, SwarmCancelTool, SwarmResultTool, SwarmStatusTool};
 
         self.with_tool(Arc::new(AgentSpawnTool::new(
             manager.clone(),
@@ -637,25 +787,6 @@ impl ToolRegistryBuilder {
         .with_tool(Arc::new(DelegateToAgentTool::new(
             manager.clone(),
             runtime.clone(),
-        )))
-        .with_tool(Arc::new(AgentSwarmTool::new(
-            manager.clone(),
-            runtime.clone(),
-        )))
-        .with_tool(Arc::new(SpawnAgentsOnCsvTool::new(
-            manager.clone(),
-            runtime.clone(),
-        )))
-        .with_tool(Arc::new(ReportAgentJobResultTool))
-        .with_tool(Arc::new(SwarmStatusTool::new(
-            runtime.context.workspace.clone(),
-        )))
-        .with_tool(Arc::new(SwarmResultTool::new(
-            runtime.context.workspace.clone(),
-        )))
-        .with_tool(Arc::new(SwarmCancelTool::new(
-            manager.clone(),
-            runtime.context.workspace.clone(),
         )))
         .with_tool(Arc::new(AgentResultTool::new(manager.clone())))
         .with_tool(Arc::new(AgentSendInputTool::new(
@@ -698,6 +829,22 @@ impl Default for ToolRegistryBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Convert CamelCase to snake_case.
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Adapter that wraps an MCP tool definition so it can live in the
@@ -868,6 +1015,27 @@ mod tests {
         assert_eq!(api_tools.len(), 1);
         assert_eq!(api_tools[0].name, "my_tool");
         assert_eq!(api_tools[0].description, "A test tool");
+    }
+
+    #[test]
+    fn api_tools_with_cache_marks_last_tool_ephemeral() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut registry = ToolRegistry::new(ctx);
+
+        registry.register(make_test_tool("tool_a"));
+        registry.register(make_test_tool("tool_b"));
+
+        let api_tools = registry.to_api_tools_with_cache(true);
+        assert_eq!(api_tools.len(), 2);
+        assert!(api_tools[0].cache_control.is_none());
+        assert_eq!(
+            api_tools[1]
+                .cache_control
+                .as_ref()
+                .map(|c| c.cache_type.as_str()),
+            Some("ephemeral")
+        );
     }
 
     /// Tool whose `description()` advances through a script of pre-built

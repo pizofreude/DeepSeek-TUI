@@ -33,6 +33,14 @@ pub struct FooterProps {
     pub mode_label: &'static str,
     /// Color used for the mode chip.
     pub mode_color: Color,
+    /// Color used for small separators between chips.
+    pub text_dim_color: Color,
+    /// Color used for the model label.
+    pub text_hint_color: Color,
+    /// Color used for steady secondary chips such as cost.
+    pub text_muted_color: Color,
+    /// Background color for the full footer/status bar row.
+    pub footer_bg: Color,
     /// Status label like `"ready"`, `"thinking ⌫"`, `"working"`. When the
     /// label equals `"ready"` the footer hides the status segment entirely.
     pub state_label: String,
@@ -46,6 +54,21 @@ pub struct FooterProps {
     pub reasoning_replay: Vec<Span<'static>>,
     /// Cache-hit-rate chip spans (empty when no usage reported).
     pub cache: Vec<Span<'static>>,
+    /// MCP server health chip spans (empty when no MCP servers configured).
+    /// Populated lazily — see [`footer_mcp_chip`]. (#502)
+    pub mcp: Vec<Span<'static>>,
+    /// Cumulative model-work chip spans ("worked 3h 12m"). Sums the
+    /// elapsed time of completed turns (from `App::cumulative_turn_duration`),
+    /// **not** wall-clock since launch — an idle TUI shouldn't claim
+    /// it's been "working." Empty until cumulative turn time crosses
+    /// 60s. Populated by [`footer_worked_chip`]. (#448)
+    pub worked: Vec<Span<'static>>,
+    /// Snapshot of the global retry-status surface (#499). Sampled once
+    /// at props-build time and rendered as a foreground banner on the
+    /// left of the footer when active. Captured here (rather than read
+    /// from `retry_status` at render time) so tests can pin a
+    /// deterministic state without racing the parallel runner.
+    pub retry: crate::retry_status::RetryState,
     /// Session-cost chip spans (empty when below the display threshold).
     /// Rendered in the left cluster (after the model name) — cost is steady
     /// info, not a transient signal, so it lives with mode and model.
@@ -59,62 +82,49 @@ pub struct FooterProps {
     pub working_strip_frame: Option<u64>,
 }
 
-/// One frame of the footer's water-spout animation. `col` is the cell index
-/// inside the strip, `width` the strip's total width, `frame` the raw
+const WAVE_GLYPHS: [char; 8] = [
+    '\u{2581}', // ▁
+    '\u{2582}', // ▂
+    '\u{2583}', // ▃
+    '\u{2584}', // ▄
+    '\u{2585}', // ▅
+    '\u{2586}', // ▆
+    '\u{2587}', // ▇
+    '\u{2588}', // █
+];
+
+/// One frame of the footer's live-work wave animation. `col` is the cell
+/// index inside the strip, `width` the strip's total width, `frame` the raw
 /// millisecond counter. Returns the glyph that should appear in that cell on
 /// that frame.
 ///
-/// Visual: two crests sweep across a calm water surface (`─`). The opener
-/// `⌒` rises, then a soft `‿` trails behind. Crest A advances one column
-/// every ~600 ms (4 × 150 ms), crest B every ~900 ms (6 × 150 ms) —
-/// independent speeds give the criss-cross fountain feel. The positions
-/// are computed from `frame / 150.0` (fractional) so crests slide smoothly
-/// rather than jumping in discrete 150 ms steps.
-///
-/// All math is pure given (col, width, frame) so unit tests can pin frames.
+/// Visual: a full-width phase-shifted wave made from one-cell block-height
+/// glyphs. The earlier crest-pair animation only changed when rounded crest
+/// positions crossed a terminal cell boundary; at an 80 ms repaint cadence it
+/// read as visible hops. Sampling a few moving sine components gives every
+/// repaint a new surface while keeping the math deterministic for tests.
 #[must_use]
 pub fn footer_working_strip_glyph_at(col: usize, width: usize, frame: u64) -> char {
     if width == 0 {
         return ' ';
     }
 
-    // Number of 150 ms ticks since epoch — fractional so crests move
-    // continuously rather than teleporting every 4-6 ticks.
-    let frame_f = frame as f64 / 150.0;
+    let t = frame as f64 / 1000.0;
+    let x = col as f64;
 
-    // Crest is two glyphs wide: the leading `⌒` followed by a trailing `‿`.
-    const CREST_SPAN: i64 = 2;
-    // Cycle wide enough that each crest enters and exits cleanly.
-    let cycle = (width as i64).max(CREST_SPAN) + CREST_SPAN * 2;
-    // Crest A advances one column every ~300 ms (2 × 150 ms ticks).
-    let pos_a = (frame_f / 2.0).round() as i64 % cycle - CREST_SPAN;
-    // Phase jitter: every ~2.5 s (17 ticks), nudge B by one column so the
-    // two crests never lock into a fixed offset.
-    let jitter = (frame_f / 17.0).round() as i64 % 3;
-    // Crest B advances one column every ~450 ms (3 × 150 ms ticks).
-    let pos_b =
-        ((frame_f / 3.0).round() as i64 + jitter + (cycle / 3) + 5).rem_euclid(cycle) - CREST_SPAN;
-
-    crest_glyph_for(col as i64, pos_a)
-        .or_else(|| crest_glyph_for(col as i64, pos_b))
-        .unwrap_or('\u{2500}') // ─  — calm water surface
+    let primary = (x * 0.52 - t * 8.0).sin();
+    let swell = (x * 0.18 + t * 3.1).sin() * 0.35;
+    let shimmer = (x * 1.35 - t * 11.0).sin() * 0.12;
+    let value = ((primary + swell + shimmer) / 1.47).clamp(-1.0, 1.0);
+    let normalized = (value + 1.0) * 0.5;
+    let idx = (normalized * (WAVE_GLYPHS.len() - 1) as f64).round() as usize;
+    WAVE_GLYPHS[idx.min(WAVE_GLYPHS.len() - 1)]
 }
 
-/// Helper: returns the glyph for column `col` if it falls inside a crest
-/// centred at `pos`. A crest is `⌒‿` shaped — soft rise then a gentle dip.
-fn crest_glyph_for(col: i64, pos: i64) -> Option<char> {
-    let dist = col - pos;
-    match dist {
-        0 => Some('\u{2312}'), // ⌒  arc rising from the left
-        1 => Some('\u{203F}'), // ‿  trailing dip
-        _ => None,
-    }
-}
-
-/// Build the per-frame water-spout string of `width` characters. Empty string
+/// Build the per-frame live-work wave string of `width` characters. Empty string
 /// when width is 0. The result is the same visual width as requested (one
-/// char per column for box-drawing chars) and is safe to drop into a `Span`
-/// between the footer's left and right segments.
+/// char per column for the selected block-height glyphs) and is safe to drop
+/// into a `Span` between the footer's left and right segments.
 #[must_use]
 pub fn footer_working_strip_string(width: usize, frame: u64) -> String {
     let mut out = String::with_capacity(width * 4);
@@ -163,6 +173,51 @@ pub fn footer_agents_chip(running: usize, locale: Locale) -> Vec<Span<'static>> 
     )]
 }
 
+/// Build the cumulative-elapsed chip ("worked 3h 12m") for the
+/// footer's right cluster (#448). Hidden during the first minute of
+/// a session so a fresh launch doesn't render a noisy `worked 5s`
+/// indicator that immediately starts ticking. Above the threshold,
+/// reuses [`crate::tui::notifications::humanize_duration`] for
+/// consistent w/d/h/m formatting.
+#[must_use]
+pub fn footer_worked_chip(elapsed: std::time::Duration) -> Vec<Span<'static>> {
+    if elapsed < std::time::Duration::from_secs(60) {
+        return Vec::new();
+    }
+    let label = format!(
+        "worked {}",
+        crate::tui::notifications::humanize_duration(elapsed)
+    );
+    vec![Span::styled(
+        label,
+        Style::default().fg(palette::TEXT_MUTED),
+    )]
+}
+
+/// Build the "MCP M/N" health chip (#502) from the user's stored
+/// snapshot. `connected` is the number of servers currently reachable;
+/// `configured` is the number declared in the user's MCP config. When
+/// `configured` is zero the chip is hidden entirely.
+///
+/// Colour-codes the count by health:
+/// - all reachable → success
+/// - some reachable → warning
+/// - none reachable but at least one configured → error
+/// - configured but no live snapshot yet → muted (count only)
+#[must_use]
+pub fn footer_mcp_chip(connected: Option<usize>, configured: usize) -> Vec<Span<'static>> {
+    if configured == 0 {
+        return Vec::new();
+    }
+    let (label, color) = match connected {
+        None => (format!("MCP {configured}"), palette::TEXT_MUTED),
+        Some(c) if c == configured => (format!("MCP {c}/{configured}"), palette::STATUS_SUCCESS),
+        Some(0) => (format!("MCP 0/{configured}"), palette::STATUS_ERROR),
+        Some(c) => (format!("MCP {c}/{configured}"), palette::STATUS_WARNING),
+    };
+    vec![Span::styled(label, Style::default().fg(color))]
+}
+
 /// A status toast routed to the footer's left segment for a short time.
 #[derive(Debug, Clone)]
 pub struct FooterToast {
@@ -192,34 +247,56 @@ impl FooterProps {
         cache: Vec<Span<'static>>,
         cost: Vec<Span<'static>>,
     ) -> Self {
-        let (mode_label, mode_color) = mode_style(app.mode);
+        let (mode_label, mode_color) = mode_style(app);
+        // MCP chip (#502) — passive, derived from the user's existing
+        // snapshot. `connected` is `None` until the user runs `/mcp`,
+        // which is the same trigger the issue spec accepts for now.
+        let mcp_configured = app.mcp_configured_count;
+        let mcp_connected = app
+            .mcp_snapshot
+            .as_ref()
+            .map(|s| s.servers.iter().filter(|server| server.connected).count());
+        let mcp = footer_mcp_chip(mcp_connected, mcp_configured);
+        // #448: cumulative work-time chip. Sums actual turn durations
+        // (set on `TurnComplete`) rather than wall-clock uptime — a TUI
+        // that's been open and idle for 4 minutes shouldn't claim
+        // "worked 4m". The chip stays empty until enough turns add up
+        // to cross the 60s threshold inside `footer_worked_chip`.
+        let worked = footer_worked_chip(app.cumulative_turn_duration);
         Self {
-            model: app.model.clone(),
+            model: app.model_display_label(),
             mode_label,
             mode_color,
+            text_dim_color: app.ui_theme.text_dim,
+            text_hint_color: app.ui_theme.text_hint,
+            text_muted_color: app.ui_theme.text_muted,
+            footer_bg: app.ui_theme.footer_bg,
             state_label: state_label.to_string(),
             state_color,
             coherence,
             agents,
             reasoning_replay,
             cache,
+            mcp,
+            worked,
             cost,
             toast,
             working_strip_frame: None,
+            retry: crate::retry_status::snapshot(),
         }
     }
 }
 
-fn mode_style(mode: AppMode) -> (&'static str, Color) {
-    let label = match mode {
+fn mode_style(app: &App) -> (&'static str, Color) {
+    let label = match app.mode {
         AppMode::Agent => "agent",
         AppMode::Yolo => "yolo",
         AppMode::Plan => "plan",
     };
-    let color = match mode {
-        AppMode::Agent => palette::MODE_AGENT,
-        AppMode::Yolo => palette::MODE_YOLO,
-        AppMode::Plan => palette::MODE_PLAN,
+    let color = match app.mode {
+        AppMode::Agent => app.ui_theme.mode_agent,
+        AppMode::Yolo => app.ui_theme.mode_yolo,
+        AppMode::Plan => app.ui_theme.mode_plan,
     };
     (label, color)
 }
@@ -245,6 +322,12 @@ impl FooterWidget {
             &self.props.agents,
             &self.props.reasoning_replay,
             &self.props.cache,
+            &self.props.mcp,
+            // `worked` is the lowest-priority chip — drops first under
+            // narrow widths (the priority loop below removes from the
+            // tail). `cost` is steady info and stays in the left
+            // cluster where the eye finds it without scanning.
+            &self.props.worked,
         ]
         .into_iter()
         .filter(|spans| !spans.is_empty())
@@ -389,31 +472,31 @@ impl FooterWidget {
             if !spans.is_empty() {
                 spans.push(Span::styled(
                     sep.to_string(),
-                    Style::default().fg(palette::TEXT_DIM),
+                    Style::default().fg(self.props.text_dim_color),
                 ));
             }
             spans.push(Span::styled(
                 model_label,
-                Style::default().fg(palette::TEXT_HINT),
+                Style::default().fg(self.props.text_hint_color),
             ));
         }
         if let Some(cost_text) = cost {
             if !spans.is_empty() {
                 spans.push(Span::styled(
                     sep.to_string(),
-                    Style::default().fg(palette::TEXT_DIM),
+                    Style::default().fg(self.props.text_dim_color),
                 ));
             }
             spans.push(Span::styled(
                 cost_text,
-                Style::default().fg(palette::TEXT_MUTED),
+                Style::default().fg(self.props.text_muted_color),
             ));
         }
         if let Some(status_label) = status {
             if !spans.is_empty() {
                 spans.push(Span::styled(
                     sep.to_string(),
-                    Style::default().fg(palette::TEXT_DIM),
+                    Style::default().fg(self.props.text_dim_color),
                 ));
             }
             spans.push(Span::styled(
@@ -427,6 +510,30 @@ impl FooterWidget {
 
 fn spans_text(spans: &[Span<'_>]) -> String {
     spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+}
+
+/// Render the retry banner (#499) when the props' captured snapshot
+/// reports an active retry or a final failure. Returns `None` when idle
+/// so callers fall back to the regular status line / toast.
+fn retry_banner_spans(max_width: usize, props: &FooterProps) -> Option<Vec<Span<'static>>> {
+    let (label, color) = match &props.retry {
+        crate::retry_status::RetryState::Active(banner) => {
+            let secs = props.retry.seconds_remaining().unwrap_or(0);
+            // Round to 1s — we redraw each frame anyway so the
+            // countdown ticks visually without us having to schedule
+            // anything extra.
+            (
+                format!("⟳ retry {} in {secs}s — {}", banner.attempt, banner.reason),
+                crate::palette::STATUS_WARNING,
+            )
+        }
+        crate::retry_status::RetryState::Failed { reason, .. } => {
+            (format!("× failed: {reason}"), crate::palette::STATUS_ERROR)
+        }
+        crate::retry_status::RetryState::Idle => return None,
+    };
+    let truncated = truncate_to_width(&label, max_width);
+    Some(vec![Span::styled(truncated, Style::default().fg(color))])
 }
 
 impl Renderable for FooterWidget {
@@ -447,7 +554,13 @@ impl Renderable for FooterWidget {
             .saturating_sub(min_gap)
             .max(1);
 
-        let left_spans = if let Some(toast) = self.props.toast.as_ref() {
+        let left_spans = if let Some(banner) = retry_banner_spans(max_left_width, &self.props) {
+            // Retry banner takes precedence over toast and the regular
+            // status line so the user sees it loud and clear (#499).
+            // The banner clears automatically on success or on the next
+            // `TurnStarted` (engine emits the clear).
+            banner
+        } else if let Some(toast) = self.props.toast.as_ref() {
             Self::toast_spans(toast, max_left_width)
         } else {
             self.status_line_spans(max_left_width)
@@ -470,7 +583,8 @@ impl Renderable for FooterWidget {
         all_spans.push(spacer_span);
         all_spans.extend(right_spans);
 
-        let paragraph = Paragraph::new(Line::from(all_spans));
+        let paragraph =
+            Paragraph::new(Line::from(all_spans)).style(Style::default().bg(self.props.footer_bg));
         paragraph.render(area, buf);
     }
 
@@ -526,6 +640,8 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-flash".to_string(),
             workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -540,6 +656,7 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
         let mut app = App::new(options, &Config::default());
         // App::new may pick up `default_model` from a local user Settings
@@ -550,7 +667,7 @@ mod tests {
     }
 
     fn idle_props_for(app: &App) -> FooterProps {
-        FooterProps::from_app(
+        let mut props = FooterProps::from_app(
             app,
             None,
             "ready",
@@ -560,7 +677,12 @@ mod tests {
             Vec::<Span<'static>>::new(),
             Vec::<Span<'static>>::new(),
             Vec::<Span<'static>>::new(),
-        )
+        );
+        // `from_app` reads the process-wide retry-status surface; pin
+        // `Idle` so footer tests don't pick up state set by retry-banner
+        // tests running in parallel.
+        props.retry = crate::retry_status::RetryState::Idle;
+        props
     }
 
     #[test]
@@ -572,13 +694,86 @@ mod tests {
         assert_eq!(props.state_color, palette::TEXT_MUTED);
         assert_eq!(props.mode_label, "agent");
         assert_eq!(props.mode_color, palette::MODE_AGENT);
+        assert_eq!(props.text_dim_color, palette::TEXT_DIM);
+        assert_eq!(props.text_hint_color, palette::TEXT_HINT);
+        assert_eq!(props.text_muted_color, palette::TEXT_MUTED);
         assert_eq!(props.model, "deepseek-v4-flash");
         assert!(props.coherence.is_empty());
         assert!(props.agents.is_empty());
         assert!(props.cache.is_empty());
         assert!(props.cost.is_empty());
         assert!(props.reasoning_replay.is_empty());
+        // #448: fresh apps don't get a `worked` chip until completed
+        // turns have added up to >= 60s of model work. A freshly-built
+        // App has cumulative_turn_duration == 0 so the chip is empty.
+        assert!(props.worked.is_empty());
         assert!(props.toast.is_none());
+    }
+
+    #[test]
+    fn worked_chip_tracks_completed_turn_time_not_session_uptime() {
+        // Regression test for the v0.8.8 takedown: the chip used to
+        // read `App::session_started_at.elapsed()`, so a TUI that had
+        // been open and idle for several minutes claimed "worked 3m"
+        // even though no turn had ever fired. The chip now sources
+        // from `App::cumulative_turn_duration`, which is only ever
+        // incremented on `TurnComplete`. Pin both directions:
+        //
+        //   1. cumulative == 0 (no turn finished yet)  → empty
+        //   2. cumulative crosses 60s (real work)      → label shows
+        //   3. wall-clock since launch is irrelevant   → not consulted
+        let mut app = make_app();
+        // The whole point: cumulative_turn_duration starts at zero,
+        // so however long the TUI has been open the chip stays empty
+        // until a turn actually completes and adds time.
+        let props = idle_props_for(&app);
+        assert!(
+            props.worked.is_empty(),
+            "idle app with zero cumulative turn time must not show worked chip"
+        );
+
+        // A real turn finishes for 90s of model work — chip lights up.
+        // (`humanize_duration` keeps both units when both are non-zero,
+        // so 90s renders as `1m 30s`, not `1m`.)
+        app.cumulative_turn_duration = std::time::Duration::from_secs(90);
+        let props = idle_props_for(&app);
+        let text: String = props
+            .worked
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "worked 1m 30s");
+    }
+
+    #[test]
+    fn footer_worked_chip_hidden_below_one_minute() {
+        use std::time::Duration;
+        for secs in [0, 1, 30, 59] {
+            let chip = super::footer_worked_chip(Duration::from_secs(secs));
+            assert!(
+                chip.is_empty(),
+                "worked chip must be hidden at {secs}s; got {chip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_worked_chip_shows_humanized_label_above_threshold() {
+        use std::time::Duration;
+        // 1 minute on the dot — boundary, must render.
+        let chip = super::footer_worked_chip(Duration::from_secs(60));
+        let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "worked 1m");
+
+        // 3h 12m — the issue's golden example.
+        let chip = super::footer_worked_chip(Duration::from_secs(11_550));
+        let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "worked 3h 12m");
+
+        // Multi-day session — exercises the d/h band.
+        let chip = super::footer_worked_chip(Duration::from_secs(2 * 86_400 + 5 * 3600));
+        let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "worked 2d 5h");
     }
 
     #[test]
@@ -598,6 +793,40 @@ mod tests {
 
         assert!(props.state_label.starts_with("thinking"));
         assert_eq!(props.state_color, palette::STATUS_WARNING);
+    }
+
+    #[test]
+    fn from_app_statusline_colors_come_from_ui_theme() {
+        let mut app = make_app();
+        app.ui_theme.mode_agent = Color::Rgb(1, 2, 3);
+        app.ui_theme.text_dim = Color::Rgb(4, 5, 6);
+        app.ui_theme.text_hint = Color::Rgb(7, 8, 9);
+        app.ui_theme.text_muted = Color::Rgb(10, 11, 12);
+        app.ui_theme.footer_bg = Color::Rgb(13, 14, 15);
+
+        let props = idle_props_for(&app);
+
+        assert_eq!(props.mode_color, Color::Rgb(1, 2, 3));
+        assert_eq!(props.text_dim_color, Color::Rgb(4, 5, 6));
+        assert_eq!(props.text_hint_color, Color::Rgb(7, 8, 9));
+        assert_eq!(props.text_muted_color, Color::Rgb(10, 11, 12));
+        assert_eq!(props.footer_bg, Color::Rgb(13, 14, 15));
+    }
+
+    #[test]
+    fn render_applies_footer_background_to_full_row() {
+        let mut app = make_app();
+        app.ui_theme.footer_bg = Color::Rgb(13, 14, 15);
+        let props = idle_props_for(&app);
+        let widget = FooterWidget::new(props);
+        let area = ratatui::layout::Rect::new(0, 0, 60, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+
+        for x in 0..area.width {
+            assert_eq!(buf[(x, 0)].bg, Color::Rgb(13, 14, 15));
+        }
     }
 
     // ---- agents chip wording ----
@@ -670,6 +899,93 @@ mod tests {
     }
 
     #[test]
+    fn footer_mcp_chip_hidden_when_no_servers() {
+        assert!(super::footer_mcp_chip(None, 0).is_empty());
+        assert!(super::footer_mcp_chip(Some(0), 0).is_empty());
+    }
+
+    #[test]
+    fn footer_mcp_chip_shows_count_only_until_snapshot_arrives() {
+        let spans = super::footer_mcp_chip(None, 3);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "MCP 3");
+    }
+
+    #[test]
+    fn footer_mcp_chip_uses_success_color_when_all_connected() {
+        let spans = super::footer_mcp_chip(Some(3), 3);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "MCP 3/3");
+        assert_eq!(spans[0].style.fg, Some(palette::STATUS_SUCCESS));
+    }
+
+    #[test]
+    fn footer_mcp_chip_uses_warning_color_when_partial() {
+        let spans = super::footer_mcp_chip(Some(2), 3);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "MCP 2/3");
+        assert_eq!(spans[0].style.fg, Some(palette::STATUS_WARNING));
+    }
+
+    #[test]
+    fn footer_mcp_chip_uses_error_color_when_zero_connected() {
+        let spans = super::footer_mcp_chip(Some(0), 3);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "MCP 0/3");
+        assert_eq!(spans[0].style.fg, Some(palette::STATUS_ERROR));
+    }
+
+    #[test]
+    fn render_shows_retry_banner_when_active() {
+        // Since `FooterProps::retry` is now a captured snapshot rather
+        // than a global read at render time, we can pin the state on
+        // the props directly without touching the global surface.
+        let app = make_app();
+        let mut props = idle_props_for(&app);
+        props.retry = crate::retry_status::RetryState::Active(crate::retry_status::RetryBanner {
+            attempt: 2,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(7),
+            reason: "rate limited".to_string(),
+        });
+        let widget = FooterWidget::new(props);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let rendered: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            rendered.contains("retry 2"),
+            "expected retry banner in render: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("rate limited"),
+            "expected reason in render: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn render_shows_failure_row_when_failed() {
+        let app = make_app();
+        let mut props = idle_props_for(&app);
+        props.retry = crate::retry_status::RetryState::Failed {
+            reason: "upstream 500".to_string(),
+            since: std::time::Instant::now(),
+        };
+        let widget = FooterWidget::new(props);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let rendered: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            rendered.contains("failed"),
+            "expected failure row: {rendered:?}",
+        );
+        assert!(
+            rendered.contains("upstream 500"),
+            "expected reason: {rendered:?}",
+        );
+    }
+
+    #[test]
     fn render_emits_mode_and_model_when_idle() {
         let app = make_app();
         let props = idle_props_for(&app);
@@ -689,8 +1005,7 @@ mod tests {
     fn working_strip_string_width_matches_request() {
         // The strip must produce exactly `width` characters per frame —
         // otherwise the spacer math in `FooterWidget::render` would
-        // mis-align the right-hand chips. (Glyphs are all ASCII / Latin-1
-        // so char count equals visual width here.)
+        // mis-align the right-hand chips. Each wave glyph is one cell wide.
         for width in [0usize, 1, 8, 60, 200] {
             let s = super::footer_working_strip_string(width, 7);
             assert_eq!(s.chars().count(), width, "width {width} mismatch");
@@ -699,21 +1014,19 @@ mod tests {
 
     #[test]
     fn working_strip_glyph_is_deterministic_per_frame() {
-        // Same (col, width, frame) → same glyph. Frames are now raw
-        // milliseconds; 150 ms apart represents one tick.
+        // Same (col, width, frame) -> same glyph. Frames are raw
+        // milliseconds so the strip can move at repaint cadence.
         let a = super::footer_working_strip_string(40, 150);
         let b = super::footer_working_strip_string(40, 150);
         assert_eq!(a, b, "deterministic given the same frame");
-        // 750 ms → 5 ticks, crest A advances every 2 ticks → ≥2 steps.
-        let c = super::footer_working_strip_string(40, 750);
-        assert_ne!(a, c, "advancing 4 ticks must change the strip",);
+        let c = super::footer_working_strip_string(40, 230);
+        assert_ne!(a, c, "advancing one repaint window must change the strip",);
     }
 
     #[test]
     fn working_strip_renders_glyphs_only_when_frame_is_some() {
         // Idle: spacer is plain whitespace. Active: spacer contains the
-        // crest animation glyphs (`⌒` opener, `‿` trailer, `─` water
-        // surface) and visibly differs from the idle render.
+        // wave animation glyphs and visibly differs from the idle render.
         let app = make_app();
         let mut props = idle_props_for(&app);
 
@@ -732,51 +1045,41 @@ mod tests {
             "active footer must visibly differ from idle one"
         );
         assert!(
-            active.contains('\u{2312}')   // ⌒  crest opener
-                || active.contains('\u{203F}') // ‿  crest trailer
-                || active.contains('\u{2500}'), // ─  water surface
+            active
+                .chars()
+                .any(|glyph| super::WAVE_GLYPHS.contains(&glyph)),
             "active strip must contain at least one animation glyph: {active:?}",
         );
     }
 
     #[test]
-    fn working_strip_advances_position_within_full_crest_step() {
-        // Crest A advances every 2 ticks (300 ms), B every 3 (450 ms).
-        // 900 ms (6 ticks) guarantees crest A has advanced at least 3 columns.
+    fn working_strip_changes_at_repaint_cadence() {
         let width = 60;
         let f0 = super::footer_working_strip_string(width, 0);
-        let f900 = super::footer_working_strip_string(width, 900);
-        // Collect the columns that hold a crest opener `⌒` in each frame.
-        let openers = |s: &str| -> Vec<usize> {
-            s.chars()
-                .enumerate()
-                .filter_map(|(i, c)| (c == '\u{2312}').then_some(i))
-                .collect()
-        };
-        assert_ne!(
-            openers(&f0),
-            openers(&f900),
-            "crest opener columns must shift across a 900ms window",
+        let f80 = super::footer_working_strip_string(width, 80);
+        let changed = f0
+            .chars()
+            .zip(f80.chars())
+            .filter(|(before, after)| before != after)
+            .count();
+        assert!(
+            changed > width / 4,
+            "expected the wave to drift across one 80ms repaint; changed {changed}/{width}"
         );
     }
 
     #[test]
-    fn working_strip_renders_paired_crest_glyphs() {
-        // The `⌒‿` pair is the visual centrepiece — a soft rise followed by
-        // a gentle dip. Sweep enough time (in ms) that a crest is guaranteed
-        // to land fully inside a 60-cell strip at some point.
-        let width = 60;
-        let mut saw_pair = false;
-        for frame_ms in (0..24_000).step_by(150) {
-            let s = super::footer_working_strip_string(width, frame_ms);
-            if s.contains("\u{2312}\u{203F}") {
-                saw_pair = true;
-                break;
+    fn working_strip_renders_multiple_wave_heights() {
+        let s = super::footer_working_strip_string(60, 0);
+        let mut distinct = Vec::new();
+        for glyph in s.chars() {
+            if super::WAVE_GLYPHS.contains(&glyph) && !distinct.contains(&glyph) {
+                distinct.push(glyph);
             }
         }
         assert!(
-            saw_pair,
-            "expected `⌒‿` pair somewhere in the first 24s of animation",
+            distinct.len() >= 5,
+            "expected several wave heights, saw {distinct:?}",
         );
     }
 

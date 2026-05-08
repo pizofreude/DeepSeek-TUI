@@ -1,6 +1,7 @@
 //! Utility helpers shared across the `DeepSeek` CLI.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::models::{ContentBlock, Message};
@@ -149,6 +150,164 @@ pub fn project_tree(root: &Path, max_depth: usize) -> String {
 
 // === Filesystem Helpers ===
 
+/// Atomically write `contents` to `path` using a temporary file + fsync + rename.
+///
+/// 1. Creates a `NamedTempFile` in the same directory as `path` (same filesystem).
+/// 2. Writes `contents` to the temp file.
+/// 3. Calls `sync_all()` on the temp file for durability.
+/// 4. Atomically renames (persists) the temp file over `path`.
+///
+/// On filesystems that support it (`ext4`, `apfs`, `ntfs`), the rename is
+/// atomic — a concurrent reader sees either the old content or the new, never
+/// a partial write. `sync_all` ensures the data is on stable storage before
+/// the metadata change so an OS crash mid-rename doesn't lose data.
+///
+/// # Errors
+/// Returns `io::Error` if the parent directory cannot be determined, the temp
+/// file cannot be created, the write fails, or the rename fails.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent directory: {}", path.display()),
+        )
+    })?;
+    // Use parent directory so the rename is on the same filesystem.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut tmp, contents)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
+/// Open or create a file for appending at `path`, optionally syncing after
+/// every write. Use this for append-only logs like `audit.log`.
+///
+/// The returned `BufWriter<fs::File>` wraps the append handle. Call
+/// `.flush()` followed by `.get_ref().sync_all()` after each batch.
+pub fn open_append(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    Ok(std::io::BufWriter::new(file))
+}
+
+/// Flush a `BufWriter` wrapping a `File`, then `fsync` the underlying file.
+pub fn flush_and_sync(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()> {
+    writer.flush()?;
+    writer.get_ref().sync_all()
+}
+
+/// Spawn a tokio task with panic supervision.
+///
+/// Wraps the future in `AssertUnwindSafe` + `catch_unwind`. On panic:
+/// 1. Logs the panic with the task name and caller location via `tracing::error!`.
+/// 2. Writes a crash dump to `~/.deepseek/crashes/<timestamp>-<name>.log`.
+///
+/// The returned `JoinHandle` resolves to `()` — the panic is caught and
+/// handled internally so the parent process stays alive.
+pub fn spawn_supervised<F>(
+    name: &'static str,
+    location: &'static std::panic::Location<'static>,
+    future: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+        if let Err(panic_info) = result {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::error!(
+                target: "panic",
+                "Task '{name}' panicked at {}: {msg}",
+                location,
+            );
+            // Write crash dump (best-effort)
+            let _ = write_panic_dump(name, location, &msg);
+        }
+    })
+}
+
+/// Write a panic dump file to `~/.deepseek/crashes/`.
+///
+/// Creates the directory if needed and writes a timestamped log
+/// with the task name, caller location, and panic message.
+/// Best-effort — failures are silently ignored.
+fn write_panic_dump(
+    name: &str,
+    location: &std::panic::Location<'_>,
+    message: &str,
+) -> std::io::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+    })?;
+    let crash_dir = home.join(".deepseek").join("crashes");
+    write_panic_dump_to(&crash_dir, name, location, message)
+}
+
+fn write_panic_dump_to(
+    crash_dir: &Path,
+    name: &str,
+    location: &std::panic::Location<'_>,
+    message: &str,
+) -> std::io::Result<()> {
+    use chrono::Utc;
+    std::fs::create_dir_all(crash_dir)?;
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let filename = format!("{timestamp}-{name}.log");
+    let path = crash_dir.join(&filename);
+    let contents =
+        format!("Task: {name}\nLocation: {location}\nTimestamp: {timestamp}\nPanic: {message}\n");
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
+/// Fire-and-forget `spawn_blocking` with panic dump protection.
+///
+/// In contrast to `spawn_supervised` (which wraps `tokio::spawn` for async
+/// tasks), this helper wraps `tokio::task::spawn_blocking`.  Use it when a
+/// CPU-bound or blocking-I/O task must run off the async runtime and its
+/// completion is *not* awaited — for example a post-turn disk snapshot or a
+/// file-tree build polled later via a shared data structure.  If the closure
+/// panics, a crash dump is written to `~/.deepseek/crashes/` and the panic
+/// is logged at ERROR level rather than being silently swallowed.
+#[track_caller]
+pub fn spawn_blocking_supervised<F>(name: &'static str, f: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let location = std::panic::Location::caller();
+    tokio::task::spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if let Err(panic_info) = result {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::error!(
+                target: "panic",
+                "Blocking task '{name}' panicked at {location}: {msg}",
+            );
+            let _ = write_panic_dump(name, location, &msg);
+        }
+    })
+}
+
 #[allow(dead_code)]
 pub fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
@@ -213,16 +372,32 @@ pub fn url_encode(input: &str) -> String {
 /// resolve correctly across processes.
 #[must_use]
 pub fn display_path(path: &Path) -> String {
-    let Some(home) = dirs::home_dir() else {
+    display_path_with_home(path, dirs::home_dir().as_deref())
+}
+
+/// Like [`display_path`] but takes an explicit home directory instead of
+/// reading `$HOME` / `dirs::home_dir()`.  Used in tests and anywhere the
+/// caller already has the home path available.
+///
+/// The home-relative suffix is rejoined with the platform separator
+/// (`\` on Windows, `/` elsewhere) by walking the path's components, so
+/// inputs that carried foreign separators don't leak through.
+#[must_use]
+pub fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
         return path.display().to_string();
     };
-    if let Ok(rest) = path.strip_prefix(&home) {
+    if let Ok(rest) = path.strip_prefix(home) {
         if rest.as_os_str().is_empty() {
             return "~".to_string();
         }
-        // Render with the platform-correct separator after the tilde.
-        let sep = std::path::MAIN_SEPARATOR;
-        return format!("~{sep}{}", rest.display());
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let mut out = String::from("~");
+        for component in rest.components() {
+            out.push_str(sep);
+            out.push_str(&component.as_os_str().to_string_lossy());
+        }
+        return out;
     }
     path.display().to_string()
 }
@@ -247,81 +422,225 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
     total
 }
 
-// Tests below set `HOME` to drive `dirs::home_dir()`, which is honored on
-// Unix but not on Windows (which reads `USERPROFILE` first). The
-// `display_path` contraction logic itself is platform-identical — it
-// delegates to `dirs::home_dir()`. Gate to `cfg(unix)` so we cover the
-// behavior on the platform whose env-var contract matches the test
-// driver, instead of writing platform-specific test scaffolding for a
-// pure abstraction.
-#[cfg(all(test, unix))]
+// Tests use `display_path_with_home` so they never mutate the global `HOME`
+// env var.  Mutating `HOME` via `std::env::set_var` is not thread-safe; Cargo
+// runs tests in parallel by default and CI runners are multi-core, so any test
+// that stomps `HOME` will race with tests that *read* it.  Using the injected
+// helper avoids the race entirely and makes the tests portable to Windows
+// without additional platform scaffolding.
+#[cfg(test)]
 mod tests {
-    use super::display_path;
+    use super::display_path_with_home;
     use std::path::PathBuf;
 
-    /// Save and restore $HOME inside one test so a panic anywhere can't
-    /// poison sibling tests that read the env var.
-    fn with_home<R>(home: &str, f: impl FnOnce() -> R) -> R {
-        let prev = std::env::var_os("HOME");
-        // SAFETY: tests in this crate are run single-threaded with respect
-        // to env-var mutation by the integration harness, and we restore
-        // immediately after the closure.
-        unsafe { std::env::set_var("HOME", home) };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match result {
-            Ok(v) => v,
-            Err(p) => std::panic::resume_unwind(p),
-        }
+    fn home(s: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(s))
     }
 
     #[test]
     fn display_path_contracts_home_prefix() {
-        with_home("/Users/alice", || {
-            assert_eq!(
-                display_path(&PathBuf::from("/Users/alice/projects/foo")),
-                format!(
-                    "~{}projects{}foo",
-                    std::path::MAIN_SEPARATOR,
-                    std::path::MAIN_SEPARATOR
-                ),
-            );
-        });
+        let h = home("/Users/alice");
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/Users/alice/projects/foo"), h.as_deref()),
+            format!(
+                "~{}projects{}foo",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            ),
+        );
     }
 
     #[test]
     fn display_path_returns_bare_tilde_for_home_itself() {
-        with_home("/Users/alice", || {
-            assert_eq!(display_path(&PathBuf::from("/Users/alice")), "~");
-        });
+        let h = home("/Users/alice");
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/Users/alice"), h.as_deref()),
+            "~"
+        );
     }
 
     #[test]
     fn display_path_leaves_unrelated_paths_alone() {
-        with_home("/Users/alice", || {
-            // Different user — must not get rewritten or share the tilde.
-            assert_eq!(
-                display_path(&PathBuf::from("/Users/bob/Code")),
-                "/Users/bob/Code".to_string()
-            );
-            // System path must stay absolute.
-            assert_eq!(display_path(&PathBuf::from("/etc/hosts")), "/etc/hosts");
-        });
+        let h = home("/Users/alice");
+        // Different user — must not get rewritten or share the tilde.
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/Users/bob/Code"), h.as_deref()),
+            "/Users/bob/Code".to_string()
+        );
+        // System path must stay absolute.
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/etc/hosts"), h.as_deref()),
+            "/etc/hosts"
+        );
     }
 
     #[test]
     fn display_path_does_not_match_username_prefix() {
         // Regression guard: a directory named like the user's home
         // *prefix* but not under it must not get rewritten.
-        with_home("/Users/alice", || {
-            assert_eq!(
-                display_path(&PathBuf::from("/Users/alice2/work")),
-                "/Users/alice2/work"
-            );
+        let h = home("/Users/alice");
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/Users/alice2/work"), h.as_deref()),
+            "/Users/alice2/work"
+        );
+    }
+
+    #[test]
+    fn display_path_with_no_home_returns_full_path() {
+        assert_eq!(
+            display_path_with_home(&PathBuf::from("/some/path"), None),
+            "/some/path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_atomic_writes_content() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("test.json");
+        let content = b"hello atomic world";
+
+        write_atomic(&path, content).expect("write_atomic");
+        assert!(path.exists());
+        let read = fs::read_to_string(&path).expect("read");
+        assert_eq!(read.as_bytes(), content);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("existing.json");
+        fs::write(&path, b"old content").expect("write old");
+        write_atomic(&path, b"new content").expect("write_atomic");
+        let read = fs::read_to_string(&path).expect("read");
+        assert_eq!(read, "new content");
+    }
+
+    #[test]
+    fn write_atomic_no_temp_left_behind_on_success() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("clean.json");
+        write_atomic(&path, b"clean").expect("write_atomic");
+        // List files in dir — there should be no .tmp files left
+        let entries: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        let tmp_files: Vec<_> = entries
+            .iter()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with('.')))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "temp files left behind: {tmp_files:?}"
+        );
+    }
+
+    #[test]
+    fn flush_and_sync_writes_and_syncs() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("append.log");
+        {
+            let mut writer = open_append(&path).expect("open_append");
+            writeln!(writer, "line 1").expect("write");
+            flush_and_sync(&mut writer).expect("flush_and_sync");
+            writeln!(writer, "line 2").expect("write");
+            flush_and_sync(&mut writer).expect("flush_and_sync");
+        }
+        let content = fs::read_to_string(&path).expect("read");
+        assert_eq!(content, "line 1\nline 2\n");
+    }
+}
+
+#[cfg(test)]
+mod spawn_supervised_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A spawned task that panics does not propagate the panic to the
+    /// parent task — `spawn_supervised` catches it. Verified in isolation
+    /// from the on-disk crash-dump path so the test is portable across
+    /// macOS / Linux / Windows (where `dirs::home_dir()` reads
+    /// `USERPROFILE`, not `HOME`, so env-mutation tricks don't redirect
+    /// the dump on Windows).
+    #[tokio::test]
+    async fn panicking_task_does_not_propagate_to_parent() {
+        let parent_alive = Arc::new(AtomicBool::new(false));
+        let parent_alive_clone = parent_alive.clone();
+
+        let handle = spawn_supervised(
+            "panic-test-fixture",
+            std::panic::Location::caller(),
+            async move {
+                parent_alive_clone.store(true, Ordering::SeqCst);
+                panic!("deliberate panic for catch-unwind test");
+            },
+        );
+
+        let result = handle.await;
+        assert!(
+            result.is_ok(),
+            "spawn_supervised must convert panic to a normal completion"
+        );
+        assert!(
+            parent_alive.load(Ordering::SeqCst),
+            "fixture task must have run before panicking"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_blocking_task_does_not_propagate_to_parent() {
+        let parent_alive = Arc::new(AtomicBool::new(false));
+        let parent_alive_clone = parent_alive.clone();
+
+        let handle = spawn_blocking_supervised("blocking-panic-test-fixture", move || {
+            parent_alive_clone.store(true, Ordering::SeqCst);
+            panic!("deliberate panic for spawn_blocking catch-unwind test");
         });
+
+        let result = handle.await;
+        assert!(
+            result.is_ok(),
+            "spawn_blocking_supervised must convert panic to a normal completion"
+        );
+        assert!(
+            parent_alive.load(Ordering::SeqCst),
+            "fixture blocking task must have run before panicking"
+        );
+    }
+
+    /// `write_panic_dump_to` writes a properly-formatted crash log into
+    /// the supplied directory. Tested separately from `spawn_supervised`
+    /// because env-mutation redirection of `dirs::home_dir()` doesn't
+    /// work on Windows.
+    #[test]
+    fn write_panic_dump_writes_named_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crash_dir = tmp.path().join("crashes");
+        let location = std::panic::Location::caller();
+        write_panic_dump_to(&crash_dir, "panic-fixture", location, "boom").expect("write dump");
+
+        let entries: Vec<_> = std::fs::read_dir(&crash_dir)
+            .expect("crashes dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one crash dump expected");
+        let dump = std::fs::read_to_string(entries[0].path()).expect("read dump");
+        assert!(
+            dump.contains("panic-fixture"),
+            "dump must include the task name; got: {dump}"
+        );
+        assert!(
+            dump.contains("boom"),
+            "dump must include the panic message; got: {dump}"
+        );
     }
 }
 

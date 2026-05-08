@@ -4,17 +4,15 @@
 //! and retrieve results. Sub-agents run with a filtered toolset and
 //! inherit the workspace configuration from the main session.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -33,12 +31,30 @@ use crate::tools::spec::{
     optional_bool, optional_u64, required_str,
 };
 use crate::tools::todo::{SharedTodoList, TodoList};
+use crate::utils::spawn_supervised;
 
 pub mod mailbox;
 #[allow(unused_imports)]
 pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
 
 // === Constants ===
+
+/// Global ownership table for cache-aware resident file sub-agents (#529).
+/// Maps file path → agent id. Agents hold a lease on a file while running;
+/// the lease is released when the agent reaches a terminal state.
+static RESIDENT_LEASES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+/// Release all resident file leases held by `agent_id`. Called when an
+/// agent transitions to a terminal state (completed, failed, cancelled).
+fn release_resident_leases_for(agent_id: &str) {
+    if let Some(lock) = RESIDENT_LEASES.get()
+        && let Ok(mut guard) = lock.lock()
+    {
+        guard.retain(|_, owner| owner != agent_id);
+    }
+}
 
 const DEFAULT_MAX_STEPS: u32 = 100;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,46 +70,66 @@ const COMPLETED_AGENT_RETENTION: Duration = Duration::from_secs(60 * 60);
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_RESTART_REASON: &str = "Interrupted by process restart";
-const DEFAULT_CSV_MAX_CONCURRENCY: u64 = 16;
-const DEFAULT_CSV_MAX_RUNTIME_SECONDS: u64 = 1800;
-const MAX_CSV_MAX_RUNTIME_SECONDS: u64 = 86_400;
 
-const VALID_SUBAGENT_TYPES: &str =
-    "general, explore, plan, review, custom, worker, explorer, awaiter, default";
+const VALID_SUBAGENT_TYPES: &str = "general, explore, plan, review, implementer, verifier, custom, \
+     worker, explorer, awaiter, default, implement, builder, verify, validator, tester";
+/// Whale species names rotated through `whale_nickname_for_index` to label
+/// sub-agents in the UI. English and Simplified-Chinese names are interleaved
+/// so any newly spawned agent has a roughly even chance of either — the goal
+/// is friendly variety, not a strict locale match.
 pub const WHALE_NICKNAMES: &[&str] = &[
     "Blue",
+    "蓝鲸",
     "Humpback",
+    "座头鲸",
     "Sperm",
+    "抹香鲸",
     "Fin",
+    "长须鲸",
     "Sei",
+    "塞鲸",
     "Bryde's",
+    "布氏鲸",
     "Minke",
+    "小须鲸",
     "Antarctic Minke",
+    "南极小须鲸",
     "Gray",
+    "灰鲸",
     "Bowhead",
+    "弓头鲸",
     "North Atlantic Right",
+    "北大西洋露脊鲸",
     "North Pacific Right",
+    "北太平洋露脊鲸",
     "Southern Right",
+    "南露脊鲸",
     "Beluga",
+    "白鲸",
     "Narwhal",
+    "独角鲸",
     "Orca",
+    "虎鲸",
     "Pilot",
+    "领航鲸",
     "False Killer",
+    "伪虎鲸",
     "Pygmy Killer",
+    "小虎鲸",
     "Melon-headed",
+    "瓜头鲸",
     "Beaked",
+    "喙鲸",
     "Cuvier's Beaked",
+    "柯氏喙鲸",
     "Baird's Beaked",
+    "贝氏喙鲸",
     "Blainville's Beaked",
+    "柏氏喙鲸",
 ];
 
 /// Removal version for deprecated tool aliases.
 const DEPRECATION_REMOVAL_VERSION: &str = "0.8.0";
-
-static AGENT_JOB_REPORTS: OnceLock<StdMutex<HashMap<String, HashMap<String, AgentJobReport>>>> =
-    OnceLock::new();
-static AGENT_JOB_ASSIGNMENTS: OnceLock<StdMutex<HashMap<String, HashMap<String, String>>>> =
-    OnceLock::new();
 
 #[must_use]
 pub fn whale_nickname_for_index(index: usize) -> String {
@@ -186,6 +222,16 @@ pub enum SubAgentType {
     Plan,
     /// Code review - read + analysis tools.
     Review,
+    /// Implementation — focused on writing / patching code to satisfy
+    /// a specific change. Distinct from `General` in that the prompt
+    /// posture pushes hard on landing the change cleanly with the
+    /// minimum surrounding edit (#404).
+    Implementer,
+    /// Verification — focused on running the test suite or other
+    /// validation gates and reporting pass/fail with evidence.
+    /// Distinct from `Review` in that Review reads code and grades it;
+    /// Verifier *runs* tests and reports the outcome (#404).
+    Verifier,
     /// Custom tool access defined at spawn time.
     Custom,
 }
@@ -201,6 +247,8 @@ impl SubAgentType {
             "explore" | "exploration" | "explorer" => Some(Self::Explore),
             "plan" | "planning" | "awaiter" => Some(Self::Plan),
             "review" | "code-review" | "code_review" | "reviewer" => Some(Self::Review),
+            "implementer" | "implement" | "implementation" | "builder" => Some(Self::Implementer),
+            "verifier" | "verify" | "verification" | "validator" | "tester" => Some(Self::Verifier),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -213,6 +261,8 @@ impl SubAgentType {
             Self::Explore => "explore",
             Self::Plan => "plan",
             Self::Review => "review",
+            Self::Implementer => "implementer",
+            Self::Verifier => "verifier",
             Self::Custom => "custom",
         }
     }
@@ -225,6 +275,8 @@ impl SubAgentType {
             Self::Explore => EXPLORE_AGENT_PROMPT.to_string(),
             Self::Plan => PLAN_AGENT_PROMPT.to_string(),
             Self::Review => REVIEW_AGENT_PROMPT.to_string(),
+            Self::Implementer => IMPLEMENTER_AGENT_PROMPT.to_string(),
+            Self::Verifier => VERIFIER_AGENT_PROMPT.to_string(),
             Self::Custom => CUSTOM_AGENT_PROMPT.to_string(),
         }
     }
@@ -266,7 +318,6 @@ impl SubAgentType {
                 "todo_update",
                 "todo_list",
                 "update_plan",
-                "report_agent_job_result",
             ],
             Self::Explore => vec![
                 "list_dir",
@@ -299,6 +350,44 @@ impl SubAgentType {
                 "todo_list",
             ],
             Self::Review => vec!["list_dir", "read_file", "grep_files", "file_search", "note"],
+            Self::Implementer => vec![
+                "list_dir",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "apply_patch",
+                "grep_files",
+                "file_search",
+                "exec_shell",
+                "exec_shell_wait",
+                "exec_shell_interact",
+                "exec_wait",
+                "exec_interact",
+                "note",
+                "checklist_write",
+                "checklist_add",
+                "checklist_update",
+                "checklist_list",
+                "todo_write",
+                "todo_add",
+                "todo_update",
+                "todo_list",
+                "update_plan",
+            ],
+            Self::Verifier => vec![
+                "list_dir",
+                "read_file",
+                "grep_files",
+                "file_search",
+                "exec_shell",
+                "exec_shell_wait",
+                "exec_shell_interact",
+                "exec_wait",
+                "exec_interact",
+                "run_tests",
+                "diagnostics",
+                "note",
+            ],
             Self::Custom => vec![], // Must be provided by caller.
         }
     }
@@ -328,12 +417,23 @@ pub struct SubAgentResult {
     pub result: Option<String>,
     pub steps_taken: u32,
     pub duration_ms: u64,
+    /// `true` when this agent was loaded from a prior-session persisted
+    /// state file rather than spawned in the current session (#405).
+    /// Lets `agent_list` filter out historical noise by default while
+    /// keeping the records reachable via `include_archived=true`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_prior_session: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SubAgentSpawnOptions {
     pub model: Option<String>,
     pub nickname: Option<String>,
+    pub fork_context: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +488,14 @@ struct SpawnRequest {
     /// into separate git worktrees: parent runs `git worktree add` first,
     /// then spawns children with the worktree path as `cwd`.
     cwd: Option<PathBuf>,
+    /// Optional file path for cache-aware resident mode (#529). When set,
+    /// the child's prompt is prefixed with the file contents for prefix-cache
+    /// locality. A global ownership table prevents two agents from holding
+    /// a resident lease on the same file simultaneously.
+    resident_file: Option<String>,
+    /// When true, seed the child with the parent's system prompt and message
+    /// prefix before appending the child task.
+    fork_context: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -397,48 +505,6 @@ struct AssignRequest {
     role: Option<String>,
     message: Option<String>,
     interrupt: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CsvRowTask {
-    row_index: usize,
-    item_id: String,
-    values: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CsvWorkerOutcome {
-    #[serde(skip_serializing)]
-    row_index: usize,
-    item_id: String,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_id: Option<String>,
-    duration_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result_json: Option<Value>,
-}
-
-#[derive(Debug, Clone)]
-struct AgentJobReport {
-    result: Value,
-    stop: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SpawnAgentsOnCsvSummary {
-    job_id: String,
-    total: usize,
-    completed: usize,
-    failed: usize,
-    timed_out: usize,
-    skipped: usize,
-    output_csv_path: String,
-    results: Vec<CsvWorkerOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,6 +523,14 @@ struct PersistedSubAgent {
     duration_ms: u64,
     allowed_tools: Vec<String>,
     updated_at_ms: u64,
+    /// Stable id of the manager / process boot that spawned this agent
+    /// (#405). Lets a fresh manager filter out agents that were
+    /// persisted by a prior session. Optional with `#[serde(default)]`
+    /// for backward compatibility — older records lack the field and
+    /// load with an empty string, which the manager treats as
+    /// "from_prior_session" because it can't match any current id.
+    #[serde(default)]
+    session_boot_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +552,32 @@ impl Default for PersistedSubAgentState {
 /// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
 pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 3;
 
+/// Terminal-state notification emitted to the engine's parent turn loop
+/// when one of its direct children finishes (issue #756). Carries the
+/// already-rendered `<deepseek:subagent.done>` sentinel that the model
+/// expects in the transcript per `prompts/base.md`.
+#[derive(Debug, Clone)]
+pub struct SubAgentCompletion {
+    /// The completing child's agent id. Held for routing/logging — the
+    /// engine's turn loop does not currently key on it (it just injects
+    /// the payload), but downstream tooling and tests need the field.
+    #[allow(dead_code)]
+    pub agent_id: String,
+    /// Human summary on line 1, sentinel on line 2. Same payload shape as
+    /// `Event::AgentComplete::result`.
+    pub payload: String,
+}
+
+/// Parent transcript snapshot available to sub-agents that opt into context
+/// forking. The system prompt and leading messages are kept byte-identical to
+/// the parent request so DeepSeek's prefix cache can reuse the warmed prefix.
+#[derive(Clone, Debug)]
+pub struct SubAgentForkContext {
+    pub system: Option<SystemPrompt>,
+    pub messages: Vec<Message>,
+    pub structured_state_block: Option<String>,
+}
+
 /// Runtime configuration for spawning sub-agents.
 ///
 /// Carries everything a child needs to (a) build its own tool registry —
@@ -487,6 +587,9 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 3;
 pub struct SubAgentRuntime {
     pub client: DeepSeekClient,
     pub model: String,
+    pub auto_model: bool,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_effort_auto: bool,
     pub role_models: HashMap<String, String>,
     pub context: ToolContext,
     pub allow_shell: bool,
@@ -508,6 +611,14 @@ pub struct SubAgentRuntime {
     /// whole spawn tree publishes into one ordered, fan-out-able mailbox.
     /// `None` only when no consumer is wired (legacy entry points / tests).
     pub mailbox: Option<Mailbox>,
+    /// Wakeup channel for the engine's parent turn loop (issue #756). Only
+    /// the engine's direct children fire on this — propagated to descendants
+    /// via clone but gated to `spawn_depth == 1` at the send site so the
+    /// parent isn't flooded with grandchild completions it didn't directly
+    /// orchestrate. `None` when no consumer is wired (tests / legacy paths).
+    pub parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
+    /// Snapshot of the request prefix visible to an opt-in forked child.
+    pub fork_context: Option<SubAgentForkContext>,
 }
 
 impl SubAgentRuntime {
@@ -527,6 +638,9 @@ impl SubAgentRuntime {
         Self {
             client,
             model,
+            auto_model: false,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
             role_models: HashMap::new(),
             context,
             allow_shell,
@@ -536,7 +650,29 @@ impl SubAgentRuntime {
             max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
             cancel_token: CancellationToken::new(),
             mailbox: None,
+            parent_completion_tx: None,
+            fork_context: None,
         }
+    }
+
+    /// Attach the wakeup channel so the engine's parent turn loop can resume
+    /// when this runtime's direct children finish (issue #756). The channel
+    /// is propagated to descendants via clone, but only `spawn_depth == 1`
+    /// agents fire on it — see `run_subagent_task`.
+    #[must_use]
+    pub fn with_parent_completion_tx(
+        mut self,
+        tx: mpsc::UnboundedSender<SubAgentCompletion>,
+    ) -> Self {
+        self.parent_completion_tx = Some(tx);
+        self
+    }
+
+    /// Attach the current parent request prefix for `fork_context` spawns.
+    #[must_use]
+    pub fn with_fork_context(mut self, context: SubAgentForkContext) -> Self {
+        self.fork_context = Some(context);
+        self
     }
 
     /// Attach a `Mailbox` so this runtime (and every descendant — children
@@ -576,9 +712,30 @@ impl SubAgentRuntime {
         self
     }
 
+    /// Preserve whether the parent session is using per-turn model routing.
+    #[must_use]
+    pub fn with_auto_model(mut self, auto_model: bool) -> Self {
+        self.auto_model = auto_model;
+        self
+    }
+
+    /// Preserve the parent's thinking configuration. `reasoning_effort_auto`
+    /// stays true even when the parent turn itself was sent with a concrete
+    /// flash-router recommendation, so children can resolve their own tier.
+    #[must_use]
+    pub fn with_reasoning_effort(
+        mut self,
+        reasoning_effort: Option<String>,
+        reasoning_effort_auto: bool,
+    ) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self.reasoning_effort_auto = reasoning_effort_auto;
+        self
+    }
+
     /// Return a child runtime that is deliberately detached from the parent
     /// turn cancellation token. Background sub-agents should keep running when
-    /// the parent turn is cancelled; explicit agent/swarm cancellation still
+    /// the parent turn is cancelled; explicit agent cancellation still
     /// aborts their task handles through the manager.
     #[must_use]
     pub fn background_runtime(&self) -> Self {
@@ -605,6 +762,9 @@ impl SubAgentRuntime {
         Self {
             client: self.client.clone(),
             model: self.model.clone(),
+            auto_model: self.auto_model,
+            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort_auto: self.reasoning_effort_auto,
             role_models: self.role_models.clone(),
             context: child_context,
             allow_shell: self.allow_shell,
@@ -614,6 +774,8 @@ impl SubAgentRuntime {
             max_spawn_depth: self.max_spawn_depth,
             cancel_token: self.cancel_token.child_token(),
             mailbox: self.mailbox.clone(),
+            parent_completion_tx: self.parent_completion_tx.clone(),
+            fork_context: self.fork_context.clone(),
         }
     }
 
@@ -639,12 +801,17 @@ pub struct SubAgent {
     /// `None` = full registry inheritance (v0.6.6 default).
     /// `Some(list)` = explicit narrow allowlist (Custom agents, legacy).
     pub allowed_tools: Option<Vec<String>>,
+    /// Stable id of the manager that spawned this agent (#405). Compared
+    /// against the manager's `current_session_boot_id` to classify the
+    /// agent as in-session vs prior-session at list time.
+    pub session_boot_id: String,
     input_tx: Option<mpsc::UnboundedSender<SubAgentInput>>,
     task_handle: Option<JoinHandle<()>>,
 }
 
 impl SubAgent {
     /// Create a new sub-agent.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         agent_type: SubAgentType,
         prompt: String,
@@ -653,6 +820,7 @@ impl SubAgent {
         nickname: Option<String>,
         allowed_tools: Option<Vec<String>>,
         input_tx: mpsc::UnboundedSender<SubAgentInput>,
+        session_boot_id: String,
     ) -> Self {
         let id = format!("agent_{}", &Uuid::new_v4().to_string()[..8]);
 
@@ -668,6 +836,7 @@ impl SubAgent {
             steps_taken: 0,
             started_at: Instant::now(),
             allowed_tools,
+            session_boot_id,
             input_tx: Some(input_tx),
             task_handle: None,
         }
@@ -686,6 +855,11 @@ impl SubAgent {
             result: self.result.clone(),
             steps_taken: self.steps_taken,
             duration_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            // Snapshots from the agent itself don't know the manager's
+            // current boot id, so default to false. The manager fills
+            // this in when it produces a snapshot via its own
+            // `snapshot_for_listing` helper (#405).
+            from_prior_session: false,
         }
     }
 }
@@ -698,6 +872,13 @@ pub struct SubAgentManager {
     state_path: Option<PathBuf>,
     max_steps: u32,
     max_agents: usize,
+    /// Stable id assigned at manager construction (#405). Stamped on
+    /// every agent the manager spawns; agents loaded from the
+    /// persisted state file carry whatever id the prior session
+    /// stamped (or empty for pre-#405 records). The manager classifies
+    /// agents whose `session_boot_id` doesn't match this value as
+    /// "from prior session" so `agent_list` can hide them by default.
+    current_session_boot_id: String,
 }
 
 impl SubAgentManager {
@@ -710,7 +891,25 @@ impl SubAgentManager {
             state_path: None,
             max_steps: DEFAULT_MAX_STEPS,
             max_agents,
+            // Fresh boot id per manager. Used by #405 to classify
+            // re-loaded persisted agents as "prior session".
+            current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
         }
+    }
+
+    /// Return the boot id this manager stamps on agents it spawns.
+    /// Exposed for tests; internal callers use the field directly.
+    #[cfg(test)]
+    pub fn session_boot_id(&self) -> &str {
+        &self.current_session_boot_id
+    }
+
+    /// Classify an agent by its `session_boot_id`: `true` when the
+    /// agent was either (a) loaded from disk with no id, or (b) carries
+    /// a different id than the manager's current boot. Filters
+    /// `agent_list` output by default (#405).
+    fn is_from_prior_session(&self, agent: &SubAgent) -> bool {
+        agent.session_boot_id.is_empty() || agent.session_boot_id != self.current_session_boot_id
     }
 
     #[must_use]
@@ -742,6 +941,7 @@ impl SubAgentManager {
                 // Reload converts empty vec back to None (full inheritance).
                 allowed_tools: agent.allowed_tools.clone().unwrap_or_default(),
                 updated_at_ms: now_ms,
+                session_boot_id: agent.session_boot_id.clone(),
             });
         }
         agents.sort_by(|a, b| a.id.cmp(&b.id));
@@ -807,6 +1007,10 @@ impl SubAgentManager {
                 steps_taken: persisted.steps_taken,
                 started_at,
                 allowed_tools,
+                // Empty string when loading pre-#405 records; the
+                // manager treats that the same as a non-matching id —
+                // i.e. agent classified as prior-session.
+                session_boot_id: persisted.session_boot_id,
                 input_tx: None,
                 task_handle: None,
             };
@@ -821,27 +1025,18 @@ impl SubAgentManager {
         self.agents
             .values()
             .filter(|agent| {
+                // Exclude non-running statuses
                 if agent.status != SubAgentStatus::Running {
                     return false;
                 }
-                !agent
-                    .task_handle
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                // Exclude persisted agents with no task_handle (they're not actually running)
+                let Some(handle) = agent.task_handle.as_ref() else {
+                    return false;
+                };
+                // Exclude agents whose task has finished (status will be updated to Completed shortly)
+                !handle.is_finished()
             })
             .count()
-    }
-
-    /// Return the maximum number of allowed agents.
-    #[must_use]
-    pub fn max_agents(&self) -> usize {
-        self.max_agents
-    }
-
-    /// Return remaining capacity for new agents.
-    #[must_use]
-    pub fn available_slots(&self) -> usize {
-        self.max_agents.saturating_sub(self.running_count())
     }
 
     /// Spawn a new background sub-agent.
@@ -924,6 +1119,7 @@ impl SubAgentManager {
             nickname,
             tools.clone(),
             input_tx,
+            self.current_session_boot_id.clone(),
         );
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
@@ -944,11 +1140,16 @@ impl SubAgentManager {
             prompt,
             assignment,
             allowed_tools: tools,
+            fork_context: options.fork_context,
             started_at,
             max_steps,
             input_rx,
         };
-        let handle = tokio::spawn(run_subagent_task(task));
+        let handle = spawn_supervised(
+            "subagent-task",
+            std::panic::Location::caller(),
+            run_subagent_task(task),
+        );
         agent.task_handle = Some(handle);
         self.agents.insert(agent_id.clone(), agent);
         self.persist_state_best_effort();
@@ -980,6 +1181,7 @@ impl SubAgentManager {
             let mut changed = false;
             if agent.status == SubAgentStatus::Running {
                 agent.status = SubAgentStatus::Cancelled;
+                release_resident_leases_for(&agent.id);
                 if let Some(handle) = agent.task_handle.take() {
                     handle.abort();
                 }
@@ -1044,11 +1246,16 @@ impl SubAgentManager {
                 prompt: agent.prompt.clone(),
                 assignment: agent.assignment.clone(),
                 allowed_tools: agent.allowed_tools.clone(),
+                fork_context: false,
                 started_at: restarted_at,
                 max_steps: self.max_steps,
                 input_rx,
             };
-            let handle = tokio::spawn(run_subagent_task(task));
+            let handle = spawn_supervised(
+                "subagent-task-resume",
+                std::panic::Location::caller(),
+                run_subagent_task(task),
+            );
 
             agent.status = SubAgentStatus::Running;
             agent.result = None;
@@ -1200,8 +1407,50 @@ impl SubAgentManager {
 
     /// List all agents and their status.
     #[must_use]
+    /// Snapshot a single agent and tag it with the manager's
+    /// classification. The bare `SubAgent::snapshot` defaults
+    /// `from_prior_session` to `false`; only the manager knows the
+    /// matching boot id, so listing goes through here.
+    fn snapshot_for_listing(&self, agent: &SubAgent) -> SubAgentResult {
+        let mut snap = agent.snapshot();
+        snap.from_prior_session = self.is_from_prior_session(agent);
+        snap
+    }
+
+    /// List all agents currently held by the manager, regardless of
+    /// session origin. Use [`Self::list_filtered`] in user-facing tool
+    /// paths so prior-session agents stay hidden by default (#405).
     pub fn list(&self) -> Vec<SubAgentResult> {
-        self.agents.values().map(SubAgent::snapshot).collect()
+        self.agents
+            .values()
+            .map(|agent| self.snapshot_for_listing(agent))
+            .collect()
+    }
+
+    /// List agents respecting the session-boundary filter (#405).
+    ///
+    /// `include_archived = false` (the default for `agent_list`) drops
+    /// any prior-session agent that is no longer running. Prior-session
+    /// agents that are still `Running` (e.g. interrupted by a process
+    /// restart) stay visible — they may matter for ongoing recovery.
+    ///
+    /// `include_archived = true` returns everything, with the
+    /// `from_prior_session` flag on each `SubAgentResult` so the model
+    /// can tell active and archived apart at a glance.
+    pub fn list_filtered(&self, include_archived: bool) -> Vec<SubAgentResult> {
+        self.agents
+            .values()
+            .filter(|agent| {
+                if include_archived {
+                    return true;
+                }
+                if agent.status == SubAgentStatus::Running {
+                    return true;
+                }
+                !self.is_from_prior_session(agent)
+            })
+            .map(|agent| self.snapshot_for_listing(agent))
+            .collect()
     }
 
     /// Clean up completed agents older than the given duration.
@@ -1238,6 +1487,7 @@ impl SubAgentManager {
         let mut changed = false;
         if let Some(agent) = self.agents.get_mut(agent_id) {
             agent.status = SubAgentStatus::Failed(error);
+            release_resident_leases_for(agent_id);
             agent.task_handle = None;
             changed = true;
         }
@@ -1248,7 +1498,7 @@ impl SubAgentManager {
 }
 
 /// Thread-safe wrapper for `SubAgentManager`.
-pub type SharedSubAgentManager = Arc<Mutex<SubAgentManager>>;
+pub type SharedSubAgentManager = Arc<RwLock<SubAgentManager>>;
 
 fn default_state_path(workspace: &Path) -> PathBuf {
     workspace
@@ -1290,7 +1540,7 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
     if let Err(err) = manager.load_state() {
         eprintln!("Failed to load sub-agent state: {err}");
     }
-    Arc::new(Mutex::new(manager))
+    Arc::new(RwLock::new(manager))
 }
 
 // === Tool Implementations ===
@@ -1332,9 +1582,10 @@ impl ToolSpec for AgentSpawnTool {
 
     fn description(&self) -> &'static str {
         "Spawn a background sub-agent for a focused task. Returns an agent_id immediately; \
-         follow with agent_result to retrieve the final result. Max 5 in flight (each is a \
-         full sub-agent loop; cancel or wait if you hit the cap). For parallel one-shot LLM \
-         queries, just emit multiple tool calls in one turn — the dispatcher runs them in parallel."
+         follow with agent_result to retrieve the final result. Default cap of 10 concurrent \
+         sub-agents (configurable via `[subagents].max_concurrent`); each is a full sub-agent \
+         loop, so cancel or wait if you hit the cap. For parallel one-shot LLM queries, just \
+         emit multiple tool calls in one turn — the dispatcher runs them in parallel."
     }
 
     fn input_schema(&self) -> Value {
@@ -1362,7 +1613,7 @@ impl ToolSpec for AgentSpawnTool {
                 },
                 "type": {
                     "type": "string",
-                    "description": "Sub-agent type: general, explore, plan, review, custom"
+                    "description": "Sub-agent type: general, explore, plan, review, implementer, verifier, custom. See docs/SUBAGENTS.md for posture per role."
                 },
                 "agent_type": {
                     "type": "string",
@@ -1392,6 +1643,14 @@ impl ToolSpec for AgentSpawnTool {
                 "cwd": {
                     "type": "string",
                     "description": "Optional working directory for the child. Must be inside the parent's workspace (use a relative path or an absolute path under the workspace root). Used for the parallel-worktree pattern: parent runs `git worktree add .worktrees/feature-x ...` then spawns the child with `cwd: \".worktrees/feature-x\"`."
+                },
+                "resident_file": {
+                    "type": "string",
+                    "description": "Optional file path for cache-aware resident mode. When set, the child's system prefix is augmented with the full contents of this file so DeepSeek's prefix cache stays warm across follow-up send_input calls. Only one agent may hold a resident lease on a given file at a time — a second spawn with the same path receives a conflict warning in the result."
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "When true, inherit the parent's system prompt and conversation prefix before appending this task. This preserves DeepSeek prefix-cache reuse and gives the child full parent context. Defaults to false for independent exploration."
                 }
             }
         })
@@ -1460,40 +1719,98 @@ impl ToolSpec for AgentSpawnTool {
         if let Some(cwd) = validated_cwd {
             child_runtime.context.workspace = cwd;
         }
-        let effective_model = match spawn_request.model.clone() {
-            Some(model) => model,
+        let configured_model = match spawn_request.model.clone() {
+            Some(model) => Some(model),
             None => configured_model_for_role_or_type(
                 &self.runtime,
                 spawn_request.assignment.role.as_deref(),
                 &spawn_request.agent_type,
-            )?
-            .unwrap_or_else(|| self.runtime.model.clone()),
+            )?,
         };
-        child_runtime.model = effective_model.clone();
 
-        let mut manager = self.manager.lock().await;
+        // Cache-aware resident mode (#529): prepend file contents to the prompt
+        // so the child's prefix is byte-stable for DeepSeek prefix caching.
+        let (effective_prompt, resident_conflict) =
+            if let Some(ref file_path) = spawn_request.resident_file {
+                let abs_path = if std::path::Path::new(file_path).is_absolute() {
+                    std::path::PathBuf::from(file_path)
+                } else {
+                    self.runtime.context.workspace.join(file_path)
+                };
+                let file_contents = std::fs::read_to_string(&abs_path)
+                    .unwrap_or_else(|e| format!("<!-- resident_file read error: {e} -->"));
+                let prefixed = format!(
+                    "<!-- resident_file: {file_path} -->\n```\n{file_contents}\n```\n\n{}",
+                    spawn_request.prompt
+                );
+                // Check ownership (best-effort, non-blocking).
+                let conflict = {
+                    let leases = RESIDENT_LEASES
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let mut guard = leases.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(owner) = guard.get(file_path) {
+                        Some(format!(
+                            "Warning: agent {owner} already holds a resident lease on {file_path}"
+                        ))
+                    } else {
+                        guard.insert(file_path.clone(), "pending".to_string());
+                        None
+                    }
+                };
+                (prefixed, conflict)
+            } else {
+                (spawn_request.prompt, None)
+            };
+
+        let route =
+            resolve_subagent_assignment_route(&self.runtime, configured_model, &effective_prompt)
+                .await;
+        child_runtime.model = route.model.clone();
+        child_runtime.reasoning_effort = route.reasoning_effort.clone();
+        child_runtime.reasoning_effort_auto = false;
+        let effective_model = route.model;
+
+        let mut manager = self.manager.write().await;
 
         let result = manager
             .spawn_background_with_assignment_options(
                 Arc::clone(&self.manager),
                 child_runtime,
                 spawn_request.agent_type,
-                spawn_request.prompt,
+                effective_prompt,
                 spawn_request.assignment,
                 spawn_request.allowed_tools,
                 SubAgentSpawnOptions {
                     model: Some(effective_model),
                     nickname: None,
+                    fork_context: spawn_request.fork_context,
                 },
             )
             .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
 
+        // Replace the "pending" lease placeholder with the real agent id now that
+        // the manager has assigned one. Without this, `release_resident_leases_for`
+        // (which matches by agent id at terminal-state transitions) can never find
+        // the entry — leases would stay stamped as "pending" forever, defeating the
+        // release machinery added in #660.
+        if let Some(ref file_path) = spawn_request.resident_file
+            && let Some(lock) = RESIDENT_LEASES.get()
+            && let Ok(mut guard) = lock.lock()
+            && let Some(owner) = guard.get_mut(file_path)
+            && owner == "pending"
+        {
+            *owner = result.agent_id.clone();
+        }
+
         let mut tool_result = if self.name == "spawn_agent" {
-            let payload = json!({
+            let mut payload = json!({
                 "agent_id": result.agent_id.clone(),
                 "nickname": result.nickname.clone(),
                 "model": result.model.clone()
             });
+            if let Some(ref warning) = resident_conflict {
+                payload["resident_conflict"] = json!(warning);
+            }
             ToolResult::json(&payload).map_err(|e| ToolError::execution_failed(e.to_string()))?
         } else {
             ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?
@@ -1582,7 +1899,7 @@ impl ToolSpec for AgentResultTool {
         let (result, timed_out) = if block {
             wait_for_result(&self.manager, agent_id, Duration::from_millis(timeout_ms)).await?
         } else {
-            let manager = self.manager.lock().await;
+            let manager = self.manager.read().await;
             (
                 manager
                     .get_result(agent_id)
@@ -1655,7 +1972,7 @@ impl ToolSpec for AgentCancelTool {
 
     async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
         let agent_id = required_str(&input, "agent_id")?;
-        let mut manager = self.manager.lock().await;
+        let mut manager = self.manager.write().await;
         let result = manager
             .cancel(agent_id)
             .map_err(|e| ToolError::execution_failed(format!("Failed to cancel sub-agent: {e}")))?;
@@ -1725,7 +2042,7 @@ impl ToolSpec for AgentCloseTool {
             .or_else(|| input.get("agent_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::missing_field("id"))?;
-        let mut manager = self.manager.lock().await;
+        let mut manager = self.manager.write().await;
         let result = manager
             .cancel(agent_id)
             .map_err(|e| ToolError::execution_failed(format!("Failed to close sub-agent: {e}")))?;
@@ -1796,7 +2113,7 @@ impl ToolSpec for AgentResumeTool {
             .or_else(|| input.get("agent_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::missing_field("id"))?;
-        let mut manager = self.manager.lock().await;
+        let mut manager = self.manager.write().await;
         let result = manager
             .resume(Arc::clone(&self.manager), self.runtime.clone(), agent_id)
             .map_err(|e| ToolError::execution_failed(format!("Failed to resume sub-agent: {e}")))?;
@@ -1819,14 +2136,22 @@ impl ToolSpec for AgentListTool {
     }
 
     fn description(&self) -> &'static str {
-        "List all active and recently completed sub-agents with their status, type, assignment, \
-         steps taken, and duration."
+        "List sub-agents from the current session with their status, type, assignment, steps, \
+         and duration. Pass `include_archived=true` to also see agents that were spawned in a \
+         prior session (e.g. before the TUI restarted) and persisted on disk; those carry \
+         `from_prior_session: true` in the result. Default is the current-session view because \
+         prior-session agents almost never matter for the live turn."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {}
+            "properties": {
+                "include_archived": {
+                    "type": "boolean",
+                    "description": "When true, include agents from prior sessions in the listing. Default false."
+                }
+            }
         })
     }
 
@@ -1834,14 +2159,14 @@ impl ToolSpec for AgentListTool {
         vec![ToolCapability::ReadOnly]
     }
 
-    async fn execute(
-        &self,
-        _input: Value,
-        _context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let mut manager = self.manager.lock().await;
+    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let include_archived = input
+            .get("include_archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut manager = self.manager.write().await;
         manager.cleanup(COMPLETED_AGENT_RETENTION);
-        let results = manager.list();
+        let results = manager.list_filtered(include_archived);
         ToolResult::json(&results).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -1918,7 +2243,7 @@ impl ToolSpec for AgentSendInputTool {
         let message = parse_text_or_items(&input, &["message", "input"], "items", "message")?;
         let interrupt = optional_bool(&input, "interrupt", false);
 
-        let mut manager = self.manager.lock().await;
+        let mut manager = self.manager.write().await;
         manager
             .send_input(agent_id, message, interrupt)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
@@ -2021,7 +2346,7 @@ impl ToolSpec for AgentAssignTool {
 
     async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
         let request = parse_assign_request(&input)?;
-        let mut manager = self.manager.lock().await;
+        let mut manager = self.manager.write().await;
         let result = manager
             .assign(
                 &request.agent_id,
@@ -2105,7 +2430,7 @@ impl ToolSpec for AgentWaitTool {
             .clamp(MIN_WAIT_TIMEOUT_MS, MAX_RESULT_TIMEOUT_MS);
         let mut ids = parse_wait_ids(&input);
         if ids.is_empty() {
-            let manager = self.manager.lock().await;
+            let manager = self.manager.read().await;
             ids = manager
                 .list()
                 .into_iter()
@@ -2181,7 +2506,8 @@ impl ToolSpec for AgentWaitTool {
     }
 }
 
-/// Tool to delegate a task to a specialized agent (alias for agent_spawn).
+/// Compatibility delegate tool. It routes through `agent_spawn`, but defaults
+/// to `fork_context=true` because delegation is usually continuation work.
 pub struct DelegateToAgentTool {
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
@@ -2202,8 +2528,9 @@ impl ToolSpec for DelegateToAgentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a task to a specialized sub-agent. This is an alias for agent_spawn — same schema, \
-         same behavior. Use `type` (or `agent_name`, `agent_type`) to pick the agent flavor."
+        "Delegate a task to a specialized sub-agent. Compatibility wrapper around agent_spawn; \
+         defaults fork_context=true so the child inherits the parent transcript. Use `type` \
+         (or `agent_name`, `agent_type`) to pick the agent flavor."
     }
 
     fn input_schema(&self) -> Value {
@@ -2212,7 +2539,7 @@ impl ToolSpec for DelegateToAgentTool {
             "properties": {
                 "agent_name": {
                     "type": "string",
-                    "description": "Name/type alias for the agent (general, explore, plan, review, worker, explorer, awaiter)"
+                    "description": "Name/type alias for the agent (general, explore, plan, review, implementer, verifier, worker, explorer, awaiter, builder, validator, tester)"
                 },
                 "type": {
                     "type": "string",
@@ -2253,6 +2580,10 @@ impl ToolSpec for DelegateToAgentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Explicit tool allowlist (required for custom type)"
+                },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "When true, inherit the parent's system prompt and conversation prefix before appending this task. delegate_to_agent defaults this to true."
                 }
             }
         })
@@ -2271,332 +2602,13 @@ impl ToolSpec for DelegateToAgentTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let spawn_tool = AgentSpawnTool::new(self.manager.clone(), self.runtime.clone());
+        let input = with_default_fork_context(input, true);
         let result = spawn_tool.execute(input, context).await?;
         Ok(wrap_with_deprecation_notice(
             result,
             "delegate_to_agent",
             "agent_spawn",
         ))
-    }
-}
-
-/// Tool to process CSV rows by spawning one worker sub-agent per row.
-pub struct SpawnAgentsOnCsvTool {
-    manager: SharedSubAgentManager,
-    runtime: SubAgentRuntime,
-}
-
-struct AgentJobReportCleanup {
-    job_id: String,
-}
-
-impl AgentJobReportCleanup {
-    fn new(job_id: String) -> Self {
-        clear_agent_job_results(&job_id);
-        Self { job_id }
-    }
-}
-
-impl Drop for AgentJobReportCleanup {
-    fn drop(&mut self) {
-        clear_agent_job_results(&self.job_id);
-    }
-}
-
-impl SpawnAgentsOnCsvTool {
-    /// Create a new CSV batch orchestration tool.
-    #[must_use]
-    pub fn new(manager: SharedSubAgentManager, runtime: SubAgentRuntime) -> Self {
-        Self { manager, runtime }
-    }
-}
-
-#[async_trait]
-impl ToolSpec for SpawnAgentsOnCsvTool {
-    fn name(&self) -> &'static str {
-        "spawn_agents_on_csv"
-    }
-
-    fn description(&self) -> &'static str {
-        "Process a CSV by spawning one worker sub-agent per row. The instruction string is a template where `{column}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "csv_path": {
-                    "type": "string",
-                    "description": "Path to the input CSV file"
-                },
-                "instruction": {
-                    "type": "string",
-                    "description": "Instruction template. Use {column_name} placeholders for row values."
-                },
-                "id_column": {
-                    "type": "string",
-                    "description": "Optional CSV column name used as stable item id"
-                },
-                "max_concurrency": {
-                    "type": "integer",
-                    "description": "Maximum concurrent workers (default: 16)"
-                },
-                "max_workers": {
-                    "type": "integer",
-                    "description": "Alias for max_concurrency"
-                },
-                "max_runtime_seconds": {
-                    "type": "integer",
-                    "description": "Per-worker timeout in seconds (default: 1800)"
-                },
-                "output_csv_path": {
-                    "type": "string",
-                    "description": "Optional output CSV path for worker results"
-                },
-                "output_schema": {
-                    "type": "object",
-                    "description": "Optional JSON schema-like object used to validate worker JSON output"
-                }
-            },
-            "required": ["csv_path", "instruction"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            ToolCapability::ExecutesCode,
-            ToolCapability::RequiresApproval,
-        ]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let csv_path_raw = required_str(&input, "csv_path")?;
-        let csv_path = context.resolve_path(csv_path_raw)?;
-        let instruction_template = required_str(&input, "instruction")?;
-        if instruction_template.trim().is_empty() {
-            return Err(ToolError::invalid_input(
-                "instruction cannot be empty".to_string(),
-            ));
-        }
-
-        let id_column = optional_input_str(&input, &["id_column"]).map(str::to_string);
-        let rows = load_csv_rows(&csv_path, id_column.as_deref())?;
-        if rows.is_empty() {
-            return Err(ToolError::invalid_input(format!(
-                "CSV '{}' has no data rows",
-                csv_path.display()
-            )));
-        }
-
-        let output_schema = input.get("output_schema").cloned();
-        let output_csv_path = resolve_results_csv_path(context, &input, &csv_path)?;
-        let max_runtime_seconds = optional_u64(
-            &input,
-            "max_runtime_seconds",
-            DEFAULT_CSV_MAX_RUNTIME_SECONDS,
-        )
-        .clamp(1, MAX_CSV_MAX_RUNTIME_SECONDS);
-        let requested_concurrency = parse_csv_concurrency(&input);
-
-        let max_agents = {
-            let manager = self.manager.lock().await;
-            manager.max_agents().max(1)
-        };
-        let max_concurrency = requested_concurrency.clamp(1, max_agents as u64) as usize;
-
-        let semaphore = Arc::new(Semaphore::new(max_concurrency));
-        let timeout = Duration::from_secs(max_runtime_seconds);
-        let job_id = format!("job_{}", &Uuid::new_v4().to_string()[..8]);
-        let _cleanup = AgentJobReportCleanup::new(job_id.clone());
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let mut workers = FuturesUnordered::new();
-
-        for row in rows {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ToolError::execution_failed("Worker semaphore closed"))?;
-            let manager = self.manager.clone();
-            let runtime = self.runtime.clone();
-            let template = instruction_template.to_string();
-            let schema = output_schema.clone();
-            let job_id = job_id.clone();
-            let stop_requested = stop_requested.clone();
-
-            workers.push(tokio::spawn(async move {
-                let _permit = permit;
-                run_csv_row_agent(
-                    manager,
-                    runtime,
-                    &job_id,
-                    row,
-                    &template,
-                    timeout,
-                    schema,
-                    stop_requested,
-                )
-                .await
-            }));
-        }
-
-        let mut outcomes = Vec::new();
-        while let Some(joined) = workers.next().await {
-            match joined {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(err) => outcomes.push(CsvWorkerOutcome {
-                    row_index: usize::MAX,
-                    item_id: "worker_join".to_string(),
-                    status: "failed".to_string(),
-                    agent_id: None,
-                    duration_ms: 0,
-                    error: Some(format!("Worker task failed to join: {err}")),
-                    result: None,
-                    result_json: None,
-                }),
-            }
-        }
-
-        outcomes.sort_by_key(|outcome| outcome.row_index);
-
-        write_csv_worker_outcomes(&output_csv_path, &outcomes).map_err(|err| {
-            ToolError::execution_failed(format!("Failed to write output CSV: {err}"))
-        })?;
-
-        let completed = outcomes
-            .iter()
-            .filter(|outcome| outcome.status == "completed")
-            .count();
-        let skipped = outcomes
-            .iter()
-            .filter(|outcome| outcome.status == "skipped")
-            .count();
-        let timed_out = outcomes
-            .iter()
-            .filter(|outcome| outcome.status == "timed_out")
-            .count();
-        let failed = outcomes
-            .iter()
-            .filter(|outcome| outcome.status == "failed")
-            .count()
-            + timed_out;
-
-        let summary = SpawnAgentsOnCsvSummary {
-            job_id,
-            total: outcomes.len(),
-            completed,
-            failed,
-            timed_out,
-            skipped,
-            output_csv_path: output_csv_path.display().to_string(),
-            results: outcomes,
-        };
-        let status = if summary.failed > 0 {
-            if summary.completed == 0 && summary.skipped == 0 {
-                "Failed"
-            } else {
-                "Partial"
-            }
-        } else if stop_requested.load(Ordering::Relaxed) || summary.skipped > 0 {
-            "Cancelled"
-        } else {
-            "Completed"
-        };
-        let mut result =
-            ToolResult::json(&summary).map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        result.metadata = Some(json!({
-            "status": status,
-            "job_id": summary.job_id,
-            "completed": summary.completed,
-            "failed": summary.failed,
-            "timed_out": summary.timed_out,
-            "skipped": summary.skipped,
-            "stop_requested": stop_requested.load(Ordering::Relaxed),
-            "output_csv_path": summary.output_csv_path,
-        }));
-        Ok(result)
-    }
-}
-
-/// Worker-oriented tool to report structured row outcomes for CSV agent jobs.
-pub struct ReportAgentJobResultTool;
-
-#[async_trait]
-impl ToolSpec for ReportAgentJobResultTool {
-    fn name(&self) -> &'static str {
-        "report_agent_job_result"
-    }
-
-    fn description(&self) -> &'static str {
-        "Worker-only tool to report a structured result for a spawn_agents_on_csv row."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "job_id": {
-                    "type": "string",
-                    "description": "Identifier of the CSV job"
-                },
-                "item_id": {
-                    "type": "string",
-                    "description": "Identifier of the CSV row item"
-                },
-                "result": {
-                    "type": "object",
-                    "description": "Structured JSON result to record for the row"
-                },
-                "stop": {
-                    "type": "boolean",
-                    "description": "Optional. When true, cancels remaining unstarted CSV rows for this job."
-                }
-            },
-            "required": ["job_id", "item_id", "result"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![]
-    }
-
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let job_id = required_str(&input, "job_id")?.trim();
-        let item_id = required_str(&input, "item_id")?.trim();
-        if job_id.is_empty() {
-            return Err(ToolError::invalid_input("job_id cannot be empty"));
-        }
-        if item_id.is_empty() {
-            return Err(ToolError::invalid_input("item_id cannot be empty"));
-        }
-        let result = input
-            .get("result")
-            .cloned()
-            .ok_or_else(|| ToolError::missing_field("result"))?;
-        if !result.is_object() {
-            return Err(ToolError::invalid_input("result must be a JSON object"));
-        }
-        let reporting_agent_id = input
-            .get("__reporting_agent_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let stop = optional_bool(&input, "stop", false);
-        let accepted =
-            record_agent_job_result(job_id, item_id, result.clone(), stop, reporting_agent_id);
-
-        let payload = json!({
-            "job_id": job_id,
-            "item_id": item_id,
-            "accepted": accepted,
-            "stop": stop,
-            "result": result
-        });
-        ToolResult::json(&payload).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
@@ -2627,6 +2639,64 @@ fn build_subagent_system_prompt(
     }
 }
 
+fn subagent_request_system_prompt(
+    subagent_system_prompt: &str,
+    fork_context: Option<&SubAgentForkContext>,
+) -> SystemPrompt {
+    fork_context
+        .and_then(|context| context.system.clone())
+        .unwrap_or_else(|| SystemPrompt::Text(subagent_system_prompt.to_string()))
+}
+
+fn build_initial_subagent_messages(
+    prompt: &str,
+    assignment: &SubAgentAssignment,
+    agent_type: &SubAgentType,
+    fork_context: Option<&SubAgentForkContext>,
+) -> Vec<Message> {
+    let mut messages = fork_context
+        .map(|context| context.messages.clone())
+        .unwrap_or_default();
+
+    if let Some(context) = fork_context {
+        if let Some(state) = context
+            .structured_state_block
+            .as_deref()
+            .map(str::trim)
+            .filter(|state| !state.is_empty())
+        {
+            messages.push(system_text_message(format!(
+                "<deepseek:fork_state>\n{state}\n</deepseek:fork_state>"
+            )));
+        }
+
+        messages.push(system_text_message(format!(
+            "<deepseek:subagent_context>\n{}\n</deepseek:subagent_context>",
+            build_subagent_system_prompt(agent_type, assignment)
+        )));
+    }
+
+    messages.push(Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: build_assignment_prompt(prompt, assignment, agent_type),
+            cache_control: None,
+        }],
+    });
+
+    messages
+}
+
+fn system_text_message(text: String) -> Message {
+    Message {
+        role: "system".to_string(),
+        content: vec![ContentBlock::Text {
+            text,
+            cache_control: None,
+        }],
+    }
+}
+
 struct SubAgentTask {
     manager_handle: SharedSubAgentManager,
     runtime: SubAgentRuntime,
@@ -2636,6 +2706,7 @@ struct SubAgentTask {
     assignment: SubAgentAssignment,
     /// `None` = full registry inheritance. `Some(list)` = explicit narrow.
     allowed_tools: Option<Vec<String>>,
+    fork_context: bool,
     started_at: Instant,
     max_steps: u32,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
@@ -2650,13 +2721,14 @@ async fn run_subagent_task(task: SubAgentTask) {
         task.prompt,
         task.assignment,
         task.allowed_tools,
+        task.fork_context,
         task.started_at,
         task.max_steps,
         task.input_rx,
     )
     .await;
 
-    let mut manager = task.manager_handle.lock().await;
+    let mut manager = task.manager_handle.write().await;
     match &result {
         Ok(res) => manager.update_from_result(&task.agent_id, res.clone()),
         Err(err) => manager.update_failed(&task.agent_id, err.to_string()),
@@ -2693,13 +2765,44 @@ async fn run_subagent_task(task: SubAgentTask) {
         let _ = mb.send(envelope);
     }
 
+    let payload = format!("{summary}\n{sentinel}");
+
+    // Wake the engine's parent turn loop if this is one of its direct
+    // children (issue #756). Gating by `spawn_depth == 1` means the parent
+    // only sees completions for agents it directly orchestrated, not for
+    // grandchildren spawned recursively inside its children.
+    emit_parent_completion(&task.runtime, &task.agent_id, &payload);
+
     if let Some(event_tx) = task.runtime.event_tx {
-        let payload = format!("{summary}\n{sentinel}");
         let _ = event_tx.try_send(Event::AgentComplete {
             id: task.agent_id,
             result: payload,
         });
     }
+}
+
+/// Notify the engine's parent turn loop that a direct child finished
+/// (issue #756). Returns `true` if a send was attempted, `false` if the
+/// notification was skipped because this isn't a direct child or no channel
+/// is wired. Skips silently when the channel sender has no receiver — the
+/// engine outlives the runtime, so a dropped receiver means we're shutting
+/// down anyway.
+pub(crate) fn emit_parent_completion(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    payload: &str,
+) -> bool {
+    if runtime.spawn_depth != 1 {
+        return false;
+    }
+    let Some(tx) = runtime.parent_completion_tx.as_ref() else {
+        return false;
+    };
+    let _ = tx.send(SubAgentCompletion {
+        agent_id: agent_id.to_string(),
+        payload: payload.to_string(),
+    });
+    true
 }
 
 /// Build a `<deepseek:subagent.done>` JSON sentinel for a successful child.
@@ -2736,13 +2839,25 @@ async fn run_subagent(
     prompt: String,
     assignment: SubAgentAssignment,
     allowed_tools: Option<Vec<String>>,
+    fork_context: bool,
     started_at: Instant,
     max_steps: u32,
     mut input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
 ) -> Result<SubAgentResult> {
     let system_prompt = build_subagent_system_prompt(&agent_type, &assignment);
+    let fork_context = fork_context
+        .then_some(runtime.fork_context.as_ref())
+        .flatten();
+    let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
+    let mut messages =
+        build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
+    let runtime_for_tools = runtime.clone().with_fork_context(SubAgentForkContext {
+        system: Some(request_system.clone()),
+        messages: messages.clone(),
+        structured_state_block: None,
+    });
     let tool_registry = SubAgentToolRegistry::new(
-        runtime.clone(),
+        runtime_for_tools,
         allowed_tools.clone(),
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -2764,14 +2879,6 @@ async fn run_subagent(
         &agent_id,
         format!("started ({})", agent_type.as_str()),
     );
-
-    let mut messages = vec![Message {
-        role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: build_assignment_prompt(&prompt, &assignment, &agent_type),
-            cache_control: None,
-        }],
-    }];
 
     let mut steps = 0;
     let mut final_result: Option<String> = None;
@@ -2803,6 +2910,7 @@ async fn run_subagent(
                 result: None,
                 steps_taken: steps,
                 duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                from_prior_session: false,
             });
         }
 
@@ -2837,12 +2945,12 @@ async fn run_subagent(
             model: runtime.model.clone(),
             messages: messages.clone(),
             max_tokens: 4096,
-            system: Some(SystemPrompt::Text(system_prompt.clone())),
+            system: Some(request_system.clone()),
             tools: Some(tools.clone()),
             tool_choice: Some(json!({ "type": "auto" })),
             metadata: None,
             thinking: None,
-            reasoning_effort: None,
+            reasoning_effort: runtime.reasoning_effort.clone(),
             stream: Some(false),
             temperature: None,
             top_p: None,
@@ -2876,6 +2984,7 @@ async fn run_subagent(
                     steps_taken: steps,
                     duration_ms: u64::try_from(started_at.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
+                    from_prior_session: false,
                 });
             }
             api = tokio::time::timeout(STEP_API_TIMEOUT, runtime.client.create_message(request)) => {
@@ -2999,6 +3108,8 @@ async fn run_subagent(
         }
     }
 
+    release_resident_leases_for(&agent_id);
+
     Ok(SubAgentResult {
         agent_id,
         agent_type,
@@ -3009,6 +3120,7 @@ async fn run_subagent(
         result: final_result,
         steps_taken: steps,
         duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        from_prior_session: false,
     })
 }
 
@@ -3021,7 +3133,7 @@ async fn wait_for_result(
 
     loop {
         let snapshot = {
-            let manager = manager.lock().await;
+            let manager = manager.read().await;
             manager
                 .get_result(agent_id)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?
@@ -3048,7 +3160,7 @@ async fn wait_for_agents(
 
     loop {
         let snapshots = {
-            let manager = manager.lock().await;
+            let manager = manager.read().await;
             ids.iter()
                 .map(|id| {
                     manager
@@ -3314,6 +3426,14 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
 
     let cwd = parse_optional_cwd(input)?;
     let model = parse_optional_subagent_model(input, "model")?;
+    let resident_file = input
+        .get("resident_file")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    let fork_context =
+        parse_optional_bool(input, &["fork_context", "forkContext", "inherit_context"])
+            .unwrap_or(false);
 
     Ok(SpawnRequest {
         prompt: prompt.clone(),
@@ -3322,7 +3442,29 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         allowed_tools,
         model,
         cwd,
+        resident_file,
+        fork_context,
     })
+}
+
+fn parse_optional_bool(input: &Value, names: &[&str]) -> Option<bool> {
+    names
+        .iter()
+        .find_map(|name| input.get(*name))
+        .and_then(Value::as_bool)
+}
+
+fn with_default_fork_context(mut input: Value, default: bool) -> Value {
+    let Some(object) = input.as_object_mut() else {
+        return input;
+    };
+    if !object.contains_key("fork_context")
+        && !object.contains_key("forkContext")
+        && !object.contains_key("inherit_context")
+    {
+        object.insert("fork_context".to_string(), Value::Bool(default));
+    }
+    input
 }
 
 pub(crate) fn normalize_requested_subagent_model(
@@ -3359,6 +3501,171 @@ pub(crate) fn configured_model_for_role_or_type(
         }
     }
     Ok(None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubAgentResolvedRoute {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+pub(crate) async fn resolve_subagent_assignment_route(
+    runtime: &SubAgentRuntime,
+    configured_model: Option<String>,
+    prompt: &str,
+) -> SubAgentResolvedRoute {
+    let explicit_model = configured_model.is_some();
+    let mut route = fallback_subagent_assignment_route(runtime, configured_model, prompt);
+
+    if should_use_subagent_flash_router(runtime)
+        && let Ok(Some(recommendation)) = subagent_flash_router(runtime, prompt).await
+    {
+        if runtime.auto_model && !explicit_model {
+            route.model = recommendation.model;
+        }
+        if runtime.reasoning_effort_auto {
+            route.reasoning_effort = recommendation
+                .reasoning_effort
+                .map(|effort| effort.as_setting().to_string())
+                .or(route.reasoning_effort);
+        }
+    }
+
+    route
+}
+
+fn should_use_subagent_flash_router(runtime: &SubAgentRuntime) -> bool {
+    runtime.auto_model
+}
+
+fn fallback_subagent_assignment_route(
+    runtime: &SubAgentRuntime,
+    configured_model: Option<String>,
+    prompt: &str,
+) -> SubAgentResolvedRoute {
+    let model = if let Some(model) = configured_model {
+        model
+    } else if runtime.auto_model {
+        crate::commands::auto_model_heuristic(prompt, &runtime.model)
+    } else {
+        runtime.model.clone()
+    };
+
+    let reasoning_effort = if runtime.reasoning_effort_auto {
+        let effort = match crate::auto_reasoning::select(false, prompt) {
+            crate::tui::app::ReasoningEffort::Low | crate::tui::app::ReasoningEffort::Medium => {
+                crate::tui::app::ReasoningEffort::High
+            }
+            other => other,
+        };
+        Some(effort.as_setting().to_string())
+    } else {
+        runtime.reasoning_effort.clone()
+    };
+
+    SubAgentResolvedRoute {
+        model,
+        reasoning_effort,
+    }
+}
+
+async fn subagent_flash_router(
+    runtime: &SubAgentRuntime,
+    prompt: &str,
+) -> Result<Option<crate::commands::AutoRouteRecommendation>> {
+    if cfg!(test) {
+        return Ok(None);
+    }
+
+    let request = MessageRequest {
+        model: "deepseek-v4-flash".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: subagent_router_prompt(runtime, prompt),
+                cache_control: None,
+            }],
+        }],
+        max_tokens: 96,
+        system: Some(SystemPrompt::Text(
+            SUBAGENT_ROUTER_SYSTEM_PROMPT.to_string(),
+        )),
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: Some("off".to_string()),
+        stream: Some(false),
+        temperature: Some(0.0),
+        top_p: None,
+    };
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(4),
+        runtime.client.create_message(request),
+    )
+    .await??;
+    Ok(crate::commands::parse_auto_route_recommendation(
+        &message_response_text(&response.content),
+    ))
+}
+
+const SUBAGENT_ROUTER_SYSTEM_PROMPT: &str = "\
+You are the DeepSeek TUI sub-agent routing manager. Return only compact JSON: \
+{\"model\":\"deepseek-v4-flash|deepseek-v4-pro\",\"thinking\":\"off|high|max\"}. \
+Treat each child assignment like a customer request entering a team queue: decide the least \
+sufficient worker and thinking budget for that assignment. Do not treat being a sub-agent as \
+important by itself. Use Flash for trivial, read-only, status, lookup, or single-step work. \
+Use Pro for coding, debugging, release work, multi-file changes, security, architecture, \
+high-risk decisions, ambiguous requests, or work likely to need tool-call judgment. Use thinking \
+off for trivial no-tool work, high for ordinary reasoning, and max only for hard, risky, \
+multi-step, uncertain, or tool-heavy work.";
+
+fn subagent_router_prompt(runtime: &SubAgentRuntime, prompt: &str) -> String {
+    format!(
+        "Parent selected model mode: {}\nParent selected thinking mode: {}\n\nSub-agent assignment:\n{}\n\nReturn JSON only.",
+        if runtime.auto_model { "auto" } else { "fixed" },
+        if runtime.reasoning_effort_auto {
+            "auto"
+        } else {
+            runtime
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("provider-default")
+        },
+        truncate_subagent_router_prompt(prompt, 4_000)
+    )
+}
+
+fn truncate_subagent_router_prompt(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn message_response_text(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            ContentBlock::Thinking { thinking } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(thinking);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn parse_optional_subagent_model(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
@@ -3417,563 +3724,6 @@ fn parse_assign_request(input: &Value) -> Result<AssignRequest, ToolError> {
         message,
         interrupt,
     })
-}
-
-fn parse_csv_concurrency(input: &Value) -> u64 {
-    if input.get("max_concurrency").is_some() {
-        return optional_u64(input, "max_concurrency", DEFAULT_CSV_MAX_CONCURRENCY).max(1);
-    }
-    if input.get("max_workers").is_some() {
-        return optional_u64(input, "max_workers", DEFAULT_CSV_MAX_CONCURRENCY).max(1);
-    }
-    DEFAULT_CSV_MAX_CONCURRENCY
-}
-
-fn agent_job_reports_store() -> &'static StdMutex<HashMap<String, HashMap<String, AgentJobReport>>>
-{
-    AGENT_JOB_REPORTS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn agent_job_assignments_store() -> &'static StdMutex<HashMap<String, HashMap<String, String>>> {
-    AGENT_JOB_ASSIGNMENTS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn record_agent_job_assignment(job_id: &str, item_id: &str, agent_id: &str) {
-    let mut store = agent_job_assignments_store()
-        .lock()
-        .expect("agent job assignments lock poisoned");
-    let job = store.entry(job_id.to_string()).or_default();
-    job.insert(item_id.to_string(), agent_id.to_string());
-}
-
-fn remove_agent_job_assignment(job_id: &str, item_id: &str) {
-    let mut store = agent_job_assignments_store()
-        .lock()
-        .expect("agent job assignments lock poisoned");
-    if let Some(job) = store.get_mut(job_id) {
-        job.remove(item_id);
-        if job.is_empty() {
-            store.remove(job_id);
-        }
-    }
-}
-
-fn clear_agent_job_assignments(job_id: &str) {
-    let mut store = agent_job_assignments_store()
-        .lock()
-        .expect("agent job assignments lock poisoned");
-    store.remove(job_id);
-}
-
-fn report_matches_assignment(
-    job_id: &str,
-    item_id: &str,
-    reporting_agent_id: Option<&str>,
-) -> bool {
-    let Some(reporting_agent_id) = reporting_agent_id else {
-        return false;
-    };
-    let store = agent_job_assignments_store()
-        .lock()
-        .expect("agent job assignments lock poisoned");
-    store
-        .get(job_id)
-        .and_then(|job| job.get(item_id))
-        .is_some_and(|expected| expected == reporting_agent_id)
-}
-
-fn record_agent_job_result(
-    job_id: &str,
-    item_id: &str,
-    result: Value,
-    stop: bool,
-    reporting_agent_id: Option<&str>,
-) -> bool {
-    if !report_matches_assignment(job_id, item_id, reporting_agent_id) {
-        return false;
-    }
-    let mut store = agent_job_reports_store()
-        .lock()
-        .expect("agent job reports lock poisoned");
-    let job = store.entry(job_id.to_string()).or_default();
-    if job.contains_key(item_id) {
-        return false;
-    }
-    job.insert(item_id.to_string(), AgentJobReport { result, stop });
-    true
-}
-
-fn take_agent_job_result(job_id: &str, item_id: &str) -> Option<AgentJobReport> {
-    let mut store = agent_job_reports_store()
-        .lock()
-        .expect("agent job reports lock poisoned");
-    let result = store.get_mut(job_id).and_then(|job| job.remove(item_id));
-    if store
-        .get(job_id)
-        .is_some_and(|job_results| job_results.is_empty())
-    {
-        store.remove(job_id);
-    }
-    remove_agent_job_assignment(job_id, item_id);
-    result
-}
-
-fn clear_agent_job_results(job_id: &str) {
-    let mut store = agent_job_reports_store()
-        .lock()
-        .expect("agent job reports lock poisoned");
-    store.remove(job_id);
-    clear_agent_job_assignments(job_id);
-}
-
-fn resolve_results_csv_path(
-    context: &ToolContext,
-    input: &Value,
-    csv_path: &Path,
-) -> Result<PathBuf, ToolError> {
-    if let Some(path) = optional_input_str(input, &["output_csv_path"]) {
-        context.resolve_path(path)
-    } else {
-        Ok(default_results_csv_path(csv_path))
-    }
-}
-
-fn default_results_csv_path(csv_path: &Path) -> PathBuf {
-    let stem = csv_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("results");
-    csv_path.with_file_name(format!("{stem}.results.csv"))
-}
-
-fn load_csv_rows(csv_path: &Path, id_column: Option<&str>) -> Result<Vec<CsvRowTask>, ToolError> {
-    let mut reader = csv::ReaderBuilder::new()
-        .from_path(csv_path)
-        .map_err(|err| {
-            ToolError::execution_failed(format!(
-                "Failed to read CSV '{}': {err}",
-                csv_path.display()
-            ))
-        })?;
-
-    let headers = reader
-        .headers()
-        .map_err(|err| {
-            ToolError::execution_failed(format!(
-                "Failed to read CSV headers '{}': {err}",
-                csv_path.display()
-            ))
-        })?
-        .clone();
-    if headers.is_empty() {
-        return Err(ToolError::invalid_input(format!(
-            "CSV '{}' has no headers",
-            csv_path.display()
-        )));
-    }
-    let mut seen_headers = HashSet::new();
-    for header in &headers {
-        if !seen_headers.insert(header.to_string()) {
-            return Err(ToolError::invalid_input(format!(
-                "CSV '{}' has duplicate header '{}'",
-                csv_path.display(),
-                header
-            )));
-        }
-    }
-
-    let id_index = if let Some(column_name) = id_column {
-        let trimmed = column_name.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            let index = headers
-                .iter()
-                .position(|header| header == trimmed)
-                .ok_or_else(|| {
-                    ToolError::invalid_input(format!(
-                        "CSV '{}' is missing id_column '{trimmed}'",
-                        csv_path.display()
-                    ))
-                })?;
-            Some(index)
-        }
-    } else {
-        None
-    };
-
-    let mut rows = Vec::new();
-    let mut seen_item_ids = HashSet::new();
-    for (row_index, row) in reader.records().enumerate() {
-        let record = row.map_err(|err| {
-            ToolError::execution_failed(format!(
-                "Failed to parse CSV row {} in '{}': {err}",
-                row_index + 1,
-                csv_path.display()
-            ))
-        })?;
-        let mut values = HashMap::new();
-        for (idx, header) in headers.iter().enumerate() {
-            values.insert(
-                header.to_string(),
-                record.get(idx).unwrap_or_default().to_string(),
-            );
-        }
-        let base_item_id = id_index
-            .and_then(|idx| record.get(idx))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("row-{}", row_index + 1));
-        let mut item_id = base_item_id.clone();
-        let mut suffix = 2usize;
-        while !seen_item_ids.insert(item_id.clone()) {
-            item_id = format!("{base_item_id}-{suffix}");
-            suffix = suffix.saturating_add(1);
-        }
-
-        rows.push(CsvRowTask {
-            row_index,
-            item_id,
-            values,
-        });
-    }
-
-    Ok(rows)
-}
-
-fn render_instruction_template(template: &str, values: &HashMap<String, String>) -> String {
-    const OPEN_BRACE_SENTINEL: &str = "__DEEPSEEK_OPEN_BRACE__";
-    const CLOSE_BRACE_SENTINEL: &str = "__DEEPSEEK_CLOSE_BRACE__";
-
-    let mut rendered = template
-        .replace("{{", OPEN_BRACE_SENTINEL)
-        .replace("}}", CLOSE_BRACE_SENTINEL);
-    for (key, value) in values {
-        rendered = rendered.replace(&format!("{{{key}}}"), value);
-    }
-    rendered
-        .replace(OPEN_BRACE_SENTINEL, "{")
-        .replace(CLOSE_BRACE_SENTINEL, "}")
-}
-
-fn validate_output_schema(schema: &Value, payload: &Value) -> Result<(), String> {
-    let object = payload
-        .as_object()
-        .ok_or_else(|| "Expected JSON object output".to_string())?;
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str)
-        && expected_type != "object"
-    {
-        return Err("output_schema.type must be 'object' when provided".to_string());
-    }
-    if let Some(required_fields) = schema.get("required").and_then(Value::as_array) {
-        for field in required_fields {
-            let Some(field_name) = field.as_str() else {
-                continue;
-            };
-            if !object.contains_key(field_name) {
-                return Err(format!(
-                    "Worker output missing required field '{field_name}'"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_csv_worker_outcomes(csv_path: &Path, outcomes: &[CsvWorkerOutcome]) -> Result<()> {
-    if let Some(parent) = csv_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut writer = csv::WriterBuilder::new().from_path(csv_path)?;
-    writer.write_record([
-        "item_id",
-        "status",
-        "agent_id",
-        "duration_ms",
-        "error",
-        "result",
-        "result_json",
-    ])?;
-    for outcome in outcomes {
-        let result_json = outcome
-            .result_json
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?
-            .unwrap_or_default();
-        writer.write_record([
-            outcome.item_id.clone(),
-            outcome.status.clone(),
-            outcome.agent_id.clone().unwrap_or_default(),
-            outcome.duration_ms.to_string(),
-            outcome.error.clone().unwrap_or_default(),
-            outcome.result.clone().unwrap_or_default(),
-            result_json,
-        ])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_csv_row_agent(
-    manager: SharedSubAgentManager,
-    runtime: SubAgentRuntime,
-    job_id: &str,
-    row: CsvRowTask,
-    instruction_template: &str,
-    timeout: Duration,
-    output_schema: Option<Value>,
-    stop_requested: Arc<AtomicBool>,
-) -> CsvWorkerOutcome {
-    let CsvRowTask {
-        row_index,
-        item_id,
-        values,
-    } = row;
-
-    if stop_requested.load(Ordering::Relaxed) {
-        return CsvWorkerOutcome {
-            row_index,
-            item_id,
-            status: "skipped".to_string(),
-            agent_id: None,
-            duration_ms: 0,
-            error: Some("Skipped because stop=true was reported by another worker".to_string()),
-            result: None,
-            result_json: None,
-        };
-    }
-
-    let schema_text = output_schema
-        .as_ref()
-        .map(serde_json::to_string_pretty)
-        .transpose()
-        .unwrap_or(None)
-        .unwrap_or_else(|| "{}".to_string());
-    let rendered_instruction = render_instruction_template(instruction_template, &values);
-    let row_json = serde_json::to_string_pretty(&values).unwrap_or_else(|_| "{}".to_string());
-    let prompt = format!(
-        "You are processing one item for a spawn_agents_on_csv job.\n\
-Job ID: {job_id}\n\
-Item ID: {item_id}\n\n\
-Task instruction:\n\
-{rendered_instruction}\n\n\
-Input row (JSON):\n\
-{row_json}\n\n\
-Expected result schema (JSON Schema or {{}}):\n\
-{schema_text}\n\n\
-You MUST call the `report_agent_job_result` tool exactly once with:\n\
-1. `job_id` = \"{job_id}\"\n\
-2. `item_id` = \"{item_id}\"\n\
-3. `result` = a JSON object for this row.\n\n\
-If you need to stop the job early, include `stop` = true in the same tool call.\n\n\
-After the tool call succeeds, stop.",
-        item_id = item_id.as_str()
-    );
-
-    let assignment = SubAgentAssignment::new(
-        format!("Process CSV item '{item_id}' for job '{job_id}'"),
-        Some("worker".to_string()),
-    );
-    let spawn_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
-    let spawned = loop {
-        if stop_requested.load(Ordering::Relaxed) {
-            return CsvWorkerOutcome {
-                row_index,
-                item_id,
-                status: "skipped".to_string(),
-                agent_id: None,
-                duration_ms: 0,
-                error: Some("Skipped because stop=true was reported by another worker".to_string()),
-                result: None,
-                result_json: None,
-            };
-        }
-        let attempt = {
-            let mut manager_guard = manager.lock().await;
-            manager_guard.spawn_background_with_assignment(
-                manager.clone(),
-                runtime.clone(),
-                SubAgentType::General,
-                prompt.clone(),
-                assignment.clone(),
-                None,
-            )
-        };
-
-        match attempt {
-            Ok(snapshot) => break Ok(snapshot),
-            Err(err) => {
-                let message = err.to_string();
-                if message.contains("Sub-agent limit reached") && Instant::now() < spawn_deadline {
-                    tokio::time::sleep(RESULT_POLL_INTERVAL).await;
-                    continue;
-                }
-                break Err(message);
-            }
-        }
-    };
-
-    let spawn_snapshot = match spawned {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return CsvWorkerOutcome {
-                row_index,
-                item_id,
-                status: "failed".to_string(),
-                agent_id: None,
-                duration_ms: 0,
-                error: Some(error),
-                result: None,
-                result_json: None,
-            };
-        }
-    };
-
-    let agent_id = spawn_snapshot.agent_id.clone();
-    record_agent_job_assignment(job_id, item_id.as_str(), &agent_id);
-    let deadline = Instant::now() + timeout;
-    let final_snapshot = loop {
-        let snapshot = {
-            let manager = manager.lock().await;
-            manager.get_result(&agent_id)
-        };
-        match snapshot {
-            Ok(snapshot) if snapshot.status != SubAgentStatus::Running => break Ok(snapshot),
-            Ok(snapshot) => {
-                if Instant::now() >= deadline {
-                    let cancelled = {
-                        let mut manager = manager.lock().await;
-                        manager.cancel(&agent_id)
-                    };
-                    let mut outcome = CsvWorkerOutcome {
-                        row_index,
-                        item_id,
-                        status: "timed_out".to_string(),
-                        agent_id: Some(agent_id.clone()),
-                        duration_ms: snapshot.duration_ms,
-                        error: Some("Worker timed out and was cancelled".to_string()),
-                        result: snapshot.result,
-                        result_json: None,
-                    };
-                    if let Ok(cancelled_snapshot) = cancelled {
-                        outcome.duration_ms = cancelled_snapshot.duration_ms;
-                    }
-                    return outcome;
-                }
-                tokio::time::sleep(RESULT_POLL_INTERVAL).await;
-            }
-            Err(err) => break Err(err.to_string()),
-        }
-    };
-
-    let snapshot = match final_snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return CsvWorkerOutcome {
-                row_index,
-                item_id,
-                status: "failed".to_string(),
-                agent_id: Some(agent_id),
-                duration_ms: 0,
-                error: Some(error),
-                result: None,
-                result_json: None,
-            };
-        }
-    };
-
-    match snapshot.status {
-        SubAgentStatus::Completed => {
-            let Some(report) = take_agent_job_result(job_id, item_id.as_str()) else {
-                return CsvWorkerOutcome {
-                    row_index,
-                    item_id,
-                    status: "failed".to_string(),
-                    agent_id: Some(snapshot.agent_id),
-                    duration_ms: snapshot.duration_ms,
-                    error: Some(
-                        "Worker finished without calling report_agent_job_result".to_string(),
-                    ),
-                    result: snapshot.result,
-                    result_json: None,
-                };
-            };
-
-            if let Some(schema) = output_schema.as_ref()
-                && let Err(error) = validate_output_schema(schema, &report.result)
-            {
-                return CsvWorkerOutcome {
-                    row_index,
-                    item_id,
-                    status: "failed".to_string(),
-                    agent_id: Some(snapshot.agent_id),
-                    duration_ms: snapshot.duration_ms,
-                    error: Some(error),
-                    result: snapshot.result,
-                    result_json: Some(report.result),
-                };
-            }
-
-            if report.stop {
-                stop_requested.store(true, Ordering::Relaxed);
-            }
-
-            CsvWorkerOutcome {
-                row_index,
-                item_id,
-                status: "completed".to_string(),
-                agent_id: Some(snapshot.agent_id),
-                duration_ms: snapshot.duration_ms,
-                error: None,
-                result: snapshot.result,
-                result_json: Some(report.result),
-            }
-        }
-        SubAgentStatus::Interrupted(error) => CsvWorkerOutcome {
-            row_index,
-            item_id,
-            status: "interrupted".to_string(),
-            agent_id: Some(snapshot.agent_id),
-            duration_ms: snapshot.duration_ms,
-            error: Some(error),
-            result: snapshot.result,
-            result_json: None,
-        },
-        SubAgentStatus::Failed(error) => CsvWorkerOutcome {
-            row_index,
-            item_id,
-            status: "failed".to_string(),
-            agent_id: Some(snapshot.agent_id),
-            duration_ms: snapshot.duration_ms,
-            error: Some(error),
-            result: snapshot.result,
-            result_json: None,
-        },
-        SubAgentStatus::Cancelled => CsvWorkerOutcome {
-            row_index,
-            item_id,
-            status: "failed".to_string(),
-            agent_id: Some(snapshot.agent_id),
-            duration_ms: snapshot.duration_ms,
-            error: Some("Worker cancelled".to_string()),
-            result: snapshot.result,
-            result_json: None,
-        },
-        SubAgentStatus::Running => CsvWorkerOutcome {
-            row_index,
-            item_id,
-            status: "failed".to_string(),
-            agent_id: Some(snapshot.agent_id),
-            duration_ms: snapshot.duration_ms,
-            error: Some("Worker did not reach terminal status".to_string()),
-            result: snapshot.result,
-            result_json: None,
-        },
-    }
 }
 
 fn normalize_role_alias(input: &str) -> Option<&'static str> {
@@ -4058,7 +3808,6 @@ impl SubAgentToolRegistry {
                 todo_list,
                 plan_state,
             )
-            .with_tool(Arc::new(ReportAgentJobResultTool))
             .build(context);
 
         Self {
@@ -4098,24 +3847,32 @@ impl SubAgentToolRegistry {
         }
     }
 
-    async fn execute(&self, agent_id: &str, name: &str, mut input: Value) -> Result<String> {
+    async fn execute(&self, _agent_id: &str, name: &str, input: Value) -> Result<String> {
         if !self.is_tool_allowed(name) {
             return Err(anyhow!("Tool {name} not allowed for this sub-agent"));
         }
-        if name == "report_agent_job_result"
-            && let Some(object) = input.as_object_mut()
-        {
-            object.insert(
-                "__reporting_agent_id".to_string(),
-                Value::String(agent_id.to_string()),
-            );
-        }
-
+        reject_subagent_terminal_takeover(name, &input)?;
         self.registry
             .execute(name, input)
             .await
             .map_err(|e| anyhow!(e))
     }
+}
+
+fn reject_subagent_terminal_takeover(name: &str, input: &Value) -> Result<()> {
+    let wants_interactive_shell = name == "exec_shell"
+        && input
+            .get("interactive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if wants_interactive_shell {
+        return Err(anyhow!(
+            "Sub-agents run in the background and cannot use exec_shell with interactive=true \
+             because that would take over the parent TUI terminal. Use non-interactive \
+             exec_shell, background=true, tty=true, or task_shell_start instead."
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the effective allowed-tools list for a child.
@@ -4310,6 +4067,61 @@ const CUSTOM_AGENT_PROMPT: &str = concat!(
     "\n",
     "Stay tightly scoped to the assigned objective. The parent chose Custom\n",
     "specifically to constrain you — do not expand into adjacent work.\n",
+    "\n",
+    include_str!("../../prompts/subagent_output_format.md"),
+);
+
+const IMPLEMENTER_AGENT_PROMPT: &str = concat!(
+    "You are an implementation sub-agent. Your job is to land the change\n",
+    "the parent assigned to you — write the code, modify the files, satisfy\n",
+    "the contract — with the *minimum* surrounding edit. You do not refactor\n",
+    "adjacent code. You do not rename unused variables. You do not 'tidy up'\n",
+    "while you're in the file. If you see related work that should happen,\n",
+    "surface it under RISKS or BLOCKERS rather than starting it.\n",
+    "\n",
+    "Method:\n",
+    "- Read the target file(s) end-to-end before editing. Edits made without\n",
+    "  reading the file produce structurally wrong patches.\n",
+    "- Prefer `edit_file` (single search/replace) for narrow changes.\n",
+    "  Reach for `apply_patch` only when the change spans multiple hunks\n",
+    "  or is structurally tricky.\n",
+    "- After every batch of edits, run a quick verification: a relevant\n",
+    "  `cargo check` / `npm run lint` / `pytest -k <test>` so you don't\n",
+    "  hand the parent a half-baked implementation.\n",
+    "- If the change requires writing tests, write them first or alongside\n",
+    "  the implementation — never as a follow-up the parent has to ask for.\n",
+    "\n",
+    "CHANGES is the load-bearing section for implementers. List every file\n",
+    "you modified with a one-line summary of what changed and why. The parent\n",
+    "uses CHANGES to decide what to inspect next.\n",
+    "\n",
+    include_str!("../../prompts/subagent_output_format.md"),
+);
+
+const VERIFIER_AGENT_PROMPT: &str = concat!(
+    "You are a verification sub-agent. Your job is to *run* the project's\n",
+    "test suite (or other validation gates) and report pass/fail with the\n",
+    "evidence the parent needs to act. You are read-only by convention —\n",
+    "do not patch failing tests, do not 'fix' lints, do not modify code.\n",
+    "If a fix seems obvious, describe it under RISKS so the parent can\n",
+    "spawn an Implementer.\n",
+    "\n",
+    "Method:\n",
+    "- Run the right gate for the language: `cargo test --workspace`,\n",
+    "  `npm test`, `pytest`, `go test ./...`. Use `run_tests` when it's\n",
+    "  available; fall back to `exec_shell` when the project has a custom\n",
+    "  invocation.\n",
+    "- Run lints if requested: `cargo clippy -- -D warnings`,\n",
+    "  `npm run lint`, `ruff check .`. Don't run lints the parent didn't\n",
+    "  ask for; lint noise drowns the signal you were spawned to surface.\n",
+    "- Capture the exact failing assertion plus the stack trace / file:line\n",
+    "  in EVIDENCE. A failure summarised as 'cargo test failed' is useless;\n",
+    "  the parent needs the actual panic.\n",
+    "\n",
+    "OUTCOME goes at the top of SUMMARY: PASS / FAIL / FLAKY. If FLAKY,\n",
+    "say which test and how many runs you tried.\n",
+    "\n",
+    "CHANGES will almost always be \"None.\" for a verifier.\n",
     "\n",
     include_str!("../../prompts/subagent_output_format.md"),
 );

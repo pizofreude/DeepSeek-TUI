@@ -24,7 +24,7 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         &messages,
         &app.model,
         &app.workspace,
-        u64::from(app.total_tokens),
+        u64::from(app.session.total_tokens),
         app.system_prompt.as_ref(),
         Some(app.mode.label()),
     );
@@ -46,7 +46,7 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
                     CommandResult::message(format!(
                         "Session saved to {} (ID: {})",
                         save_path.display(),
-                        &session.metadata.id[..8]
+                        crate::session_manager::truncate_id(&session.metadata.id)
                     ))
                 }
                 Err(e) => CommandResult::error(format!("Failed to save session: {e}")),
@@ -91,14 +91,25 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
         .collect();
     app.extend_history(cells_to_add);
     app.mark_history_updated();
-    app.transcript_selection.clear();
+    app.viewport.transcript_selection.clear();
     app.model.clone_from(&session.metadata.model);
     app.update_model_compaction_budget();
     app.workspace.clone_from(&session.metadata.workspace);
-    app.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
-    app.total_conversation_tokens = app.total_tokens;
-    app.last_prompt_tokens = None;
-    app.last_completion_tokens = None;
+    app.session.total_tokens = u32::try_from(session.metadata.total_tokens).unwrap_or(u32::MAX);
+    app.session.total_conversation_tokens = app.session.total_tokens;
+    app.session.session_cost = 0.0;
+    app.session.session_cost_cny = 0.0;
+    app.session.subagent_cost = 0.0;
+    app.session.subagent_cost_cny = 0.0;
+    app.session.subagent_cost_event_seqs.clear();
+    app.session.displayed_cost_high_water = 0.0;
+    app.session.displayed_cost_high_water_cny = 0.0;
+    app.session.last_prompt_tokens = None;
+    app.session.last_completion_tokens = None;
+    app.session.last_prompt_cache_hit_tokens = None;
+    app.session.last_prompt_cache_miss_tokens = None;
+    app.session.last_reasoning_replay_tokens = None;
+    app.session.turn_cache_history.clear();
     app.current_session_id = Some(session.metadata.id.clone());
     if let Some(sp) = session.system_prompt {
         app.system_prompt = Some(crate::models::SystemPrompt::Text(sp));
@@ -109,7 +120,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
         format!(
             "Session loaded from {} (ID: {}, {} messages)",
             load_path.display(),
-            &session.metadata.id[..8],
+            crate::session_manager::truncate_id(&session.metadata.id),
             session.metadata.message_count
         ),
         crate::tui::app::AppAction::SyncSession {
@@ -183,10 +194,68 @@ pub fn export(app: &mut App, path: Option<&str>) -> CommandResult {
     }
 }
 
-/// Open the session picker UI
-pub fn sessions(app: &mut App) -> CommandResult {
-    app.view_stack.push(SessionPickerView::new());
-    CommandResult::ok()
+/// Open the session picker UI, or run a sub-action like
+/// `prune <days>` for housekeeping (#406 phase-1.5).
+pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let trimmed = arg.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        app.view_stack.push(SessionPickerView::new());
+        return CommandResult::ok();
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let action = parts.next().unwrap_or("").to_ascii_lowercase();
+    match action.as_str() {
+        "prune" => prune(app, parts.next()),
+        "show" | "list" | "picker" => {
+            app.view_stack.push(SessionPickerView::new());
+            CommandResult::ok()
+        }
+        _ => CommandResult::error(format!(
+            "unknown subcommand `{action}`. usage: /sessions [show|prune <days>]"
+        )),
+    }
+}
+
+/// Prune persisted sessions older than `<days>` from
+/// `~/.deepseek/sessions/`. Wraps
+/// [`crate::session_manager::SessionManager::prune_sessions_older_than`]
+/// so users can run a safe cleanup without leaving the TUI. Skips
+/// the checkpoint subdirectory (the helper guarantees that already).
+fn prune(_app: &mut App, days_arg: Option<&str>) -> CommandResult {
+    let days_str = match days_arg {
+        Some(s) => s,
+        None => {
+            return CommandResult::error(
+                "usage: /sessions prune <days>   (e.g. `/sessions prune 30` to drop sessions older than 30 days)",
+            );
+        }
+    };
+    let days: u64 = match days_str.parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            return CommandResult::error(format!(
+                "expected a positive integer number of days, got `{days_str}`"
+            ));
+        }
+    };
+
+    let manager = match crate::session_manager::SessionManager::default_location() {
+        Ok(m) => m,
+        Err(err) => {
+            return CommandResult::error(format!("could not open sessions directory: {err}"));
+        }
+    };
+
+    let max_age = std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60));
+    match manager.prune_sessions_older_than(max_age) {
+        Ok(0) => CommandResult::message(format!("no sessions older than {days}d to prune")),
+        Ok(n) => CommandResult::message(format!(
+            "pruned {n} session{} older than {days}d",
+            if n == 1 { "" } else { "s" }
+        )),
+        Err(err) => CommandResult::error(format!("prune failed: {err}")),
+    }
 }
 
 fn render_tool_cell(tool: &crate::tui::history::ToolCell, width: u16) -> String {
@@ -216,13 +285,16 @@ fn line_to_string(line: ratatui::text::Line<'static>) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tui::app::{App, TuiOptions};
+    use crate::tui::app::{App, TuiOptions, TurnCacheRecord};
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: tmpdir.path().to_path_buf(),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -237,6 +309,7 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
         App::new(options, &Config::default())
     }
@@ -327,7 +400,7 @@ mod tests {
                 cache_control: None,
             }],
         });
-        app1.total_tokens = 500;
+        app1.session.total_tokens = 500;
         let save_path = tmpdir.path().join("test.json");
         save(&mut app1, Some(save_path.to_str().unwrap()));
 
@@ -340,9 +413,66 @@ mod tests {
         assert!(msg.contains("ID:"));
         assert!(msg.contains("messages"));
         assert_eq!(app2.api_messages.len(), 1);
-        assert_eq!(app2.total_tokens, 500);
+        assert_eq!(app2.session.total_tokens, 500);
         assert!(app2.current_session_id.is_some());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn load_resets_cache_history_and_cost() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
+        saved_app.api_messages.push(crate::models::Message {
+            role: "user".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: "checkpoint".to_string(),
+                cache_control: None,
+            }],
+        });
+        saved_app.session.total_tokens = 500;
+        let save_path = tmpdir.path().join("checkpoint.json");
+        save(&mut saved_app, Some(save_path.to_str().unwrap()));
+
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.session.session_cost = 1.25;
+        app.session.session_cost_cny = 9.13;
+        app.session.subagent_cost = 0.75;
+        app.session.subagent_cost_cny = 5.48;
+        app.session.subagent_cost_event_seqs.insert(42);
+        app.session.displayed_cost_high_water = 2.0;
+        app.session.displayed_cost_high_water_cny = 14.61;
+        app.session.last_prompt_tokens = Some(120);
+        app.session.last_completion_tokens = Some(35);
+        app.session.last_prompt_cache_hit_tokens = Some(80);
+        app.session.last_prompt_cache_miss_tokens = Some(40);
+        app.session.last_reasoning_replay_tokens = Some(12);
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 120,
+            output_tokens: 35,
+            cache_hit_tokens: Some(80),
+            cache_miss_tokens: Some(40),
+            reasoning_replay_tokens: Some(12),
+            recorded_at: Instant::now(),
+        });
+
+        let result = load(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(result.message.is_some());
+        assert_eq!(app.session.total_tokens, 500);
+        assert_eq!(app.session.total_conversation_tokens, 500);
+        assert_eq!(app.session.session_cost, 0.0);
+        assert_eq!(app.session.session_cost_cny, 0.0);
+        assert_eq!(app.session.subagent_cost, 0.0);
+        assert_eq!(app.session.subagent_cost_cny, 0.0);
+        assert!(app.session.subagent_cost_event_seqs.is_empty());
+        assert_eq!(app.session.displayed_cost_high_water, 0.0);
+        assert_eq!(app.session.displayed_cost_high_water_cny, 0.0);
+        assert_eq!(app.session.last_prompt_tokens, None);
+        assert_eq!(app.session.last_completion_tokens, None);
+        assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
+        assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
+        assert_eq!(app.session.last_reasoning_replay_tokens, None);
+        assert!(app.session.turn_cache_history.is_empty());
     }
 
     #[test]
@@ -408,10 +538,63 @@ mod tests {
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         let initial_kind = app.view_stack.top_kind();
 
-        let result = sessions(&mut app);
+        let result = sessions(&mut app, None);
         assert_eq!(result.message, None);
         assert!(result.action.is_none());
         // View should have changed (session picker should be on top)
         assert_ne!(app.view_stack.top_kind(), initial_kind);
+    }
+
+    #[test]
+    fn test_sessions_show_subcommand_pushes_picker_view() {
+        // `/sessions show` and `/sessions list` are explicit aliases
+        // for the no-arg picker form. Verify they don't fall through
+        // to the prune branch.
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        let initial_kind = app.view_stack.top_kind();
+        let result = sessions(&mut app, Some("show"));
+        assert_eq!(result.message, None);
+        assert_ne!(app.view_stack.top_kind(), initial_kind);
+    }
+
+    #[test]
+    fn test_sessions_prune_requires_days_argument() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        let result = sessions(&mut app, Some("prune"));
+        assert!(result.is_error);
+        assert!(
+            result.message.as_deref().unwrap_or("").contains("usage"),
+            "expected usage hint: {:?}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn test_sessions_prune_rejects_non_positive_days() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        for bad in ["0", "-3", "abc", "3.14"] {
+            let result = sessions(&mut app, Some(&format!("prune {bad}")));
+            assert!(result.is_error, "expected error for `{bad}`");
+        }
+    }
+
+    #[test]
+    fn test_sessions_unknown_subcommand_errors() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        let result = sessions(&mut app, Some("teleport"));
+        assert!(result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown subcommand"),
+            "expected unknown-subcommand error: {:?}",
+            result.message
+        );
     }
 }

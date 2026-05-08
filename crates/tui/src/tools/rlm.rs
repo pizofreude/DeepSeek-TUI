@@ -21,6 +21,7 @@ use crate::rlm::turn::{RlmTermination, run_rlm_turn_with_root};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
+use crate::utils::spawn_supervised;
 
 /// Default child model — cheap and fast.
 const DEFAULT_CHILD_MODEL: &str = "deepseek-v4-flash";
@@ -53,15 +54,28 @@ impl ToolSpec for RlmTool {
     }
 
     fn description(&self) -> &'static str {
-        "Heavy-lift recursive language model. Use when you have a long input \
-         (a whole file, a long transcript, a doc) that doesn't fit in your \
-         working context. The input is loaded into a sandboxed Python REPL \
-         where a sub-agent writes code to chunk and process it via sub-LLM \
-         calls, and returns a synthesized answer. Provide `task` (what to \
-         do) plus exactly one of `file_path` (relative to workspace, \
-         preferred) or `content` (inline, capped at 200k chars). Slower and \
-         pricier than `read_file` / `rlm_query` — only reach for it when \
-         the input genuinely doesn't fit. Returns the final answer string."
+        "Specialty tool for processing long inputs that don't fit in your \
+         own context window. Loads the input into a sandboxed Python REPL \
+         as `PROMPT`; a sub-agent writes Python that chunks the input and \
+         calls in-REPL helpers (`llm_query`, `llm_query_batched`, \
+         `rlm_query`, `rlm_query_batched`) to process it, then returns a \
+         synthesized answer. \n\n\
+         Use this tool when the input is genuinely large or when a Python \
+         map-reduce pass plus child LLM calls is the right shape: whole \
+         files, long transcripts, multi-document corpora, bulk semantic \
+         classification, or decomposition/critique work. For exact counts \
+         or structured aggregates, compute them directly in Python inside \
+         the REPL and report the deterministic result instead of asking a \
+         child LLM to guess. For whole-input map-reduce, use the REPL \
+         helpers `chunk_context()` and `chunk_coverage()` so the result \
+         states what was covered. \n\n\
+         Provide `task` (what to do) plus exactly one of `file_path` \
+         (workspace-relative, preferred — keeps the long input out of \
+         your context entirely) or `content` (inline, capped at 200k \
+         chars). The Python helpers (`llm_query`, `rlm_query`, etc.) live \
+         INSIDE the REPL — they are not separately-callable tools. \n\n\
+         Returns the final synthesized answer plus an RLM report showing \
+         input size, iterations, duration, sub-LLM calls, and trace summary."
     }
 
     fn input_schema(&self) -> Value {
@@ -80,10 +94,6 @@ impl ToolSpec for RlmTool {
                 "content": {
                     "type": "string",
                     "description": "Inline content to load as PROMPT. Use only when the input isn't a file you can point at. Capped at 200k chars."
-                },
-                "child_model": {
-                    "type": "string",
-                    "description": "Model for sub-LLM (`llm_query`) calls inside the REPL. Default: deepseek-v4-flash."
                 },
                 "max_depth": {
                     "type": "integer",
@@ -169,13 +179,13 @@ impl ToolSpec for RlmTool {
                 "rlm: input is empty after loading",
             ));
         }
+        let input_chars = body.chars().count();
+        let input_lines = body.lines().count();
 
-        let child_model = input
-            .get("child_model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_CHILD_MODEL)
-            .to_string();
+        // Pin child calls to Flash so model-generated tool args cannot quietly
+        // turn fanout work into Pro-billed requests. The RLM root still uses
+        // the session model; child helper calls are the cheap batch layer.
+        let child_model = DEFAULT_CHILD_MODEL.to_string();
 
         let max_depth = input
             .get("max_depth")
@@ -187,7 +197,11 @@ impl ToolSpec for RlmTool {
         // we don't want RLM's progress events to interleave with the
         // parent agent's stream. Drain into a no-op channel.
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let drain = spawn_supervised(
+            "rlm-progress-drain",
+            std::panic::Location::caller(),
+            async move { while rx.recv().await.is_some() {} },
+        );
 
         // The big body lives only in the REPL as `context`. The small
         // `task` rides along as `root_prompt` and is shown to the root
@@ -240,6 +254,14 @@ impl ToolSpec for RlmTool {
             RlmTermination::Error => String::new(),
         };
 
+        let report = format!(
+            "RLM report:\n- input: {input_lines} line(s), {input_chars} char(s)\n- iterations: {}\n- duration: {}ms\n- sub-LLM RPCs: {}\n- termination: {:?}\n\nAnswer:\n",
+            result.iterations,
+            result.duration.as_millis(),
+            result.total_rpcs,
+            result.termination,
+        );
+
         let trace_summary = if result.trace.is_empty() {
             String::from("\n\n[trace: no REPL rounds executed]")
         } else {
@@ -280,22 +302,36 @@ impl ToolSpec for RlmTool {
             })
             .collect();
 
+        // The `child_*` keys are the contract the engine reads in
+        // `tool_routing::accrue_child_token_cost_if_any` to roll
+        // sub-LLM token usage into the session-cost counter. RLM
+        // spawns its own DeepSeek calls under `child_model`; without
+        // this accrual the dashboard under-reports a session that
+        // uses RLM heavily by 10-20× because only the parent turn's
+        // tokens hit `accrue_session_cost` (#524).
         let metadata = json!({
             "iterations": result.iterations,
             "duration_ms": result.duration.as_millis() as u64,
             "input_tokens": result.usage.input_tokens,
             "output_tokens": result.usage.output_tokens,
-            "termination": format!("{:?}", result.termination).to_lowercase(),
+            "child_input_tokens": result.usage.input_tokens,
+            "child_output_tokens": result.usage.output_tokens,
+            "child_prompt_cache_hit_tokens": result.usage.prompt_cache_hit_tokens,
+            "child_prompt_cache_miss_tokens": result.usage.prompt_cache_miss_tokens,
             "child_model": child_model,
+            "termination": format!("{:?}", result.termination).to_lowercase(),
             "max_depth": max_depth,
+            "context_chars": input_chars,
+            "context_lines": input_lines,
             "total_rpcs": result.total_rpcs,
             "trace": trace_json,
         });
 
-        Ok(
-            ToolResult::success(format!("{}{}{}", result.answer, footer, trace_summary))
-                .with_metadata(metadata),
-        )
+        Ok(ToolResult::success(format!(
+            "{report}{}{}{}",
+            result.answer, footer, trace_summary
+        ))
+        .with_metadata(metadata))
     }
 }
 
@@ -326,7 +362,6 @@ mod tests {
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["file_path"].is_object());
         assert!(schema["properties"]["content"].is_object());
-        assert!(schema["properties"]["child_model"].is_object());
         assert!(schema["properties"]["max_depth"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task"));
@@ -347,6 +382,24 @@ mod tests {
     #[test]
     fn supports_parallel_dispatch() {
         assert!(tool().supports_parallel());
+    }
+
+    #[test]
+    fn description_steers_without_suppressing_rlm_use() {
+        let t = tool();
+        let description = t.description();
+        assert!(
+            description.contains("Use this tool when"),
+            "description should positively explain the RLM fit"
+        );
+        assert!(
+            !description.contains("DO NOT use"),
+            "avoid training the model to avoid an available tool"
+        );
+        assert!(
+            !description.contains("slower and more expensive"),
+            "cost caveats belong in verification guidance, not tool suppression"
+        );
     }
 
     #[tokio::test]

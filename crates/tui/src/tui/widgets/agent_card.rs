@@ -5,8 +5,9 @@
 //!
 //! - [`DelegateCard`] — single `agent_spawn` invocation. Live tree of the
 //!   last 3 actions plus a header with status / glyph / role.
-//! - [`FanoutCard`] — `agent_swarm` / `rlm` fanout. Dot-grid of worker
-//!   slots (`●` filled, `○` pending) plus an aggregate counts line.
+//! - [`FanoutCard`] — `rlm` fanout (or any future multi-child dispatch).
+//!   Dot-grid of worker slots (`●` filled, `○` pending) plus an aggregate
+//!   counts line.
 //!
 //! Both cards are state machines updated by [`apply_to_delegate`] /
 //! [`apply_to_fanout`]. The sidebar (see `tui/sidebar.rs`) defers detail
@@ -154,14 +155,11 @@ impl DelegateCard {
 /// One worker slot in a fanout group.
 #[derive(Debug, Clone)]
 pub struct WorkerSlot {
-    /// Stable logical worker key. For swarms this stays tied to the task even
-    /// after a concrete sub-agent id exists.
+    /// Stable logical worker key. Stays tied to the worker slot even after a
+    /// concrete sub-agent id exists.
     pub worker_id: String,
     /// Concrete agent id once spawned; placeholders use the worker id.
     pub agent_id: String,
-    pub label: Option<String>,
-    pub model: Option<String>,
-    pub nickname: Option<String>,
     pub status: AgentLifecycle,
 }
 
@@ -172,32 +170,13 @@ impl WorkerSlot {
         Self {
             agent_id: worker_id.clone(),
             worker_id,
-            label: None,
-            model: None,
-            nickname: None,
-            status,
-        }
-    }
-
-    #[must_use]
-    pub fn with_agent(
-        worker_id: impl Into<String>,
-        agent_id: Option<String>,
-        status: AgentLifecycle,
-    ) -> Self {
-        let worker_id = worker_id.into();
-        Self {
-            agent_id: agent_id.unwrap_or_else(|| worker_id.clone()),
-            worker_id,
-            label: None,
-            model: None,
-            nickname: None,
             status,
         }
     }
 }
 
-/// Card for `agent_swarm` / `rlm` fanout: dot-grid + aggregate counts.
+/// Card for `rlm` (or any multi-child dispatch) fanout: dot-grid +
+/// aggregate counts.
 ///
 /// Slots are added as `ChildSpawned` envelopes arrive (or pre-allocated by
 /// the engine when the worker count is known up front); each slot
@@ -246,7 +225,7 @@ impl FanoutCard {
         }
     }
 
-    /// Attach a real agent id to the first pending placeholder slot. Swarm
+    /// Attach a real agent id to the first pending placeholder slot. Fanout
     /// cards are seeded from task ids before child agents exist; when a child
     /// starts, this keeps the dot count stable instead of appending a second
     /// circle for the same unit of work.
@@ -304,12 +283,12 @@ impl FanoutCard {
         let mut lines = Vec::with_capacity(3);
         let header_status = self.aggregate_status();
         let title = format!("{} ({} workers)", self.kind, self.workers.len());
-        lines.push(card_header(
-            ToolFamily::Fanout,
-            header_status,
-            &self.kind,
-            &title,
-        ));
+        let family = if self.kind == "rlm" {
+            ToolFamily::Rlm
+        } else {
+            ToolFamily::Fanout
+        };
+        lines.push(card_header(family, header_status, &self.kind, &title));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(
@@ -410,23 +389,15 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
         }
         MailboxMessage::Progress { status, .. } => {
             card.status = AgentLifecycle::Running;
-            card.push_action(status);
+            if !is_low_signal_progress(status) {
+                card.push_action(status);
+            }
         }
-        MailboxMessage::ToolCallStarted {
-            tool_name, step, ..
-        } => {
-            card.push_action(format!("[{step}] {tool_name} started"));
+        MailboxMessage::ToolCallStarted { tool_name, .. } => {
+            card.push_action(format!("{tool_name} running"));
         }
-        MailboxMessage::ToolCallCompleted {
-            tool_name,
-            step,
-            ok,
-            ..
-        } => {
-            card.push_action(format!(
-                "[{step}] {tool_name} {}",
-                if *ok { "ok" } else { "failed" }
-            ));
+        MailboxMessage::ToolCallCompleted { tool_name, ok, .. } => {
+            card.push_action(format!("{tool_name} {}", if *ok { "ok" } else { "failed" }));
         }
         MailboxMessage::Completed { summary, .. } => {
             card.status = AgentLifecycle::Completed;
@@ -452,6 +423,13 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
         }
     }
     true
+}
+
+fn is_low_signal_progress(status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
+    status.contains("requesting model response")
+        || status.starts_with("started (")
+        || (status.starts_with("step ") && status.contains(": complete"))
 }
 
 /// Apply a mailbox envelope to a `FanoutCard`. Updates per-worker state
@@ -572,6 +550,57 @@ mod tests {
     }
 
     #[test]
+    fn delegate_card_ignores_low_signal_scheduler_progress() {
+        let mut card = DelegateCard::new("agent_003", "general");
+        let msg = MailboxMessage::progress("agent_003", "step 1/100: requesting model response");
+
+        assert!(apply_to_delegate(&mut card, &msg));
+        assert_eq!(card.status, AgentLifecycle::Running);
+        assert_eq!(
+            card.action_count(),
+            0,
+            "scheduler progress should not become a stale transcript row"
+        );
+
+        let rendered = render_to_strings(&card.render_lines(80)).join("\n");
+        assert!(!rendered.contains("step 1/100"), "{rendered}");
+        assert!(
+            !rendered.contains("requesting model response"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn delegate_tool_rows_omit_internal_step_numbers() {
+        let mut card = DelegateCard::new("agent_004", "general");
+
+        assert!(apply_to_delegate(
+            &mut card,
+            &MailboxMessage::ToolCallStarted {
+                agent_id: "agent_004".into(),
+                tool_name: "read_file".into(),
+                step: 7,
+            }
+        ));
+        assert!(apply_to_delegate(
+            &mut card,
+            &MailboxMessage::ToolCallCompleted {
+                agent_id: "agent_004".into(),
+                tool_name: "read_file".into(),
+                step: 7,
+                ok: true,
+            }
+        ));
+
+        let rendered = render_to_strings(&card.render_lines(80)).join("\n");
+        assert!(rendered.contains("read_file"), "{rendered}");
+        assert!(
+            !rendered.contains("[7]"),
+            "internal loop step numbers are not useful in the live card: {rendered}"
+        );
+    }
+
+    #[test]
     fn delegate_card_ignores_envelopes_for_other_agents() {
         let mut card = DelegateCard::new("agent_a", "general");
         let other = MailboxMessage::progress("agent_b", "noise");
@@ -581,7 +610,7 @@ mod tests {
 
     #[test]
     fn fanout_card_dot_grid_renders_stateful_worker_slots() {
-        let mut card = FanoutCard::new("swarm")
+        let mut card = FanoutCard::new("fanout")
             .with_workers(["w_1", "w_2", "w_3", "w_4", "w_5", "w_6", "w_7"]);
         card.upsert_worker("w_1", AgentLifecycle::Completed);
         card.upsert_worker("w_2", AgentLifecycle::Completed);
@@ -621,7 +650,7 @@ mod tests {
 
     #[test]
     fn fanout_apply_inserts_unknown_worker_via_child_spawned() {
-        let mut card = FanoutCard::new("swarm");
+        let mut card = FanoutCard::new("fanout");
         let msg = MailboxMessage::ChildSpawned {
             parent_id: "root".into(),
             child_id: "agent_late".into(),
@@ -634,7 +663,7 @@ mod tests {
 
     #[test]
     fn fanout_started_claims_seeded_pending_slot_without_growing_grid() {
-        let mut card = FanoutCard::new("agent_swarm").with_workers(["task:a", "task:b"]);
+        let mut card = FanoutCard::new("fanout").with_workers(["task:a", "task:b"]);
         let started =
             MailboxMessage::started("agent_live", crate::tools::subagent::SubAgentType::General);
 
@@ -649,7 +678,7 @@ mod tests {
 
     #[test]
     fn fanout_apply_transitions_worker_through_lifecycle() {
-        let mut card = FanoutCard::new("swarm").with_workers(["w_1"]);
+        let mut card = FanoutCard::new("fanout").with_workers(["w_1"]);
         let started = MailboxMessage::started("w_1", crate::tools::subagent::SubAgentType::General);
         apply_to_fanout(&mut card, &started);
         assert_eq!(card.workers[0].status, AgentLifecycle::Running);
@@ -678,7 +707,7 @@ mod tests {
         ];
         for (total, done, expected) in cases {
             let ids: Vec<String> = (0..*total).map(|i| format!("w_{i}")).collect();
-            let mut card = FanoutCard::new("swarm").with_workers(ids.iter().cloned());
+            let mut card = FanoutCard::new("fanout").with_workers(ids.iter().cloned());
             for id in ids.iter().take(*done) {
                 card.upsert_worker(id, AgentLifecycle::Completed);
             }

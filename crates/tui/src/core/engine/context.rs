@@ -6,7 +6,7 @@
 
 use crate::compaction::estimate_tokens;
 use crate::error_taxonomy::ErrorCategory;
-use crate::models::{Message, SystemBlock, SystemPrompt, context_window_for_model};
+use crate::models::{Message, SystemPrompt, context_window_for_model};
 use crate::tools::spec::ToolResult;
 
 /// Max output tokens requested for normal agent turns. Generous on purpose:
@@ -16,6 +16,30 @@ use crate::tools::spec::ToolResult;
 /// `max_tokens` near pressure; hard-cycle/preflight checks reserve this budget
 /// plus safety headroom before sending the next request.
 pub(super) const TURN_MAX_OUTPUT_TOKENS: u32 = 262_144;
+
+/// Safe max output tokens sent in the API request. This must be low enough to
+/// work with providers that have smaller context limits than the model's native
+/// window (e.g., self-hosted vLLM/SGLang with `--max-model-len 131072`).
+/// DeepSeek's API will still produce as many tokens as needed for thinking;
+/// this cap just prevents HTTP 400 from providers with tight limits.
+const API_MAX_OUTPUT_TOKENS: u32 = 65_536;
+
+/// Compute the effective `max_tokens` to send in the API request for a given
+/// model. Uses `API_MAX_OUTPUT_TOKENS` (64K) which fits within common provider
+/// limits (128K+ total). For non-V4 models with smaller context windows, caps
+/// at half the context window.
+pub(super) fn effective_max_output_tokens(model: &str) -> u32 {
+    let window = context_window_for_model(model).unwrap_or(128_000);
+    if window >= 500_000 {
+        // V4-class models on large-context providers: use 64K which is safe
+        // for most deployments while still allowing substantial output.
+        API_MAX_OUTPUT_TOKENS
+    } else {
+        // Smaller models: cap at half the context window (leave room for input)
+        let capped = window / 2;
+        capped.min(API_MAX_OUTPUT_TOKENS)
+    }
+}
 /// Keep this many most recent messages when emergency trimming is required.
 pub(super) const MIN_RECENT_MESSAGES_TO_KEEP: usize = 4;
 /// Allow a few emergency recovery attempts before failing the turn.
@@ -40,7 +64,6 @@ const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 const TOOL_RESULT_METADATA_SUMMARY_CHARS: usize = 320;
 
 pub(super) const COMPACTION_SUMMARY_MARKER: &str = "Conversation Summary (Auto-Generated)";
-pub(super) const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
 
 #[derive(Debug, Clone, Copy)]
 struct ToolResultContextLimits {
@@ -107,6 +130,105 @@ fn tool_result_metadata_summary(metadata: Option<&serde_json::Value>) -> Option<
     None
 }
 
+fn summarize_subagent_status(status: &serde_json::Value) -> String {
+    if let Some(raw) = status.as_str() {
+        return raw.to_string();
+    }
+    if let Some(obj) = status.as_object()
+        && let Some((kind, value)) = obj.iter().next()
+    {
+        if let Some(reason) = value.as_str().filter(|s| !s.trim().is_empty()) {
+            return format!("{kind}({})", summarize_text(reason.trim(), 120));
+        }
+        return kind.to_string();
+    }
+    status.to_string()
+}
+
+fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> String {
+    let Some(obj) = snapshot.as_object() else {
+        return format!(
+            "- item {index}: {}",
+            summarize_text(&snapshot.to_string(), 240)
+        );
+    };
+
+    let agent_id = obj
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let agent_type = obj
+        .get("agent_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("agent");
+    let status = obj
+        .get("status")
+        .map(summarize_subagent_status)
+        .unwrap_or_else(|| "unknown".to_string());
+    let objective = obj
+        .get("assignment")
+        .and_then(|assignment| assignment.get("objective"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| summarize_text(s, 220));
+    let result = obj
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| summarize_text(s, 1_600));
+    let steps = obj.get("steps_taken").and_then(serde_json::Value::as_u64);
+    let duration_ms = obj.get("duration_ms").and_then(serde_json::Value::as_u64);
+
+    let mut lines = vec![format!("- {agent_id} ({agent_type}) status={status}")];
+    if let Some(objective) = objective {
+        lines.push(format!("  objective: {objective}"));
+    }
+    match result {
+        Some(result) => lines.push(format!("  result: {result}")),
+        None => lines.push("  result: not available yet".to_string()),
+    }
+    if steps.is_some() || duration_ms.is_some() {
+        let steps = steps
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let duration_ms = duration_ms
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        lines.push(format!("  stats: steps={steps}, duration_ms={duration_ms}"));
+    }
+    lines.join("\n")
+}
+
+fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
+    if !matches!(tool_name, "agent_result" | "agent_wait" | "wait") {
+        return None;
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let snapshots: Vec<&serde_json::Value> = match &parsed {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![&parsed],
+        _ => return None,
+    };
+
+    let mut out = String::from("[sub-agent result summarized for parent context]\n");
+    out.push_str("Use `agent_result` again only if you need the full raw payload.\n");
+    for (idx, snapshot) in snapshots.iter().enumerate() {
+        if idx >= 8 {
+            out.push_str(&format!(
+                "- ... {} more sub-agent result(s) omitted from context summary\n",
+                snapshots.len().saturating_sub(idx)
+            ));
+            break;
+        }
+        out.push_str(&summarize_subagent_snapshot(snapshot, idx + 1));
+        out.push('\n');
+    }
+    Some(out.trim_end().to_string())
+}
+
 fn tool_result_context_limits_for_model(model: &str) -> ToolResultContextLimits {
     let is_large_context =
         context_window_for_model(model).is_some_and(|window| window >= LARGE_CONTEXT_WINDOW_TOKENS);
@@ -134,6 +256,10 @@ pub(crate) fn compact_tool_result_for_context(
     let raw = output.content.trim();
     if raw.is_empty() {
         return String::new();
+    }
+
+    if let Some(summary) = compact_subagent_tool_result_for_context(tool_name, raw) {
+        return summary;
     }
 
     let limits = tool_result_context_limits_for_model(model);
@@ -182,56 +308,6 @@ pub(super) fn extract_compaction_summary_prompt(
             }
         }
         None => None,
-    }
-}
-
-pub(super) fn remove_working_set_summary(prompt: Option<&SystemPrompt>) -> Option<SystemPrompt> {
-    match prompt {
-        Some(SystemPrompt::Blocks(blocks)) => {
-            let filtered: Vec<SystemBlock> = blocks
-                .iter()
-                .filter(|block| !block.text.contains(WORKING_SET_SUMMARY_MARKER))
-                .cloned()
-                .collect();
-            if filtered.is_empty() {
-                None
-            } else {
-                Some(SystemPrompt::Blocks(filtered))
-            }
-        }
-        Some(SystemPrompt::Text(text)) => Some(SystemPrompt::Text(text.clone())),
-        None => None,
-    }
-}
-
-pub(super) fn append_working_set_summary(
-    prompt: Option<SystemPrompt>,
-    working_set_summary: Option<&str>,
-) -> Option<SystemPrompt> {
-    let Some(summary) = working_set_summary.map(str::trim).filter(|s| !s.is_empty()) else {
-        return prompt;
-    };
-    let working_set_block = SystemBlock {
-        block_type: "text".to_string(),
-        text: summary.to_string(),
-        cache_control: None,
-    };
-
-    match prompt {
-        Some(SystemPrompt::Text(text)) => Some(SystemPrompt::Blocks(vec![
-            SystemBlock {
-                block_type: "text".to_string(),
-                text,
-                cache_control: None,
-            },
-            working_set_block,
-        ])),
-        Some(SystemPrompt::Blocks(mut blocks)) => {
-            blocks.retain(|block| !block.text.contains(WORKING_SET_SUMMARY_MARKER));
-            blocks.push(working_set_block);
-            Some(SystemPrompt::Blocks(blocks))
-        }
-        None => Some(SystemPrompt::Blocks(vec![working_set_block])),
     }
 }
 

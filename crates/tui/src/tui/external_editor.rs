@@ -15,12 +15,17 @@ use std::io::{self, Stdout, Write};
 use std::process::Command;
 
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        PopKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::Terminal;
 use tempfile::Builder;
+
+use super::color_compat::ColorCompatBackend;
 
 /// Outcome of a single external-editor invocation.
 #[derive(Debug, PartialEq, Eq)]
@@ -117,14 +122,18 @@ pub fn run_editor_raw(seed: &str) -> io::Result<EditorOutcome> {
 ///
 /// On any error (raw-mode toggle, IO, editor spawn failure), the function
 /// still attempts to fully restore the terminal before returning.
-pub fn spawn_editor_for_input(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+pub(crate) fn spawn_editor_for_input(
+    terminal: &mut Terminal<ColorCompatBackend<Stdout>>,
     use_alt_screen: bool,
     use_mouse_capture: bool,
     use_bracketed_paste: bool,
     current: &str,
 ) -> io::Result<EditorOutcome> {
     // 1. Suspend.
+    // #443: pop keyboard enhancement flags first so the editor
+    // process doesn't inherit a half-configured input mode. Best-
+    // effort — matches the shutdown / panic paths in main.rs.
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     let _ = disable_raw_mode();
     if use_bracketed_paste {
         let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);

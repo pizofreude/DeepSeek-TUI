@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::hooks::HookEvent;
 use crate::tools::ReviewOutput;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
@@ -20,6 +21,20 @@ pub(super) fn handle_tool_call_started(
     name: &str,
     input: &serde_json::Value,
 ) {
+    // #455 (observer-only): fire `tool_call_before` hooks here, before
+    // any UI bookkeeping. Hooks are read-only observers in this slice
+    // — they can log, notify, or audit, but cannot mutate the args.
+    // Fast-path skip when no hooks are configured so per-tool
+    // dispatch doesn't pay for context construction in the common
+    // case (most users have no hooks).
+    if app.hooks.has_hooks_for_event(HookEvent::ToolCallBefore) {
+        let context = app
+            .base_hook_context()
+            .with_tool_name(name)
+            .with_tool_args(input);
+        let _ = app.execute_hooks(HookEvent::ToolCallBefore, &context);
+    }
+
     let id = id.to_string();
 
     // All in-flight tool work for the current turn lives in `app.active_cell`
@@ -231,7 +246,6 @@ pub(super) fn handle_tool_call_started(
     }
 
     let input_summary = summarize_tool_args(input);
-    let prompts = extract_fanout_prompts(name, input);
     push_active_tool_cell(
         app,
         &id,
@@ -242,38 +256,10 @@ pub(super) fn handle_tool_call_started(
             status: ToolStatus::Running,
             input_summary,
             output: None,
-            prompts,
+            prompts: None,
+            spillover_path: None,
         })),
     );
-}
-
-/// Extract per-child prompts from a fan-out tool's input. `agent_swarm`
-/// carries a structured `tasks` list up front, so the transcript can show
-/// one readable row per child instead of a collapsed JSON args blob.
-fn extract_fanout_prompts(name: &str, input: &serde_json::Value) -> Option<Vec<String>> {
-    if name != "agent_swarm" {
-        return None;
-    }
-
-    let prompts = input
-        .get("tasks")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
-        .filter_map(|task| {
-            task.get("objective")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| task.get("prompt").and_then(serde_json::Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-
-    if prompts.is_empty() {
-        None
-    } else {
-        Some(prompts)
-    }
 }
 
 /// Push a tool cell as a new entry in `active_cell`, register the tool id,
@@ -344,6 +330,61 @@ fn store_tool_detail_output(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Inspect a tool's success metadata for the `child_*` token-usage
+/// fields that tools spawning their own LLM calls populate (e.g.
+/// `rlm`). Roll any reported child-token cost into the session's
+/// running sub-agent cost counter so the footer total reflects all
+/// tokens the user is actually billed for, not just the parent turn's
+/// tokens.
+///
+/// Without this hook, an RLM-heavy session shows a fraction of the
+/// real spend because the parent turn's `Usage` only counts the
+/// orchestrator's tokens, not the dozens of `deepseek-v4-flash` child
+/// rounds RLM fans out under the hood (#524).
+fn accrue_child_token_cost_if_any(app: &mut App, result: &Result<ToolResult, ToolError>) {
+    let Ok(tool_result) = result else { return };
+    let Some(metadata) = tool_result.metadata.as_ref() else {
+        return;
+    };
+    let Some(model) = metadata
+        .get("child_model")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let input_tokens = metadata
+        .get("child_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = metadata
+        .get("child_output_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if input_tokens == 0 && output_tokens == 0 {
+        return;
+    }
+    let prompt_cache_hit_tokens = metadata
+        .get("child_prompt_cache_hit_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let prompt_cache_miss_tokens = metadata
+        .get("child_prompt_cache_miss_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let usage = crate::models::Usage {
+        input_tokens: u32::try_from(input_tokens).unwrap_or(u32::MAX),
+        output_tokens: u32::try_from(output_tokens).unwrap_or(u32::MAX),
+        prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens,
+        reasoning_tokens: None,
+        reasoning_replay_tokens: None,
+        server_tool_use: None,
+    };
+    if let Some(cost) = crate::pricing::calculate_turn_cost_estimate_from_usage(model, &usage) {
+        app.accrue_subagent_cost_estimate(cost);
+    }
+}
+
 pub(super) fn handle_tool_call_complete(
     app: &mut App,
     id: &str,
@@ -353,6 +394,11 @@ pub(super) fn handle_tool_call_complete(
     if app.ignored_tool_calls.remove(id) {
         return;
     }
+    // Roll any child-LLM token usage the tool reports into the
+    // session-cost counter. Runs unconditionally so future tools that
+    // spawn their own LLM calls (RLM, summarizers, retrieval helpers)
+    // get accrued without needing a per-tool hook (#524).
+    accrue_child_token_cost_if_any(app, result);
 
     // Exploring entries land in the per-tool map regardless of whether they
     // live in the active cell or in finalized history; the path is the same.
@@ -527,6 +573,25 @@ pub(super) fn handle_tool_call_complete(
             active.bump_revision();
         }
     }
+
+    // #455 (observer-only): fire `tool_call_after` hooks once the
+    // result has settled. Hooks see tool_name + the result content
+    // (or error message) + success flag. Read-only — they cannot
+    // mutate the result that goes back to the model. Mutation
+    // remains a v0.8.9 follow-up. Fast-path skip avoids the
+    // result.content.clone() and HookContext allocation when no
+    // hooks are configured.
+    if app.hooks.has_hooks_for_event(HookEvent::ToolCallAfter) {
+        let (result_text, success): (String, bool) = match result.as_ref() {
+            Ok(tool_result) => (tool_result.content.clone(), tool_result.success),
+            Err(err) => (err.to_string(), false),
+        };
+        let context = app
+            .base_hook_context()
+            .with_tool_name(name)
+            .with_tool_result(&result_text, success, None);
+        let _ = app.execute_hooks(HookEvent::ToolCallAfter, &context);
+    }
 }
 
 /// Build a finalized standalone history cell for a tool completion whose
@@ -566,12 +631,20 @@ fn push_orphan_tool_completion(
     };
     let history_threshold_before_push = app.history.len();
     let active_in_flight = app.active_cell.is_some();
+    let spillover_path = result
+        .as_ref()
+        .ok()
+        .and_then(|r| r.metadata.as_ref())
+        .and_then(|m| m.get("spillover_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
     app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         name: name.to_string(),
         status,
         input_summary: None,
         output,
         prompts: None,
+        spillover_path,
     })));
     let cell_index = app.history.len().saturating_sub(1);
     app.tool_details_by_cell.insert(

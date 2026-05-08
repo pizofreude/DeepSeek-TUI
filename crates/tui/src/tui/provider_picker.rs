@@ -1,5 +1,5 @@
 //! `/provider` picker modal — pick a provider (DeepSeek / NVIDIA NIM /
-//! OpenRouter / Novita) and, if it lacks credentials, type the API key
+//! hosted providers / self-hosted providers) and, if it lacks credentials, type the API key
 //! inline before completing the switch (#52).
 //!
 //! The picker is intentionally a single modal with two visible states:
@@ -17,7 +17,7 @@
 //! Pressing Esc backs out: from key entry returns to the list; from the
 //! list closes the modal without changes.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -86,12 +86,27 @@ impl ProviderPickerView {
 
     fn env_var_for(provider: ApiProvider) -> &'static str {
         match provider {
-            ApiProvider::Deepseek => "DEEPSEEK_API_KEY",
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY",
+            ApiProvider::Openai => "OPENAI_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
+            ApiProvider::Vllm => "VLLM_API_KEY",
+            ApiProvider::Ollama => "OLLAMA_API_KEY",
+        }
+    }
+
+    fn provider_hint(provider: ApiProvider, has_key: bool) -> String {
+        match provider {
+            ApiProvider::Ollama => "self-hosted; defaults to http://localhost:11434".to_string(),
+            ApiProvider::Sglang | ApiProvider::Vllm if has_key => {
+                "(configured; optional key)".to_string()
+            }
+            ApiProvider::Sglang | ApiProvider::Vllm => "(optional key)".to_string(),
+            _ if has_key => "(configured)".to_string(),
+            _ => "(needs API key)".to_string(),
         }
     }
 
@@ -113,7 +128,7 @@ impl ProviderPickerView {
             ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK));
+            .style(Style::default());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -140,11 +155,7 @@ impl ProviderPickerView {
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
             };
-            let hint = if *has_key {
-                "(configured)".to_string()
-            } else {
-                "(needs API key)".to_string()
-            };
+            let hint = Self::provider_hint(*provider, *has_key);
             lines.push(Line::from(vec![
                 Span::raw(" "),
                 Span::styled(arrow, label_style),
@@ -175,7 +186,7 @@ impl ProviderPickerView {
             ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK));
+            .style(Style::default());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -246,6 +257,18 @@ impl ModalView for ProviderPickerView {
         self
     }
 
+    fn handle_paste(&mut self, text: &str) -> bool {
+        if self.stage == Stage::KeyEntry {
+            let sanitized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            if !sanitized.is_empty() {
+                self.api_key_input.push_str(&sanitized);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match self.stage {
             Stage::List => match key.code {
@@ -277,6 +300,10 @@ impl ModalView for ProviderPickerView {
                     ViewAction::None
                 }
                 KeyCode::Backspace => {
+                    self.api_key_input.pop();
+                    ViewAction::None
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.api_key_input.pop();
                     ViewAction::None
                 }
@@ -340,8 +367,19 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn move_to_provider(picker: &mut ProviderPickerView, provider: ApiProvider) {
+        let max_steps = picker.providers.len();
+        for _ in 0..max_steps {
+            if picker.selected_provider() == provider {
+                return;
+            }
+            picker.handle_key(key(KeyCode::Down));
+        }
+        panic!("provider {provider:?} not found in picker");
+    }
+
     #[test]
-    fn picker_lists_all_six_providers() {
+    fn picker_lists_all_providers() {
         let config = Config::default();
         let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         let names: Vec<_> = picker
@@ -354,12 +392,31 @@ mod tests {
             vec![
                 "DeepSeek",
                 "NVIDIA NIM",
+                "OpenAI-compatible",
                 "OpenRouter",
                 "Novita AI",
                 "Fireworks AI",
-                "SGLang"
+                "SGLang",
+                "vLLM",
+                "Ollama"
             ]
         );
+    }
+
+    #[test]
+    fn ollama_is_selectable_without_key() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Ollama);
+        assert_eq!(picker.selected_provider(), ApiProvider::Ollama);
+        assert!(picker.selected_has_key());
+        let action = picker.handle_key(key(KeyCode::Enter));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied { provider }) => {
+                assert_eq!(provider, ApiProvider::Ollama);
+            }
+            other => panic!("expected ProviderPickerApplied, got {other:?}"),
+        }
     }
 
     #[test]
@@ -374,9 +431,8 @@ mod tests {
     fn enter_with_no_key_transitions_to_key_entry_stage() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        // Move to OpenRouter (index 2), which has no key in default config.
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
+        // Move to OpenRouter, which has no key in default config.
+        move_to_provider(&mut picker, ApiProvider::Openrouter);
         assert_eq!(picker.selected_provider(), ApiProvider::Openrouter);
         let action = picker.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, ViewAction::None));
@@ -390,7 +446,8 @@ mod tests {
             ..Config::default()
         };
         let mut picker = ProviderPickerView::new(ApiProvider::NvidiaNim, &config);
-        // Move up to DeepSeek (index 0), which has a key from the config.
+        // Move up twice to DeepSeek (index 0), which has a key from the config.
+        picker.handle_key(key(KeyCode::Up));
         picker.handle_key(key(KeyCode::Up));
         let action = picker.handle_key(key(KeyCode::Enter));
         match action {
@@ -405,10 +462,8 @@ mod tests {
     fn key_entry_enter_submits_after_typing() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        // Navigate to Novita (index 3) and trigger key entry.
-        for _ in 0..3 {
-            picker.handle_key(key(KeyCode::Down));
-        }
+        // Navigate to Novita and trigger key entry.
+        move_to_provider(&mut picker, ApiProvider::Novita);
         picker.handle_key(key(KeyCode::Enter));
         assert_eq!(picker.stage, Stage::KeyEntry);
         for c in "novita-key".chars() {
@@ -431,8 +486,7 @@ mod tests {
     fn key_entry_esc_returns_to_list_without_emitting() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
+        move_to_provider(&mut picker, ApiProvider::Openrouter);
         picker.handle_key(key(KeyCode::Enter));
         assert_eq!(picker.stage, Stage::KeyEntry);
         picker.handle_key(key(KeyCode::Char('a')));
@@ -454,8 +508,7 @@ mod tests {
     fn key_entry_strips_whitespace_chars() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
+        move_to_provider(&mut picker, ApiProvider::Openrouter);
         picker.handle_key(key(KeyCode::Enter));
         assert_eq!(picker.stage, Stage::KeyEntry);
         for c in "abc def".chars() {

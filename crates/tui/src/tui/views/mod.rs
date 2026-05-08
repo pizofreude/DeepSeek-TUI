@@ -1,15 +1,17 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{buffer::Buffer, layout::Rect};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
 use crate::tools::UserInputResponse;
-use crate::tools::subagent::{SubAgentResult, SubAgentStatus, SubAgentType};
+use crate::tools::subagent::{SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType};
 use crate::tui::app::App;
 use crate::tui::approval::{ElevationOption, ReviewDecision};
+use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
+use crate::tui::widgets::agent_card::AgentLifecycle;
 
 pub mod status_picker;
 
@@ -46,12 +48,30 @@ pub enum ContextMenuAction {
     CopySelection,
     OpenSelection,
     ClearSelection,
-    CopyCell { cell_index: usize },
-    OpenDetails { cell_index: usize },
+    CopyCell {
+        cell_index: usize,
+    },
+    OpenDetails {
+        cell_index: usize,
+    },
     Paste,
     OpenCommandPalette,
     OpenContextInspector,
     OpenHelp,
+    /// Open the selected file:line in the user's editor.
+    OpenFileAtLine {
+        cell_index: usize,
+    },
+    /// Hide a transcript cell. Adds the cell's index to `collapsed_cells`.
+    HideCell {
+        cell_index: usize,
+    },
+    /// Show a previously hidden cell (when right-clicking near it).
+    ShowCell {
+        cell_index: usize,
+    },
+    /// Show all currently hidden cells.
+    ShowAllHidden,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +193,14 @@ pub enum ViewAction {
 pub trait ModalView: std::any::Any {
     fn kind(&self) -> ModalKind;
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction;
+    /// Returns `true` if the modal consumed the paste; `false` to let the
+    /// host route the text elsewhere (e.g. drop it because a modal is open,
+    /// or insert it into the composer when no modal wants it). The default
+    /// is `false` so modals that don't care about paste don't silently
+    /// swallow Cmd-V.
+    fn handle_paste(&mut self, _text: &str) -> bool {
+        false
+    }
     fn handle_mouse(&mut self, _mouse: MouseEvent) -> ViewAction {
         ViewAction::None
     }
@@ -209,18 +237,26 @@ impl ViewStack {
     }
 
     pub fn push<V: ModalView + 'static>(&mut self, view: V) {
+        let kind = view.kind();
         self.views.push(Box::new(view));
+        tracing::debug!(target: "deepseek_tui::view_stack", action = "push", kind = ?kind, depth = self.views.len(), "view pushed");
     }
 
     /// Push an already-boxed view back onto the stack. Used by call sites
     /// that pop a view, mutate it externally, and need to restore it without
     /// the generic `push` re-boxing dance.
     pub fn push_boxed(&mut self, view: Box<dyn ModalView>) {
+        let kind = view.kind();
         self.views.push(view);
+        tracing::debug!(target: "deepseek_tui::view_stack", action = "push_boxed", kind = ?kind, depth = self.views.len(), "view pushed");
     }
 
     pub fn pop(&mut self) -> Option<Box<dyn ModalView>> {
-        self.views.pop()
+        let popped = self.views.pop();
+        if let Some(view) = popped.as_ref() {
+            tracing::debug!(target: "deepseek_tui::view_stack", action = "pop", kind = ?view.kind(), depth = self.views.len(), "view popped");
+        }
+        popped
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -243,6 +279,13 @@ impl ViewStack {
             .map(|view| view.handle_key(key))
             .unwrap_or(ViewAction::None);
         self.apply_action(action)
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.views
+            .last_mut()
+            .map(|view| view.handle_paste(text))
+            .unwrap_or(false)
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<ViewEvent> {
@@ -268,14 +311,18 @@ impl ViewStack {
         match action {
             ViewAction::None => {}
             ViewAction::Close => {
-                self.views.pop();
+                if let Some(view) = self.views.pop() {
+                    tracing::debug!(target: "deepseek_tui::view_stack", action = "close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
+                }
             }
             ViewAction::Emit(event) => {
                 events.push(event);
             }
             ViewAction::EmitAndClose(event) => {
                 events.push(event);
-                self.views.pop();
+                if let Some(view) = self.views.pop() {
+                    tracing::debug!(target: "deepseek_tui::view_stack", action = "emit_and_close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
+                }
             }
         }
         events
@@ -506,6 +553,7 @@ pub struct ConfigView {
     status: Option<String>,
     locale: Locale,
     last_visible_rows: Cell<usize>,
+    last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
 }
 
 impl ConfigView {
@@ -548,6 +596,16 @@ impl ConfigView {
                 section: ConfigSection::Display,
                 key: "locale".to_string(),
                 value: settings.locale.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
+                key: "background_color".to_string(),
+                value: settings
+                    .background_color
+                    .clone()
+                    .unwrap_or_else(|| "(default)".to_string()),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -653,6 +711,7 @@ impl ConfigView {
             status: None,
             locale: app.ui_locale,
             last_visible_rows: Cell::new(0),
+            last_row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -956,6 +1015,7 @@ fn config_hint_for_key(key: &str) -> &'static str {
         | "paste_burst_detection" => "on/off, true/false, yes/no, 1/0",
         "composer_density" | "transcript_spacing" => "compact | comfortable | spacious",
         "locale" => "auto | en | ja | zh-Hans | pt-BR",
+        "background_color" => "#RRGGBB | default",
         "default_mode" => "agent | plan | yolo",
         "sidebar_width" => "10..=50",
         "sidebar_focus" => "auto | plan | todos | tasks | agents",
@@ -1102,6 +1162,27 @@ impl ModalView for ConfigView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        if self.editing.is_some() {
+            return ViewAction::None;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return ViewAction::None;
+        }
+
+        let selected = self
+            .last_row_hitboxes
+            .borrow()
+            .iter()
+            .find_map(|(y, row_idx)| (*y == mouse.row).then_some(*row_idx));
+        if let Some(row_idx) = selected {
+            self.selected = row_idx;
+            self.status = None;
+            self.adjust_scroll(self.visible_rows_cached());
+        }
+        ViewAction::None
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         use ratatui::{
             prelude::Stylize,
@@ -1196,6 +1277,7 @@ impl ModalView for ConfigView {
                 Line::from("  Key                 Value                                    Scope"),
                 Line::from("  ----------------------------------------------------------------"),
             ];
+            let mut row_hitboxes = Vec::new();
 
             for item in items.iter().skip(start).take(visible_rows) {
                 match item {
@@ -1209,11 +1291,14 @@ impl ModalView for ConfigView {
                         let Some(row) = self.rows.get(*idx) else {
                             continue;
                         };
+                        let line_y = inner.y.saturating_add(lines.len() as u16);
+                        row_hitboxes.push((line_y, *idx));
                         let selected = *idx == self.selected;
                         let style = if selected {
                             Style::default()
-                                .fg(palette::SELECTION_TEXT)
-                                .bg(palette::SELECTION_BG)
+                                .fg(ratatui::style::Color::White)
+                                .bg(palette::DEEPSEEK_BLUE)
+                                .add_modifier(ratatui::style::Modifier::BOLD)
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
                         };
@@ -1229,6 +1314,7 @@ impl ModalView for ConfigView {
                     }
                 }
             }
+            *self.last_row_hitboxes.borrow_mut() = row_hitboxes;
 
             if items.is_empty() {
                 let message = if self.filter.is_empty() {
@@ -1309,6 +1395,105 @@ pub use help::HelpView;
 pub struct SubAgentsView {
     agents: Vec<SubAgentResult>,
     scroll: usize,
+}
+
+/// Build the agent rows shown by `/subagents`.
+///
+/// The engine manager is the durable source of truth, but live UI cards can
+/// briefly be ahead of the manager-list refresh. Include those live rows so
+/// the command does not say "no agents" while the footer/sidebar already show
+/// active delegated work.
+pub(crate) fn subagent_view_agents(
+    app: &App,
+    manager_agents: &[SubAgentResult],
+) -> Vec<SubAgentResult> {
+    let mut agents = manager_agents.to_vec();
+    let mut seen: std::collections::HashSet<String> =
+        agents.iter().map(|agent| agent.agent_id.clone()).collect();
+
+    for (agent_id, progress) in &app.agent_progress {
+        if seen.insert(agent_id.clone()) {
+            agents.push(live_subagent_result(
+                agent_id,
+                SubAgentType::General,
+                SubAgentStatus::Running,
+                progress,
+                Some("live"),
+            ));
+        }
+    }
+
+    for cell in &app.history {
+        match cell {
+            HistoryCell::SubAgent(SubAgentCell::Delegate(card))
+                if seen.insert(card.agent_id.clone()) =>
+            {
+                let agent_type =
+                    SubAgentType::from_str(&card.agent_type).unwrap_or(SubAgentType::General);
+                agents.push(live_subagent_result(
+                    &card.agent_id,
+                    agent_type,
+                    lifecycle_to_subagent_status(card.status),
+                    card.summary.as_deref().unwrap_or(card.agent_type.as_str()),
+                    Some("transcript"),
+                ));
+            }
+            HistoryCell::SubAgent(SubAgentCell::Fanout(card)) => {
+                for worker in &card.workers {
+                    if seen.insert(worker.agent_id.clone()) {
+                        let objective = format!(
+                            "{} worker {}",
+                            summarize_tool_output(&card.kind),
+                            summarize_tool_output(&worker.worker_id)
+                        );
+                        agents.push(live_subagent_result(
+                            &worker.agent_id,
+                            SubAgentType::General,
+                            lifecycle_to_subagent_status(worker.status),
+                            &objective,
+                            Some(card.kind.as_str()),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    agents
+}
+
+fn lifecycle_to_subagent_status(status: AgentLifecycle) -> SubAgentStatus {
+    match status {
+        AgentLifecycle::Pending | AgentLifecycle::Running => SubAgentStatus::Running,
+        AgentLifecycle::Completed => SubAgentStatus::Completed,
+        AgentLifecycle::Failed => SubAgentStatus::Failed("failed in transcript".to_string()),
+        AgentLifecycle::Cancelled => SubAgentStatus::Cancelled,
+    }
+}
+
+fn live_subagent_result(
+    agent_id: &str,
+    agent_type: SubAgentType,
+    status: SubAgentStatus,
+    objective: &str,
+    role: Option<&str>,
+) -> SubAgentResult {
+    SubAgentResult {
+        agent_id: agent_id.to_string(),
+        agent_type,
+        assignment: SubAgentAssignment {
+            objective: summarize_tool_output(objective),
+            role: role.map(str::to_string),
+        },
+        model: String::new(),
+        nickname: None,
+        status,
+        result: None,
+        steps_taken: 0,
+        duration_ms: 0,
+        from_prior_session: false,
+    }
 }
 
 impl SubAgentsView {
@@ -1406,7 +1591,7 @@ impl ModalView for SubAgentsView {
             ];
 
             lines.push(Line::from(Span::styled(
-                "Sub-agent swarm",
+                "Sub-agents",
                 Style::default().fg(palette::DEEPSEEK_SKY).bold(),
             )));
 
@@ -1616,19 +1801,17 @@ fn agent_type_order(agent_type: &SubAgentType) -> u8 {
         SubAgentType::General => 0,
         SubAgentType::Explore => 1,
         SubAgentType::Plan => 2,
-        SubAgentType::Review => 3,
-        SubAgentType::Custom => 4,
+        SubAgentType::Implementer => 3,
+        SubAgentType::Verifier => 4,
+        SubAgentType::Review => 5,
+        SubAgentType::Custom => 6,
     }
 }
 
 fn format_agent_type(agent_type: &SubAgentType) -> &'static str {
-    match agent_type {
-        SubAgentType::General => "general",
-        SubAgentType::Explore => "explore",
-        SubAgentType::Plan => "plan",
-        SubAgentType::Review => "review",
-        SubAgentType::Custom => "custom",
-    }
+    // Source of truth lives on the enum so any new role lands in both
+    // the user-visible label and the sort order via the as_str() helper.
+    agent_type.as_str()
 }
 
 fn format_agent_status(
@@ -1670,13 +1853,20 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigListItem, ConfigSection, ConfigView, ModalView, ShellControlView, ViewAction,
-        ViewEvent, truncate_view_text,
+        ConfigListItem, ConfigSection, ConfigView, ModalKind, ModalView, ShellControlView,
+        ViewAction, ViewEvent, ViewStack, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::Locale;
+    use crate::tools::subagent::{
+        SubAgentAssignment, SubAgentResult, SubAgentStatus, SubAgentType,
+    };
     use crate::tui::app::{App, TuiOptions};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::tui::history::{HistoryCell, SubAgentCell};
+    use crate::tui::widgets::agent_card::{AgentLifecycle, FanoutCard};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{buffer::Buffer, layout::Rect};
     use std::path::PathBuf;
 
@@ -1684,6 +1874,8 @@ mod tests {
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
             use_mouse_capture: false,
@@ -1698,6 +1890,7 @@ mod tests {
             skip_onboarding: true,
             yolo: false,
             resume_session_id: None,
+            initial_input: None,
         };
         App::new(options, &Config::default())
     }
@@ -1707,6 +1900,72 @@ mod tests {
             let action = view.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
             assert!(matches!(action, ViewAction::None));
         }
+    }
+
+    fn manager_agent(id: &str, status: SubAgentStatus) -> SubAgentResult {
+        SubAgentResult {
+            agent_id: id.to_string(),
+            agent_type: SubAgentType::Explore,
+            assignment: SubAgentAssignment {
+                objective: "read the docs".to_string(),
+                role: None,
+            },
+            model: "deepseek-v4-flash".to_string(),
+            nickname: None,
+            status,
+            result: None,
+            steps_taken: 1,
+            duration_ms: 10,
+            from_prior_session: false,
+        }
+    }
+
+    #[test]
+    fn subagent_view_agents_includes_progress_only_running_agent() {
+        let mut app = create_test_app();
+        app.agent_progress
+            .insert("agent_live".to_string(), "reading code".to_string());
+
+        let agents = subagent_view_agents(&app, &[]);
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id, "agent_live");
+        assert!(matches!(agents[0].status, SubAgentStatus::Running));
+        assert_eq!(agents[0].assignment.role.as_deref(), Some("live"));
+        assert!(agents[0].assignment.objective.contains("reading code"));
+    }
+
+    #[test]
+    fn subagent_view_agents_includes_live_fanout_workers_when_cache_is_empty() {
+        let mut app = create_test_app();
+        let mut card = FanoutCard::new("rlm").with_workers(["chunk_1", "chunk_2"]);
+        card.upsert_worker("chunk_1", AgentLifecycle::Completed);
+        card.upsert_worker("chunk_2", AgentLifecycle::Running);
+        app.add_message(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
+        app.last_fanout_card_index = Some(app.history.len().saturating_sub(1));
+
+        let agents = subagent_view_agents(&app, &[]);
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].agent_id, "chunk_1");
+        assert!(matches!(agents[0].status, SubAgentStatus::Completed));
+        assert_eq!(agents[1].agent_id, "chunk_2");
+        assert!(matches!(agents[1].status, SubAgentStatus::Running));
+        assert_eq!(agents[1].assignment.role.as_deref(), Some("rlm"));
+    }
+
+    #[test]
+    fn subagent_view_agents_deduplicates_manager_rows_over_live_rows() {
+        let mut app = create_test_app();
+        app.agent_progress
+            .insert("agent_cached".to_string(), "live duplicate".to_string());
+        let manager = vec![manager_agent("agent_cached", SubAgentStatus::Running)];
+
+        let agents = subagent_view_agents(&app, &manager);
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_type, SubAgentType::Explore);
+        assert_eq!(agents[0].assignment.objective, "read the docs");
     }
 
     fn visible_section_labels(view: &ConfigView) -> Vec<&'static str> {
@@ -1769,6 +2028,7 @@ mod tests {
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"approval_mode"));
         assert!(keys.contains(&"locale"));
+        assert!(keys.contains(&"background_color"));
         assert!(keys.contains(&"auto_compact"));
         assert!(keys.contains(&"composer_border"));
         assert!(keys.contains(&"mcp_config_path"));
@@ -1914,6 +2174,40 @@ mod tests {
     }
 
     #[test]
+    fn config_view_mouse_click_selects_row() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let hitboxes = view.last_row_hitboxes.borrow().clone();
+        let (_, row_idx) = hitboxes
+            .iter()
+            .find(|(_, idx)| {
+                view.rows
+                    .get(*idx)
+                    .is_some_and(|row| row.key == "default_model")
+            })
+            .copied()
+            .expect("default_model row should have a hitbox");
+        let y = hitboxes
+            .iter()
+            .find_map(|(y, idx)| (*idx == row_idx).then_some(*y))
+            .expect("selected row should have a y coordinate");
+
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.selected, row_idx);
+    }
+
+    #[test]
     fn config_view_typing_replaces_on_first_char() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
@@ -1962,6 +2256,18 @@ mod tests {
             action,
             ViewAction::EmitAndClose(ViewEvent::ShellControlCancel)
         ));
+    }
+
+    /// A modal that doesn't override `handle_paste` must report
+    /// "not consumed" so the host can fall through to the composer.
+    /// Regression: views/mod.rs previously inverted the boolean, swallowing
+    /// every Cmd-V while any modal was on top.
+    #[test]
+    fn default_modal_does_not_consume_paste() {
+        let mut stack = ViewStack::new();
+        stack.push(ShellControlView::new());
+        assert!(!stack.handle_paste("hello"));
+        assert_eq!(stack.top_kind(), Some(ModalKind::ShellControl));
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {

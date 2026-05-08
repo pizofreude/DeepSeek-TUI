@@ -52,6 +52,8 @@ mod tests {
             TuiOptions {
                 model: "deepseek-v4-pro".to_string(),
                 workspace: PathBuf::from("."),
+                config_path: None,
+                config_profile: None,
                 allow_shell: false,
                 use_alt_screen: false,
                 use_mouse_capture: false,
@@ -66,6 +68,7 @@ mod tests {
                 skip_onboarding: true,
                 yolo: false,
                 resume_session_id: None,
+                initial_input: None,
             },
             &Config::default(),
         )

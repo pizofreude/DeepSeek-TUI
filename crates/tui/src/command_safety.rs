@@ -299,6 +299,64 @@ pub fn classify_command(tokens: &[&str]) -> String {
     positional[0].clone()
 }
 
+/// Return `true` when an allow-rule `pattern` (a command-prefix string such
+/// as `"git status"`) matches the concrete `command` string using the
+/// arity-aware prefix classification from [`classify_command`].
+///
+/// This is the canonical entry point for config `allow` / `auto_allow` rule
+/// evaluation.  It correctly handles:
+///
+/// * `"git status"` → matches `git status -s`, `git status --porcelain`;
+///   does **not** match `git push origin main`.
+/// * `"npm run dev"` → matches only `npm run dev`, not `npm run build`.
+/// * `"cargo check"` → matches `cargo check --workspace`.
+/// * `"make"` → matches `make all`, `make clean` (arity 1).
+///
+/// For allow rules that contain wildcards (`*`) or regex metacharacters, the
+/// caller should additionally invoke the pattern-matching path from
+/// `crate::execpolicy::matcher::pattern_matches`.
+///
+/// # Examples
+///
+/// ```
+/// # use deepseek_tui::command_safety::prefix_allow_matches;
+/// assert!( prefix_allow_matches("git status",    "git status --porcelain"));
+/// assert!(!prefix_allow_matches("git status",    "git push origin main"));
+/// assert!( prefix_allow_matches("cargo check",   "cargo check --workspace"));
+/// assert!( prefix_allow_matches("npm run dev",   "npm run dev"));
+/// assert!(!prefix_allow_matches("npm run dev",   "npm run build"));
+/// ```
+pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
+    // Normalise the pattern: trim + lowercase + collapse whitespace.
+    let pattern_norm: String = pattern
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return pattern_norm.is_empty();
+    }
+
+    // Primary path: arity-aware classification.
+    let canonical = classify_command(&tokens);
+    if canonical == pattern_norm {
+        return true;
+    }
+
+    // Fallback: normalised exact match for patterns not in the arity table
+    // (e.g. exact-match rules like `"ls -la"` that lack a dictionary entry).
+    let command_norm: String = command
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    command_norm == pattern_norm || command_norm.starts_with(&format!("{pattern_norm} "))
+}
+
 /// Safety classification of a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyLevel {
@@ -524,6 +582,14 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
         );
     }
 
+    if command.contains('\0') {
+        return SafetyAnalysis::dangerous(
+            command,
+            vec!["Command contains a null byte".to_string()],
+            vec!["Strip embedded null bytes before retrying".to_string()],
+        );
+    }
+
     if command.contains("&&") || command.contains("||") || command.contains(';') {
         // Chains of known-safe commands (cargo/git/zig/npm/etc.) are
         // routine for build+test workflows. Instead of hard-blocking,
@@ -717,28 +783,68 @@ fn is_workspace_safe_command(command: &str) -> bool {
 
 /// Check if a path escapes the workspace
 pub fn path_escapes_workspace(path: &str, workspace: &str) -> bool {
-    let path_lower = path.to_lowercase();
+    let path_lower = normalize_safety_path(path);
+    let workspace_lower = normalize_safety_path(workspace);
 
     // Check for obvious escape patterns
-    if path_lower.starts_with('/') && !path_lower.starts_with(workspace) {
-        return true;
-    }
-
     if path_lower.starts_with("~/") || path_lower.starts_with("$home") {
         return true;
     }
 
-    // Check for ../ traversal
-    if path.contains("..") {
-        // Count the ../ sequences and check if they escape
-        let workspace_depth = workspace.matches('/').count();
-        let escape_count = path.matches("..").count();
-        if escape_count > workspace_depth {
+    if is_absolute_safety_path(&path_lower) {
+        let path_components = lexical_components(&path_lower);
+        let workspace_components = lexical_components(&workspace_lower);
+        return !components_start_with(&path_components, &workspace_components);
+    }
+
+    // Walk the path components. Track depth relative to the workspace root:
+    // non-`..` components increment depth, `..` components decrement it.
+    // If depth ever goes negative, the path escapes the workspace boundary.
+    // This correctly distinguishes genuine traversal like `../outside` from
+    // names that happen to contain consecutive dots like `foo..bar`.
+    let mut depth: i32 = 0;
+    for component in path_lower.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+        if depth < 0 {
             return true;
         }
     }
 
     false
+}
+
+fn normalize_safety_path(path: &str) -> String {
+    path.trim().replace('\\', "/").to_lowercase()
+}
+
+fn is_absolute_safety_path(path: &str) -> bool {
+    path.starts_with('/')
+        || path
+            .as_bytes()
+            .get(1..3)
+            .is_some_and(|bytes| bytes[0] == b':' && bytes[1] == b'/')
+}
+
+fn lexical_components(path: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    components
+}
+
+fn components_start_with(path: &[&str], prefix: &[&str]) -> bool {
+    path.len() >= prefix.len() && path.iter().zip(prefix.iter()).all(|(a, b)| a == b)
 }
 
 /// Parse a command and extract the primary command name
@@ -850,6 +956,39 @@ mod tests {
     }
 
     #[test]
+    fn test_null_byte_is_blocked() {
+        assert_eq!(
+            analyze_command("ls\0 -la").level,
+            SafetyLevel::Dangerous,
+            "embedded NUL byte must be rejected as dangerous"
+        );
+        assert_eq!(
+            analyze_command("echo hello\0world").level,
+            SafetyLevel::Dangerous
+        );
+    }
+
+    #[test]
+    fn test_eval_substring_is_not_misclassified() {
+        // Words like `evaluate` / `evaluation` / `cargo run -- eval`
+        // contain the substring "eval" but are not eval invocations.
+        // Guard against the naive `command.contains("eval")` regression
+        // — these should stay safe / workspace-safe, never Dangerous.
+        let evaluate_safe = analyze_command("cargo run --bin deepseek -- eval").level;
+        assert_ne!(
+            evaluate_safe,
+            SafetyLevel::Dangerous,
+            "running the eval harness should not be classified as dangerous"
+        );
+        let evaluator = analyze_command("python evaluator.py --suite default").level;
+        assert_ne!(
+            evaluator,
+            SafetyLevel::Dangerous,
+            "running an evaluator script should not be classified as dangerous"
+        );
+    }
+
+    #[test]
     fn test_privileged_commands() {
         assert_eq!(
             analyze_command("sudo rm file").level,
@@ -912,6 +1051,52 @@ mod tests {
         assert!(!path_escapes_workspace(
             "./src/main.rs",
             "/home/user/project"
+        ));
+    }
+
+    #[test]
+    fn test_path_escapes_workspace_doesnt_flag_double_dot_in_names() {
+        // Names like `foo..bar` should NOT be flagged as path traversal
+        assert!(!path_escapes_workspace(
+            "some..file.txt",
+            "/home/user/project"
+        ));
+        assert!(!path_escapes_workspace(
+            "./dir..name/file.txt",
+            "/home/user/project"
+        ));
+    }
+
+    #[test]
+    fn test_path_escapes_workspace_detects_genuine_traversal() {
+        assert!(path_escapes_workspace("../outside", "/home/user/project"));
+        assert!(path_escapes_workspace(
+            "..\\outside",
+            "C:\\Users\\me\\project"
+        ));
+        assert!(path_escapes_workspace(
+            "./subdir/../../etc/passwd",
+            "/home/user/project"
+        ));
+        assert!(path_escapes_workspace(
+            "/home/user/project/../secret",
+            "/home/user/project"
+        ));
+        assert!(path_escapes_workspace(
+            "C:\\Users\\me\\project\\..\\secret",
+            "C:\\Users\\me\\project"
+        ));
+    }
+
+    #[test]
+    fn test_path_escapes_workspace_allows_absolute_workspace_children() {
+        assert!(!path_escapes_workspace(
+            "/home/user/project/src/main.rs",
+            "/home/user/project"
+        ));
+        assert!(!path_escapes_workspace(
+            "C:\\Users\\me\\project\\src\\main.rs",
+            "C:\\Users\\me\\project"
         ));
     }
 

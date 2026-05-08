@@ -28,15 +28,16 @@ impl Default for CapacityControllerConfig {
         model_priors.insert("deepseek_v4_flash".to_string(), 4.2);
 
         Self {
-            // OFF BY DEFAULT. The capacity controller's main intervention,
-            // `TargetedContextRefresh`, runs `compact_messages_safe` which
-            // rewrites the live conversation — visually identical to the
-            // agent "restarting" mid-turn. Power users running V4 on a 1M
-            // context window simply don't need this guardrail; the failure
-            // mode it protects against (context overflow) is rare in
-            // practice and self-correcting (the model surfaces a clear
-            // error). Users who do want the controller back can enable it
-            // via `capacity.enabled = true` in `~/.deepseek/config.toml`.
+            // OFF BY DEFAULT since v0.8.11. The capacity controller's
+            // interventions (TargetedContextRefresh, VerifyAndReplan)
+            // silently rewrite or clear the session message log, which
+            // surprises the user and destroys V4's prefix cache. v0.8.11
+            // committed to "trust the model with the full 1M-token
+            // context, only compact on explicit user `/compact`."
+            // Auto-managing the prefix on the user's behalf works against
+            // that posture. Power users who want the controller can opt
+            // in via `capacity.enabled = true` in
+            // `~/.deepseek/config.toml`.
             enabled: false,
             // Thresholds retained for the opt-in path; tuning notes live
             // in git history (#63 follow-up).
@@ -618,8 +619,10 @@ mod tests {
         assert_eq!(decide_policy(&cfg, &snap), GuardrailAction::VerifyAndReplan);
     }
 
+    /// v0.8.11 flipped the default to `enabled = false`. The controller's
+    /// observe / decide methods early-return when disabled — opt-in only.
     #[test]
-    fn default_controller_is_disabled_and_does_not_observe() {
+    fn default_controller_is_disabled_and_skips_observations() {
         let cfg = CapacityControllerConfig::default();
         assert!(!cfg.enabled);
 
@@ -633,15 +636,40 @@ mod tests {
             context_used_ratio: 0.95,
         });
 
+        // With enabled=false, observe_pre_turn returns None.
         assert!(snapshot.is_none());
-        let decision = controller.decide(1, snapshot.as_ref());
-        assert_eq!(decision.action, GuardrailAction::NoIntervention);
-        assert_eq!(decision.reason, "capacity_controller_disabled");
+    }
+
+    /// Opting in via `capacity.enabled = true` re-arms the controller —
+    /// observations produce snapshots, decisions can fire interventions.
+    #[test]
+    fn opt_in_controller_observes_and_decides() {
+        let cfg = CapacityControllerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let mut controller = CapacityController::new(cfg);
+        let snapshot = controller.observe_pre_turn(CapacityObservationInput {
+            turn_index: 1,
+            model: "deepseek-v4-pro".to_string(),
+            action_count_this_turn: 10,
+            tool_calls_recent_window: 10,
+            unique_reference_ids_recent_window: 10,
+            context_used_ratio: 0.95,
+        });
+
+        assert!(snapshot.is_some());
+        let snap = snapshot.unwrap();
+        assert_eq!(snap.turn_index, 1);
+        assert!(snap.p_fail > 0.0);
     }
 
     #[test]
-    fn app_config_without_capacity_keeps_controller_disabled() {
+    fn app_config_without_capacity_uses_default_disabled() {
         let cfg = CapacityControllerConfig::from_app_config(&crate::config::Config::default());
+        // v0.8.11: default is disabled. No capacity section in config
+        // means the controller stays inert; users opt in deliberately.
         assert!(!cfg.enabled);
         assert_eq!(cfg.low_risk_max, 0.50);
         assert_eq!(cfg.refresh_cooldown_turns, 6);
@@ -691,22 +719,14 @@ mod tests {
     }
 
     #[test]
-    fn normalize_v3_and_reasoner_unchanged() {
+    fn normalize_v4_and_fallback_prior_keys() {
         assert_eq!(
-            normalize_model_prior_key("deepseek-chat"),
-            "deepseek_v3_2_chat"
+            normalize_model_prior_key("deepseek-v4-pro"),
+            "deepseek_v4_pro"
         );
         assert_eq!(
-            normalize_model_prior_key("deepseek-v3-chat"),
-            "deepseek_v3_2_chat"
-        );
-        assert_eq!(
-            normalize_model_prior_key("deepseek-reasoner"),
-            "deepseek_v3_2_reasoner"
-        );
-        assert_eq!(
-            normalize_model_prior_key("deepseek-r1"),
-            "deepseek_v3_2_reasoner"
+            normalize_model_prior_key("deepseek-v4-flash"),
+            "deepseek_v4_flash"
         );
         assert_eq!(
             normalize_model_prior_key("unknown-model"),

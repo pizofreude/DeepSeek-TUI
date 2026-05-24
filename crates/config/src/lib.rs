@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
-use deepseek_secrets::SecretSource;
-pub use deepseek_secrets::Secrets;
+use codewhale_secrets::SecretSource;
+pub use codewhale_secrets::Secrets;
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -21,6 +21,10 @@ const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1";
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
 const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_ATLASCLOUD_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
+const DEFAULT_ATLASCLOUD_BASE_URL: &str = "https://api.atlascloud.ai/v1";
+const DEFAULT_WANJIE_ARK_MODEL: &str = "deepseek-reasoner";
+const DEFAULT_WANJIE_ARK_BASE_URL: &str = "https://maas-openapi.wanjiedata.com/api/v1";
 const DEFAULT_OPENROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
 const DEFAULT_OPENROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
 const DEFAULT_NOVITA_MODEL: &str = "deepseek/deepseek-v4-pro";
@@ -42,9 +46,25 @@ const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[default]
+    #[serde(
+        alias = "deepseek-cn",
+        alias = "deepseek_china",
+        alias = "deepseekcn",
+        alias = "deepseek-china"
+    )]
     Deepseek,
     NvidiaNim,
     Openai,
+    Atlascloud,
+    #[serde(
+        alias = "wanjie",
+        alias = "wanjie_ark",
+        alias = "ark-wanjie",
+        alias = "ark_wanjie",
+        alias = "wanjie-maas",
+        alias = "wanjie_maas"
+    )]
+    WanjieArk,
     Openrouter,
     Novita,
     Fireworks,
@@ -60,6 +80,8 @@ impl ProviderKind {
             Self::Deepseek => "deepseek",
             Self::NvidiaNim => "nvidia-nim",
             Self::Openai => "openai",
+            Self::Atlascloud => "atlascloud",
+            Self::WanjieArk => "wanjie-ark",
             Self::Openrouter => "openrouter",
             Self::Novita => "novita",
             Self::Fireworks => "fireworks",
@@ -72,9 +94,13 @@ impl ProviderKind {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "deepseek" | "deep-seek" => Some(Self::Deepseek),
+            "deepseek" | "deep-seek" | "deepseek-cn" | "deepseek_china" | "deepseekcn"
+            | "deepseek-china" => Some(Self::Deepseek),
             "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => Some(Self::NvidiaNim),
             "openai" | "open-ai" => Some(Self::Openai),
+            "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => Some(Self::Atlascloud),
+            "wanjie" | "wanjie-ark" | "wanjie_ark" | "ark-wanjie" | "ark_wanjie" | "wanjieark"
+            | "wanjie-maas" | "wanjie_maas" | "wanjiemaas" => Some(Self::WanjieArk),
             "openrouter" | "open_router" => Some(Self::Openrouter),
             "novita" => Some(Self::Novita),
             "fireworks" | "fireworks-ai" => Some(Self::Fireworks),
@@ -104,6 +130,10 @@ pub struct ProvidersToml {
     #[serde(default)]
     pub openai: ProviderConfigToml,
     #[serde(default)]
+    pub atlascloud: ProviderConfigToml,
+    #[serde(default)]
+    pub wanjie_ark: ProviderConfigToml,
+    #[serde(default)]
     pub openrouter: ProviderConfigToml,
     #[serde(default)]
     pub novita: ProviderConfigToml,
@@ -124,6 +154,8 @@ impl ProvidersToml {
             ProviderKind::Deepseek => &self.deepseek,
             ProviderKind::NvidiaNim => &self.nvidia_nim,
             ProviderKind::Openai => &self.openai,
+            ProviderKind::Atlascloud => &self.atlascloud,
+            ProviderKind::WanjieArk => &self.wanjie_ark,
             ProviderKind::Openrouter => &self.openrouter,
             ProviderKind::Novita => &self.novita,
             ProviderKind::Fireworks => &self.fireworks,
@@ -138,6 +170,8 @@ impl ProvidersToml {
             ProviderKind::Deepseek => &mut self.deepseek,
             ProviderKind::NvidiaNim => &mut self.nvidia_nim,
             ProviderKind::Openai => &mut self.openai,
+            ProviderKind::Atlascloud => &mut self.atlascloud,
+            ProviderKind::WanjieArk => &mut self.wanjie_ark,
             ProviderKind::Openrouter => &mut self.openrouter,
             ProviderKind::Novita => &mut self.novita,
             ProviderKind::Fireworks => &mut self.fireworks,
@@ -151,7 +185,7 @@ impl ProvidersToml {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigToml {
     /// TUI-compatible DeepSeek API key. Kept at the root so both `deepseek`
-    /// and `deepseek-tui` can share a single config file.
+    /// and `codewhale-tui` can share a single config file.
     pub api_key: Option<String>,
     /// TUI-compatible DeepSeek base URL.
     pub base_url: Option<String>,
@@ -350,6 +384,14 @@ impl ConfigToml {
         );
         merge_provider_config(&mut self.providers.openai, &project.providers.openai);
         merge_provider_config(
+            &mut self.providers.atlascloud,
+            &project.providers.atlascloud,
+        );
+        merge_provider_config(
+            &mut self.providers.wanjie_ark,
+            &project.providers.wanjie_ark,
+        );
+        merge_provider_config(
             &mut self.providers.openrouter,
             &project.providers.openrouter,
         );
@@ -411,6 +453,18 @@ impl ConfigToml {
             "providers.openai.http_headers" => {
                 serialize_http_headers(&self.providers.openai.http_headers)
             }
+            "providers.atlascloud.api_key" => self.providers.atlascloud.api_key.clone(),
+            "providers.atlascloud.base_url" => self.providers.atlascloud.base_url.clone(),
+            "providers.atlascloud.model" => self.providers.atlascloud.model.clone(),
+            "providers.atlascloud.http_headers" => {
+                serialize_http_headers(&self.providers.atlascloud.http_headers)
+            }
+            "providers.wanjie_ark.api_key" => self.providers.wanjie_ark.api_key.clone(),
+            "providers.wanjie_ark.base_url" => self.providers.wanjie_ark.base_url.clone(),
+            "providers.wanjie_ark.model" => self.providers.wanjie_ark.model.clone(),
+            "providers.wanjie_ark.http_headers" => {
+                serialize_http_headers(&self.providers.wanjie_ark.http_headers)
+            }
             "providers.openrouter.api_key" => self.providers.openrouter.api_key.clone(),
             "providers.openrouter.base_url" => self.providers.openrouter.base_url.clone(),
             "providers.openrouter.model" => self.providers.openrouter.model.clone(),
@@ -449,6 +503,17 @@ impl ConfigToml {
             }
             _ => self.extras.get(key).map(toml::Value::to_string),
         }
+    }
+
+    #[must_use]
+    pub fn get_display_value(&self, key: &str) -> Option<String> {
+        self.get_value(key).map(|value| {
+            if is_sensitive_config_key(key) {
+                redact_secret(&value)
+            } else {
+                value
+            }
+        })
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
@@ -497,6 +562,30 @@ impl ConfigToml {
             "providers.openai.model" => self.providers.openai.model = Some(value.to_string()),
             "providers.openai.http_headers" => {
                 self.providers.openai.http_headers = parse_http_headers(value)?;
+            }
+            "providers.atlascloud.api_key" => {
+                self.providers.atlascloud.api_key = Some(value.to_string());
+            }
+            "providers.atlascloud.base_url" => {
+                self.providers.atlascloud.base_url = Some(value.to_string());
+            }
+            "providers.atlascloud.model" => {
+                self.providers.atlascloud.model = Some(value.to_string());
+            }
+            "providers.atlascloud.http_headers" => {
+                self.providers.atlascloud.http_headers = parse_http_headers(value)?;
+            }
+            "providers.wanjie_ark.api_key" => {
+                self.providers.wanjie_ark.api_key = Some(value.to_string());
+            }
+            "providers.wanjie_ark.base_url" => {
+                self.providers.wanjie_ark.base_url = Some(value.to_string());
+            }
+            "providers.wanjie_ark.model" => {
+                self.providers.wanjie_ark.model = Some(value.to_string());
+            }
+            "providers.wanjie_ark.http_headers" => {
+                self.providers.wanjie_ark.http_headers = parse_http_headers(value)?;
             }
             "providers.nvidia_nim.api_key" => {
                 self.providers.nvidia_nim.api_key = Some(value.to_string());
@@ -626,6 +715,16 @@ impl ConfigToml {
             "providers.openai.base_url" => self.providers.openai.base_url = None,
             "providers.openai.model" => self.providers.openai.model = None,
             "providers.openai.http_headers" => self.providers.openai.http_headers.clear(),
+            "providers.atlascloud.api_key" => self.providers.atlascloud.api_key = None,
+            "providers.atlascloud.base_url" => self.providers.atlascloud.base_url = None,
+            "providers.atlascloud.model" => self.providers.atlascloud.model = None,
+            "providers.atlascloud.http_headers" => self.providers.atlascloud.http_headers.clear(),
+            "providers.wanjie_ark.api_key" => self.providers.wanjie_ark.api_key = None,
+            "providers.wanjie_ark.base_url" => self.providers.wanjie_ark.base_url = None,
+            "providers.wanjie_ark.model" => self.providers.wanjie_ark.model = None,
+            "providers.wanjie_ark.http_headers" => {
+                self.providers.wanjie_ark.http_headers.clear();
+            }
             "providers.nvidia_nim.api_key" => self.providers.nvidia_nim.api_key = None,
             "providers.nvidia_nim.base_url" => self.providers.nvidia_nim.base_url = None,
             "providers.nvidia_nim.model" => self.providers.nvidia_nim.model = None,
@@ -729,6 +828,30 @@ impl ConfigToml {
         if let Some(v) = serialize_http_headers(&self.providers.openai.http_headers) {
             out.insert("providers.openai.http_headers".to_string(), v);
         }
+        if let Some(v) = self.providers.atlascloud.api_key.as_ref() {
+            out.insert("providers.atlascloud.api_key".to_string(), redact_secret(v));
+        }
+        if let Some(v) = self.providers.atlascloud.base_url.as_ref() {
+            out.insert("providers.atlascloud.base_url".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.atlascloud.model.as_ref() {
+            out.insert("providers.atlascloud.model".to_string(), v.clone());
+        }
+        if let Some(v) = serialize_http_headers(&self.providers.atlascloud.http_headers) {
+            out.insert("providers.atlascloud.http_headers".to_string(), v);
+        }
+        if let Some(v) = self.providers.wanjie_ark.api_key.as_ref() {
+            out.insert("providers.wanjie_ark.api_key".to_string(), redact_secret(v));
+        }
+        if let Some(v) = self.providers.wanjie_ark.base_url.as_ref() {
+            out.insert("providers.wanjie_ark.base_url".to_string(), v.clone());
+        }
+        if let Some(v) = self.providers.wanjie_ark.model.as_ref() {
+            out.insert("providers.wanjie_ark.model".to_string(), v.clone());
+        }
+        if let Some(v) = serialize_http_headers(&self.providers.wanjie_ark.http_headers) {
+            out.insert("providers.wanjie_ark.http_headers".to_string(), v);
+        }
         if let Some(v) = self.providers.nvidia_nim.api_key.as_ref() {
             out.insert("providers.nvidia_nim.api_key".to_string(), redact_secret(v));
         }
@@ -824,18 +947,19 @@ impl ConfigToml {
     ///
     /// This method keeps library callers prompt-free: CLI flag → config file
     /// → environment. Call `resolve_runtime_options_with_secrets` when a
-    /// user-facing dispatcher should recover OS-keyring credentials.
+    /// user-facing dispatcher should recover credentials from the configured
+    /// secret store.
     #[must_use]
     pub fn resolve_runtime_options(&self, cli: &CliRuntimeOverrides) -> ResolvedRuntimeOptions {
         let no_keyring = Secrets::new(std::sync::Arc::new(
-            deepseek_secrets::InMemoryKeyringStore::new(),
+            codewhale_secrets::InMemoryKeyringStore::new(),
         ));
         self.resolve_runtime_options_with_secrets(cli, &no_keyring)
     }
 
     /// Resolve runtime options using an explicit secrets façade.
     ///
-    /// API-key precedence is **CLI flag → config-file → keyring → environment**.
+    /// API-key precedence is **CLI flag → config-file → secret store → environment**.
     #[must_use]
     pub fn resolve_runtime_options_with_secrets(
         &self,
@@ -855,26 +979,6 @@ impl ConfigToml {
         let root_deepseek_model = (provider == ProviderKind::Deepseek)
             .then(|| self.default_text_model.clone())
             .flatten();
-        // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
-        // This makes `deepseek auth set` a reliable fix even when the user's
-        // shell still exports an old key. When the file is empty, the injected
-        // secrets façade recovers older OS-keyring credentials before falling
-        // back to ambient env.
-        let from_file = provider_cfg.api_key.clone().or(root_deepseek_api_key);
-        let (api_key, api_key_source) = if let Some(value) = cli.api_key.clone() {
-            (Some(value), Some(RuntimeApiKeySource::Cli))
-        } else if let Some(value) = from_file.clone().filter(|v| !v.trim().is_empty()) {
-            (Some(value), Some(RuntimeApiKeySource::ConfigFile))
-        } else if let Some((value, source)) = secrets.resolve_with_source(provider.as_str()) {
-            let source = match source {
-                SecretSource::Keyring => RuntimeApiKeySource::Keyring,
-                SecretSource::Env => RuntimeApiKeySource::Env,
-            };
-            (Some(value), Some(source))
-        } else {
-            (None, None)
-        };
-
         let base_url = cli
             .base_url
             .clone()
@@ -885,6 +989,8 @@ impl ConfigToml {
                 ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL.to_string(),
                 ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL.to_string(),
                 ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL.to_string(),
+                ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL.to_string(),
+                ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL.to_string(),
                 ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL.to_string(),
                 ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL.to_string(),
                 ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL.to_string(),
@@ -892,9 +998,42 @@ impl ConfigToml {
                 ProviderKind::Vllm => DEFAULT_VLLM_BASE_URL.to_string(),
                 ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL.to_string(),
             });
+        let auth_mode = cli
+            .auth_mode
+            .clone()
+            .or_else(|| env.auth_mode.clone())
+            .or_else(|| self.auth_mode.clone());
+        // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
+        // This makes `deepseek auth set` a reliable fix even when the user's
+        // shell still exports an old key. When the file is empty, the injected
+        // secrets façade recovers configured secret-store credentials before
+        // falling back to ambient env.
+        let from_file = provider_cfg.api_key.clone().or(root_deepseek_api_key);
+        let (api_key, api_key_source) = if let Some(value) = cli.api_key.clone() {
+            (Some(value), Some(RuntimeApiKeySource::Cli))
+        } else if let Some(value) = from_file.clone().filter(|v| !v.trim().is_empty()) {
+            (Some(value), Some(RuntimeApiKeySource::ConfigFile))
+        } else if should_skip_secret_store_for_provider(provider, &base_url, auth_mode.as_deref()) {
+            match codewhale_secrets::env_for(provider.as_str()) {
+                Some(value) => (Some(value), Some(RuntimeApiKeySource::Env)),
+                None => (None, None),
+            }
+        } else {
+            match secrets.resolve_with_source(provider.as_str()) {
+                Some((value, source)) => {
+                    let source = match source {
+                        SecretSource::Keyring => RuntimeApiKeySource::Keyring,
+                        SecretSource::Env => RuntimeApiKeySource::Env,
+                    };
+                    (Some(value), Some(source))
+                }
+                None => (None, None),
+            }
+        };
 
         let explicit_model = cli.model.is_some()
             || env.model.is_some()
+            || env.model_for(provider).is_some()
             || provider_cfg.model.is_some()
             || root_deepseek_model.is_some()
             || self.model.is_some();
@@ -902,6 +1041,7 @@ impl ConfigToml {
             .model
             .clone()
             .or_else(|| env.model.clone())
+            .or_else(|| env.model_for(provider))
             .or_else(|| provider_cfg.model.clone())
             .or(root_deepseek_model)
             .or_else(|| self.model.clone())
@@ -925,11 +1065,6 @@ impl ConfigToml {
             .clone()
             .or_else(|| env.output_mode.clone())
             .or_else(|| self.output_mode.clone());
-        let auth_mode = cli
-            .auth_mode
-            .clone()
-            .or_else(|| env.auth_mode.clone())
-            .or_else(|| self.auth_mode.clone());
         let log_level = cli
             .log_level
             .clone()
@@ -950,6 +1085,7 @@ impl ConfigToml {
             .clone()
             .or_else(|| env.sandbox_mode.clone())
             .or_else(|| self.sandbox_mode.clone());
+        let yolo = cli.yolo.or(env.yolo);
 
         ResolvedRuntimeOptions {
             provider,
@@ -963,6 +1099,7 @@ impl ConfigToml {
             telemetry,
             approval_policy,
             sandbox_mode,
+            yolo,
             http_headers,
         }
     }
@@ -995,7 +1132,10 @@ pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
 }
 
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
-    if matches!(provider, ProviderKind::Ollama) {
+    if matches!(
+        provider,
+        ProviderKind::Atlascloud | ProviderKind::WanjieArk | ProviderKind::Ollama
+    ) {
         return model.to_string();
     }
 
@@ -1053,6 +1193,8 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL,
         ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_MODEL,
         ProviderKind::Openai => DEFAULT_OPENAI_MODEL,
+        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_MODEL,
+        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_MODEL,
         ProviderKind::Openrouter => DEFAULT_OPENROUTER_MODEL,
         ProviderKind::Novita => DEFAULT_NOVITA_MODEL,
         ProviderKind::Fireworks => DEFAULT_FIREWORKS_MODEL,
@@ -1067,6 +1209,8 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL,
         ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL,
         ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL,
+        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL,
+        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL,
         ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL,
         ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL,
         ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
@@ -1083,8 +1227,76 @@ fn base_url_is_custom_for_provider(provider: ProviderKind, base_url: &str) -> bo
 }
 
 fn provider_preserves_custom_base_url_model(provider: ProviderKind, base_url: &str) -> bool {
-    matches!(provider, ProviderKind::Openrouter)
-        && base_url_is_custom_for_provider(provider, base_url)
+    base_url_is_custom_for_provider(provider, base_url)
+}
+
+fn should_skip_secret_store_for_provider(
+    provider: ProviderKind,
+    base_url: &str,
+    auth_mode: Option<&str>,
+) -> bool {
+    if auth_mode_requires_api_key(auth_mode) {
+        return false;
+    }
+    if auth_mode_disables_api_key(auth_mode) {
+        return true;
+    }
+
+    matches!(
+        provider,
+        ProviderKind::Sglang | ProviderKind::Vllm | ProviderKind::Ollama
+    ) || base_url_uses_local_host(base_url)
+}
+
+fn auth_mode_requires_api_key(auth_mode: Option<&str>) -> bool {
+    matches!(
+        auth_mode
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase()),
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "api_key" | "api-key" | "apikey" | "bearer" | "bearer-token"
+            )
+    )
+}
+
+fn auth_mode_disables_api_key(auth_mode: Option<&str>) -> bool {
+    matches!(
+        auth_mode
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase()),
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "none" | "off" | "disabled" | "no_auth" | "no-auth" | "anonymous"
+            )
+    )
+}
+
+fn base_url_uses_local_host(base_url: &str) -> bool {
+    let Some(host) = base_url_host(base_url) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "0.0.0.0") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|addr| addr.is_loopback() || addr.is_unspecified())
+}
+
+fn base_url_host(base_url: &str) -> Option<&str> {
+    let without_scheme = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next()?.rsplit('@').next()?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
+    }
+    authority.split(':').next().filter(|host| !host.is_empty())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1099,6 +1311,7 @@ pub struct CliRuntimeOverrides {
     pub telemetry: Option<bool>,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
+    pub yolo: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1134,6 +1347,7 @@ pub struct ResolvedRuntimeOptions {
     pub telemetry: bool,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
+    pub yolo: Option<bool>,
     pub http_headers: BTreeMap<String, String>,
 }
 
@@ -1206,7 +1420,7 @@ impl ConfigStore {
 
 /// Process-wide default [`Secrets`] façade. The first caller wins; the
 /// lock is exposed so test or CLI code can install an explicit
-/// backend (e.g. an [`deepseek_secrets::InMemoryKeyringStore`]) before
+/// backend (e.g. an [`codewhale_secrets::InMemoryKeyringStore`]) before
 /// any resolver runs.
 pub fn default_secrets() -> &'static Secrets {
     static SECRETS: OnceLock<Secrets> = OnceLock::new();
@@ -1218,7 +1432,7 @@ pub fn default_secrets() -> &'static Secrets {
         #[cfg(test)]
         {
             Secrets::new(std::sync::Arc::new(
-                deepseek_secrets::InMemoryKeyringStore::new(),
+                codewhale_secrets::InMemoryKeyringStore::new(),
             ))
         }
         #[cfg(not(test))]
@@ -1229,16 +1443,19 @@ pub fn default_secrets() -> &'static Secrets {
 }
 
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-    if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
+    let path = if let Some(path) = explicit {
+        path
+    } else if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
+            PathBuf::from(trimmed)
+        } else {
+            return default_config_path();
         }
-    }
-    default_config_path()
+    } else {
+        return default_config_path();
+    };
+    normalize_config_file_path(path)
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -1307,20 +1524,53 @@ fn redact_secret(secret: &str) -> String {
     format!("{prefix}***{suffix}")
 }
 
+#[must_use]
+pub fn is_sensitive_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "api_key" | "auth.chatgpt_access_token" | "auth.device_code_session"
+    ) || key.ends_with(".api_key")
+}
+
+fn normalize_config_file_path(path: PathBuf) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("config path cannot be empty");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("config path cannot contain '..' components");
+    }
+    if path.file_name().is_none() {
+        bail!("config path must include a file name");
+    }
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()
+        .context("failed to resolve current directory for config path")?
+        .join(path))
+}
+
 #[derive(Debug, Clone, Default)]
 struct EnvRuntimeOverrides {
     provider: Option<ProviderKind>,
     model: Option<String>,
+    wanjie_ark_model: Option<String>,
     output_mode: Option<String>,
     auth_mode: Option<String>,
     log_level: Option<String>,
     telemetry: Option<bool>,
     approval_policy: Option<String>,
     sandbox_mode: Option<String>,
+    yolo: Option<bool>,
     http_headers: Option<BTreeMap<String, String>>,
     deepseek_base_url: Option<String>,
     nvidia_base_url: Option<String>,
     openai_base_url: Option<String>,
+    atlascloud_base_url: Option<String>,
+    wanjie_ark_base_url: Option<String>,
     openrouter_base_url: Option<String>,
     novita_base_url: Option<String>,
     fireworks_base_url: Option<String>,
@@ -1336,6 +1586,11 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .and_then(|v| ProviderKind::parse(&v)),
             model: std::env::var("DEEPSEEK_MODEL").ok(),
+            wanjie_ark_model: std::env::var("WANJIE_ARK_MODEL")
+                .or_else(|_| std::env::var("WANJIE_MODEL"))
+                .or_else(|_| std::env::var("WANJIE_MAAS_MODEL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             output_mode: std::env::var("DEEPSEEK_OUTPUT_MODE").ok(),
             auth_mode: std::env::var("DEEPSEEK_AUTH_MODE").ok(),
             log_level: std::env::var("DEEPSEEK_LOG_LEVEL").ok(),
@@ -1344,6 +1599,9 @@ impl EnvRuntimeOverrides {
                 .and_then(|v| parse_bool(&v).ok()),
             approval_policy: std::env::var("DEEPSEEK_APPROVAL_POLICY").ok(),
             sandbox_mode: std::env::var("DEEPSEEK_SANDBOX_MODE").ok(),
+            yolo: std::env::var("DEEPSEEK_YOLO")
+                .ok()
+                .and_then(|v| parse_bool(&v).ok()),
             http_headers: std::env::var("DEEPSEEK_HTTP_HEADERS")
                 .ok()
                 .and_then(|value| parse_http_headers(&value).ok())
@@ -1357,6 +1615,14 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             openai_base_url: std::env::var("OPENAI_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            atlascloud_base_url: std::env::var("ATLASCLOUD_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            wanjie_ark_base_url: std::env::var("WANJIE_ARK_BASE_URL")
+                .or_else(|_| std::env::var("WANJIE_BASE_URL"))
+                .or_else(|_| std::env::var("WANJIE_MAAS_BASE_URL"))
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             openrouter_base_url: std::env::var("OPENROUTER_BASE_URL")
@@ -1387,12 +1653,21 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepseek => self.deepseek_base_url.clone(),
             ProviderKind::NvidiaNim => self.nvidia_base_url.clone(),
             ProviderKind::Openai => self.openai_base_url.clone(),
+            ProviderKind::Atlascloud => self.atlascloud_base_url.clone(),
+            ProviderKind::WanjieArk => self.wanjie_ark_base_url.clone(),
             ProviderKind::Openrouter => self.openrouter_base_url.clone(),
             ProviderKind::Novita => self.novita_base_url.clone(),
             ProviderKind::Fireworks => self.fireworks_base_url.clone(),
             ProviderKind::Sglang => self.sglang_base_url.clone(),
             ProviderKind::Vllm => self.vllm_base_url.clone(),
             ProviderKind::Ollama => self.ollama_base_url.clone(),
+        }
+    }
+
+    fn model_for(&self, provider: ProviderKind) -> Option<String> {
+        match provider {
+            ProviderKind::WanjieArk => self.wanjie_ark_model.clone(),
+            _ => None,
         }
     }
 }
@@ -1402,6 +1677,7 @@ mod tests {
     use super::*;
     use std::env;
     use std::ffi::OsString;
+    use std::sync::Arc;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1430,6 +1706,7 @@ mod tests {
         deepseek_http_headers: Option<OsString>,
         deepseek_model: Option<OsString>,
         deepseek_provider: Option<OsString>,
+        deepseek_auth_mode: Option<OsString>,
         nvidia_api_key: Option<OsString>,
         nvidia_nim_api_key: Option<OsString>,
         nim_base_url: Option<OsString>,
@@ -1437,6 +1714,13 @@ mod tests {
         nvidia_nim_base_url: Option<OsString>,
         openrouter_api_key: Option<OsString>,
         openrouter_base_url: Option<OsString>,
+        wanjie_ark_api_key: Option<OsString>,
+        wanjie_ark_base_url: Option<OsString>,
+        wanjie_base_url: Option<OsString>,
+        wanjie_maas_base_url: Option<OsString>,
+        wanjie_ark_model: Option<OsString>,
+        wanjie_model: Option<OsString>,
+        wanjie_maas_model: Option<OsString>,
         novita_api_key: Option<OsString>,
         novita_base_url: Option<OsString>,
         fireworks_api_key: Option<OsString>,
@@ -1457,6 +1741,7 @@ mod tests {
                 deepseek_http_headers: env::var_os("DEEPSEEK_HTTP_HEADERS"),
                 deepseek_model: env::var_os("DEEPSEEK_MODEL"),
                 deepseek_provider: env::var_os("DEEPSEEK_PROVIDER"),
+                deepseek_auth_mode: env::var_os("DEEPSEEK_AUTH_MODE"),
                 nvidia_api_key: env::var_os("NVIDIA_API_KEY"),
                 nvidia_nim_api_key: env::var_os("NVIDIA_NIM_API_KEY"),
                 nim_base_url: env::var_os("NIM_BASE_URL"),
@@ -1464,6 +1749,13 @@ mod tests {
                 nvidia_nim_base_url: env::var_os("NVIDIA_NIM_BASE_URL"),
                 openrouter_api_key: env::var_os("OPENROUTER_API_KEY"),
                 openrouter_base_url: env::var_os("OPENROUTER_BASE_URL"),
+                wanjie_ark_api_key: env::var_os("WANJIE_ARK_API_KEY"),
+                wanjie_ark_base_url: env::var_os("WANJIE_ARK_BASE_URL"),
+                wanjie_base_url: env::var_os("WANJIE_BASE_URL"),
+                wanjie_maas_base_url: env::var_os("WANJIE_MAAS_BASE_URL"),
+                wanjie_ark_model: env::var_os("WANJIE_ARK_MODEL"),
+                wanjie_model: env::var_os("WANJIE_MODEL"),
+                wanjie_maas_model: env::var_os("WANJIE_MAAS_MODEL"),
                 novita_api_key: env::var_os("NOVITA_API_KEY"),
                 novita_base_url: env::var_os("NOVITA_BASE_URL"),
                 fireworks_api_key: env::var_os("FIREWORKS_API_KEY"),
@@ -1482,6 +1774,7 @@ mod tests {
                 env::remove_var("DEEPSEEK_HTTP_HEADERS");
                 env::remove_var("DEEPSEEK_MODEL");
                 env::remove_var("DEEPSEEK_PROVIDER");
+                env::remove_var("DEEPSEEK_AUTH_MODE");
                 env::remove_var("NVIDIA_API_KEY");
                 env::remove_var("NVIDIA_NIM_API_KEY");
                 env::remove_var("NIM_BASE_URL");
@@ -1489,6 +1782,13 @@ mod tests {
                 env::remove_var("NVIDIA_NIM_BASE_URL");
                 env::remove_var("OPENROUTER_API_KEY");
                 env::remove_var("OPENROUTER_BASE_URL");
+                env::remove_var("WANJIE_ARK_API_KEY");
+                env::remove_var("WANJIE_ARK_BASE_URL");
+                env::remove_var("WANJIE_BASE_URL");
+                env::remove_var("WANJIE_MAAS_BASE_URL");
+                env::remove_var("WANJIE_ARK_MODEL");
+                env::remove_var("WANJIE_MODEL");
+                env::remove_var("WANJIE_MAAS_MODEL");
                 env::remove_var("NOVITA_API_KEY");
                 env::remove_var("NOVITA_BASE_URL");
                 env::remove_var("FIREWORKS_API_KEY");
@@ -1521,6 +1821,7 @@ mod tests {
                 Self::restore_var("DEEPSEEK_HTTP_HEADERS", self.deepseek_http_headers.take());
                 Self::restore_var("DEEPSEEK_MODEL", self.deepseek_model.take());
                 Self::restore_var("DEEPSEEK_PROVIDER", self.deepseek_provider.take());
+                Self::restore_var("DEEPSEEK_AUTH_MODE", self.deepseek_auth_mode.take());
                 Self::restore_var("NVIDIA_API_KEY", self.nvidia_api_key.take());
                 Self::restore_var("NVIDIA_NIM_API_KEY", self.nvidia_nim_api_key.take());
                 Self::restore_var("NIM_BASE_URL", self.nim_base_url.take());
@@ -1528,6 +1829,13 @@ mod tests {
                 Self::restore_var("NVIDIA_NIM_BASE_URL", self.nvidia_nim_base_url.take());
                 Self::restore_var("OPENROUTER_API_KEY", self.openrouter_api_key.take());
                 Self::restore_var("OPENROUTER_BASE_URL", self.openrouter_base_url.take());
+                Self::restore_var("WANJIE_ARK_API_KEY", self.wanjie_ark_api_key.take());
+                Self::restore_var("WANJIE_ARK_BASE_URL", self.wanjie_ark_base_url.take());
+                Self::restore_var("WANJIE_BASE_URL", self.wanjie_base_url.take());
+                Self::restore_var("WANJIE_MAAS_BASE_URL", self.wanjie_maas_base_url.take());
+                Self::restore_var("WANJIE_ARK_MODEL", self.wanjie_ark_model.take());
+                Self::restore_var("WANJIE_MODEL", self.wanjie_model.take());
+                Self::restore_var("WANJIE_MAAS_MODEL", self.wanjie_maas_model.take());
                 Self::restore_var("NOVITA_API_KEY", self.novita_api_key.take());
                 Self::restore_var("NOVITA_BASE_URL", self.novita_base_url.take());
                 Self::restore_var("FIREWORKS_API_KEY", self.fireworks_api_key.take());
@@ -1539,6 +1847,39 @@ mod tests {
                 Self::restore_var("OLLAMA_API_KEY", self.ollama_api_key.take());
                 Self::restore_var("OLLAMA_BASE_URL", self.ollama_base_url.take());
             }
+        }
+    }
+
+    struct RecordingSecretsStore {
+        gets: Mutex<Vec<String>>,
+        value: Option<String>,
+    }
+
+    impl RecordingSecretsStore {
+        fn with_value(value: &str) -> Self {
+            Self {
+                gets: Mutex::new(Vec::new()),
+                value: Some(value.to_string()),
+            }
+        }
+    }
+
+    impl codewhale_secrets::KeyringStore for RecordingSecretsStore {
+        fn get(&self, key: &str) -> Result<Option<String>, codewhale_secrets::SecretsError> {
+            self.gets.lock().unwrap().push(key.to_string());
+            Ok(self.value.clone())
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> Result<(), codewhale_secrets::SecretsError> {
+            Ok(())
+        }
+
+        fn delete(&self, _key: &str) -> Result<(), codewhale_secrets::SecretsError> {
+            Ok(())
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "recording"
         }
     }
 
@@ -1799,6 +2140,38 @@ mod tests {
     }
 
     #[test]
+    fn get_display_value_redacts_sensitive_keys() {
+        let mut config = ConfigToml {
+            api_key: Some("sk-deepseek-secret".to_string()),
+            chatgpt_access_token: Some("chatgpt-access-secret".to_string()),
+            ..ConfigToml::default()
+        };
+        config.providers.openrouter.api_key = Some("openrouter-secret-value".to_string());
+        config.model = Some("deepseek-v4-pro".to_string());
+
+        assert_eq!(
+            config.get_display_value("api_key").as_deref(),
+            Some("sk-d***cret")
+        );
+        assert_eq!(
+            config
+                .get_display_value("auth.chatgpt_access_token")
+                .as_deref(),
+            Some("chat***cret")
+        );
+        assert_eq!(
+            config
+                .get_display_value("providers.openrouter.api_key")
+                .as_deref(),
+            Some("open***alue")
+        );
+        assert_eq!(
+            config.get_display_value("model").as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
     fn list_values_redacts_unicode_api_key_without_byte_slicing() {
         let config = ConfigToml {
             api_key: Some("密钥密钥密钥密钥123456789".to_string()),
@@ -1811,6 +2184,13 @@ mod tests {
             values.get("api_key").map(String::as_str),
             Some("密钥密钥***6789")
         );
+    }
+
+    #[test]
+    fn normalize_config_file_path_rejects_traversal() {
+        let err = normalize_config_file_path(PathBuf::from("../config.toml"))
+            .expect_err("traversal path should fail");
+        assert!(format!("{err:#}").contains("cannot contain '..'"));
     }
 
     #[cfg(unix)]
@@ -1870,6 +2250,34 @@ mod tests {
             ProviderKind::parse("ollama-local"),
             Some(ProviderKind::Ollama)
         );
+        assert_eq!(
+            ProviderKind::parse("wanjie-ark"),
+            Some(ProviderKind::WanjieArk)
+        );
+        assert_eq!(
+            ProviderKind::parse("ark_wanjie"),
+            Some(ProviderKind::WanjieArk)
+        );
+
+        let parsed: ConfigToml =
+            toml::from_str("provider = \"ark-wanjie\"").expect("wanjie provider alias");
+        assert_eq!(parsed.provider, ProviderKind::WanjieArk);
+    }
+
+    #[test]
+    fn provider_kind_accepts_legacy_deepseek_cn_aliases() {
+        for alias in [
+            "deepseek-cn",
+            "deepseek_china",
+            "deepseekcn",
+            "deepseek-china",
+        ] {
+            assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Deepseek));
+
+            let parsed: ConfigToml =
+                toml::from_str(&format!("provider = \"{alias}\"")).expect("legacy provider alias");
+            assert_eq!(parsed.provider, ProviderKind::Deepseek);
+        }
     }
 
     #[test]
@@ -1921,6 +2329,22 @@ mod tests {
     }
 
     #[test]
+    fn wanjie_ark_provider_defaults_to_openai_compatible_endpoint_and_model() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let config = ConfigToml {
+            provider: ProviderKind::WanjieArk,
+            ..ConfigToml::default()
+        };
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::WanjieArk);
+        assert_eq!(resolved.base_url, DEFAULT_WANJIE_ARK_BASE_URL);
+        assert_eq!(resolved.model, DEFAULT_WANJIE_ARK_MODEL);
+    }
+
+    #[test]
     fn sglang_provider_defaults_to_local_endpoint_and_model() {
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -1967,6 +2391,78 @@ mod tests {
         assert_eq!(resolved.base_url, DEFAULT_OLLAMA_BASE_URL);
         assert_eq!(resolved.model, DEFAULT_OLLAMA_MODEL);
         assert_eq!(resolved.api_key, None);
+    }
+
+    #[test]
+    fn self_hosted_providers_do_not_probe_secret_store_by_default() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let store = Arc::new(RecordingSecretsStore::with_value("secret-store-key"));
+        let secrets = Secrets::new(store.clone());
+
+        for provider in [
+            ProviderKind::Sglang,
+            ProviderKind::Vllm,
+            ProviderKind::Ollama,
+        ] {
+            let config = ConfigToml {
+                provider,
+                ..ConfigToml::default()
+            };
+
+            let resolved = config
+                .resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+            assert_eq!(resolved.provider, provider);
+            assert_eq!(resolved.api_key, None);
+        }
+
+        assert!(
+            store.gets.lock().unwrap().is_empty(),
+            "self-hosted providers should not read the secret store by default"
+        );
+    }
+
+    #[test]
+    fn self_hosted_api_key_auth_can_use_secret_store_when_requested() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let store = Arc::new(RecordingSecretsStore::with_value("secret-store-key"));
+        let secrets = Secrets::new(store.clone());
+        let config = ConfigToml {
+            provider: ProviderKind::Ollama,
+            auth_mode: Some("api_key".to_string()),
+            ..ConfigToml::default()
+        };
+
+        let resolved =
+            config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+        assert_eq!(resolved.api_key.as_deref(), Some("secret-store-key"));
+        assert_eq!(store.gets.lock().unwrap().as_slice(), ["ollama"]);
+    }
+
+    #[test]
+    fn loopback_custom_deepseek_base_url_does_not_probe_secret_store_by_default() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let store = Arc::new(RecordingSecretsStore::with_value("stale-deepseek-key"));
+        let secrets = Secrets::new(store.clone());
+        let config = ConfigToml {
+            base_url: Some("http://127.0.0.1:8000/v1".to_string()),
+            ..ConfigToml::default()
+        };
+
+        let resolved =
+            config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
+
+        assert_eq!(resolved.provider, ProviderKind::Deepseek);
+        assert_eq!(resolved.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(resolved.api_key, None);
+        assert!(
+            store.gets.lock().unwrap().is_empty(),
+            "loopback custom endpoints should not read macOS Keychain or any secret store"
+        );
     }
 
     #[test]
@@ -2056,6 +2552,27 @@ mod tests {
         assert_eq!(resolved.provider, ProviderKind::Fireworks);
         assert_eq!(resolved.api_key.as_deref(), Some("fw-env-key"));
         assert_eq!(resolved.base_url, DEFAULT_FIREWORKS_BASE_URL);
+    }
+
+    #[test]
+    fn wanjie_ark_env_api_key_and_base_url_fall_back_when_config_missing() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        // Safety: test-only environment mutation guarded by a module mutex.
+        unsafe {
+            env::set_var("DEEPSEEK_PROVIDER", "wanjie-ark");
+            env::set_var("WANJIE_ARK_API_KEY", "wanjie-env-key");
+            env::set_var("WANJIE_ARK_BASE_URL", "https://wanjie.example/api/v1");
+            env::set_var("WANJIE_ARK_MODEL", "account-model-id");
+        }
+
+        let resolved =
+            ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::WanjieArk);
+        assert_eq!(resolved.api_key.as_deref(), Some("wanjie-env-key"));
+        assert_eq!(resolved.base_url, "https://wanjie.example/api/v1");
+        assert_eq!(resolved.model, "account-model-id");
     }
 
     #[test]
@@ -2158,14 +2675,33 @@ mod tests {
     }
 
     #[test]
+    fn fireworks_custom_base_url_preserves_provider_model() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        let mut config = ConfigToml {
+            provider: ProviderKind::Fireworks,
+            ..ConfigToml::default()
+        };
+        config.providers.fireworks.base_url = Some("https://my-gateway.example/v1".to_string());
+        config.providers.fireworks.model = Some("DeepSeek-V4-Pro".to_string());
+
+        let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+        assert_eq!(resolved.provider, ProviderKind::Fireworks);
+        assert_eq!(resolved.base_url, "https://my-gateway.example/v1");
+        // Custom base URL skips provider-specific model prefixing.
+        assert_eq!(resolved.model, "DeepSeek-V4-Pro");
+    }
+
+    #[test]
     fn config_file_resolves_above_env_and_keyring() {
-        use deepseek_secrets::KeyringStore;
+        use codewhale_secrets::KeyringStore;
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
         // Safety: env mutation guarded by env_lock().
         unsafe { std::env::set_var("DEEPSEEK_API_KEY", "env-key") };
 
-        let store = std::sync::Arc::new(deepseek_secrets::InMemoryKeyringStore::new());
+        let store = std::sync::Arc::new(codewhale_secrets::InMemoryKeyringStore::new());
         store.set("deepseek", "ring-key").unwrap();
         let secrets = Secrets::new(store);
 
@@ -2192,7 +2728,7 @@ mod tests {
         unsafe { std::env::set_var("DEEPSEEK_API_KEY", "env-key") };
 
         let secrets = Secrets::new(std::sync::Arc::new(
-            deepseek_secrets::InMemoryKeyringStore::new(),
+            codewhale_secrets::InMemoryKeyringStore::new(),
         ));
         let config = ConfigToml::default();
 
@@ -2211,7 +2747,7 @@ mod tests {
         let _env = EnvGuard::without_deepseek_runtime_overrides();
 
         let secrets = Secrets::new(std::sync::Arc::new(
-            deepseek_secrets::InMemoryKeyringStore::new(),
+            codewhale_secrets::InMemoryKeyringStore::new(),
         ));
         let mut config = ConfigToml::default();
         config.providers.deepseek.api_key = Some("file-key".to_string());
@@ -2227,13 +2763,13 @@ mod tests {
 
     #[test]
     fn keyring_resolves_when_config_file_empty_even_if_env_is_set() {
-        use deepseek_secrets::KeyringStore;
+        use codewhale_secrets::KeyringStore;
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
         // Safety: env mutation guarded by env_lock().
         unsafe { std::env::set_var("DEEPSEEK_API_KEY", "stale-env-key") };
 
-        let store = std::sync::Arc::new(deepseek_secrets::InMemoryKeyringStore::new());
+        let store = std::sync::Arc::new(codewhale_secrets::InMemoryKeyringStore::new());
         store.set("deepseek", "ring-key").unwrap();
         let secrets = Secrets::new(store);
 
@@ -2248,11 +2784,11 @@ mod tests {
 
     #[test]
     fn cli_flag_still_overrides_keyring() {
-        use deepseek_secrets::KeyringStore;
+        use codewhale_secrets::KeyringStore;
         let _lock = env_lock();
         let _env = EnvGuard::without_deepseek_runtime_overrides();
 
-        let store = std::sync::Arc::new(deepseek_secrets::InMemoryKeyringStore::new());
+        let store = std::sync::Arc::new(codewhale_secrets::InMemoryKeyringStore::new());
         store.set("deepseek", "ring-key").unwrap();
         let secrets = Secrets::new(store);
 

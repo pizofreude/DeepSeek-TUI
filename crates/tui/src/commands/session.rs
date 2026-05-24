@@ -3,7 +3,9 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::session_manager::create_saved_session_with_mode;
+use crate::session_manager::{
+    create_saved_session_with_id_and_mode, create_saved_session_with_mode,
+};
 use crate::tui::app::{App, AppAction};
 use crate::tui::history::{HistoryCell, history_cells_from_message};
 use crate::tui::session_picker::SessionPickerView;
@@ -20,7 +22,7 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
     };
 
     let messages = app.api_messages.clone();
-    let session = create_saved_session_with_mode(
+    let mut session = create_saved_session_with_mode(
         &messages,
         &app.model,
         &app.workspace,
@@ -28,6 +30,8 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         app.system_prompt.as_ref(),
         Some(app.mode.label()),
     );
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.artifacts = app.session_artifacts.clone();
 
     let sessions_dir = save_path
         .parent()
@@ -54,6 +58,71 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
         }
         Err(e) => CommandResult::error(format!("Failed to create directory: {e}")),
     }
+}
+
+/// Fork the active conversation into a new saved sibling session and switch to it.
+pub fn fork(app: &mut App) -> CommandResult {
+    if app.api_messages.is_empty() {
+        return CommandResult::error("Nothing to fork. Send or load a message first.");
+    }
+
+    let manager = match crate::session_manager::SessionManager::default_location() {
+        Ok(manager) => manager,
+        Err(err) => {
+            return CommandResult::error(format!("could not open sessions directory: {err}"));
+        }
+    };
+
+    let parent_id = app
+        .current_session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut parent = create_saved_session_with_id_and_mode(
+        parent_id,
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.label()),
+    );
+    app.sync_cost_to_metadata(&mut parent.metadata);
+    parent.artifacts = app.session_artifacts.clone();
+
+    if let Err(err) = manager.save_session(&parent) {
+        return CommandResult::error(format!("Failed to save parent session: {err}"));
+    }
+
+    let mut forked = create_saved_session_with_mode(
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.label()),
+    );
+    forked.metadata.copy_cost_from(&parent.metadata);
+    forked.metadata.mark_forked_from(&parent.metadata);
+
+    if let Err(err) = manager.save_session(&forked) {
+        return CommandResult::error(format!("Failed to save forked session: {err}"));
+    }
+
+    app.current_session_id = Some(forked.metadata.id.clone());
+    let fork_id = forked.metadata.id.clone();
+    let parent_label = crate::session_manager::truncate_id(&parent.metadata.id).to_string();
+    let fork_label = crate::session_manager::truncate_id(&fork_id).to_string();
+
+    CommandResult::with_message_and_action(
+        format!("Forked session {parent_label} -> {fork_label}"),
+        AppAction::SyncSession {
+            session_id: Some(fork_id),
+            messages: app.api_messages.clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+        },
+    )
 }
 
 /// Load session from file
@@ -111,6 +180,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     app.session.last_reasoning_replay_tokens = None;
     app.session.turn_cache_history.clear();
     app.current_session_id = Some(session.metadata.id.clone());
+    app.session_artifacts = session.artifacts.clone();
     if let Some(sp) = session.system_prompt {
         app.system_prompt = Some(crate::models::SystemPrompt::Text(sp));
     }
@@ -124,6 +194,7 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
             session.metadata.message_count
         ),
         crate::tui::app::AppAction::SyncSession {
+            session_id: app.current_session_id.clone(),
             messages: app.api_messages.clone(),
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
@@ -199,7 +270,7 @@ pub fn export(app: &mut App, path: Option<&str>) -> CommandResult {
 pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     let trimmed = arg.unwrap_or("").trim();
     if trimmed.is_empty() {
-        app.view_stack.push(SessionPickerView::new());
+        app.view_stack.push(SessionPickerView::new(&app.workspace));
         return CommandResult::ok();
     }
 
@@ -208,7 +279,7 @@ pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     match action.as_str() {
         "prune" => prune(app, parts.next()),
         "show" | "list" | "picker" => {
-            app.view_stack.push(SessionPickerView::new());
+            app.view_stack.push(SessionPickerView::new(&app.workspace));
             CommandResult::ok()
         }
         _ => CommandResult::error(format!(
@@ -330,6 +401,82 @@ mod tests {
     }
 
     #[test]
+    fn save_preserves_artifact_registry() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        let save_path = tmpdir.path().join("artifact_session.json");
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "artifact-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 512_000,
+                preview: "cargo test output".to_string(),
+                storage_path: tmpdir.path().join("call-big.txt"),
+            });
+
+        let result = save(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(!result.is_error);
+        let saved: crate::session_manager::SavedSession =
+            serde_json::from_str(&std::fs::read_to_string(save_path).unwrap()).unwrap();
+        assert_eq!(saved.artifacts, app.session_artifacts);
+    }
+
+    #[test]
+    fn fork_saves_parent_and_switches_to_child_session() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let home = tmpdir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: guarded by the process-wide test env mutex above.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.current_session_id = Some("parent-session".to_string());
+        app.api_messages.push(crate::models::Message {
+            role: "user".to_string(),
+            content: vec![crate::models::ContentBlock::Text {
+                text: "try another path".to_string(),
+                cache_control: None,
+            }],
+        });
+
+        let result = fork(&mut app);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        let new_id = app.current_session_id.clone().expect("fork session id");
+        assert_ne!(new_id, "parent-session");
+        assert!(result.message.as_deref().unwrap_or("").contains("Forked"));
+        assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+
+        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let parent = manager
+            .load_session("parent-session")
+            .expect("parent saved");
+        let child = manager.load_session(&new_id).expect("child saved");
+        assert_eq!(parent.messages.len(), 1);
+        assert_eq!(
+            child.metadata.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(child.metadata.forked_from_message_count, Some(1));
+        // SAFETY: guarded by the process-wide test env mutex above.
+        unsafe {
+            if let Some(previous_home) = previous_home {
+                std::env::set_var("HOME", previous_home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    #[test]
     fn test_save_with_default_path_uses_workspace() {
         let tmpdir = TempDir::new().unwrap();
         let mut app = create_test_app_with_tmpdir(&tmpdir);
@@ -416,6 +563,46 @@ mod tests {
         assert_eq!(app2.session.total_tokens, 500);
         assert!(app2.current_session_id.is_some());
         assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    }
+
+    #[test]
+    fn load_restores_artifact_registry() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
+        saved_app
+            .session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_call_big".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "artifact-session".to_string(),
+                tool_call_id: "call-big".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 128,
+                preview: "checking crate".to_string(),
+                storage_path: tmpdir.path().join("call-big.txt"),
+            });
+        let save_path = tmpdir.path().join("artifact_load.json");
+        save(&mut saved_app, Some(save_path.to_str().unwrap()));
+
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        app.session_artifacts
+            .push(crate::artifacts::ArtifactRecord {
+                id: "art_stale".to_string(),
+                kind: crate::artifacts::ArtifactKind::ToolOutput,
+                session_id: "stale-session".to_string(),
+                tool_call_id: "stale".to_string(),
+                tool_name: "exec_shell".to_string(),
+                created_at: chrono::Utc::now(),
+                byte_size: 1,
+                preview: "stale".to_string(),
+                storage_path: tmpdir.path().join("stale.txt"),
+            });
+
+        let result = load(&mut app, Some(save_path.to_str().unwrap()));
+
+        assert!(!result.is_error);
+        assert_eq!(app.session_artifacts, saved_app.session_artifacts);
     }
 
     #[test]

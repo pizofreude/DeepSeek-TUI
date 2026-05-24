@@ -95,6 +95,10 @@ pub struct EngineConfig {
     /// `instructions = [...]` config (or the per-project override).
     /// Resolved via `expand_path` so `~` works.
     pub instructions: Vec<PathBuf>,
+    pub project_context_pack_enabled: bool,
+    /// When true, the model is instructed to respond in the current locale
+    /// and a post-hoc translation layer replaces remaining English output.
+    pub translation_enabled: bool,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
@@ -128,6 +132,10 @@ pub struct EngineConfig {
     pub network_policy: Option<crate::network_policy::NetworkPolicyDecider>,
     /// Whether to take side-git workspace snapshots before/after each turn.
     pub snapshots_enabled: bool,
+    /// Maximum workspace size (in bytes) before snapshots self-disable on
+    /// first init. `0` disables the cap. Resolved from
+    /// `[snapshots] max_workspace_gb` × 1 GB at engine construction.
+    pub snapshots_max_workspace_bytes: u64,
     /// Post-edit LSP diagnostics injection (#136). When `None`, the engine
     /// constructs a disabled manager so the field is always present.
     pub lsp_config: Option<crate::lsp::LspConfig>,
@@ -142,6 +150,7 @@ pub struct EngineConfig {
     /// Path to the user memory file (#489). Always populated; only
     /// consulted when `memory_enabled` is `true`.
     pub memory_path: PathBuf,
+    pub vision_config: Option<crate::config::VisionModelConfig>,
     pub goal_objective: Option<String>,
     /// Resolved BCP-47 locale tag (e.g. `"en"`, `"zh-Hans"`, `"ja"`)
     /// for the `## Environment` block in the system prompt. The
@@ -153,6 +162,15 @@ pub struct EngineConfig {
     pub strict_tool_mode: bool,
     /// Workshop / large-tool-output routing (#548). `None` disables routing.
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
+    /// Which search backend `web_search` should use. Default: Bing.
+    pub search_provider: crate::config::SearchProvider,
+    /// API key for Tavily or Bocha. `None` for Bing or DuckDuckGo.
+    pub search_api_key: Option<String>,
+    /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
+    /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
+    /// once at engine construction, then threaded onto every
+    /// `SubAgentRuntime` the engine builds (#1806, #1808).
+    pub subagent_api_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -166,6 +184,8 @@ impl Default for EngineConfig {
             mcp_config_path: PathBuf::from("mcp.json"),
             skills_dir: crate::skills::default_skills_dir(),
             instructions: Vec::new(),
+            project_context_pack_enabled: true,
+            translation_enabled: false,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             features: Features::with_defaults(),
@@ -177,15 +197,57 @@ impl Default for EngineConfig {
             max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
             network_policy: None,
             snapshots_enabled: true,
+            snapshots_max_workspace_bytes:
+                crate::snapshot::DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT,
             lsp_config: None,
             runtime_services: RuntimeToolServices::default(),
             subagent_model_overrides: HashMap::new(),
             memory_enabled: false,
             memory_path: PathBuf::from("./memory.md"),
+            vision_config: None,
             strict_tool_mode: false,
             goal_objective: None,
             locale_tag: "en".to_string(),
             workshop: None,
+            search_provider: crate::config::SearchProvider::default(),
+            search_api_key: None,
+            subagent_api_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
+            ),
+        }
+    }
+}
+
+/// Reason the active turn was cancelled. The token from `tokio_util`
+/// does not carry a cause, so the engine keeps a sibling latch for
+/// approval and user-input waits that need to explain cancellation.
+///
+/// `External`, `Preempted`, and `Internal` are reserved for the
+/// remaining direct cancellation paths tracked in #1541.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CancelReason {
+    /// User-initiated cancel (Esc, `/cancel`, click cancel on modal).
+    User,
+    /// External / runtime-API cancel (HTTP `DELETE /v1/threads/...`,
+    /// task manager stop, parent agent cancel).
+    External,
+    /// Cancel triggered when a new turn starts before the previous one
+    /// finished — e.g. plain Enter while busy after the queueing path
+    /// pre-empts the running turn.
+    Preempted,
+    /// Engine internals tore down the turn (drop, channel close,
+    /// shutdown). Rare — surfaced as an internal error.
+    Internal,
+}
+
+impl CancelReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::User => "user cancelled the request",
+            Self::External => "request cancelled by external caller",
+            Self::Preempted => "request was preempted by a new turn",
+            Self::Internal => "engine torn down before approval resolved",
         }
     }
 }
@@ -199,6 +261,10 @@ pub struct EngineHandle {
     pub rx_event: Arc<RwLock<mpsc::Receiver<Event>>>,
     /// Shared pointer to the cancellation token for the current request.
     cancel_token: Arc<StdMutex<CancellationToken>>,
+    /// Latched reason for the most recent cancellation. Read by the
+    /// approval / user-input handlers to enrich their error strings.
+    /// Cleared by the engine when a fresh turn starts.
+    cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     /// Send approval decisions to the engine
     tx_approval: mpsc::Sender<ApprovalDecision>,
     /// Send user input responses to the engine
@@ -207,91 +273,8 @@ pub struct EngineHandle {
     tx_steer: mpsc::Sender<String>,
 }
 
-impl EngineHandle {
-    /// Send an operation to the engine
-    pub async fn send(&self, op: Op) -> Result<()> {
-        self.tx_op.send(op).await?;
-        Ok(())
-    }
-
-    /// Cancel the current request
-    pub fn cancel(&self) {
-        match self.cancel_token.lock() {
-            Ok(token) => token.cancel(),
-            Err(poisoned) => poisoned.into_inner().cancel(),
-        }
-    }
-
-    /// Check if a request is currently cancelled
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn is_cancelled(&self) -> bool {
-        match self.cancel_token.lock() {
-            Ok(token) => token.is_cancelled(),
-            Err(poisoned) => poisoned.into_inner().is_cancelled(),
-        }
-    }
-
-    /// Approve a pending tool call
-    pub async fn approve_tool_call(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::Approved { id: id.into() })
-            .await?;
-        Ok(())
-    }
-
-    /// Deny a pending tool call
-    pub async fn deny_tool_call(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::Denied { id: id.into() })
-            .await?;
-        Ok(())
-    }
-
-    /// Retry a tool call with an elevated sandbox policy.
-    pub async fn retry_tool_with_policy(
-        &self,
-        id: impl Into<String>,
-        policy: crate::sandbox::SandboxPolicy,
-    ) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::RetryWithPolicy {
-                id: id.into(),
-                policy,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Submit a response for request_user_input.
-    pub async fn submit_user_input(
-        &self,
-        id: impl Into<String>,
-        response: UserInputResponse,
-    ) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Submitted {
-                id: id.into(),
-                response,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Cancel a request_user_input prompt.
-    pub async fn cancel_user_input(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_user_input
-            .send(UserInputDecision::Cancelled { id: id.into() })
-            .await?;
-        Ok(())
-    }
-
-    /// Steer an in-flight turn with additional user input.
-    pub async fn steer(&self, content: impl Into<String>) -> Result<()> {
-        self.tx_steer.send(content.into()).await?;
-        Ok(())
-    }
-}
+// `impl EngineHandle { ... }` moved to `engine/handle.rs` so the
+// mailbox API can be reviewed independently of the engine internals.
 
 // === Engine ===
 
@@ -315,11 +298,16 @@ pub struct Engine {
     /// can fan completion events back into the engine.
     tx_subagent_completion: mpsc::UnboundedSender<SubAgentCompletion>,
     /// Receiver paired with `tx_subagent_completion`. Drained at the
-    /// turn-loop's empty-tool_uses branch to surface `<deepseek:subagent.done>`
+    /// turn-loop's empty-tool_uses branch to surface `<codewhale:subagent.done>`
     /// sentinels into the parent's transcript before deciding to end the turn.
     pub(super) rx_subagent_completion: mpsc::UnboundedReceiver<SubAgentCompletion>,
     cancel_token: CancellationToken,
     shared_cancel_token: Arc<StdMutex<CancellationToken>>,
+    /// Latched reason for the current cancellation, mirrored to
+    /// `EngineHandle::cancel_reason`. Read by `approval.rs` when
+    /// surfacing the "Request cancelled while awaiting …" error so the
+    /// user-facing message names a cause.
+    pub(super) cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     tool_exec_lock: Arc<RwLock<()>>,
     capacity_controller: CapacityController,
     /// Append-only layered context manager (#159). Opt-in for v0.7.5 while
@@ -359,6 +347,13 @@ impl Engine {
                 *poisoned.into_inner() = token;
             }
         }
+        // Fresh turn → clear any latched cancellation reason from the
+        // previous turn so a downstream "request cancelled" message
+        // doesn't inherit a stale cause.
+        match self.cancel_reason.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
     }
 
     fn env_only_api_key_recovery_hint(api_config: &Config) -> Option<String> {
@@ -371,6 +366,8 @@ impl Engine {
             ApiProvider::Deepseek | ApiProvider::DeepseekCN => "DEEPSEEK_API_KEY",
             ApiProvider::NvidiaNim => "NVIDIA_API_KEY/NVIDIA_NIM_API_KEY",
             ApiProvider::Openai => "OPENAI_API_KEY",
+            ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
+            ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
@@ -381,8 +378,8 @@ impl Engine {
 
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
-             Run `deepseek auth status` to inspect credential sources, then \
-             `deepseek auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
+             Run `codewhale auth status` to inspect credential sources, then \
+             `codewhale auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
              or remove the stale export and open a fresh shell.",
             provider = provider.as_str()
         ))
@@ -410,6 +407,7 @@ impl Engine {
         let (tx_subagent_completion, rx_subagent_completion) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
         let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
+        let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
         let tool_exec_lock = Arc::new(RwLock::new(()));
 
         // Create clients for both providers
@@ -442,13 +440,27 @@ impl Engine {
                 prompts::PromptSessionContext {
                     user_memory_block: user_memory_block.as_deref(),
                     goal_objective: config.goal_objective.as_deref(),
+                    project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
+                    translation_enabled: config.translation_enabled,
                 },
                 session.approval_mode,
             );
         let stable_prompt = Some(system_prompt);
         session.last_system_prompt_hash = Some(system_prompt_hash(stable_prompt.as_ref()));
         session.system_prompt = stable_prompt;
+
+        // Initialize prefix-cache stability monitor (lazy-pin).
+        // The system prompt is available now but the tool catalog isn't
+        // fully built until the first turn, so we start unpinned. The
+        // first `check_and_update` call in the turn loop will pin the
+        // fingerprint automatically.
+        let _ = session.prefix_stability.get_or_insert_with(|| {
+            // Use the tool registry's spec names for fingerprinting.
+            // At this point tool spec builders may not be registered yet,
+            // so we start with None — fingerprint will pin on first request.
+            crate::prefix_cache::PrefixStabilityManager::new_unpinned()
+        });
 
         let subagent_manager =
             new_shared_subagent_manager(config.workspace.clone(), config.max_subagents);
@@ -542,6 +554,7 @@ impl Engine {
             rx_subagent_completion,
             cancel_token: cancel_token.clone(),
             shared_cancel_token: shared_cancel_token.clone(),
+            cancel_reason: cancel_reason.clone(),
             tool_exec_lock,
             capacity_controller,
             seam_manager,
@@ -558,6 +571,7 @@ impl Engine {
             tx_op,
             rx_event: Arc::new(RwLock::new(rx_event)),
             cancel_token: shared_cancel_token,
+            cancel_reason,
             tx_approval,
             tx_user_input,
             tx_steer,
@@ -583,6 +597,7 @@ impl Engine {
                     trust_mode,
                     auto_approve,
                     approval_mode,
+                    translation_enabled,
                 } => {
                     self.handle_send_message(
                         content,
@@ -596,6 +611,7 @@ impl Engine {
                         trust_mode,
                         auto_approve,
                         approval_mode,
+                        translation_enabled,
                     )
                     .await;
                 }
@@ -648,8 +664,15 @@ impl Engine {
                         self.session.reasoning_effort_auto,
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
+                    .with_step_api_timeout(self.config.subagent_api_timeout)
                     .background_runtime();
-                    let route = resolve_subagent_assignment_route(&runtime, None, &prompt).await;
+                    let route = resolve_subagent_assignment_route(
+                        &runtime,
+                        None,
+                        &prompt,
+                        &SubAgentType::General,
+                    )
+                    .await;
                     runtime.model = route.model;
                     runtime.reasoning_effort = route.reasoning_effort;
                     runtime.reasoning_effort_auto = false;
@@ -723,15 +746,24 @@ impl Engine {
                         .await;
                 }
                 Op::SyncSession {
+                    session_id,
                     messages,
                     system_prompt,
+                    system_prompt_override,
                     model,
                     workspace,
                 } => {
+                    if let Some(session_id) = session_id {
+                        self.session.id = session_id;
+                    } else if messages.is_empty() && system_prompt.is_none() {
+                        self.session.id = uuid::Uuid::new_v4().to_string();
+                    }
                     self.session.messages = messages;
                     self.session.compaction_summary_prompt =
                         extract_compaction_summary_prompt(system_prompt.clone());
                     self.session.system_prompt = system_prompt;
+                    self.session.system_prompt_override =
+                        system_prompt_override && self.session.system_prompt.is_some();
                     self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                     self.session.model = model;
                     self.session.workspace = workspace.clone();
@@ -753,15 +785,6 @@ impl Engine {
                 }
                 Op::CompactContext => {
                     self.handle_manual_compaction().await;
-                }
-                Op::Rlm {
-                    content,
-                    model,
-                    child_model,
-                    max_depth,
-                } => {
-                    self.handle_rlm(content, model, child_model, max_depth)
-                        .await;
                 }
                 Op::EditLastTurn { new_message } => {
                     // #383: /edit — remove the last user+assistant exchange
@@ -794,6 +817,7 @@ impl Engine {
                         self.session.trust_mode,
                         self.session.auto_approve,
                         self.session.approval_mode,
+                        self.config.translation_enabled,
                     )
                     .await;
                 }
@@ -818,6 +842,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::SessionUpdated {
+                session_id: self.session.id.clone(),
                 messages: self.session.messages.clone(),
                 system_prompt: self.session.system_prompt.clone(),
                 model: self.session.model.clone(),
@@ -880,6 +905,7 @@ impl Engine {
         trust_mode: bool,
         auto_approve: bool,
         approval_mode: crate::tui::approval::ApprovalMode,
+        translation_enabled: bool,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -892,23 +918,28 @@ impl Engine {
         self.turn_counter = self.turn_counter.saturating_add(1);
         self.capacity_controller.mark_turn_start(self.turn_counter);
 
-        // Snapshot the workspace BEFORE we touch a single tool. Run the git
-        // work on the blocking pool so the async runtime stays responsive;
-        // failure is non-fatal (the helper logs at WARN).
-        if self.config.snapshots_enabled {
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let _ = tokio::task::spawn_blocking(move || pre_turn_snapshot(&pre_workspace, pre_seq))
-                .await;
-        }
-
-        // Emit turn started event
+        // Emit turn started event IMMEDIATELY so the UI knows the turn is
+        // active. The snapshot below can take 30+ seconds on slow filesystems
+        // (e.g. WSL2 /mnt/c) and must not delay the TurnStarted event.
         let _ = self
             .tx_event
             .send(Event::TurnStarted {
                 turn_id: turn.id.clone(),
             })
             .await;
+
+        // Snapshot the workspace BEFORE we touch a single tool. Run the git
+        // work on the blocking pool so the async runtime stays responsive;
+        // failure is non-fatal (the helper logs at WARN).
+        if self.config.snapshots_enabled {
+            let pre_workspace = self.session.workspace.clone();
+            let pre_seq = self.turn_counter;
+            let pre_cap = self.config.snapshots_max_workspace_bytes;
+            let _ = tokio::task::spawn_blocking(move || {
+                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap)
+            })
+            .await;
+        }
 
         // A new turn means any leftover retry banner (success cleared
         // it, failure pinned it) is no longer relevant — reset to idle
@@ -957,6 +988,7 @@ impl Engine {
         self.config.allow_shell = allow_shell;
         self.session.trust_mode = trust_mode;
         self.config.trust_mode = trust_mode;
+        self.config.translation_enabled = translation_enabled;
         self.session.auto_approve = auto_approve;
         self.session.approval_mode = if auto_approve {
             crate::tui::approval::ApprovalMode::Auto
@@ -1046,6 +1078,7 @@ impl Engine {
                             self.session.reasoning_effort_auto,
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
+                        .with_step_api_timeout(self.config.subagent_api_timeout)
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -1125,8 +1158,9 @@ impl Engine {
         if self.config.snapshots_enabled {
             let post_workspace = self.session.workspace.clone();
             let post_seq = self.turn_counter;
+            let post_cap = self.config.snapshots_max_workspace_bytes;
             crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(&post_workspace, post_seq);
+                post_turn_snapshot(&post_workspace, post_seq, post_cap);
             });
         }
     }
@@ -1233,100 +1267,6 @@ impl Engine {
             .await;
     }
 
-    /// Handle a Recursive Language Model (RLM) query — Algorithm 1 from
-    /// Zhang et al. (arXiv:2512.24601).
-    ///
-    /// The prompt is stored as PROMPT in a REPL variable. The root LLM
-    /// only sees metadata about the REPL state, never the prompt text
-    /// directly. The model generates Python code, which is executed by
-    /// the REPL. When FINAL() is called, the loop ends.
-    async fn handle_rlm(
-        &mut self,
-        content: String,
-        model: String,
-        child_model: String,
-        max_depth: u32,
-    ) {
-        use crate::rlm::turn::run_rlm_turn;
-
-        let Some(ref client) = self.deepseek_client else {
-            let err = self
-                .deepseek_client_error
-                .as_deref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "API client not configured".to_string());
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
-                    "RLM error: {err}"
-                ))))
-                .await;
-            return;
-        };
-
-        let _ = self
-            .tx_event
-            .send(Event::status("RLM turn started".to_string()))
-            .await;
-
-        let result = run_rlm_turn(
-            client,
-            model,
-            content,
-            child_model,
-            self.tx_event.clone(),
-            max_depth,
-        )
-        .await;
-
-        let has_error = result.error.is_some();
-        if let Some(ref err) = result.error {
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::tool(format!(
-                    "RLM error: {err}"
-                ))))
-                .await;
-        }
-
-        if !result.answer.is_empty() {
-            // Add the final answer as an assistant message in the session.
-            self.add_session_message(crate::models::Message {
-                role: "assistant".to_string(),
-                content: vec![crate::models::ContentBlock::Text {
-                    text: result.answer.clone(),
-                    cache_control: None,
-                }],
-            })
-            .await;
-
-            let _ = self
-                .tx_event
-                .send(Event::MessageDelta {
-                    index: 0,
-                    content: result.answer.clone(),
-                })
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::MessageComplete { index: 0 })
-                .await;
-        }
-
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: result.usage,
-                status: if has_error {
-                    crate::core::events::TurnOutcomeStatus::Failed
-                } else {
-                    crate::core::events::TurnOutcomeStatus::Completed
-                },
-                error: result.error,
-            })
-            .await;
-    }
-
     fn estimated_input_tokens(&self) -> usize {
         estimate_input_tokens_conservative(
             &self.session.messages,
@@ -1423,7 +1363,7 @@ impl Engine {
                 "Emergency compaction complete: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
             );
             if retries_used > 0 {
-                details.push_str(&format!(" ({} retries)", retries_used));
+                details.push_str(&format!(" ({retries_used} retries)"));
             }
             if trimmed > 0 {
                 details.push_str(&format!(", trimmed {trimmed} oldest"));
@@ -1442,8 +1382,7 @@ impl Engine {
 
         let message = format!(
             "Emergency context compaction failed to reduce request below model limit \
-             (estimate ~{} tokens, budget ~{}).",
-            after_tokens, target_budget
+             (estimate ~{after_tokens} tokens, budget ~{target_budget})."
         );
         self.emit_compaction_failed(id, true, message.clone()).await;
         let _ = self.tx_event.send(Event::status(message)).await;
@@ -1456,6 +1395,15 @@ impl Engine {
         // `/trust add` / `/trust remove` mutations without an explicit cache
         // refresh hook.
         let trusted = crate::workspace_trust::WorkspaceTrust::load_for(&self.session.workspace);
+        let mut trusted_external_paths = trusted.paths().to_vec();
+        let clipboard_images_dir =
+            crate::tui::clipboard::clipboard_images_dir(&self.session.workspace);
+        if !trusted_external_paths
+            .iter()
+            .any(|path| path == &clipboard_images_dir)
+        {
+            trusted_external_paths.push(clipboard_images_dir);
+        }
         let mut ctx = ToolContext::with_auto_approve(
             self.session.workspace.clone(),
             self.session.trust_mode,
@@ -1468,7 +1416,7 @@ impl Engine {
         .with_shell_manager(self.shell_manager.clone())
         .with_runtime_services(self.config.runtime_services.clone())
         .with_cancel_token(self.cancel_token.clone())
-        .with_trusted_external_paths(trusted.paths().to_vec());
+        .with_trusted_external_paths(trusted_external_paths);
 
         // Hand the user-memory path to tools so the model-callable
         // `remember` tool can append entries (#489). `None` when the
@@ -1500,11 +1448,15 @@ impl Engine {
             ctx = ctx.with_sandbox_backend(std::sync::Arc::clone(backend));
         }
 
+        // Wire search provider config.
+        ctx.search_provider = self.config.search_provider;
+        ctx.search_api_key = self.config.search_api_key.clone();
+
         let policy = sandbox_policy_for_mode(mode, &self.session.workspace);
         let mut ctx = ctx.with_elevated_sandbox_policy(policy);
         if matches!(mode, AppMode::Plan) {
             ctx = ctx.with_shell_network_denied_hint(
-                "Shell command blocked: Plan mode runs shell commands in a read-only sandbox — no writes, no network. Use Agent mode (`/agent`) for any command that creates or modifies files, or that needs network access.",
+                "Shell command blocked: Plan mode runs shell commands in a read-only sandbox — no writes, no network. Use Agent mode (`/mode agent`) for any command that creates or modifies files, or that needs network access.",
             );
         }
         ctx
@@ -1539,7 +1491,7 @@ impl Engine {
             let _ = self
                 .tx_event
                 .send(Event::status(format!(
-                    "Failed to connect MCP server '{server}': {err}"
+                    "Failed to connect MCP server '{server}': {err:#}"
                 )))
                 .await;
         }
@@ -1862,13 +1814,19 @@ impl Engine {
             prompts::PromptSessionContext {
                 user_memory_block: user_memory_block.as_deref(),
                 goal_objective: self.config.goal_objective.as_deref(),
+                project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
+                translation_enabled: self.config.translation_enabled,
             },
             self.session.approval_mode,
         );
         let stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
+        if self.session.system_prompt_override {
+            self.session.last_system_prompt_hash = Some(stable_hash);
+            return;
+        }
         if self.session.last_system_prompt_hash != Some(stable_hash) {
             self.session.system_prompt = stable_prompt;
             self.session.last_system_prompt_hash = Some(stable_hash);
@@ -1975,10 +1933,12 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
+    let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
     let handle = EngineHandle {
         tx_op,
         rx_event: Arc::new(RwLock::new(rx_event)),
         cancel_token: shared_cancel_token,
+        cancel_reason,
         tx_approval,
         tx_user_input,
         tx_steer,
@@ -1997,6 +1957,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
 mod approval;
 mod capacity_flow;
 mod context;
+mod handle;
 pub(crate) use context::compact_tool_result_for_context;
 use context::{
     COMPACTION_SUMMARY_MARKER, MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
@@ -2014,12 +1975,14 @@ mod tool_setup;
 mod turn_loop;
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
+#[cfg(test)]
+use self::dispatch::should_parallelize_tool_batch;
 use self::dispatch::{
-    ParallelToolResult, ParallelToolResultEntry, ToolExecGuard, ToolExecOutcome, ToolExecutionPlan,
-    caller_allowed_for_tool, caller_type_for_tool_use, final_tool_input, format_tool_error,
-    mcp_tool_approval_description, mcp_tool_is_parallel_safe, mcp_tool_is_read_only,
-    parse_parallel_tool_calls, parse_tool_input, should_force_update_plan_first,
-    should_parallelize_tool_batch, should_stop_after_plan_tool,
+    ParallelToolResult, ParallelToolResultEntry, ToolExecGuard, ToolExecOutcome,
+    ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
+    final_tool_input, format_tool_error, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
+    mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
+    plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
 };
 use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
@@ -2033,15 +1996,20 @@ use self::streaming::{
     should_transparently_retry_stream, stream_chunk_timeout_secs,
 };
 use self::tool_catalog::{
-    CODE_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME, REQUEST_USER_INPUT_NAME,
-    active_tools_for_step, build_model_tool_catalog, ensure_advanced_tooling,
-    execute_code_execution_tool, execute_tool_search, initial_active_tools, is_tool_search_tool,
-    maybe_activate_requested_deferred_tool, missing_tool_error_message,
+    CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
+    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
+    ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
+    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
+    missing_tool_error_message,
 };
 #[cfg(test)]
-use self::tool_catalog::{TOOL_SEARCH_BM25_NAME, should_default_defer_tool};
+use self::tool_catalog::{
+    TOOL_SEARCH_BM25_NAME, maybe_activate_requested_deferred_tool,
+    preflight_requested_deferred_tool, should_default_defer_tool,
+};
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::sandbox_policy_for_mode;
+use crate::tools::js_execution::execute_js_execution_tool;
 
 #[cfg(test)]
 mod tests;

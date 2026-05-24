@@ -4,6 +4,18 @@ use crate::tools::spec::ToolContext;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+// `env_lock` exists only to serialize Unix-only env-mutating tests.
+// Windows builds gate that test out, so the helper would be dead code
+// under `-Dwarnings` if the import + helper were unconditional.
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(unix)]
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn echo_command(message: &str) -> String {
     format!("echo {message}")
 }
@@ -12,10 +24,7 @@ fn sleep_command(seconds: u64) -> String {
     #[cfg(windows)]
     {
         let ping_count = seconds.saturating_add(1);
-        let ps_path = r#"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"#;
-        format!(
-            "\"{ps_path}\" -NoProfile -Command \"Start-Sleep -Seconds {seconds}\" || ping 127.0.0.1 -n {ping_count} > NUL"
-        )
+        format!("ping 127.0.0.1 -n {ping_count} > NUL")
     }
     #[cfg(not(windows))]
     {
@@ -27,10 +36,7 @@ fn sleep_then_echo_command(seconds: u64, message: &str) -> String {
     #[cfg(windows)]
     {
         let ping_count = seconds.saturating_add(1);
-        let ps_path = r#"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"#;
-        format!(
-            "\"{ps_path}\" -NoProfile -Command \"Start-Sleep -Seconds {seconds}; Write-Output {message}\" || (ping 127.0.0.1 -n {ping_count} > NUL && echo {message})"
-        )
+        format!("ping 127.0.0.1 -n {ping_count} > NUL && echo {message}")
     }
     #[cfg(not(windows))]
     {
@@ -80,6 +86,49 @@ fn failed_network_shell_result(stdout: &str, stderr: &str) -> ShellResult {
         sandbox_type: Some("seatbelt".to_string()),
         sandbox_denied: false,
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn shell_execution_scrubs_parent_env_and_keeps_explicit_env() {
+    let _guard = env_lock().lock().expect("env lock");
+    let previous = std::env::var_os("DEEPSEEK_CHILD_ENV_SHELL_SECRET");
+    unsafe {
+        std::env::set_var("DEEPSEEK_CHILD_ENV_SHELL_SECRET", "parent-secret");
+    }
+
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let mut extra = std::collections::HashMap::new();
+    extra.insert(
+        "DEEPSEEK_CHILD_ENV_EXPLICIT".to_string(),
+        "explicit-value".to_string(),
+    );
+
+    let result = manager
+        .execute_with_options_env(
+            "printf '%s\\n%s\\n' \"${DEEPSEEK_CHILD_ENV_SHELL_SECRET-unset}\" \"${DEEPSEEK_CHILD_ENV_EXPLICIT-unset}\"",
+            None,
+            5000,
+            false,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .expect("execute");
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("DEEPSEEK_CHILD_ENV_SHELL_SECRET", value);
+        },
+        None => unsafe {
+            std::env::remove_var("DEEPSEEK_CHILD_ENV_SHELL_SECRET");
+        },
+    }
+
+    assert_eq!(result.status, ShellStatus::Completed);
+    assert_eq!(result.stdout, "unset\nexplicit-value\n");
 }
 
 #[test]
@@ -346,6 +395,29 @@ async fn test_exec_shell_metadata_includes_summaries() {
     assert!(summary.contains("hello"));
     assert!(meta.get("stdout_len").is_some());
     assert!(meta.get("stdout_truncated").is_some());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_exec_shell_combined_output_uses_single_stream() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let tool = ExecShellTool;
+    let command = "printf 'out\\n'; printf 'err\\n' >&2";
+
+    let result = tool
+        .execute(json!({"command": command, "combined_output": true}), &ctx)
+        .await
+        .expect("execute");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("out"), "{}", result.content);
+    assert!(result.content.contains("err"), "{}", result.content);
+
+    let meta = result.metadata.expect("metadata");
+    assert_eq!(
+        meta.get("combined_output").and_then(Value::as_bool),
+        Some(true)
+    );
 }
 
 #[tokio::test]
@@ -633,4 +705,155 @@ async fn test_exec_shell_cancel_tool_can_kill_all_running_processes() {
     let second_job = manager.inspect_job(&second).expect("inspect second");
     assert_eq!(first_job.snapshot.status, ShellStatus::Killed);
     assert_eq!(second_job.snapshot.status, ShellStatus::Killed);
+}
+
+fn make_failed_result(stderr: &str) -> ShellResult {
+    ShellResult {
+        task_id: None,
+        status: ShellStatus::Failed,
+        exit_code: Some(1),
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+        duration_ms: 0,
+        stdout_len: 0,
+        stderr_len: stderr.len(),
+        stdout_omitted: 0,
+        stderr_omitted: 0,
+        stdout_truncated: false,
+        sandboxed: false,
+        sandbox_type: None,
+        sandbox_denied: false,
+        stderr_truncated: false,
+    }
+}
+
+#[test]
+fn test_macos_provenance_detected_by_activity_time_message() {
+    let result = make_failed_result(
+        "failed to update builder last activity time: open \
+         /Users/user/.docker/buildx/activity/.tmp-abc: operation not permitted",
+    );
+    assert!(looks_like_macos_provenance_failure(&result));
+}
+
+#[test]
+fn test_macos_provenance_detected_by_activity_path_and_eperm() {
+    let result = make_failed_result(
+        "error: open /home/user/.docker/buildx/activity/foo: operation not permitted",
+    );
+    assert!(looks_like_macos_provenance_failure(&result));
+}
+
+#[test]
+fn test_macos_provenance_not_triggered_on_success() {
+    let mut result = make_failed_result(
+        "failed to update builder last activity time: open \
+         /Users/user/.docker/buildx/activity/.tmp-abc: operation not permitted",
+    );
+    result.status = ShellStatus::Completed;
+    result.exit_code = Some(0);
+    assert!(!looks_like_macos_provenance_failure(&result));
+}
+
+#[test]
+fn test_macos_provenance_not_triggered_on_unrelated_eperm() {
+    let result = make_failed_result("open /some/other/path: operation not permitted");
+    assert!(!looks_like_macos_provenance_failure(&result));
+}
+
+// Regression test for #828: shell spawns an orphaned background subprocess
+// (simulating `nohup curl`) that keeps the pipe write-end open after the shell
+// exits. collect_output() must not block indefinitely — it kills the whole
+// process group first, allowing reader threads to get EOF and exit.
+#[cfg(unix)]
+#[test]
+fn test_orphaned_subprocess_does_not_block_collect_output() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+
+    // sh spawns `sleep 100 &` and exits; the sleep subprocess inherits the
+    // pipe write-ends and would keep reader threads blocked without the fix.
+    let result = manager
+        .execute("sh -c 'sleep 100 &'", None, 5000, true)
+        .expect("execute");
+    let task_id = result.task_id.expect("task id");
+
+    // Drive to completion with a tight timeout — must not hang.
+    let done = manager
+        .get_output(&task_id, true, 3000)
+        .expect("get_output must complete, not hang");
+    assert_eq!(done.status, ShellStatus::Completed);
+}
+
+#[test]
+fn test_list_jobs_cleans_up_completed_old_processes() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+
+    let bg = manager
+        .execute(&echo_command("bg"), None, 5000, true)
+        .expect("execute bg");
+    let bg_id = bg.task_id.expect("bg task id");
+    manager.get_output(&bg_id, true, 3000).expect("bg done");
+
+    // Both the completed job and any tracking state should be present.
+    assert!(!manager.processes.is_empty());
+
+    // cleanup(ZERO) removes all completed processes immediately.
+    manager.cleanup(Duration::ZERO);
+    assert!(
+        manager.processes.is_empty(),
+        "completed processes should be evicted by cleanup"
+    );
+}
+
+/// Regression for #1691: a `git commit -m "feat: complete sub-pages"` shell
+/// command must reach the OS shell with its quoted message intact (one argv
+/// slot), never split into `feat:` / `complete` / `sub-pages"`.
+#[test]
+fn issue_1691_quoted_commit_message_round_trips() {
+    let cmd = r#"git commit -m "feat: complete sub-pages""#;
+    let spec = CommandSpec::shell(
+        cmd,
+        std::path::PathBuf::from("/tmp"),
+        Duration::from_secs(5),
+    );
+
+    #[cfg(not(windows))]
+    {
+        // `sh -c <cmd>`: the whole command (with quotes) is a single argv
+        // entry. `sh` then POSIX-tokenizes it → correct git argv. We never
+        // split the command string ourselves.
+        assert_eq!(spec.program, "sh");
+        assert_eq!(spec.args, ["-c".to_string(), cmd.to_string()]);
+        assert_eq!(spec.args.len(), 2);
+
+        // push_shell_args is a faithful pass-through on Unix.
+        let mut built = Command::new(&spec.program);
+        push_shell_args(&mut built, &spec.program, &spec.args);
+        let got: Vec<String> = built
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, ["-c".to_string(), cmd.to_string()]);
+    }
+
+    #[cfg(windows)]
+    {
+        // `cmd /C <payload>`: payload carries the quotes verbatim. The fix
+        // routes /C + payload through `raw_arg` so `cmd.exe` (not MSVCRT)
+        // parses it, matching what a terminal does.
+        assert_eq!(spec.program, "cmd");
+        assert_eq!(
+            spec.args,
+            ["/C".to_string(), format!("chcp 65001 >NUL & {cmd}")]
+        );
+        let mut built = Command::new(&spec.program);
+        push_shell_args(&mut built, &spec.program, &spec.args);
+        let got: Vec<String> = built
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, spec.args);
+    }
 }

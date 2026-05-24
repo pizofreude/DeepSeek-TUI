@@ -6,16 +6,18 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use dotenvy::dotenv;
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
 mod acp_server;
+mod artifacts;
 mod audit;
 mod auto_reasoning;
 mod automation_manager;
+mod child_env;
 mod client;
 mod command_safety;
 mod commands;
@@ -28,6 +30,7 @@ mod core;
 mod cost_status;
 mod cycle_manager;
 mod deepseek_theme;
+mod dependencies;
 mod error_taxonomy;
 mod eval;
 mod execpolicy;
@@ -44,6 +47,7 @@ mod memory;
 mod models;
 mod network_policy;
 mod palette;
+mod prefix_cache;
 mod pricing;
 mod project_context;
 mod project_doc;
@@ -52,6 +56,7 @@ pub mod repl;
 mod retry_status;
 pub mod rlm;
 mod runtime_api;
+mod runtime_log;
 mod runtime_threads;
 mod sandbox;
 mod schema_migration;
@@ -67,6 +72,7 @@ mod test_support;
 mod tools;
 mod tui;
 mod utils;
+mod vision;
 mod working_set;
 mod workspace_trust;
 
@@ -95,11 +101,12 @@ fn configure_windows_console_utf8() {}
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "deepseek",
+    name = "codewhale-tui",
+    bin_name = "codewhale-tui",
     author,
     version = env!("DEEPSEEK_BUILD_VERSION"),
-    about = "DeepSeek TUI/CLI for DeepSeek models",
-    long_about = "Terminal-native TUI and CLI for DeepSeek models.\n\nRun 'deepseek' to start.\n\nNot affiliated with DeepSeek Inc."
+    about = "codewhale/CLI for DeepSeek models",
+    long_about = "Terminal-native TUI and CLI for DeepSeek models.\n\nRun 'codewhale' to start.\n\nNot affiliated with DeepSeek Inc."
 )]
 struct Cli {
     /// Subcommand to run
@@ -150,7 +157,8 @@ struct Cli {
     #[arg(long = "no-alt-screen", hide = true)]
     no_alt_screen: bool,
 
-    /// Enable TUI mouse capture for internal scrolling and transcript selection
+    /// Enable TUI mouse capture for internal scrolling, transcript selection,
+    /// and scrollbar dragging
     /// (default off on Windows)
     #[arg(long = "mouse-capture", conflicts_with = "no_mouse_capture")]
     mouse_capture: bool,
@@ -279,12 +287,97 @@ struct ExecArgs {
     #[arg(long, default_value_t = false)]
     auto: bool,
     /// Emit machine-readable JSON output
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "output_format")]
     json: bool,
+    /// Resume a previous session by ID or prefix
+    #[arg(long, value_name = "SESSION_ID", conflicts_with_all = ["session_id", "continue_session"])]
+    resume: Option<String>,
+    /// Resume a previous session by ID or prefix
+    #[arg(long = "session-id", value_name = "SESSION_ID", conflicts_with_all = ["resume", "continue_session"])]
+    session_id: Option<String>,
+    /// Continue the most recent session for this workspace
+    #[arg(long = "continue", default_value_t = false, conflicts_with_all = ["resume", "session_id"])]
+    continue_session: bool,
+    /// Output format for exec mode
+    #[arg(long, value_enum, default_value_t = ExecOutputFormat::Text)]
+    output_format: ExecOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExecOutputFormat {
+    Text,
+    #[value(name = "stream-json")]
+    StreamJson,
+}
+
+/// Spawn a tokio task that listens for terminating signals (SIGINT
+/// always; SIGTERM and SIGHUP on Unix) and, on receipt, restores the
+/// terminal modes and exits with the conventional 128 + signal code.
+/// Multiple deliveries are tolerated: once the cleanup runs, a second
+/// signal short-circuits to plain exit so a stuck cleanup can never
+/// trap a frustrated user pressing Ctrl+C repeatedly.
+///
+/// See the call site in `main` for the rationale (#1583).
+fn spawn_signal_cleanup_task() {
+    tokio::spawn(async {
+        let exit_code = wait_for_terminating_signal().await;
+        // If we get here a fatal signal arrived. Restore the terminal
+        // and exit. A second signal during cleanup re-enters this
+        // path and aborts via `std::process::exit` directly.
+        static CLEANED_UP: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !CLEANED_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            crate::tui::ui::emergency_restore_terminal();
+        }
+        std::process::exit(exit_code);
+    });
+}
+
+#[cfg(unix)]
+async fn wait_for_terminating_signal() -> i32 {
+    use tokio::signal::unix::{SignalKind, signal};
+    // Failing to install any individual stream is non-fatal: we still
+    // want the others to work. The fallback never-resolving future
+    // keeps `select!` well-typed when a stream fails to register.
+    let mut sigint = signal(SignalKind::interrupt()).ok();
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    let mut sighup = signal(SignalKind::hangup()).ok();
+    tokio::select! {
+        _ = async { match sigint.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 130,
+        _ = async { match sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 143,
+        _ = async { match sighup.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 129,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminating_signal() -> i32 {
+    // Windows: tokio::signal::ctrl_c covers both Ctrl+C and Ctrl+Break
+    // (CTRL_C_EVENT / CTRL_BREAK_EVENT). Console-close, logoff, and
+    // shutdown events are not currently routed through tokio.
+    let _ = tokio::signal::ctrl_c().await;
+    130
 }
 
 fn join_prompt_parts(parts: &[String]) -> String {
     parts.join(" ")
+}
+
+fn resolve_exec_resume_session_id(args: &ExecArgs, workspace: &Path) -> Result<Option<String>> {
+    if let Some(id) = args.resume.as_ref().or(args.session_id.as_ref()) {
+        return Ok(Some(id.clone()));
+    }
+    if !args.continue_session {
+        return Ok(None);
+    }
+    latest_session_id_for_workspace(workspace)?.map_or_else(
+        || {
+            bail!(
+                "No saved sessions found for workspace {}. Use `codewhale sessions` to list sessions, or pass `codewhale exec --resume <SESSION_ID> ...`.",
+                workspace.display()
+            )
+        },
+        |id| Ok(Some(id)),
+    )
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -437,6 +530,9 @@ struct ServeArgs {
     /// `DEEPSEEK_RUNTIME_TOKEN` when omitted.
     #[arg(long = "auth-token", value_name = "TOKEN")]
     auth_token: Option<String>,
+    /// Disable runtime API auth when no token is configured. Only use on a trusted loopback.
+    #[arg(long = "insecure")]
+    insecure_no_auth: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -494,15 +590,15 @@ enum McpCommand {
     Validate,
     /// Register this DeepSeek binary as a local MCP stdio server.
     ///
-    /// This adds a config entry that runs `deepseek serve --mcp` (stdio protocol).
-    /// For the HTTP/SSE runtime API, use `deepseek serve --http` directly instead.
+    /// This adds a config entry that runs `codewhale serve --mcp` (stdio protocol).
+    /// For the HTTP/SSE runtime API, use `codewhale serve --http` directly instead.
     #[command(
         name = "add-self",
-        long_about = "Register this DeepSeek binary as a local MCP stdio server.\n\nAdds a config entry to ~/.deepseek/mcp.json that launches `deepseek serve --mcp`\nvia the stdio transport. Other DeepSeek sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `deepseek serve --http` instead if you need the HTTP/SSE runtime API."
+        long_about = "Register this DeepSeek binary as a local MCP stdio server.\n\nAdds a config entry to ~/.deepseek/mcp.json that launches `codewhale serve --mcp`\nvia the stdio transport. Other DeepSeek sessions (or any MCP client) can then\ndiscover and call tools exposed by this server.\n\nUse `codewhale serve --http` instead if you need the HTTP/SSE runtime API."
     )]
     AddSelf {
-        /// Server name in mcp.json (default: "deepseek")
-        #[arg(long, default_value = "deepseek")]
+        /// Server name in mcp.json (default: "codewhale")
+        #[arg(long, default_value = "codewhale")]
         name: String,
         /// Workspace directory for the MCP server
         #[arg(long)]
@@ -583,19 +679,10 @@ async fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |panic_info| {
         // Restore the terminal first so the panic message itself, plus the
         // user's shell after exit, are visible. Best-effort — we may not be
-        // in raw / alt-screen mode if the panic happens pre-TUI.
-        use crossterm::event::{
-            DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
-        };
-        use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
-        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-        // Best-effort: turn off bracketed paste + mouse capture so the user's
-        // parent shell doesn't get stuck wrapping pastes in `\e[200~…\e[201~`
-        // or printing `\e[<…M` on every click after a TUI panic.
-        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-        let _ = disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        // in raw / alt-screen mode if the panic happens pre-TUI. Shared
+        // with the signal handler installed below so both exit paths leave
+        // the terminal in the same well-defined state.
+        crate::tui::ui::emergency_restore_terminal();
 
         let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -623,6 +710,22 @@ async fn main() -> Result<()> {
         // Invoke the original hook (prints to stderr, etc.)
         orig_hook(panic_info);
     }));
+
+    // Install signal handlers that restore the terminal before the
+    // process exits. Without this, Ctrl+C delivered while raw mode /
+    // kitty keyboard enhancement / alt-screen are active (or in the
+    // brief windows around startup and teardown where they're being
+    // toggled) leaves the user's shell receiving raw CSI sequences
+    // like `^[[>5u` until they run `reset` (#1583).
+    //
+    // Once the TUI's raw mode is engaged the terminal driver delivers
+    // Ctrl+C as the byte 0x03 rather than SIGINT, so the in-TUI key
+    // handler — not this handler — is what processes user interrupts
+    // during normal operation. This handler exists for the gaps:
+    // pre-TUI subcommands (--version, doctor, login, …), the moments
+    // around enable_raw_mode / disable_raw_mode, the external-editor
+    // suspend path, and SIGTERM / SIGHUP from the OS.
+    spawn_signal_cleanup_task();
 
     dotenv().ok();
     let cli = Cli::parse();
@@ -662,13 +765,19 @@ async fn main() -> Result<()> {
                 let config = load_config_from_cli(&cli)?;
                 let model = args
                     .model
+                    .clone()
                     .or_else(|| config.default_text_model.clone())
                     .unwrap_or_else(|| config.default_model());
                 let prompt = join_prompt_parts(&args.prompt);
-                if args.auto || cli.yolo {
-                    let workspace = cli.workspace.clone().unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                    });
+                let workspace = cli.workspace.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                });
+                let resume_session_id = resolve_exec_resume_session_id(&args, &workspace)?;
+                let needs_engine = args.auto
+                    || cli.yolo
+                    || resume_session_id.is_some()
+                    || args.output_format == ExecOutputFormat::StreamJson;
+                if needs_engine {
                     let max_subagents = cli.max_subagents.map_or_else(
                         || config.max_subagents(),
                         |value| value.clamp(1, MAX_SUBAGENTS),
@@ -680,9 +789,11 @@ async fn main() -> Result<()> {
                         &prompt,
                         workspace,
                         max_subagents,
-                        true,
+                        auto_mode,
                         auto_mode,
                         args.json,
+                        resume_session_id,
+                        args.output_format,
                     )
                     .await
                 } else if args.json {
@@ -748,6 +859,7 @@ async fn main() -> Result<()> {
                             workers: args.workers.clamp(1, 8),
                             cors_origins,
                             auth_token: args.auth_token,
+                            insecure_no_auth: args.insecure_no_auth,
                         },
                     )
                     .await
@@ -782,7 +894,7 @@ async fn main() -> Result<()> {
         return run_one_shot(&config, &model, &prompt).await;
     }
 
-    // Handle session resume. Plain `deepseek` starts fresh: interrupted
+    // Handle session resume. Plain `codewhale` starts fresh: interrupted
     // snapshots are preserved for explicit resume, but never auto-attached.
     let resume_session_id = if cli.continue_session {
         let workspace = resolve_workspace(&cli);
@@ -932,6 +1044,7 @@ fn mcp_template_json() -> Result<String> {
             required: false,
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            headers: std::collections::HashMap::new(),
         },
     );
     serde_json::to_string_pretty(&cfg)
@@ -974,7 +1087,7 @@ fn init_skills_dir(skills_dir: &Path, force: bool) -> Result<(PathBuf, WriteStat
 fn tools_readme_template() -> &'static str {
     "# Local tools\n\n\
      Drop self-describing scripts here so they can be discovered by\n\
-     `deepseek-tui setup --status` and surfaced in `deepseek-tui doctor`.\n\n\
+     `codewhale-tui setup --status` and surfaced in `codewhale-tui doctor`.\n\n\
      Each script should start with a frontmatter-style header so the\n\
      description is visible without executing the file:\n\n\
      ```\n\
@@ -992,7 +1105,7 @@ fn tools_example_script() -> &'static str {
      # name: example\n\
      # description: Print a confirmation that local tool discovery works\n\
      # usage: example [name]\n\
-     printf 'deepseek-tui local tool ok: %s\\n' \"${1:-world}\"\n"
+     printf 'codewhale-tui local tool ok: %s\\n' \"${1:-world}\"\n"
 }
 
 fn init_tools_dir(tools_dir: &Path, force: bool) -> Result<(PathBuf, WriteStatus, WriteStatus)> {
@@ -1053,7 +1166,7 @@ fn init_plugins_dir(
     Ok((readme_path, example_path, readme_status, example_status))
 }
 
-/// Resolve the user-supplied CORS origins for `deepseek serve --http`.
+/// Resolve the user-supplied CORS origins for `codewhale serve --http`.
 ///
 /// Sources, in priority order (later sources extend earlier ones):
 /// 1. `--cors-origin URL` flags (repeatable)
@@ -1178,7 +1291,9 @@ fn run_setup(config: &Config, workspace: &Path, args: SetupArgs) -> Result<()> {
                 println!("  · MCP config already exists at {}", mcp_path.display());
             }
         }
-        println!("    Next: edit the file, then run `deepseek mcp list` or `deepseek mcp tools`.");
+        println!(
+            "    Next: edit the file, then run `codewhale mcp list` or `codewhale mcp tools`."
+        );
     }
 
     if run_skills {
@@ -1350,37 +1465,45 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
             let (env_var, login_hint) = match config.api_provider() {
                 crate::config::ApiProvider::NvidiaNim => (
                     "NVIDIA_API_KEY",
-                    "deepseek auth set --provider nvidia-nim --api-key \"...\"",
+                    "codewhale auth set --provider nvidia-nim --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Openai => (
                     "OPENAI_API_KEY",
-                    "deepseek auth set --provider openai --api-key \"...\"",
+                    "codewhale auth set --provider openai --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::Atlascloud => (
+                    "ATLASCLOUD_API_KEY",
+                    "codewhale auth set --provider atlascloud --api-key \"...\"",
+                ),
+                crate::config::ApiProvider::WanjieArk => (
+                    "WANJIE_ARK_API_KEY",
+                    "codewhale auth set --provider wanjie-ark --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Openrouter => (
                     "OPENROUTER_API_KEY",
-                    "deepseek auth set --provider openrouter --api-key \"...\"",
+                    "codewhale auth set --provider openrouter --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Novita => (
                     "NOVITA_API_KEY",
-                    "deepseek auth set --provider novita --api-key \"...\"",
+                    "codewhale auth set --provider novita --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Fireworks => (
                     "FIREWORKS_API_KEY",
-                    "deepseek auth set --provider fireworks --api-key \"...\"",
+                    "codewhale auth set --provider fireworks --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Sglang => (
                     "SGLANG_API_KEY",
-                    "deepseek auth set --provider sglang --api-key \"...\"",
+                    "codewhale auth set --provider sglang --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Vllm => (
                     "VLLM_API_KEY",
-                    "deepseek auth set --provider vllm --api-key \"...\"",
+                    "codewhale auth set --provider vllm --api-key \"...\"",
                 ),
                 crate::config::ApiProvider::Ollama => {
-                    ("OLLAMA_API_KEY", "deepseek auth set --provider ollama")
+                    ("OLLAMA_API_KEY", "codewhale auth set --provider ollama")
                 }
                 crate::config::ApiProvider::Deepseek | crate::config::ApiProvider::DeepseekCN => {
-                    ("DEEPSEEK_API_KEY", "deepseek auth set --provider deepseek")
+                    ("DEEPSEEK_API_KEY", "codewhale auth set --provider deepseek")
                 }
             };
             println!(
@@ -1389,6 +1512,8 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
                 match config.api_provider() {
                     crate::config::ApiProvider::NvidiaNim => "nvidia_nim",
                     crate::config::ApiProvider::Openai => "openai",
+                    crate::config::ApiProvider::Atlascloud => "atlascloud",
+                    crate::config::ApiProvider::WanjieArk => "wanjie_ark",
                     crate::config::ApiProvider::Openrouter => "openrouter",
                     crate::config::ApiProvider::Novita => "novita",
                     crate::config::ApiProvider::Fireworks => "fireworks",
@@ -1473,7 +1598,7 @@ fn run_setup_status(config: &Config, workspace: &Path) -> Result<()> {
     println!("  {} {}", "·".dimmed(), dotenv_status_line(workspace));
 
     println!();
-    println!("Run `deepseek doctor --json` for a machine-readable check.");
+    println!("Run `codewhale doctor --json` for a machine-readable check.");
     Ok(())
 }
 
@@ -1541,16 +1666,14 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
 
     println!(
         "{}",
-        "DeepSeek TUI Doctor"
-            .truecolor(blue_r, blue_g, blue_b)
-            .bold()
+        "codewhale Doctor".truecolor(blue_r, blue_g, blue_b).bold()
     );
     println!("{}", "==================".truecolor(sky_r, sky_g, sky_b));
     println!();
 
     // Version info
     println!("{}", "Version Information:".bold());
-    println!("  deepseek-tui: {}", env!("DEEPSEEK_BUILD_VERSION"));
+    println!("  codewhale-tui: {}", env!("DEEPSEEK_BUILD_VERSION"));
     println!("  rust: {}", rustc_version());
     println!();
 
@@ -1599,6 +1722,25 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             crate::config::ApiProvider::NvidiaNim,
             "nvidia-nim",
             &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"][..],
+        ),
+        (
+            crate::config::ApiProvider::Openai,
+            "openai",
+            &["OPENAI_API_KEY"][..],
+        ),
+        (
+            crate::config::ApiProvider::Atlascloud,
+            "atlascloud",
+            &["ATLASCLOUD_API_KEY"][..],
+        ),
+        (
+            crate::config::ApiProvider::WanjieArk,
+            "wanjie-ark",
+            &[
+                "WANJIE_ARK_API_KEY",
+                "WANJIE_API_KEY",
+                "WANJIE_MAAS_API_KEY",
+            ][..],
         ),
         (
             crate::config::ApiProvider::Openrouter,
@@ -1694,7 +1836,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             "✗".truecolor(red_r, red_g, red_b)
         );
         println!(
-            "    Run 'deepseek auth set --provider <name>' to save a key to ~/.deepseek/config.toml."
+            "    Run 'codewhale auth set --provider <name>' to save a key to ~/.deepseek/config.toml."
         );
         false
     };
@@ -1732,11 +1874,10 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
         std::io::stdout().flush().ok();
 
         match test_api_connectivity(config).await {
-            Ok(model) => {
+            Ok(()) => {
                 println!(
-                    "\r  {} API connection successful (model: {})",
-                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
-                    model
+                    "\r  {} API connection successful",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b)
                 );
             }
             Err(e) => {
@@ -1747,21 +1888,21 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
                 );
                 if error_msg.contains("401") || error_msg.contains("Unauthorized") {
                     println!(
-                        "    Invalid API key. Check `deepseek auth status`, DEEPSEEK_API_KEY, or config.toml"
+                        "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
                     );
                     if matches!(api_key_source, ApiKeySource::Keyring) {
                         println!(
                             "    The rejected key came from the OS keyring via the dispatcher."
                         );
                         println!(
-                            "    Run `deepseek auth status` to inspect config/keyring/env sources."
+                            "    Run `codewhale auth status` to inspect config/keyring/env sources."
                         );
                     } else if matches!(api_key_source, ApiKeySource::Env) {
                         println!(
                             "    The rejected key came from DEEPSEEK_API_KEY; no saved config key is present."
                         );
                         println!(
-                            "    Run `deepseek auth set --provider deepseek` to save a config key that overrides stale env."
+                            "    Run `codewhale auth set --provider deepseek` to save a config key that overrides stale env."
                         );
                     }
                 } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
@@ -1777,7 +1918,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
                 } else if error_msg.contains("connect") {
                     println!("    Connection failed. Check firewall settings or try again");
                 } else {
-                    println!("    Error: {}", error_msg);
+                    println!("    Error: {error_msg}");
                 }
             }
         }
@@ -1863,7 +2004,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             "·".dimmed(),
             crate::utils::display_path(&mcp_config_path)
         );
-        println!("    Run `deepseek mcp init` or `deepseek setup --mcp`.");
+        println!("    Run `codewhale mcp init` or `codewhale setup --mcp`.");
     }
 
     // Skills configuration
@@ -1993,7 +2134,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             .is_some_and(|dir| dir.exists())
         && !global_skills_dir.exists()
     {
-        println!("    Run `deepseek setup --skills` (or add --local for ./skills).");
+        println!("    Run `codewhale setup --skills` (or add --local for ./skills).");
     }
 
     // Tools directory
@@ -2014,7 +2155,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             "·".dimmed(),
             crate::utils::display_path(&tools_dir)
         );
-        println!("    Run `deepseek setup --tools` to scaffold a starter dir.");
+        println!("    Run `codewhale setup --tools` to scaffold a starter dir.");
     }
 
     // Plugins directory
@@ -2035,7 +2176,7 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
             "·".dimmed(),
             crate::utils::display_path(&plugins_dir)
         );
-        println!("    Run `deepseek setup --plugins` to scaffold a starter dir.");
+        println!("    Run `codewhale setup --plugins` to scaffold a starter dir.");
     }
 
     // Storage surfaces (#422 / #440 / #500)
@@ -2080,6 +2221,238 @@ async fn run_doctor(config: &Config, workspace: &Path, config_path_override: Opt
                 "·".dimmed()
             );
         }
+    }
+
+    // Tool dependencies — probe external binaries that individual
+    // tools rely on (Python for code_execution, pdftotext for PDF
+    // reading) so users see explicit ✓/✗ rather than the tool failing
+    // at execution time with "program not found". New in v0.8.31.
+    println!();
+    println!("{}", "Tool Dependencies:".bold());
+
+    match crate::dependencies::resolve_python_interpreter() {
+        Some(name) => println!(
+            "  {} Python: {} → code_execution tool registered",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b),
+            name
+        ),
+        None => {
+            println!(
+                "  {} Python: not found (tried {:?})",
+                "✗".truecolor(red_r, red_g, red_b),
+                crate::dependencies::PYTHON_CANDIDATES,
+            );
+            println!("    code_execution tool is NOT advertised to the model on this install.");
+            println!("    Install Python 3 and ensure one of those names is on PATH:");
+            match std::env::consts::OS {
+                "macos" => {
+                    println!("      brew install python@3.12   (or download from python.org)")
+                }
+                "linux" => println!(
+                    "      sudo apt install python3    (Debian/Ubuntu) — or your distro's equivalent"
+                ),
+                "windows" => {
+                    println!("      winget install Python.Python.3   (or download from python.org)")
+                }
+                other => println!("      install Python 3 for {other} from python.org"),
+            }
+        }
+    }
+
+    match crate::dependencies::resolve_node() {
+        Some(_) => println!(
+            "  {} Node.js: present → js_execution tool registered",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b),
+        ),
+        None => {
+            println!(
+                "  {} Node.js: not found (tried `node`)",
+                "✗".truecolor(red_r, red_g, red_b),
+            );
+            println!("    js_execution tool is NOT advertised to the model on this install.");
+            println!("    Install Node 18+ and ensure `node` is on PATH:");
+            match std::env::consts::OS {
+                "macos" => println!("      brew install node   (or download from nodejs.org)"),
+                "linux" => println!(
+                    "      sudo apt install nodejs    (Debian/Ubuntu) — or your distro's equivalent"
+                ),
+                "windows" => {
+                    println!("      winget install OpenJS.NodeJS   (or download from nodejs.org)")
+                }
+                other => println!("      install Node.js for {other} from nodejs.org"),
+            }
+        }
+    }
+
+    match crate::dependencies::resolve_pandoc() {
+        Some(_) => println!(
+            "  {} pandoc: present → pandoc_convert tool registered",
+            "✓".truecolor(aqua_r, aqua_g, aqua_b),
+        ),
+        None => {
+            println!("  {} pandoc: not found (optional)", "·".dimmed(),);
+            println!(
+                "    pandoc_convert tool is NOT advertised to the model. Install pandoc to enable:"
+            );
+            match std::env::consts::OS {
+                "macos" => println!("      brew install pandoc"),
+                "linux" => println!(
+                    "      sudo apt install pandoc    (Debian/Ubuntu) — or your distro's equivalent"
+                ),
+                "windows" => {
+                    println!("      winget install JohnMacFarlane.Pandoc")
+                }
+                other => println!("      install pandoc for {other} from pandoc.org"),
+            }
+        }
+    }
+
+    match crate::dependencies::resolve_tesseract() {
+        Some(_) => {
+            if cfg!(target_os = "macos") {
+                println!(
+                    "  {} OCR: macOS Vision + tesseract available → image_ocr/read_file screenshot OCR enabled",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                );
+            } else {
+                println!(
+                    "  {} tesseract: present → image_ocr/read_file screenshot OCR enabled",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                );
+            }
+        }
+        None => {
+            if cfg!(target_os = "macos") {
+                println!(
+                    "  {} OCR: macOS Vision available → image_ocr/read_file screenshot OCR enabled",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                );
+                println!(
+                    "    tesseract not found (optional; install only for alternate OCR packs)."
+                );
+            } else {
+                println!("  {} tesseract: not found (optional)", "·".dimmed(),);
+                println!(
+                    "    image_ocr tool is NOT advertised to the model. Install tesseract to enable:"
+                );
+                match std::env::consts::OS {
+                    "macos" => println!("      brew install tesseract"),
+                    "linux" => println!(
+                        "      sudo apt install tesseract-ocr    (Debian/Ubuntu) — or your distro's equivalent"
+                    ),
+                    "windows" => println!("      winget install UB-Mannheim.TesseractOCR"),
+                    other => {
+                        println!("      install tesseract for {other} from tesseract-ocr.github.io")
+                    }
+                }
+            }
+        }
+    }
+
+    // PDF reader: pure-Rust `pdf-extract` is the v0.8.32 default, so
+    // `pdftotext` is no longer required for `read_file` to handle PDFs.
+    // We still surface its presence (a) so users with column-heavy PDFs
+    // know they can opt in via `prefer_external_pdftotext = true`, and
+    // (b) so users who *did* opt in get a clean signal when the binary
+    // is missing rather than discovering it on the next PDF read.
+    let prefer_external = crate::settings::Settings::load()
+        .map(|s| s.prefer_external_pdftotext)
+        .unwrap_or(false);
+    match crate::dependencies::resolve_pdftotext() {
+        Some(_) => {
+            if prefer_external {
+                println!(
+                    "  {} pdftotext: available → read_file routes PDFs through Poppler (prefer_external_pdftotext = true)",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                );
+            } else {
+                println!(
+                    "  {} pdftotext: available (optional — pure-Rust extractor is the default in v0.8.32)",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                );
+                println!(
+                    "    Set `prefer_external_pdftotext = true` in settings.toml for column-heavy PDFs."
+                );
+            }
+        }
+        None => {
+            if prefer_external {
+                println!(
+                    "  {} pdftotext: not found, but `prefer_external_pdftotext = true` is set → PDF reads will return `binary_unavailable`",
+                    "✗".truecolor(red_r, red_g, red_b),
+                );
+                println!(
+                    "    Either install Poppler or unset `prefer_external_pdftotext` to fall back to the bundled pure-Rust extractor."
+                );
+                match std::env::consts::OS {
+                    "macos" => println!("    Install via: brew install poppler"),
+                    "linux" => println!(
+                        "    Install via: sudo apt install poppler-utils   (Debian/Ubuntu)"
+                    ),
+                    "windows" => println!(
+                        "    Install Poppler for Windows from https://blog.alivate.com.au/poppler-windows/"
+                    ),
+                    _ => {}
+                }
+            } else {
+                println!(
+                    "  {} pdftotext: not found (optional — pure-Rust extractor is the default in v0.8.32)",
+                    "·".dimmed(),
+                );
+                println!(
+                    "    Install Poppler only if you want to opt into pdftotext for column-heavy PDFs."
+                );
+            }
+        }
+    }
+
+    // Terminal-quirk overrides currently active. Mirrors the env
+    // signals checked by `Settings::apply_env_overrides` so users
+    // can see at a glance which a11y/compat overrides fired.
+    println!();
+    println!("{}", "Terminal Quirks:".bold());
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let term_program_lc = term_program.to_ascii_lowercase();
+    let mut any_quirk = false;
+    if matches!(term_program.as_str(), "vscode" | "ghostty") {
+        println!(
+            "  {} TERM_PROGRAM={} → low_motion + fancy_animations=false (auto)",
+            "•".truecolor(sky_r, sky_g, sky_b),
+            term_program
+        );
+        any_quirk = true;
+    }
+    if term_program == "Termius"
+        || std::env::var_os("SSH_CLIENT").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("SSH_TTY").is_some_and(|v| !v.is_empty())
+    {
+        println!(
+            "  {} SSH/Termius session → low_motion + fancy_animations=false (auto, #1433)",
+            "•".truecolor(sky_r, sky_g, sky_b)
+        );
+        any_quirk = true;
+    }
+    if term_program_lc.contains("ptyxis")
+        || std::env::var_os("PTYXIS_VERSION").is_some_and(|v| !v.is_empty())
+    {
+        println!(
+            "  {} Ptyxis detected → synchronized_output=off (auto, v0.8.31)",
+            "•".truecolor(sky_r, sky_g, sky_b)
+        );
+        any_quirk = true;
+    }
+    if crate::settings::detected_legacy_windows_console_host() {
+        println!(
+            "  {} legacy Windows console host → low_motion + fancy_animations=false + synchronized_output=off (auto)",
+            "•".truecolor(sky_r, sky_g, sky_b)
+        );
+        any_quirk = true;
+    }
+    if !any_quirk {
+        println!(
+            "  {} no env-driven terminal-quirk overrides active",
+            "·".dimmed()
+        );
     }
 
     // Platform and sandbox checks
@@ -2334,7 +2707,7 @@ fn run_doctor_json(
         },
         "api_connectivity": {
             "checked": false,
-            "note": "Skipped in --json mode; run `deepseek doctor` for a live check.",
+            "note": "Skipped in --json mode; run `codewhale doctor` for a live check.",
         },
         "capability": provider_capability_report(config),
     });
@@ -2471,7 +2844,7 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
                 && !target.base_url.contains("api.deepseeki.com") =>
         {
             lines.push(
-                "If this is a custom DeepSeek-compatible endpoint, set its HTTPS base URL in ~/.deepseek/config.toml and rerun `deepseek doctor`."
+                "If this is a custom DeepSeek-compatible endpoint, set its HTTPS base URL in ~/.deepseek/config.toml and rerun `codewhale doctor`."
                     .to_string(),
             );
         }
@@ -2490,7 +2863,7 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
     }
 
     lines.push(
-        "Run `deepseek doctor --json` and include `base_url`, `default_text_model`, and `api_connectivity` when filing an issue."
+        "Run `codewhale doctor --json` and include `base_url`, `default_text_model`, and `api_connectivity` when filing an issue."
             .to_string(),
     );
     lines
@@ -2544,7 +2917,7 @@ async fn run_models(config: &Config, args: ModelsArgs) -> Result<()> {
 }
 
 /// Test API connectivity by making a minimal request
-async fn test_api_connectivity(config: &Config) -> Result<String> {
+async fn test_api_connectivity(config: &Config) -> Result<()> {
     use crate::client::DeepSeekClient;
     use crate::models::{ContentBlock, Message, MessageRequest};
 
@@ -2576,7 +2949,7 @@ async fn test_api_connectivity(config: &Config) -> Result<String> {
     // Use tokio timeout to catch hanging requests
     let timeout_duration = std::time::Duration::from_secs(15);
     match tokio::time::timeout(timeout_duration, client.create_message(request)).await {
-        Ok(Ok(_response)) => Ok(model),
+        Ok(Ok(_response)) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_) => anyhow::bail!("Request timeout after 15 seconds"),
     }
@@ -2614,7 +2987,7 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
         println!("{}", "No sessions found.".truecolor(sky_r, sky_g, sky_b));
         println!(
             "Start a new session with: {}",
-            "deepseek".truecolor(blue_r, blue_g, blue_b)
+            "codewhale".truecolor(blue_r, blue_g, blue_b)
         );
         return Ok(());
     }
@@ -2647,12 +3020,12 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     println!();
     println!(
         "Resume with: {} {}",
-        "deepseek --resume".truecolor(blue_r, blue_g, blue_b),
+        "codewhale --resume".truecolor(blue_r, blue_g, blue_b),
         "<session-id>".dimmed()
     );
     println!(
         "Continue latest in this workspace: {}",
-        "deepseek --continue".truecolor(blue_r, blue_g, blue_b)
+        "codewhale --continue".truecolor(blue_r, blue_g, blue_b)
     );
 
     Ok(())
@@ -2689,7 +3062,7 @@ fn init_project() -> Result<()> {
             );
             println!();
             println!("Edit this file to customize how the AI agent works with your project.");
-            println!("The instructions will be loaded automatically when you run deepseek.");
+            println!("The instructions will be loaded automatically when you run codewhale.");
         }
         Err(e) => {
             println!(
@@ -2753,7 +3126,7 @@ fn resolve_session_id(session_id: Option<String>, last: bool, workspace: &Path) 
     if last {
         return latest_session_id_for_workspace(workspace)?.ok_or_else(|| {
             anyhow!(
-                "No saved sessions found for workspace {}. Use `deepseek sessions` to list all sessions, or `deepseek resume <SESSION_ID>` to resume one explicitly.",
+                "No saved sessions found for workspace {}. Use `codewhale sessions` to list all sessions, or `codewhale resume <SESSION_ID>` to resume one explicitly.",
                 workspace.display()
             )
         });
@@ -2790,13 +3163,15 @@ fn fork_session(session_id: Option<String>, last: bool, workspace: &Path) -> Res
         .system_prompt
         .as_ref()
         .map(|text| SystemPrompt::Text(text.clone()));
-    let forked = create_saved_session(
+    let mut forked = create_saved_session(
         &saved.messages,
         &saved.metadata.model,
         &saved.metadata.workspace,
         saved.metadata.total_tokens,
         system_prompt.as_ref(),
     );
+    forked.metadata.copy_cost_from(&saved.metadata);
+    forked.metadata.mark_forked_from(&saved.metadata);
     manager.save_session(&forked)?;
 
     let source_title = saved.metadata.title.trim();
@@ -2914,7 +3289,7 @@ Provide findings ordered by severity with file references, then open questions, 
     Ok(())
 }
 
-/// `deepseek pr <N>` (#451) — fetch a GitHub PR via `gh`, format
+/// `codewhale pr <N>` (#451) — fetch a GitHub PR via `gh`, format
 /// title + body + diff as the composer's first message, and launch
 /// the interactive TUI. Falls back gracefully if `gh` is missing.
 async fn run_pr(
@@ -2928,7 +3303,7 @@ async fn run_pr(
         bail!(
             "`gh` CLI not found on PATH. Install GitHub CLI \
              (https://cli.github.com) and authenticate (`gh auth login`) \
-             so `deepseek pr <N>` can fetch PR metadata and the diff."
+             so `codewhale pr <N>` can fetch PR metadata and the diff."
         );
     }
 
@@ -3137,7 +3512,7 @@ fn collect_diff(args: &ReviewArgs) -> Result<String> {
 
     let output = cmd
         .output()
-        .map_err(|e| anyhow::anyhow!("Failed to run git diff. Is git installed? ({})", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run git diff. Is git installed? ({e})"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git diff failed: {}", stderr.trim());
@@ -3169,7 +3544,7 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
         .arg("--whitespace=nowarn")
         .arg(&tmp_path)
         .output()
-        .map_err(|e| anyhow::anyhow!("Failed to run git apply: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run git apply: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3208,7 +3583,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     );
                 }
             }
-            println!("Edit the file, then run `deepseek mcp list` or `deepseek mcp tools`.");
+            println!("Edit the file, then run `codewhale mcp list` or `codewhale mcp tools`.");
             Ok(())
         }
         McpCommand::List => {
@@ -3252,7 +3627,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     println!("Connected to all configured MCP servers.");
                 } else {
                     for (name, err) in errors {
-                        eprintln!("Failed to connect {name}: {err}");
+                        eprintln!("Failed to connect {name}: {err:#}");
                     }
                 }
             }
@@ -3321,6 +3696,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     required: false,
                     enabled_tools: Vec::new(),
                     disabled_tools: Vec::new(),
+                    headers: std::collections::HashMap::new(),
                 },
             );
             save_mcp_config(&config_path, &cfg)?;
@@ -3369,7 +3745,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             }
             eprintln!("MCP validation failed:");
             for (name, err) in errors {
-                eprintln!("  - {name}: {err}");
+                eprintln!("  - {name}: {err:#}");
             }
             bail!("one or more MCP servers failed validation");
         }
@@ -3387,7 +3763,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
             let mut cfg = load_mcp_config(&config_path)?;
             if cfg.servers.contains_key(&name) {
                 bail!(
-                    "MCP server '{name}' already exists in {}. Use `deepseek mcp remove {name}` first, or choose a different --name.",
+                    "MCP server '{name}' already exists in {}. Use `codewhale mcp remove {name}` first, or choose a different --name.",
                     config_path.display()
                 );
             }
@@ -3406,6 +3782,7 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                     required: false,
                     enabled_tools: Vec::new(),
                     disabled_tools: Vec::new(),
+                    headers: std::collections::HashMap::new(),
                 },
             );
             save_mcp_config(&config_path, &cfg)?;
@@ -3419,8 +3796,8 @@ async fn run_mcp_command(config: &Config, command: McpCommand) -> Result<()> {
                 workspace.map_or(String::new(), |ws| format!(" --workspace {ws}"))
             );
             println!();
-            println!("Tip: Use `deepseek mcp validate` to test the connection.");
-            println!("     Use `deepseek serve --http` for the HTTP/SSE runtime API instead.");
+            println!("Tip: Use `codewhale mcp validate` to test the connection.");
+            println!("     Use `codewhale serve --http` for the HTTP/SSE runtime API instead.");
             Ok(())
         }
     }
@@ -3549,9 +3926,7 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         .current_dir(&exec_env.cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, value) in &exec_env.env {
-        cmd.env(key, value);
-    }
+    child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
 
     let mut child = cmd
         .spawn()
@@ -3591,7 +3966,7 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             print!("{}", String::from_utf8_lossy(&stdout));
         }
         if !stderr.is_empty() {
-            eprint!("{}", stderr_str);
+            eprint!("{stderr_str}");
         }
         if sandbox_denied {
             eprintln!(
@@ -3642,7 +4017,16 @@ fn should_use_alt_screen(_cli: &Cli, _config: &Config) -> bool {
 
 fn should_use_mouse_capture(cli: &Cli, config: &Config, use_alt_screen: bool) -> bool {
     let terminal_emulator = std::env::var("TERMINAL_EMULATOR").ok();
-    should_use_mouse_capture_with(cli, config, use_alt_screen, terminal_emulator.as_deref())
+    let wt_session = std::env::var("WT_SESSION").ok().filter(|s| !s.is_empty());
+    let conemu_pid = std::env::var("ConEmuPID").ok().filter(|s| !s.is_empty());
+    should_use_mouse_capture_with(
+        cli,
+        config,
+        use_alt_screen,
+        terminal_emulator.as_deref(),
+        wt_session.as_deref(),
+        conemu_pid.as_deref(),
+    )
 }
 
 fn should_use_mouse_capture_with(
@@ -3650,6 +4034,8 @@ fn should_use_mouse_capture_with(
     config: &Config,
     use_alt_screen: bool,
     terminal_emulator: Option<&str>,
+    wt_session: Option<&str>,
+    conemu_pid: Option<&str>,
 ) -> bool {
     if !use_alt_screen || cli.no_mouse_capture {
         return false;
@@ -3661,21 +4047,30 @@ fn should_use_mouse_capture_with(
         .tui
         .as_ref()
         .and_then(|tui| tui.mouse_capture)
-        .unwrap_or_else(|| default_mouse_capture_enabled(terminal_emulator))
+        .unwrap_or_else(|| default_mouse_capture_enabled(terminal_emulator, wt_session, conemu_pid))
 }
 
 /// Whether to enable terminal mouse capture by default for this platform/host.
 ///
-/// Returns `false` on Windows (legacy console mouse-mode reporting is flaky;
-/// `--mouse-capture` opts in) and on JetBrains' JediTerm, which advertises
-/// mouse support but delivers SGR mouse-event escape sequences as raw text
-/// in the input stream — visible to users as garbled characters in the
-/// composer when they move the mouse over the TUI (#878, #898). The user
-/// can still opt back in with `[tui] mouse_capture = true` in
+/// On Windows the default depends on the host: Windows Terminal (which sets
+/// `WT_SESSION`) and ConEmu/Cmder (which set `ConEmuPID`) handle mouse-mode
+/// reporting cleanly, so default-on there gives users in-app text selection
+/// and keeps the application's selection clamped to the transcript area
+/// (#1169). Legacy conhost (CMD without either env var) stays default-off
+/// because its mouse-mode reporting can leak SGR escape sequences as raw
+/// text into the composer (#878 / #898).
+///
+/// Off elsewhere only for JetBrains' JediTerm, which advertises mouse
+/// support but forwards the same SGR escape sequences as raw input. The
+/// user can still opt back in with `[tui] mouse_capture = true` in
 /// `~/.deepseek/config.toml` or `--mouse-capture`.
-fn default_mouse_capture_enabled(terminal_emulator: Option<&str>) -> bool {
+fn default_mouse_capture_enabled(
+    terminal_emulator: Option<&str>,
+    wt_session: Option<&str>,
+    conemu_pid: Option<&str>,
+) -> bool {
     if cfg!(windows) {
-        return false;
+        return wt_session.is_some() || conemu_pid.is_some();
     }
     if matches!(terminal_emulator, Some(t) if t.eq_ignore_ascii_case("JetBrains-JediTerm")) {
         return false;
@@ -3724,7 +4119,7 @@ fn checkpoint_age_label(age: std::time::Duration) -> String {
 /// **The checkpoint's workspace must also match the resolved launch workspace
 /// after canonicalisation.** If the workspace doesn't match, the checkpoint is
 /// persisted as a regular session (so the user can find it via
-/// `deepseek sessions` / `deepseek resume <id>`) and cleared, but not loaded.
+/// `codewhale sessions` / `codewhale resume <id>`) and cleared, but not loaded.
 fn recover_interrupted_checkpoint_for_resume(launch_workspace: &Path) -> Option<String> {
     let manager = session_manager::SessionManager::default_location().ok()?;
     let (session, age) = load_recent_checkpoint(&manager)?;
@@ -3738,21 +4133,17 @@ fn recover_interrupted_checkpoint_for_resume(launch_workspace: &Path) -> Option<
         session_manager::workspace_scope_matches(&session_workspace, launch_workspace);
 
     if !workspace_matches {
-        // Persist the checkpoint so the user can find it via `deepseek
+        // Persist the checkpoint so the user can find it via `codewhale
         // sessions`, then clear it so the next launch in this folder doesn't
         // re-trip the nag. Print a one-line notice pointing at the explicit
         // resume command — but DO NOT auto-load the session here.
-        let session_id_for_notice = session.metadata.id.clone();
         let _ = manager.save_session(&session);
         let _ = manager.clear_checkpoint();
         eprintln!(
-            "Note: an interrupted session ({}…) from another workspace ({}) is \
-             available. Run `deepseek resume {}` from there to recover it, or \
-             use `deepseek sessions` to list all saved sessions. Starting fresh \
-             in {}.",
-            &session_id_for_notice.chars().take(8).collect::<String>(),
+            "Note: an interrupted session from another workspace ({}) is \
+             available. Run `codewhale sessions` to list saved sessions. Starting \
+             fresh in {}.",
             session_workspace.display(),
-            session_id_for_notice,
             launch_workspace.display(),
         );
         return None;
@@ -3775,7 +4166,7 @@ fn recover_interrupted_checkpoint_for_resume(launch_workspace: &Path) -> Option<
 }
 
 /// Preserve an interrupted checkpoint on a normal fresh launch without
-/// attaching it to the new TUI instance. This keeps "open another deepseek in
+/// attaching it to the new TUI instance. This keeps "open another codewhale in
 /// the same folder" from re-entering the previous in-flight session while still
 /// leaving an explicit resume path.
 fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) {
@@ -3786,27 +4177,22 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
         return;
     };
 
-    let session_id = session.metadata.id.clone();
     let session_workspace = session.metadata.workspace.clone();
     let _ = manager.save_session(&session);
     let _ = manager.clear_checkpoint();
 
     let age_str = checkpoint_age_label(age);
-    let short_id = session_id.chars().take(8).collect::<String>();
     if session_manager::workspace_scope_matches(&session_workspace, launch_workspace) {
         eprintln!(
-            "Found an in-flight session snapshot ({age_str}, {short_id}…). \
-             Starting a new session. Run `deepseek resume {session_id}` or \
-             `deepseek --continue` to resume it."
+            "Found an in-flight session snapshot ({age_str}). Starting a new \
+             session. Run `codewhale --continue` to resume it."
         );
     } else {
         eprintln!(
-            "Note: an interrupted session ({short_id}…) from another workspace ({}) \
-             is available. Run `deepseek resume {}` from there to recover it, or \
-             use `deepseek sessions` to list all saved sessions. Starting fresh \
-             in {}.",
+            "Note: an interrupted session from another workspace ({}) is \
+             available. Run `codewhale sessions` to list saved sessions. Starting \
+             fresh in {}.",
             session_workspace.display(),
-            session_id,
             launch_workspace.display(),
         );
     }
@@ -4034,9 +4420,17 @@ async fn resolve_cli_auto_route(config: &Config, model: &str, prompt: &str) -> C
             auto_model: true,
         }
     } else {
+        // When --model is not `auto`, fall back to the reasoning_effort
+        // declared in the user's config.toml. The previous hard-coded `None`
+        // silently dropped the user's setting on every non-auto-route exec
+        // call, which (for example) prevented vllm + Qwen3 users from
+        // disabling thinking via `reasoning_effort = "off"` and caused
+        // 30+ second SSE idle timeouts on trivial prompts.
         CliAutoRoute {
             model: model.to_string(),
-            reasoning_effort: None,
+            reasoning_effort: config
+                .reasoning_effort()
+                .map(crate::tui::app::ReasoningEffort::from_setting),
             auto_model: false,
         }
     }
@@ -4136,6 +4530,95 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct ExecStreamMeta {
+    model: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    session_id: String,
+    status: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+enum ExecStreamEvent {
+    #[serde(rename = "content")]
+    Content { content: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        name: String,
+        id: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        id: String,
+        output: String,
+        status: String,
+    },
+    #[serde(rename = "session_capture")]
+    SessionCapture { content: String },
+    #[serde(rename = "metadata")]
+    Metadata { meta: ExecStreamMeta },
+    #[serde(rename = "done")]
+    Done,
+    #[serde(rename = "error")]
+    Error { error: String },
+}
+
+fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
+    println!("{}", serde_json::to_string(event)?);
+    Ok(())
+}
+
+fn persist_exec_session(
+    messages: &[Message],
+    model: &str,
+    workspace: &Path,
+    system_prompt: &Option<SystemPrompt>,
+    session_id: Option<&str>,
+    total_tokens: u64,
+) -> Result<String> {
+    let manager =
+        SessionManager::default_location().context("could not open session manager for save")?;
+    let saved = if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
+        match manager.load_session(id) {
+            Ok(existing) => session_manager::update_session(
+                existing,
+                messages,
+                total_tokens,
+                system_prompt.as_ref(),
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                session_manager::create_saved_session_with_id_and_mode(
+                    id.to_string(),
+                    messages,
+                    model,
+                    workspace,
+                    total_tokens,
+                    system_prompt.as_ref(),
+                    Some("exec"),
+                )
+            }
+            Err(err) => return Err(err).context("could not load existing exec session"),
+        }
+    } else {
+        session_manager::create_saved_session_with_mode(
+            messages,
+            model,
+            workspace,
+            total_tokens,
+            system_prompt.as_ref(),
+            Some("exec"),
+        )
+    };
+    let id = saved.metadata.id.clone();
+    manager
+        .save_session(&saved)
+        .context("could not save exec session")?;
+    Ok(id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_agent(
     config: &Config,
@@ -4146,6 +4629,8 @@ async fn run_exec_agent(
     auto_approve: bool,
     trust_mode: bool,
     json_output: bool,
+    resume_session_id: Option<String>,
+    output_format: ExecOutputFormat,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
     use crate::core::engine::{EngineConfig, spawn_engine};
@@ -4193,6 +4678,8 @@ async fn run_exec_agent(
         mcp_config_path: config.mcp_config_path(),
         skills_dir: config.skills_dir(),
         instructions: config.instructions_paths(),
+        project_context_pack_enabled: config.project_context_pack_enabled(),
+        translation_enabled: false,
         max_steps: 100,
         max_subagents,
         features: config.features(),
@@ -4204,11 +4691,17 @@ async fn run_exec_agent(
         max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
         network_policy,
         snapshots_enabled: config.snapshots_config().enabled,
+        snapshots_max_workspace_bytes: config
+            .snapshots_config()
+            .max_workspace_gb
+            .saturating_mul(1024 * 1024 * 1024),
         lsp_config,
         runtime_services: crate::tools::spec::RuntimeToolServices::default(),
         subagent_model_overrides: config.subagent_model_overrides(),
+        subagent_api_timeout: std::time::Duration::from_secs(config.subagent_api_timeout_secs()),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
+        vision_config: config.vision_model_config(),
         strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
         goal_objective: None,
         locale_tag: crate::localization::resolve_locale(
@@ -4217,6 +4710,12 @@ async fn run_exec_agent(
         .tag()
         .to_string(),
         workshop: config.workshop.clone(),
+        search_provider: config
+            .search
+            .as_ref()
+            .and_then(|s| s.provider)
+            .unwrap_or_default(),
+        search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
     };
 
     let engine_handle = spawn_engine(engine_config, config);
@@ -4225,6 +4724,38 @@ async fn run_exec_agent(
     } else {
         AppMode::Agent
     };
+
+    let mut loaded_session_id = None;
+    if let Some(session_id) = resume_session_id.as_deref() {
+        let manager = SessionManager::default_location()
+            .context("could not open session manager for exec resume")?;
+        let saved = manager
+            .load_session_by_prefix(session_id)
+            .with_context(|| format!("could not load session '{session_id}'"))?;
+        let saved_id = saved.metadata.id.clone();
+        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+            eprintln!(
+                "Warning: session {} was created in a different workspace ({}). Resuming anyway.",
+                truncate_id(&saved_id),
+                saved.metadata.workspace.display(),
+            );
+        }
+
+        engine_handle
+            .send(Op::SyncSession {
+                session_id: Some(saved_id.clone()),
+                messages: saved.messages,
+                system_prompt: saved.system_prompt.map(SystemPrompt::Text),
+                system_prompt_override: false,
+                model: saved.metadata.model,
+                workspace: saved.metadata.workspace,
+            })
+            .await?;
+        loaded_session_id = Some(saved_id.clone());
+        if output_format == ExecOutputFormat::Text && !json_output {
+            eprintln!("resumed session: {saved_id}");
+        }
+    }
 
     engine_handle
         .send(Op::SendMessage {
@@ -4238,6 +4769,7 @@ async fn run_exec_agent(
             allow_shell: auto_approve || config.allow_shell(),
             trust_mode,
             auto_approve,
+            translation_enabled: false,
             approval_mode: if auto_approve {
                 crate::tui::approval::ApprovalMode::Auto
             } else {
@@ -4268,10 +4800,18 @@ async fn run_exec_agent(
     }
     let mut summary = ExecSummary {
         mode: "agent".to_string(),
-        model: effective_model,
+        model: effective_model.clone(),
         prompt: prompt.to_string(),
         ..ExecSummary::default()
     };
+
+    let should_persist_session =
+        resume_session_id.is_some() || output_format == ExecOutputFormat::StreamJson;
+    let mut latest_session_id = loaded_session_id;
+    let mut latest_messages: Vec<Message> = Vec::new();
+    let mut latest_system_prompt: Option<SystemPrompt> = None;
+    let mut latest_model = effective_model;
+    let mut latest_workspace = workspace.clone();
 
     let mut stdout = io::stdout();
     let mut ends_with_newline = false;
@@ -4288,71 +4828,115 @@ async fn run_exec_agent(
         match event {
             Event::MessageDelta { content, .. } => {
                 summary.output.push_str(&content);
-                if !json_output {
+                if output_format == ExecOutputFormat::StreamJson {
+                    emit_exec_stream_event(&ExecStreamEvent::Content { content })?;
+                } else if !json_output {
                     print!("{content}");
                     stdout.flush()?;
                 }
-                ends_with_newline = content.ends_with('\n');
+                ends_with_newline = summary.output.ends_with('\n');
             }
-            Event::MessageComplete { .. } if !json_output && !ends_with_newline => {
+            Event::MessageComplete { .. }
+                if output_format == ExecOutputFormat::Text
+                    && !json_output
+                    && !ends_with_newline =>
+            {
                 println!();
             }
-            Event::ToolCallStarted { name, input, .. } if !json_output => {
-                let summary = summarize_tool_args(&input);
-                if let Some(summary) = summary {
-                    eprintln!("tool: {name} ({summary})");
-                } else {
-                    eprintln!("tool: {name}");
+            Event::ThinkingDelta { .. } => {
+                // Exec stream-json intentionally omits reasoning deltas; the
+                // TUI transcript retains its existing Activity Detail surface.
+            }
+            Event::ToolCallStarted { id, name, input } => {
+                if output_format == ExecOutputFormat::StreamJson {
+                    emit_exec_stream_event(&ExecStreamEvent::ToolUse { name, id, input })?;
+                } else if !json_output {
+                    let summary = summarize_tool_args(&input);
+                    if let Some(summary) = summary {
+                        eprintln!("tool: {name} ({summary})");
+                    } else {
+                        eprintln!("tool: {name}");
+                    }
                 }
             }
-            Event::ToolCallProgress { id, output } if !json_output => {
+            Event::ToolCallProgress { id, output }
+                if output_format == ExecOutputFormat::Text && !json_output =>
+            {
                 eprintln!("tool {id}: {}", summarize_tool_output(&output));
             }
-            Event::ToolCallComplete { name, result, .. } => match result {
+            Event::ToolCallComplete {
+                id, name, result, ..
+            } => match result {
                 Ok(output) => {
                     summary.tools.push(ExecToolEntry {
                         name: name.clone(),
                         success: output.success,
                         output: output.content.clone(),
                     });
-                    if name == "exec_shell" && !output.content.trim().is_empty() {
-                        if !json_output {
+                    if output_format == ExecOutputFormat::StreamJson {
+                        emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+                            id,
+                            output: output.content,
+                            status: if output.success {
+                                "success".to_string()
+                            } else {
+                                "error".to_string()
+                            },
+                        })?;
+                    } else if !json_output {
+                        if name == "exec_shell" && !output.content.trim().is_empty() {
                             eprintln!("tool {name} completed");
                             eprintln!(
                                 "--- stdout/stderr ---\n{}\n---------------------",
                                 output.content
                             );
+                        } else {
+                            eprintln!(
+                                "tool {name} completed: {}",
+                                summarize_tool_output(&output.content)
+                            );
                         }
-                    } else if !json_output {
-                        eprintln!(
-                            "tool {name} completed: {}",
-                            summarize_tool_output(&output.content)
-                        );
                     }
                 }
                 Err(err) => {
+                    let error_text = err.to_string();
                     summary.tools.push(ExecToolEntry {
                         name: name.clone(),
                         success: false,
-                        output: err.to_string(),
+                        output: error_text.clone(),
                     });
-                    if !json_output {
+                    if output_format == ExecOutputFormat::StreamJson {
+                        emit_exec_stream_event(&ExecStreamEvent::ToolResult {
+                            id,
+                            output: error_text,
+                            status: "error".to_string(),
+                        })?;
+                    } else if !json_output {
                         eprintln!("tool {name} failed: {err}");
                     }
                 }
             },
-            Event::AgentSpawned { id, prompt } => {
+            Event::AgentSpawned { id, prompt }
+                if output_format == ExecOutputFormat::Text && !json_output =>
+            {
                 eprintln!("sub-agent {id} spawned: {}", summarize_tool_output(&prompt));
             }
-            Event::AgentProgress { id, status } => {
+            Event::AgentProgress { id, status }
+                if output_format == ExecOutputFormat::Text && !json_output =>
+            {
                 eprintln!("sub-agent {id}: {status}");
             }
-            Event::AgentComplete { id, result } => {
+            Event::AgentComplete { id, result }
+                if output_format == ExecOutputFormat::Text && !json_output =>
+            {
                 eprintln!(
                     "sub-agent {id} completed: {}",
                     summarize_tool_output(&result)
                 );
             }
+            Event::AgentSpawned { .. }
+            | Event::AgentProgress { .. }
+            | Event::AgentComplete { .. } => {}
             Event::ApprovalRequired { id, .. } => {
                 if auto_approve {
                     let _ = engine_handle.approve_tool_call(id).await;
@@ -4367,11 +4951,15 @@ async fn run_exec_agent(
                 ..
             } => {
                 if auto_approve {
-                    eprintln!("sandbox denied {tool_name}: {denial_reason} (auto-elevating)");
+                    if output_format == ExecOutputFormat::Text && !json_output {
+                        eprintln!("sandbox denied {tool_name}: {denial_reason} (auto-elevating)");
+                    }
                     let policy = crate::sandbox::SandboxPolicy::DangerFullAccess;
                     let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
                 } else {
-                    eprintln!("sandbox denied {tool_name}: {denial_reason}");
+                    if output_format == ExecOutputFormat::Text && !json_output {
+                        eprintln!("sandbox denied {tool_name}: {denial_reason}");
+                    }
                     let _ = engine_handle.deny_tool_call(tool_id).await;
                 }
             }
@@ -4380,15 +4968,80 @@ async fn run_exec_agent(
                 recoverable: _,
             } => {
                 summary.error = Some(envelope.message.clone());
-                if !json_output {
+                if output_format == ExecOutputFormat::StreamJson {
+                    emit_exec_stream_event(&ExecStreamEvent::Error {
+                        error: envelope.message,
+                    })?;
+                } else if !json_output {
                     eprintln!("error: {}", envelope.message);
                 }
             }
-            Event::TurnComplete { status, error, .. } => {
+            Event::TurnComplete {
+                status,
+                error,
+                usage,
+                ..
+            } => {
                 summary.status = Some(format!("{status:?}").to_lowercase());
                 summary.error = error;
+                let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
+                    match persist_exec_session(
+                        &latest_messages,
+                        &latest_model,
+                        &latest_workspace,
+                        &latest_system_prompt,
+                        latest_session_id.as_deref(),
+                        u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                    ) {
+                        Ok(id) => {
+                            if output_format == ExecOutputFormat::Text && !json_output {
+                                eprintln!("session: {id}");
+                            }
+                            Some(id)
+                        }
+                        Err(err) => {
+                            if output_format == ExecOutputFormat::Text && !json_output {
+                                eprintln!("warning: failed to save exec session: {err}");
+                            }
+                            latest_session_id.clone()
+                        }
+                    }
+                } else {
+                    latest_session_id.clone()
+                };
+
+                if output_format == ExecOutputFormat::StreamJson {
+                    if let Some(id) = saved_session_id.as_ref() {
+                        emit_exec_stream_event(&ExecStreamEvent::SessionCapture {
+                            content: id.clone(),
+                        })?;
+                    }
+                    emit_exec_stream_event(&ExecStreamEvent::Metadata {
+                        meta: ExecStreamMeta {
+                            model: latest_model.clone(),
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            session_id: saved_session_id.unwrap_or_default(),
+                            status: summary.status.clone(),
+                        },
+                    })?;
+                    emit_exec_stream_event(&ExecStreamEvent::Done)?;
+                }
                 let _ = engine_handle.send(Op::Shutdown).await;
                 break;
+            }
+            Event::SessionUpdated {
+                session_id,
+                messages,
+                system_prompt,
+                model,
+                workspace,
+            } => {
+                latest_session_id = Some(session_id);
+                latest_messages = messages;
+                latest_system_prompt = system_prompt;
+                latest_model = model;
+                latest_workspace = workspace;
             }
             _ => {}
         }
@@ -4552,7 +5205,7 @@ mod doctor_endpoint_tests {
         assert!(text.contains("api.deepseek.com"));
         assert!(text.contains("custom DeepSeek-compatible endpoint"));
         assert!(!text.contains("provider = \"deepseek-cn\""));
-        assert!(text.contains("deepseek doctor --json"));
+        assert!(text.contains("codewhale doctor --json"));
     }
 
     #[test]
@@ -4581,14 +5234,19 @@ mod terminal_mode_tests {
 
     #[test]
     fn prompt_flag_accepts_split_prompt_words_for_windows_cmd_shims() {
-        let cli = parse_cli(&["deepseek", "-p", "hello", "world"]);
+        let cli = parse_cli(&["codewhale", "-p", "hello", "world"]);
 
         assert_eq!(cli.prompt, vec!["hello", "world"]);
     }
 
     #[test]
+    fn companion_binary_reports_its_own_name() {
+        assert_eq!(Cli::command().get_name(), "codewhale-tui");
+    }
+
+    #[test]
     fn exec_accepts_split_prompt_words_for_windows_cmd_shims() {
-        let cli = parse_cli(&["deepseek", "exec", "hello", "world"]);
+        let cli = parse_cli(&["codewhale", "exec", "hello", "world"]);
         let Some(Commands::Exec(args)) = cli.command else {
             panic!("expected exec command");
         };
@@ -4598,7 +5256,7 @@ mod terminal_mode_tests {
 
     #[test]
     fn exec_keeps_flags_before_split_prompt_words() {
-        let cli = parse_cli(&["deepseek", "exec", "--json", "hello", "world"]);
+        let cli = parse_cli(&["codewhale", "exec", "--json", "hello", "world"]);
         let Some(Commands::Exec(args)) = cli.command else {
             panic!("expected exec command");
         };
@@ -4608,8 +5266,78 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn exec_accepts_resume_session_flags_for_harnesses() {
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--resume",
+            "abc123",
+            "--output-format",
+            "stream-json",
+            "follow up",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.resume.as_deref(), Some("abc123"));
+        assert_eq!(args.output_format, ExecOutputFormat::StreamJson);
+        assert_eq!(args.prompt, vec!["follow up"]);
+    }
+
+    #[test]
+    fn exec_accepts_session_id_alias() {
+        let cli = parse_cli(&["codewhale", "exec", "--session-id", "abc123", "follow up"]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(args.session_id.as_deref(), Some("abc123"));
+        assert_eq!(args.output_format, ExecOutputFormat::Text);
+    }
+
+    #[test]
+    fn exec_accepts_continue_for_latest_workspace_session() {
+        let cli = parse_cli(&["codewhale", "exec", "--continue", "follow up"]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert!(args.continue_session);
+    }
+
+    #[test]
+    fn exec_json_conflicts_with_stream_json_output() {
+        let err = Cli::try_parse_from([
+            "codewhale",
+            "exec",
+            "--json",
+            "--output-format",
+            "stream-json",
+            "hello",
+        ])
+        .expect_err("json summary and stream-json must not mix");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn exec_stream_events_are_json_lines() {
+        let event = ExecStreamEvent::ToolResult {
+            id: "call_1".to_string(),
+            output: "line 1\nline 2".to_string(),
+            status: "success".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(!json.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["type"], "tool_result");
+    }
+
+    #[test]
     fn alternate_screen_defaults_on_in_auto_mode() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
 
         assert!(should_use_alt_screen(&cli, &config));
@@ -4617,7 +5345,7 @@ mod terminal_mode_tests {
 
     #[test]
     fn no_alt_screen_flag_is_accepted_but_keeps_alternate_screen() {
-        let cli = parse_cli(&["deepseek", "--no-alt-screen"]);
+        let cli = parse_cli(&["codewhale", "--no-alt-screen"]);
         let config = Config::default();
 
         assert!(should_use_alt_screen(&cli, &config));
@@ -4625,7 +5353,7 @@ mod terminal_mode_tests {
 
     #[test]
     fn config_never_is_accepted_but_keeps_alternate_screen() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config {
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: Some("never".to_string()),
@@ -4633,6 +5361,7 @@ mod terminal_mode_tests {
                 terminal_probe_timeout_ms: None,
                 status_items: None,
                 osc8_links: None,
+                composer_arrows_scroll: None,
                 notification_condition: None,
             }),
             ..Config::default()
@@ -4644,32 +5373,80 @@ mod terminal_mode_tests {
     #[test]
     #[cfg(not(windows))]
     fn mouse_capture_defaults_on_when_alternate_screen_is_active() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
 
-        assert!(should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
     }
 
     #[test]
     #[cfg(windows)]
-    fn mouse_capture_defaults_off_on_windows_when_alternate_screen_is_active() {
-        let cli = parse_cli(&["deepseek"]);
+    fn mouse_capture_defaults_off_on_legacy_windows_console() {
+        // Legacy conhost (no `WT_SESSION` and no `ConEmuPID`) keeps the
+        // v0.8.x default-off behavior: mouse-mode reporting on legacy console
+        // can leak SGR escapes into the composer.
+        let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
 
-        assert!(!should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(!should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
+    }
+
+    // #1169: Windows Terminal sets `WT_SESSION` and handles mouse-mode
+    // reporting cleanly, so default-on there gives users in-app text
+    // selection (and the side-effect of clamping selection to the
+    // transcript region instead of the terminal painting across the
+    // sidebar via native selection).
+    #[test]
+    #[cfg(windows)]
+    fn mouse_capture_defaults_on_in_windows_terminal() {
+        let cli = parse_cli(&["codewhale"]);
+        let config = Config::default();
+
+        assert!(should_use_mouse_capture_with(
+            &cli,
+            &config,
+            true,
+            None,
+            Some("{a3a3b3a8-aa00-0000-0000-000000000000}"),
+            None,
+        ));
+    }
+
+    // ConEmu/Cmder sets `ConEmuPID` and handles VT mouse-mode reporting
+    // cleanly; default mouse capture on there so users get in-app scrolling.
+    #[test]
+    #[cfg(windows)]
+    fn mouse_capture_defaults_on_in_conemu() {
+        let cli = parse_cli(&["codewhale"]);
+        let config = Config::default();
+
+        assert!(should_use_mouse_capture_with(
+            &cli,
+            &config,
+            true,
+            None,
+            None,
+            Some("12345"),
+        ));
     }
 
     #[test]
     fn no_mouse_capture_flag_disables_mouse_capture() {
-        let cli = parse_cli(&["deepseek", "--no-mouse-capture"]);
+        let cli = parse_cli(&["codewhale", "--no-mouse-capture"]);
         let config = Config::default();
 
-        assert!(!should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(!should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
     }
 
     #[test]
     fn config_can_disable_default_mouse_capture() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config {
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
@@ -4677,25 +5454,30 @@ mod terminal_mode_tests {
                 terminal_probe_timeout_ms: None,
                 status_items: None,
                 osc8_links: None,
+                composer_arrows_scroll: None,
                 notification_condition: None,
             }),
             ..Config::default()
         };
 
-        assert!(!should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(!should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
     }
 
     #[test]
     fn mouse_capture_flag_enables_mouse_capture() {
-        let cli = parse_cli(&["deepseek", "--mouse-capture"]);
+        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
         let config = Config::default();
 
-        assert!(should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
     }
 
     #[test]
     fn config_can_enable_mouse_capture() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config {
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
@@ -4703,20 +5485,25 @@ mod terminal_mode_tests {
                 terminal_probe_timeout_ms: None,
                 status_items: None,
                 osc8_links: None,
+                composer_arrows_scroll: None,
                 notification_condition: None,
             }),
             ..Config::default()
         };
 
-        assert!(should_use_mouse_capture_with(&cli, &config, true, None));
+        assert!(should_use_mouse_capture_with(
+            &cli, &config, true, None, None, None
+        ));
     }
 
     #[test]
     fn mouse_capture_is_off_without_alternate_screen() {
-        let cli = parse_cli(&["deepseek", "--mouse-capture"]);
+        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
         let config = Config::default();
 
-        assert!(!should_use_mouse_capture_with(&cli, &config, false, None));
+        assert!(!should_use_mouse_capture_with(
+            &cli, &config, false, None, None, None
+        ));
     }
 
     // Issue #878 / #898: JetBrains JediTerm advertises mouse support but
@@ -4728,7 +5515,7 @@ mod terminal_mode_tests {
 
     #[test]
     fn mouse_capture_defaults_off_in_jetbrains_jediterm() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
 
         assert!(!should_use_mouse_capture_with(
@@ -4736,12 +5523,14 @@ mod terminal_mode_tests {
             &config,
             true,
             Some("JetBrains-JediTerm"),
+            None,
+            None,
         ));
     }
 
     #[test]
     fn jetbrains_default_off_is_case_insensitive() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config::default();
 
         // JetBrains has occasionally varied the casing across releases;
@@ -4751,12 +5540,14 @@ mod terminal_mode_tests {
             &config,
             true,
             Some("jetbrains-jediterm"),
+            None,
+            None,
         ));
     }
 
     #[test]
     fn mouse_capture_flag_overrides_jetbrains_default() {
-        let cli = parse_cli(&["deepseek", "--mouse-capture"]);
+        let cli = parse_cli(&["codewhale", "--mouse-capture"]);
         let config = Config::default();
 
         assert!(should_use_mouse_capture_with(
@@ -4764,12 +5555,14 @@ mod terminal_mode_tests {
             &config,
             true,
             Some("JetBrains-JediTerm"),
+            None,
+            None,
         ));
     }
 
     #[test]
     fn config_mouse_capture_true_overrides_jetbrains_default() {
-        let cli = parse_cli(&["deepseek"]);
+        let cli = parse_cli(&["codewhale"]);
         let config = Config {
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
@@ -4777,6 +5570,7 @@ mod terminal_mode_tests {
                 terminal_probe_timeout_ms: None,
                 status_items: None,
                 osc8_links: None,
+                composer_arrows_scroll: None,
                 notification_condition: None,
             }),
             ..Config::default()
@@ -4787,6 +5581,8 @@ mod terminal_mode_tests {
             &config,
             true,
             Some("JetBrains-JediTerm"),
+            None,
+            None,
         ));
     }
 }
@@ -4986,24 +5782,24 @@ max_subagents = -3
     fn project_overlay_skips_missing_config_file() {
         let tmp = tempdir().expect("tempdir");
         let mut config = Config {
-            provider: Some("deepseek".to_string()),
+            provider: Some("codewhale".to_string()),
             ..Config::default()
         };
         merge_project_config(&mut config, tmp.path());
         // Untouched.
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.provider.as_deref(), Some("codewhale"));
     }
 
     #[test]
     fn project_overlay_skips_malformed_toml() {
         let tmp = workspace_with_project_config("this is not valid TOML !!");
         let mut config = Config {
-            provider: Some("deepseek".to_string()),
+            provider: Some("codewhale".to_string()),
             ..Config::default()
         };
         merge_project_config(&mut config, tmp.path());
         // Untouched on parse error — better to fall back to global than crash.
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.provider.as_deref(), Some("codewhale"));
     }
 
     #[test]
@@ -5015,13 +5811,13 @@ model = ""
 "#,
         );
         let mut config = Config {
-            provider: Some("deepseek".to_string()),
+            provider: Some("codewhale".to_string()),
             default_text_model: Some("deepseek-v4-pro".to_string()),
             ..Config::default()
         };
         merge_project_config(&mut config, tmp.path());
         // Empty strings are ignored — they're rarely a deliberate override.
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.provider.as_deref(), Some("codewhale"));
         assert_eq!(
             config.default_text_model.as_deref(),
             Some("deepseek-v4-pro")
@@ -5129,6 +5925,7 @@ mod doctor_mcp_tests {
             required: false,
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            headers: std::collections::HashMap::new(),
         }
     }
 
@@ -5161,7 +5958,7 @@ mod doctor_mcp_tests {
 
     #[test]
     fn test_self_hosted_absolute_is_ok() {
-        let server = make_server(Some("/usr/local/bin/deepseek"), &["serve", "--mcp"], None);
+        let server = make_server(Some("/usr/local/bin/codewhale"), &["serve", "--mcp"], None);
         match doctor_check_mcp_server(&server) {
             McpServerDoctorStatus::Ok(detail) | McpServerDoctorStatus::Error(detail) => {
                 // On systems where the path doesn't exist, this will be Error.
@@ -5179,7 +5976,7 @@ mod doctor_mcp_tests {
 
     #[test]
     fn test_self_hosted_relative_is_warning() {
-        let server = make_server(Some("deepseek"), &["serve", "--mcp"], None);
+        let server = make_server(Some("codewhale"), &["serve", "--mcp"], None);
         match doctor_check_mcp_server(&server) {
             McpServerDoctorStatus::Warning(detail) => {
                 assert!(detail.contains("relative"));
@@ -5203,13 +6000,6 @@ mod setup_helper_tests {
     use super::*;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
-
-    // Serialize tests that mutate process-global env vars. Without this,
-    // `cargo test` runs them in parallel and they race on `DEEPSEEK_API_KEY`,
-    // causing intermittent CI failures (one test reads while another's set
-    // is still active). `unwrap_or_else` recovers from poisoning so a panic
-    // in one test doesn't cascade through the whole module.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn init_tools_dir_creates_readme_and_example() {
@@ -5365,7 +6155,7 @@ mod setup_helper_tests {
 
     #[test]
     fn plain_launch_preserves_checkpoint_but_starts_fresh() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_support::lock_test_env();
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -5401,7 +6191,7 @@ mod setup_helper_tests {
 
     #[test]
     fn continue_recovers_same_workspace_checkpoint() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_support::lock_test_env();
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -5465,6 +6255,7 @@ mod setup_helper_tests {
             "RUST_LOG",
             "DEEPSEEK_APPROVAL_POLICY",
             "DEEPSEEK_SANDBOX_MODE",
+            "DEEPSEEK_YOLO",
         ] {
             assert!(
                 keys.contains(required),
@@ -5510,7 +6301,7 @@ mod setup_helper_tests {
 
     #[test]
     fn resolve_api_key_source_reports_env_when_set() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_support::lock_test_env();
         let prev = std::env::var("DEEPSEEK_API_KEY").ok();
         let prev_source = std::env::var("DEEPSEEK_API_KEY_SOURCE").ok();
         unsafe {
@@ -5532,7 +6323,7 @@ mod setup_helper_tests {
 
     #[test]
     fn resolve_api_key_source_reports_dispatcher_keyring() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_support::lock_test_env();
         let prev = std::env::var("DEEPSEEK_API_KEY").ok();
         let prev_source = std::env::var("DEEPSEEK_API_KEY_SOURCE").ok();
         unsafe {
@@ -5554,7 +6345,7 @@ mod setup_helper_tests {
 
     #[test]
     fn resolve_api_key_source_prefers_config_over_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::test_support::lock_test_env();
         let prev = std::env::var("DEEPSEEK_API_KEY").ok();
         let prev_source = std::env::var("DEEPSEEK_API_KEY_SOURCE").ok();
         unsafe {
@@ -5670,7 +6461,7 @@ mod pr_prompt_tests {
         // A deliberately-implausible name to confirm the negative
         // branch — `--version` on this would exec(3) → ENOENT.
         assert!(
-            !is_command_available("this-command-cannot-exist-deepseek-tui-test-ENOENT-marker"),
+            !is_command_available("this-command-cannot-exist-codewhale-tui-test-ENOENT-marker"),
             "missing command should return false, not panic"
         );
     }

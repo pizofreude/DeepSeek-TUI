@@ -142,7 +142,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
     };
 
     let dispatch_kind = app.pending_subagent_dispatch.as_deref();
-    let is_fanout = matches!(dispatch_kind, Some("rlm"));
+    let is_fanout = matches!(dispatch_kind, Some("rlm_open" | "rlm_eval" | "rlm"));
 
     if is_fanout {
         // Reuse the active fanout card for sibling spawns; otherwise create
@@ -154,7 +154,7 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
             card.claim_pending_worker(&agent_id, AgentLifecycle::Running);
             app.subagent_card_index.insert(agent_id, idx);
         } else {
-            let mut card = FanoutCard::new(dispatch_kind.unwrap_or("rlm").to_string());
+            let mut card = FanoutCard::new(dispatch_kind.unwrap_or("rlm_eval").to_string());
             card.upsert_worker(&agent_id, AgentLifecycle::Running);
             app.add_message(HistoryCell::SubAgent(SubAgentCell::Fanout(card)));
             let idx = app.history.len().saturating_sub(1);
@@ -259,10 +259,10 @@ fn format_task_detail(task: &TaskRecord) -> String {
     }
     lines.push(format!("Created: {}", task.created_at));
     if let Some(started_at) = task.started_at {
-        lines.push(format!("Started: {}", started_at));
+        lines.push(format!("Started: {started_at}"));
     }
     if let Some(ended_at) = task.ended_at {
-        lines.push(format!("Ended: {}", ended_at));
+        lines.push(format!("Ended: {ended_at}"));
     }
     if let Some(duration) = task.duration_ms {
         lines.push(format!("Duration: {:.2}s", duration as f64 / 1000.0));

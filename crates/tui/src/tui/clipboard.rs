@@ -7,10 +7,15 @@
 //! endpoint, so we materialize the bytes to disk instead of base64-embedding
 //! them in the request).
 
+#[cfg(any(not(test), all(test, unix)))]
+use std::io::Write;
 #[cfg(not(test))]
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-#[cfg(all(any(target_os = "macos", target_os = "windows"), not(test)))]
+#[cfg(any(
+    all(test, unix),
+    all(any(target_os = "macos", target_os = "windows"), not(test))
+))]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,19 +60,50 @@ pub enum ClipboardContent {
 /// Clipboard reader/writer helper.
 pub struct ClipboardHandler {
     clipboard: Option<Clipboard>,
+    clipboard_init_attempted: bool,
     #[cfg(test)]
     written_text: Vec<String>,
 }
 
 impl ClipboardHandler {
-    /// Create a new clipboard handler, falling back to a no-op when unavailable.
+    /// Create a new clipboard handler without connecting.
+    ///
+    /// The actual clipboard connection is deferred to first use
+    /// (`ensure_clipboard`) so that startup on hosts without an X11/Wayland
+    /// server (headless, WSL2) never blocks the TUI event loop.
     pub fn new() -> Self {
-        let clipboard = Clipboard::new().ok();
         Self {
-            clipboard,
+            clipboard: None,
+            clipboard_init_attempted: false,
             #[cfg(test)]
             written_text: Vec::new(),
         }
+    }
+
+    /// Try to connect to the system clipboard, bounded by a short timeout.
+    ///
+    /// On Linux, `arboard::Clipboard::new()` opens a blocking X11 connection.
+    /// When no X server is running (headless, WSL2 without WSLg), the connect
+    /// call can hang indefinitely.  We spawn the connection attempt on a
+    /// temporary thread and give it 500 ms; if it doesn't return in time the
+    /// handler stays in fallback/no-op mode and `read`/`write_text` fall
+    /// through to their OSC 52 and pbcopy/powershell fallbacks.
+    fn ensure_clipboard(&mut self) {
+        if self.clipboard_init_attempted {
+            return;
+        }
+        self.clipboard_init_attempted = true;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Clipboard::new().ok());
+        });
+        // 500 ms is generous for a local Unix socket connect — the
+        // kernel either answers or doesn't.
+        self.clipboard = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .ok()
+            .flatten();
     }
 
     /// Read the clipboard and return the parsed content.
@@ -75,6 +111,7 @@ impl ClipboardHandler {
     /// `workspace` is used as a fallback location when `~/.deepseek/` cannot
     /// be resolved (e.g. running with a stripped HOME in CI sandboxes).
     pub fn read(&mut self, workspace: &Path) -> Option<ClipboardContent> {
+        self.ensure_clipboard();
         let clipboard = self.clipboard.as_mut()?;
         if let Ok(text) = clipboard.get_text() {
             return Some(ClipboardContent::Text(text));
@@ -99,6 +136,7 @@ impl ClipboardHandler {
 
         #[cfg(not(test))]
         {
+            self.ensure_clipboard();
             if let Some(clipboard) = self.clipboard.as_mut()
                 && clipboard.set_text(text.to_string()).is_ok()
             {
@@ -128,43 +166,47 @@ impl ClipboardHandler {
 
 #[cfg(all(target_os = "macos", not(test)))]
 fn write_text_with_pbcopy(text: &str) -> Result<()> {
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to run pbcopy: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write to pbcopy: {e}"))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("Failed to wait for pbcopy: {e}"))?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!("pbcopy failed"))
+    write_text_with_stdin_command("pbcopy", &[], text, "pbcopy")
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
 fn write_text_with_set_clipboard(text: &str) -> Result<()> {
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Set-Clipboard -Value $input"])
+    write_text_with_stdin_command(
+        "powershell.exe",
+        &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+        text,
+        "Set-Clipboard",
+    )
+}
+
+#[cfg(any(
+    all(test, unix),
+    all(any(target_os = "macos", target_os = "windows"), not(test))
+))]
+fn write_text_with_stdin_command(
+    program: &str,
+    args: &[&str],
+    text: &str,
+    label: &str,
+) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to run Set-Clipboard: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run {label}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(text.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write to Set-Clipboard: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to write to {label}: {e}"))?;
     }
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("Failed to wait for Set-Clipboard: {e}"))?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!("Set-Clipboard failed"))
+    let _ = std::thread::Builder::new()
+        .name("clipboard-wait".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -199,7 +241,7 @@ fn osc52_sequence(text: &str, in_tmux: bool) -> Result<String> {
 /// `~/.deepseek/clipboard-images/` so the path is stable across worktrees and
 /// matches the location described in user-facing docs; falls back to
 /// `<workspace>/clipboard-images/` if the home dir is unavailable.
-fn clipboard_images_dir(workspace: &Path) -> PathBuf {
+pub(crate) fn clipboard_images_dir(workspace: &Path) -> PathBuf {
     if let Some(home) = dirs::home_dir() {
         return home.join(".deepseek").join("clipboard-images");
     }
@@ -290,6 +332,48 @@ mod tests {
         // we ever regress to PPM or another format this will catch it.
         let header = std::fs::read(&pasted.path).unwrap();
         assert_eq!(&header[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_clipboard_command_returns_before_helper_exits() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("clipboard.txt");
+        let script = dir.path().join("slow-clipboard.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat > \"$1\"\nsleep 1\n").unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let started = Instant::now();
+        write_text_with_stdin_command(
+            script.to_str().unwrap(),
+            &[marker.to_str().unwrap()],
+            "copied",
+            "test-clipboard",
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "clipboard helper wait leaked onto caller path"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut last_body = String::new();
+        while Instant::now() < deadline {
+            if let Ok(body) = std::fs::read_to_string(&marker) {
+                if body == "copied" {
+                    return;
+                }
+                last_body = body;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("clipboard helper did not receive stdin; last body: {last_body:?}");
     }
 
     #[test]

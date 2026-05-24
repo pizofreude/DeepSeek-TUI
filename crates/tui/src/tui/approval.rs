@@ -130,8 +130,11 @@ pub struct ApprovalRequest {
     pub impacts: Vec<String>,
     /// Tool parameters (for display)
     pub params: Value,
-    /// Fingerprint key for per‑call approval caching (§5.A).
+    /// Exact-argument fingerprint, used to scope *denials* (#1617).
     pub approval_key: String,
+    /// Lossy / arity-aware fingerprint, used to scope *approvals* so an
+    /// "approve for session" covers later flag variants (v0.8.37).
+    pub approval_grouping_key: String,
 }
 
 impl ApprovalRequest {
@@ -144,6 +147,8 @@ impl ApprovalRequest {
     ) -> Self {
         let category = get_tool_category(tool_name);
         let risk = classify_risk(tool_name, category, params);
+        let approval_grouping_key =
+            crate::tools::approval_cache::build_approval_grouping_key(tool_name, params).0;
 
         Self {
             id: id.to_string(),
@@ -154,6 +159,7 @@ impl ApprovalRequest {
             impacts: build_impact_summary(tool_name, category, params),
             params: params.clone(),
             approval_key: approval_key.to_string(),
+            approval_grouping_key,
         }
     }
 
@@ -504,6 +510,8 @@ pub struct ApprovalView {
     pending_confirm: Option<ApprovalOption>,
     timeout: Option<Duration>,
     requested_at: Instant,
+    /// Whether the approval card is collapsed to a single-line banner.
+    pub(crate) collapsed: bool,
 }
 
 impl ApprovalView {
@@ -520,6 +528,7 @@ impl ApprovalView {
             pending_confirm: None,
             timeout: None,
             requested_at: Instant::now(),
+            collapsed: false,
         }
     }
 
@@ -594,6 +603,7 @@ impl ApprovalView {
             decision,
             timed_out,
             approval_key: self.request.approval_key.clone(),
+            approval_grouping_key: self.request.approval_grouping_key.clone(),
         })
     }
 
@@ -625,6 +635,10 @@ impl ModalView for ApprovalView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         match key.code {
+            KeyCode::Tab => {
+                self.collapsed = !self.collapsed;
+                ViewAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_prev();
                 ViewAction::None
@@ -636,15 +650,17 @@ impl ModalView for ApprovalView {
             KeyCode::Enter => self.commit_or_stage(self.current_option()),
             // Direct shortcuts; '1' / '2' map to the first two options
             // so a numeric pad still works for benign approve flows.
-            KeyCode::Char('y') | KeyCode::Char('1') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
                 self.commit_or_stage(ApprovalOption::ApproveOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('2') => {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') => {
                 self.commit_or_stage(ApprovalOption::ApproveAlways)
             }
-            KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('3') => {
-                self.commit_or_stage(ApprovalOption::Deny)
-            }
+            KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('d')
+            | KeyCode::Char('D')
+            | KeyCode::Char('3') => self.commit_or_stage(ApprovalOption::Deny),
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.pending_confirm = None;
                 self.emit_params_pager()
@@ -1152,6 +1168,28 @@ mod tests {
     }
 
     #[test]
+    fn tab_toggles_collapsed_card_so_transcript_stays_visible() {
+        // Regression for PR #1455 / @tiger-dog: the approval modal
+        // rendered as a full-screen takeover that hid the transcript
+        // behind it, so users had to dismiss the prompt to remember
+        // what they were approving. Tab now flips between the full
+        // takeover card and a single-line bottom banner.
+        let mut view = ApprovalView::new(benign_request());
+        assert!(
+            !view.collapsed,
+            "modal must start expanded so first-time users notice it"
+        );
+
+        let action = view.handle_key(create_key_event(KeyCode::Tab));
+        assert!(matches!(action, ViewAction::None));
+        assert!(view.collapsed, "first Tab collapses the card");
+
+        let action = view.handle_key(create_key_event(KeyCode::Tab));
+        assert!(matches!(action, ViewAction::None));
+        assert!(!view.collapsed, "second Tab restores the takeover card");
+    }
+
+    #[test]
     fn test_approval_view_navigation() {
         let mut view = ApprovalView::new(benign_request());
         assert_eq!(view.selected, 0);
@@ -1173,15 +1211,20 @@ mod tests {
 
     #[test]
     fn benign_y_one_step_approves() {
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Approved,
-                ..
-            })
-        ));
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut view = ApprovalView::new(benign_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Approved,
+                        ..
+                    })
+                ),
+                "expected Approved for {code:?}"
+            );
+        }
     }
 
     #[test]
@@ -1212,30 +1255,31 @@ mod tests {
 
     #[test]
     fn benign_a_two_approves_for_session() {
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::ApprovedForSession,
-                ..
-            })
-        ));
-
-        let mut view = ApprovalView::new(benign_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('2')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::ApprovedForSession,
-                ..
-            })
-        ));
+        for code in [KeyCode::Char('a'), KeyCode::Char('A'), KeyCode::Char('2')] {
+            let mut view = ApprovalView::new(benign_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::ApprovedForSession,
+                        ..
+                    })
+                ),
+                "expected ApprovedForSession for {code:?}"
+            );
+        }
     }
 
     #[test]
     fn benign_n_d_three_all_deny() {
-        for code in [KeyCode::Char('n'), KeyCode::Char('d'), KeyCode::Char('3')] {
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Char('3'),
+        ] {
             let mut view = ApprovalView::new(benign_request());
             let action = view.handle_key(create_key_event(code));
             assert!(
@@ -1343,22 +1387,27 @@ mod tests {
 
     #[test]
     fn destructive_y_first_press_stages_then_second_commits() {
-        let mut view = ApprovalView::new(destructive_request());
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut view = ApprovalView::new(destructive_request());
 
-        // First press stages — no decision emitted yet.
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
+            // First press stages — no decision emitted yet.
+            let action = view.handle_key(create_key_event(code));
+            assert!(matches!(action, ViewAction::None));
+            assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveOnce));
 
-        // Second press of the same key commits.
-        let action = view.handle_key(create_key_event(KeyCode::Char('y')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Approved,
-                ..
-            })
-        ));
+            // Second press of the same key commits.
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Approved,
+                        ..
+                    })
+                ),
+                "expected Approved for {code:?}"
+            );
+        }
     }
 
     #[test]
@@ -1408,20 +1457,25 @@ mod tests {
 
     #[test]
     fn destructive_a_first_press_stages_then_second_commits_session() {
-        let mut view = ApprovalView::new(destructive_request());
+        for code in [KeyCode::Char('a'), KeyCode::Char('A')] {
+            let mut view = ApprovalView::new(destructive_request());
 
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(action, ViewAction::None));
-        assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveAlways));
+            let action = view.handle_key(create_key_event(code));
+            assert!(matches!(action, ViewAction::None));
+            assert_eq!(view.pending_confirm(), Some(ApprovalOption::ApproveAlways));
 
-        let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::ApprovedForSession,
-                ..
-            })
-        ));
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::ApprovedForSession,
+                        ..
+                    })
+                ),
+                "expected ApprovedForSession for {code:?}"
+            );
+        }
     }
 
     #[test]
@@ -1442,15 +1496,25 @@ mod tests {
     #[test]
     fn destructive_deny_does_not_require_confirmation() {
         // Deny / Abort skip the two-key dance — the user is bailing.
-        let mut view = ApprovalView::new(destructive_request());
-        let action = view.handle_key(create_key_event(KeyCode::Char('n')));
-        assert!(matches!(
-            action,
-            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
-                decision: ReviewDecision::Denied,
-                ..
-            })
-        ));
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+        ] {
+            let mut view = ApprovalView::new(destructive_request());
+            let action = view.handle_key(create_key_event(code));
+            assert!(
+                matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                        decision: ReviewDecision::Denied,
+                        ..
+                    })
+                ),
+                "expected Denied for {code:?}"
+            );
+        }
     }
 
     #[test]

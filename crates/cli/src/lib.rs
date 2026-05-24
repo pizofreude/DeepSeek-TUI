@@ -9,23 +9,25 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use deepseek_agent::ModelRegistry;
-use deepseek_app_server::{
+use codewhale_agent::ModelRegistry;
+use codewhale_app_server::{
     AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
 };
-use deepseek_config::{
+use codewhale_config::{
     CliRuntimeOverrides, ConfigStore, ProviderKind, ResolvedRuntimeOptions, RuntimeApiKeySource,
 };
-use deepseek_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
-use deepseek_mcp::{McpServerDefinition, run_stdio_server};
-use deepseek_secrets::Secrets;
-use deepseek_state::{StateStore, ThreadListFilters};
+use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
+use codewhale_mcp::{McpServerDefinition, run_stdio_server};
+use codewhale_secrets::Secrets;
+use codewhale_state::{StateStore, ThreadListFilters};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProviderArg {
     Deepseek,
     NvidiaNim,
     Openai,
+    Atlascloud,
+    WanjieArk,
     Openrouter,
     Novita,
     Fireworks,
@@ -40,6 +42,8 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Deepseek => ProviderKind::Deepseek,
             ProviderArg::NvidiaNim => ProviderKind::NvidiaNim,
             ProviderArg::Openai => ProviderKind::Openai,
+            ProviderArg::Atlascloud => ProviderKind::Atlascloud,
+            ProviderArg::WanjieArk => ProviderKind::WanjieArk,
             ProviderArg::Openrouter => ProviderKind::Openrouter,
             ProviderArg::Novita => ProviderKind::Novita,
             ProviderArg::Fireworks => ProviderKind::Fireworks,
@@ -52,10 +56,10 @@ impl From<ProviderArg> for ProviderKind {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "deepseek",
+    name = "codewhale",
     version = env!("DEEPSEEK_BUILD_VERSION"),
-    bin_name = "deepseek",
-    override_usage = "deepseek [OPTIONS] [PROMPT]\n       deepseek [OPTIONS] <COMMAND> [ARGS]"
+    bin_name = "codewhale",
+    override_usage = "codewhale [OPTIONS] [PROMPT]\n       codewhale [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct Cli {
     #[arg(long)]
@@ -92,6 +96,9 @@ struct Cli {
     no_mouse_capture: bool,
     #[arg(long = "skip-onboarding")]
     skip_onboarding: bool,
+    /// YOLO mode: auto-approve all tools
+    #[arg(long)]
+    yolo: bool,
     #[arg(short = 'p', long = "prompt", value_name = "PROMPT")]
     prompt_flag: Option<String>,
     #[arg(
@@ -108,7 +115,7 @@ struct Cli {
 enum Commands {
     /// Run interactive/non-interactive flows via the TUI binary.
     Run(RunArgs),
-    /// Run DeepSeek TUI diagnostics.
+    /// Run CodeWhale diagnostics.
     Doctor(TuiPassthroughArgs),
     /// List live DeepSeek API models via the TUI binary.
     Models(TuiPassthroughArgs),
@@ -122,9 +129,18 @@ enum Commands {
     Init(TuiPassthroughArgs),
     /// Bootstrap MCP config and/or skills directories.
     Setup(TuiPassthroughArgs),
-    /// Run the DeepSeek TUI non-interactive agent command.
+    /// Run the CodeWhale non-interactive agent command.
+    #[command(after_help = "\
+Common forwarded flags:
+  --auto                           Enable agentic mode with tool access
+  --json                           Emit summary JSON
+  --resume <SESSION_ID>            Resume a previous session by ID or prefix
+  --session-id <SESSION_ID>        Resume a previous session by ID or prefix
+  --continue                       Continue the most recent session for this workspace
+  --output-format <FORMAT>         Output format: text or stream-json
+")]
     Exec(TuiPassthroughArgs),
-    /// Run a DeepSeek-powered code review over a git diff.
+    /// Run a CodeWhale-powered code review over a git diff.
     Review(TuiPassthroughArgs),
     /// Apply a patch file or stdin to the working tree.
     Apply(TuiPassthroughArgs),
@@ -159,26 +175,26 @@ enum Commands {
     /// Generate shell completions.
     #[command(after_help = r#"Examples:
   Bash (current shell only):
-    source <(deepseek completion bash)
+    source <(codewhale completion bash)
 
   Bash (persistent, Linux/bash-completion):
     mkdir -p ~/.local/share/bash-completion/completions
-    deepseek completion bash > ~/.local/share/bash-completion/completions/deepseek
+    codewhale completion bash > ~/.local/share/bash-completion/completions/codewhale
     # Requires bash-completion to be installed and loaded by your shell.
 
   Zsh:
     mkdir -p ~/.zfunc
-    deepseek completion zsh > ~/.zfunc/_deepseek
+    codewhale completion zsh > ~/.zfunc/_codewhale
     # Add to ~/.zshrc if needed:
     #   fpath=(~/.zfunc $fpath)
     #   autoload -Uz compinit && compinit
 
   Fish:
     mkdir -p ~/.config/fish/completions
-    deepseek completion fish > ~/.config/fish/completions/deepseek.fish
+    codewhale completion fish > ~/.config/fish/completions/codewhale.fish
 
   PowerShell (current shell only):
-    deepseek completion powershell | Out-String | Invoke-Expression
+    codewhale completion powershell | Out-String | Invoke-Expression
 
 The command prints the completion script to stdout; redirect it to a path your shell loads automatically."#)]
     Completion {
@@ -187,7 +203,7 @@ The command prints the completion script to stdout; redirect it to a path your s
     },
     /// Print a usage rollup from the audit log and session store.
     Metrics(MetricsArgs),
-    /// Check for and apply updates to the `deepseek` binary.
+    /// Check for and apply updates to the `codewhale` binary.
     Update,
 }
 
@@ -256,7 +272,7 @@ enum AuthCommand {
         #[arg(long, value_enum)]
         provider: ProviderArg,
     },
-    /// Delete a provider's key from config and keyring storage.
+    /// Delete a provider's key from config and secret-store storage.
     Clear {
         #[arg(long, value_enum)]
         provider: ProviderArg,
@@ -425,6 +441,7 @@ fn run() -> Result<()> {
         telemetry: cli.telemetry,
         approval_policy: cli.approval_policy.clone(),
         sandbox_mode: cli.sandbox_mode.clone(),
+        yolo: Some(cli.yolo),
     };
     let command = cli.command.take();
 
@@ -504,7 +521,7 @@ fn run() -> Result<()> {
         Some(Commands::AppServer(args)) => run_app_server_command(args),
         Some(Commands::Completion { shell }) => {
             let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "deepseek", &mut io::stdout());
+            generate(shell, &mut cmd, "codewhale", &mut io::stdout());
             Ok(())
         }
         Some(Commands::Metrics(args)) => run_metrics_command(args),
@@ -556,14 +573,14 @@ fn resolve_runtime_for_dispatch_with_secrets(
         match store.save() {
             Ok(()) => {
                 eprintln!(
-                    "info: recovered API key from OS keyring and saved it to {}",
+                    "info: recovered API key from secret store and saved it to {}",
                     store.path().display()
                 );
                 resolved.api_key_source = Some(RuntimeApiKeySource::ConfigFile);
             }
             Err(err) => {
                 eprintln!(
-                    "warning: recovered API key from OS keyring but failed to save {}: {err}",
+                    "warning: recovered API key from secret store but failed to save {}: {err}",
                     store.path().display()
                 );
             }
@@ -669,6 +686,8 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepseek => "deepseek",
         ProviderKind::NvidiaNim => "nvidia-nim",
         ProviderKind::Openai => "openai",
+        ProviderKind::Atlascloud => "atlascloud",
+        ProviderKind::WanjieArk => "wanjie-ark",
         ProviderKind::Openrouter => "openrouter",
         ProviderKind::Novita => "novita",
         ProviderKind::Fireworks => "fireworks",
@@ -679,22 +698,24 @@ fn provider_slot(provider: ProviderKind) -> &'static str {
 }
 
 /// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 9] = [
+const PROVIDER_LIST: [ProviderKind; 11] = [
     ProviderKind::Deepseek,
     ProviderKind::NvidiaNim,
+    ProviderKind::Openai,
+    ProviderKind::Atlascloud,
+    ProviderKind::WanjieArk,
     ProviderKind::Openrouter,
     ProviderKind::Novita,
     ProviderKind::Fireworks,
     ProviderKind::Sglang,
     ProviderKind::Vllm,
     ProviderKind::Ollama,
-    ProviderKind::Openai,
 ];
 
 #[cfg(test)]
 fn no_keyring_secrets() -> Secrets {
     Secrets::new(std::sync::Arc::new(
-        deepseek_secrets::InMemoryKeyringStore::new(),
+        codewhale_secrets::InMemoryKeyringStore::new(),
     ))
 }
 
@@ -744,6 +765,12 @@ fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
         ProviderKind::Vllm => &["VLLM_API_KEY"],
         ProviderKind::Ollama => &["OLLAMA_API_KEY"],
         ProviderKind::Openai => &["OPENAI_API_KEY"],
+        ProviderKind::Atlascloud => &["ATLASCLOUD_API_KEY"],
+        ProviderKind::WanjieArk => &[
+            "WANJIE_ARK_API_KEY",
+            "WANJIE_API_KEY",
+            "WANJIE_MAAS_API_KEY",
+        ],
     }
 }
 
@@ -806,7 +833,7 @@ fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     let active_source = if config_key.is_some() {
         "config"
     } else if keyring_key.is_some() {
-        "keyring"
+        "secret store"
     } else if env_key.is_some() {
         "env"
     } else {
@@ -832,14 +859,14 @@ fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     vec![
         format!("provider: {}", provider.as_str()),
         format!("active source: {active_label}"),
-        "lookup order: config -> keyring -> env".to_string(),
+        "lookup order: config -> secret store -> env".to_string(),
         format!(
             "config file: {} ({})",
             store.path().display(),
             source_status(config_key, "missing")
         ),
         format!(
-            "keyring: {} ({})",
+            "secret store: {} ({})",
             secrets.backend_name(),
             source_status(keyring_key.as_deref(), "missing")
         ),
@@ -929,7 +956,7 @@ fn run_auth_command_with_secrets(
             let source = if in_file {
                 Some("config-file")
             } else if in_keyring {
-                Some("keyring")
+                Some("secret-store")
             } else if in_env {
                 Some("env")
             } else {
@@ -947,11 +974,11 @@ fn run_auth_command_with_secrets(
             clear_provider_api_key_from_config(store, provider);
             clear_provider_api_key_from_keyring(secrets, provider);
             store.save()?;
-            println!("cleared API key for {slot} from config and keyring");
+            println!("cleared API key for {slot} from config and secret store");
             Ok(())
         }
         AuthCommand::List => {
-            println!("provider     config keyring env  active");
+            println!("provider     config store env  active");
             let active_provider = store.config.provider;
             for provider in PROVIDER_LIST {
                 let slot = provider_slot(provider);
@@ -962,7 +989,7 @@ fn run_auth_command_with_secrets(
                 let active = if file {
                     "config"
                 } else if keyring == Some(true) {
-                    "keyring"
+                    "store"
                 } else if env {
                     "env"
                 } else {
@@ -1012,8 +1039,8 @@ fn prompt_api_key(slot: &str) -> Result<String> {
     Ok(key)
 }
 
-/// Move plaintext keys from config.toml into an explicit platform credential
-/// store. Hidden in v0.8.8 because the normal setup path is config/env only.
+/// Move plaintext keys from config.toml into the configured secret store.
+/// Hidden in v0.8.8 because the normal setup path is config/env only.
 fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -> Result<()> {
     let mut migrated: Vec<(ProviderKind, &'static str)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -1042,7 +1069,9 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
             migrated.push((provider, slot));
             continue;
         } else if let Err(err) = secrets.set(slot, &value) {
-            warnings.push(format!("skipped {slot}: failed to write to keyring: {err}"));
+            warnings.push(format!(
+                "skipped {slot}: failed to write to secret store: {err}"
+            ));
             continue;
         }
         if !dry_run {
@@ -1060,7 +1089,7 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
             .context("failed to write updated config.toml")?;
     }
 
-    println!("keyring backend: {}", secrets.backend_name());
+    println!("secret store backend: {}", secrets.backend_name());
     if migrated.is_empty() {
         println!("nothing to migrate (config.toml has no plaintext api_key entries)");
     } else {
@@ -1088,7 +1117,7 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
 fn run_config_command(store: &mut ConfigStore, command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Get { key } => {
-            if let Some(value) = store.config.get_value(&key) {
+            if let Some(value) = store.config.get_display_value(&key) {
                 println!("{value}");
                 return Ok(());
             }
@@ -1255,8 +1284,7 @@ fn load_mcp_server_definitions(store: &ConfigStore) -> Vec<McpServerDefinition> 
         Ok(definitions) => definitions,
         Err(err) => {
             eprintln!(
-                "warning: failed to parse persisted MCP server definitions ({}): {}",
-                MCP_SERVER_DEFINITIONS_KEY, err
+                "warning: failed to parse persisted MCP server definitions ({MCP_SERVER_DEFINITIONS_KEY}): {err}"
             );
             Vec::new()
         }
@@ -1327,7 +1355,7 @@ fn run_dispatcher_resume_picker(
 
     println!();
     println!("Windows note: enter a session id or prefix from the list above.");
-    println!("You can also run `deepseek resume --last` to skip this prompt.");
+    println!("You can also run `codewhale resume --last` to skip this prompt.");
     print!("Session id/prefix (Enter to cancel): ");
     io::stdout().flush()?;
 
@@ -1384,6 +1412,8 @@ fn build_tui_command(
         ProviderKind::Deepseek
             | ProviderKind::NvidiaNim
             | ProviderKind::Openai
+            | ProviderKind::Atlascloud
+            | ProviderKind::WanjieArk
             | ProviderKind::Openrouter
             | ProviderKind::Novita
             | ProviderKind::Fireworks
@@ -1392,7 +1422,7 @@ fn build_tui_command(
             | ProviderKind::Ollama
     ) {
         bail!(
-            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, OpenRouter, Novita, Fireworks, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `deepseek model ...` for provider registry inspection.",
+            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, OpenRouter, Novita, Fireworks, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
             resolved_runtime.provider.as_str()
         );
     }
@@ -1413,6 +1443,12 @@ fn build_tui_command(
         cmd.env("DEEPSEEK_API_KEY", api_key);
         if resolved_runtime.provider == ProviderKind::Openai {
             cmd.env("OPENAI_API_KEY", api_key);
+        }
+        if resolved_runtime.provider == ProviderKind::Atlascloud {
+            cmd.env("ATLASCLOUD_API_KEY", api_key);
+        }
+        if resolved_runtime.provider == ProviderKind::WanjieArk {
+            cmd.env("WANJIE_ARK_API_KEY", api_key);
         }
         let source = resolved_runtime
             .api_key_source
@@ -1439,10 +1475,19 @@ fn build_tui_command(
     if let Some(mode) = cli.sandbox_mode.as_ref() {
         cmd.env("DEEPSEEK_SANDBOX_MODE", mode);
     }
+    if cli.yolo {
+        cmd.env("DEEPSEEK_YOLO", "true");
+    }
     if let Some(api_key) = cli.api_key.as_ref() {
         cmd.env("DEEPSEEK_API_KEY", api_key);
         if resolved_runtime.provider == ProviderKind::Openai {
             cmd.env("OPENAI_API_KEY", api_key);
+        }
+        if resolved_runtime.provider == ProviderKind::Atlascloud {
+            cmd.env("ATLASCLOUD_API_KEY", api_key);
+        }
+        if resolved_runtime.provider == ProviderKind::WanjieArk {
+            cmd.env("WANJIE_ARK_API_KEY", api_key);
         }
         cmd.env("DEEPSEEK_API_KEY_SOURCE", "cli");
     }
@@ -1456,7 +1501,7 @@ fn build_tui_command(
 fn exit_with_tui_status(status: std::process::ExitStatus) -> Result<()> {
     match status.code() {
         Some(code) => std::process::exit(code),
-        None => bail!("deepseek-tui terminated by signal"),
+        None => bail!("codewhale-tui terminated by signal"),
     }
 }
 
@@ -1468,7 +1513,7 @@ fn delegate_simple_tui(args: Vec<String>) -> Result<()> {
         .map_err(|err| anyhow!("{}", tui_spawn_error(&tui, &err)))?;
     match status.code() {
         Some(code) => std::process::exit(code),
-        None => bail!("deepseek-tui terminated by signal"),
+        None => bail!("codewhale-tui terminated by signal"),
     }
 }
 
@@ -1476,23 +1521,23 @@ fn tui_spawn_error(tui: &Path, err: &io::Error) -> String {
     format!(
         "failed to spawn companion TUI binary at {}: {err}\n\
 \n\
-The `deepseek` dispatcher found a `deepseek-tui` file, but the OS refused \
+The `codewhale` dispatcher found a `codewhale-tui` file, but the OS refused \
 to execute it. Common fixes:\n\
-  - Reinstall with `npm install -g deepseek-tui`, or run `deepseek update`.\n\
-  - On Windows, run `where deepseek` and `where deepseek-tui`; both should \
+  - Reinstall with `npm install -g codewhale`, or run `codewhale update`.\n\
+  - On Windows, run `where codewhale` and `where codewhale-tui`; both should \
 come from the same install directory.\n\
-  - If you downloaded release assets manually, keep both `deepseek` and \
-`deepseek-tui` binaries together and make sure the TUI binary is executable.\n\
-  - Set DEEPSEEK_TUI_BIN to the absolute path of a working `deepseek-tui` \
+  - If you downloaded release assets manually, keep both `codewhale` and \
+`codewhale-tui` binaries together and make sure the TUI binary is executable.\n\
+  - Set DEEPSEEK_TUI_BIN to the absolute path of a working `codewhale-tui` \
 binary.",
         tui.display()
     )
 }
 
-/// Resolve the sibling `deepseek-tui` executable next to the running
+/// Resolve the sibling `codewhale-tui` executable next to the running
 /// dispatcher. Honours platform executable suffix (`.exe` on Windows) so
 /// the npm-distributed Windows package — which ships
-/// `bin/downloads/deepseek-tui.exe` — is found by `Path::exists` (#247).
+/// `bin/downloads/codewhale-tui.exe` — is found by `Path::exists` (#247).
 ///
 /// `DEEPSEEK_TUI_BIN` is consulted first as an explicit override for
 /// custom installs and CI test layouts. On Windows we additionally try
@@ -1516,39 +1561,39 @@ fn locate_sibling_tui_binary() -> Result<PathBuf> {
     }
 
     // Build a stable error path so the user sees the platform-correct
-    // expected name, not "deepseek-tui" on Windows.
-    let expected = current.with_file_name(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+    // expected name, not "codewhale-tui" on Windows.
+    let expected = current.with_file_name(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
     bail!(
-        "Companion `deepseek-tui` binary not found at {}.\n\
+        "Companion `codewhale-tui` binary not found at {}.\n\
 \n\
-The `deepseek` dispatcher delegates interactive sessions to a sibling \
-`deepseek-tui` binary. To fix this, install one of:\n\
-  • npm:    npm install -g deepseek-tui            (downloads both binaries)\n\
-  • cargo:  cargo install deepseek-tui-cli deepseek-tui --locked\n\
-  • GitHub Releases: download BOTH `deepseek-<platform>` AND \
-`deepseek-tui-<platform>` from https://github.com/Hmbown/DeepSeek-TUI/releases/latest \
+The `codewhale` dispatcher delegates interactive sessions to a sibling \
+`codewhale-tui` binary. To fix this, install one of:\n\
+  • npm:    npm install -g codewhale                (downloads both binaries)\n\
+  • cargo:  cargo install codewhale-cli codewhale-tui --locked\n\
+  • GitHub Releases: download BOTH `codewhale-<platform>` AND \
+`codewhale-tui-<platform>` from https://github.com/Hmbown/CodeWhale/releases/latest \
 and place them in the same directory.\n\
 \n\
-Or set DEEPSEEK_TUI_BIN to the absolute path of an existing `deepseek-tui` binary.",
+Or set DEEPSEEK_TUI_BIN to the absolute path of an existing `codewhale-tui` binary.",
         expected.display()
     );
 }
 
 /// Return the first existing sibling-binary path under any of the names
-/// `deepseek-tui` might use on this platform. Pure function to keep
+/// `codewhale-tui` might use on this platform. Pure function to keep
 /// `locate_sibling_tui_binary` testable.
 fn sibling_tui_candidate(dispatcher: &Path) -> Option<PathBuf> {
     // Primary: platform-correct name. EXE_SUFFIX is "" on Unix and ".exe"
     // on Windows.
     let primary =
-        dispatcher.with_file_name(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+        dispatcher.with_file_name(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
     if primary.is_file() {
         return Some(primary);
     }
     // Windows fallback: a user who manually renamed `.exe` away (per the
     // workaround in #247) still launches successfully under the new code.
     if cfg!(windows) {
-        let suffixless = dispatcher.with_file_name("deepseek-tui");
+        let suffixless = dispatcher.with_file_name("codewhale-tui");
         if suffixless.is_file() {
             return Some(suffixless);
         }
@@ -2032,6 +2077,18 @@ mod tests {
             }))
         ));
 
+        let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "wanjie-ark"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Set {
+                    provider: ProviderArg::WanjieArk,
+                    api_key: None,
+                    api_key_stdin: false,
+                }
+            }))
+        ));
+
         let cli = parse_ok(&["deepseek", "auth", "get", "--provider", "sglang"]);
         assert!(matches!(
             cli.command,
@@ -2091,7 +2148,7 @@ mod tests {
 
     #[test]
     fn auth_set_writes_to_shared_config_file() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -2162,7 +2219,7 @@ mod tests {
 
     #[test]
     fn auth_clear_removes_from_config() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -2197,7 +2254,7 @@ mod tests {
 
     #[test]
     fn auth_status_and_list_only_probe_active_provider_keyring() {
-        use deepseek_secrets::{KeyringStore, SecretsError};
+        use codewhale_secrets::{KeyringStore, SecretsError};
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
@@ -2249,7 +2306,7 @@ mod tests {
 
     #[test]
     fn auth_status_reports_all_active_provider_sources_with_last4() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let _lock = env_lock();
@@ -2273,10 +2330,10 @@ mod tests {
 
         assert!(output.contains("provider: deepseek"));
         assert!(output.contains("active source: config (last4: ...3333)"));
-        assert!(output.contains("lookup order: config -> keyring -> env"));
+        assert!(output.contains("lookup order: config -> secret store -> env"));
         assert!(output.contains("config file: "));
         assert!(output.contains("set, last4: ...3333"));
-        assert!(output.contains("keyring: in-memory (test) (set, last4: ...2222)"));
+        assert!(output.contains("secret store: in-memory (test) (set, last4: ...2222)"));
         assert!(output.contains("env var: DEEPSEEK_API_KEY (set, last4: ...1111)"));
         assert!(!output.contains("sk-config-3333"));
         assert!(!output.contains("sk-keyring-2222"));
@@ -2287,7 +2344,7 @@ mod tests {
 
     #[test]
     fn dispatch_keyring_recovery_self_heals_into_config_file() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -2360,7 +2417,7 @@ mod tests {
 
     #[test]
     fn auth_migrate_moves_plaintext_keys_into_keyring_and_strips_file() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -2405,7 +2462,7 @@ mod tests {
 
     #[test]
     fn auth_migrate_dry_run_does_not_modify_anything() {
-        use deepseek_secrets::{InMemoryKeyringStore, KeyringStore};
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
         use std::sync::Arc;
 
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -2507,6 +2564,7 @@ mod tests {
             telemetry: false,
             approval_policy: None,
             sandbox_mode: None,
+            yolo: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -2633,6 +2691,18 @@ mod tests {
             ),
             ("sandbox", vec!["check"]),
             (
+                "exec",
+                vec![
+                    "--auto",
+                    "--json",
+                    "--resume",
+                    "--session-id",
+                    "--continue",
+                    "--output-format",
+                    "stream-json",
+                ],
+            ),
+            (
                 "app-server",
                 vec!["--host", "--port", "--config", "--stdio"],
             ),
@@ -2641,11 +2711,11 @@ mod tests {
                 vec![
                     "<SHELL>",
                     "bash",
-                    "source <(deepseek completion bash)",
-                    "~/.local/share/bash-completion/completions/deepseek",
+                    "source <(codewhale completion bash)",
+                    "~/.local/share/bash-completion/completions/codewhale",
                     "fpath=(~/.zfunc $fpath)",
-                    "deepseek completion fish > ~/.config/fish/completions/deepseek.fish",
-                    "deepseek completion powershell | Out-String | Invoke-Expression",
+                    "codewhale completion fish > ~/.config/fish/completions/codewhale.fish",
+                    "codewhale completion powershell | Out-String | Invoke-Expression",
                 ],
             ),
             ("metrics", vec!["--json", "--since"]),
@@ -2664,8 +2734,8 @@ mod tests {
     }
 
     /// Regression for issue #247: on Windows the dispatcher must find the
-    /// sibling `deepseek-tui.exe`, not bail out looking for an
-    /// extension-less `deepseek-tui`. The candidate resolver also accepts
+    /// sibling `codewhale-tui.exe`, not bail out looking for an
+    /// extension-less `codewhale-tui`. The candidate resolver also accepts
     /// the suffix-less name on Windows so users who manually renamed the
     /// file as a workaround keep working after the upgrade.
     #[test]
@@ -2673,7 +2743,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let dispatcher = dir
             .path()
-            .join("deepseek")
+            .join("codewhale")
             .with_extension(std::env::consts::EXE_EXTENSION);
         // Touch the dispatcher so its parent dir is the lookup root.
         std::fs::write(&dispatcher, b"").unwrap();
@@ -2682,7 +2752,7 @@ mod tests {
         assert!(sibling_tui_candidate(&dispatcher).is_none());
 
         let target =
-            dispatcher.with_file_name(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+            dispatcher.with_file_name(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&target, b"").unwrap();
 
         let found = sibling_tui_candidate(&dispatcher).expect("must locate sibling");
@@ -2692,11 +2762,11 @@ mod tests {
     #[test]
     fn dispatcher_spawn_error_names_path_and_recovery_checks() {
         let err = io::Error::new(io::ErrorKind::PermissionDenied, "access is denied");
-        let message = tui_spawn_error(Path::new("C:/tools/deepseek-tui.exe"), &err);
+        let message = tui_spawn_error(Path::new("C:/tools/codewhale-tui.exe"), &err);
 
-        assert!(message.contains("C:/tools/deepseek-tui.exe"));
+        assert!(message.contains("C:/tools/codewhale-tui.exe"));
         assert!(message.contains("access is denied"));
-        assert!(message.contains("where deepseek"));
+        assert!(message.contains("where codewhale"));
         assert!(message.contains("DEEPSEEK_TUI_BIN"));
     }
 
@@ -2708,15 +2778,15 @@ mod tests {
     #[test]
     fn sibling_tui_candidate_windows_falls_back_to_suffixless() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let dispatcher = dir.path().join("deepseek.exe");
+        let dispatcher = dir.path().join("codewhale.exe");
         std::fs::write(&dispatcher, b"").unwrap();
 
         // Only the suffixless name exists — emulates the manual rename.
-        let suffixless = dispatcher.with_file_name("deepseek-tui");
+        let suffixless = dispatcher.with_file_name("codewhale-tui");
         std::fs::write(&suffixless, b"").unwrap();
 
         let found = sibling_tui_candidate(&dispatcher)
-            .expect("Windows fallback must locate suffixless deepseek-tui");
+            .expect("Windows fallback must locate suffixless codewhale-tui");
         assert_eq!(found, suffixless);
     }
 

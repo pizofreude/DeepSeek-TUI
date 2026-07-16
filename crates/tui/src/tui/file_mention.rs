@@ -162,11 +162,35 @@ pub fn find_file_mention_completions(
     entries
 }
 
+/// Deterministic directory-browser completion entry point. This deliberately
+/// skips frecency so the popup remains stable for users navigating deep trees.
+pub fn find_file_mention_browser_completions(
+    workspace: &Workspace,
+    partial: &str,
+    limit: usize,
+) -> Vec<String> {
+    let entries = workspace.browser_completions(partial, limit);
+    tracing::debug!(
+        target: "codewhale_tui::file_mention",
+        partial = %partial,
+        workspace = %workspace.root.display(),
+        cwd = ?std::env::current_dir().ok(),
+        match_count = entries.len(),
+        "file mention browser completion walk",
+    );
+    entries
+}
+
 /// Build a `Workspace` for the running app: anchors at `app.workspace` and
 /// captures the process CWD so the resolver and completion walker honor the
 /// user's launch directory when it differs from `--workspace`.
 fn workspace_for_app(app: &App) -> Workspace {
-    Workspace::with_cwd(app.workspace.clone(), std::env::current_dir().ok())
+    Workspace::with_cwd_depth_and_follow_links(
+        app.workspace.clone(),
+        std::env::current_dir().ok(),
+        app.mention_walk_depth,
+        app.workspace_follow_symlinks,
+    )
 }
 
 /// Resolve the `@`-mention completion popup contents for the current
@@ -197,23 +221,96 @@ pub fn visible_mention_menu_entries(app: &mut App, limit: usize) -> Vec<String> 
 
     let workspace = app.workspace.clone();
     let cwd = std::env::current_dir().ok();
+    let walk_depth = app.mention_walk_depth;
+    let behavior = app.mention_menu_behavior.clone();
+    let follow_links = app.workspace_follow_symlinks;
     if let Some(ref cache) = app.composer.mention_completion_cache
         && cache.workspace == workspace
         && cache.cwd == cwd
         && cache.partial == partial
         && cache.limit == limit
+        && cache.walk_depth == walk_depth
+        && cache.behavior == behavior
+        && cache.follow_links == follow_links
     {
         return cache.entries.clone();
     }
 
-    let ws = Workspace::with_cwd(workspace.clone(), cwd.clone());
-    let entries = find_file_mention_completions(&ws, &partial, limit);
+    // Fast path (#3757): for non-path-like partials the candidate set is
+    // needle-independent, so one cached walk serves every keystroke of the
+    // mention token and ranking happens in memory. Path-like partials fall
+    // through to the live walk because local path-reference completions are
+    // needle-gated (see `should_try_local_reference_completion`).
+    let path_like = partial.starts_with('.') || partial.contains('/') || partial.contains('\\');
+    if behavior != "browser" && !path_like {
+        const CANDIDATE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+        let fresh = app
+            .composer
+            .mention_candidate_cache
+            .as_ref()
+            .is_some_and(|c| {
+                c.workspace == workspace
+                    && c.cwd == cwd
+                    && c.walk_depth == walk_depth
+                    && c.follow_links == follow_links
+                    && c.collected_at.elapsed() < CANDIDATE_TTL
+            });
+        if !fresh {
+            let ws = Workspace::with_cwd_depth_and_follow_links(
+                workspace.clone(),
+                cwd.clone(),
+                walk_depth,
+                follow_links,
+            );
+            app.composer.mention_candidate_cache = Some(crate::tui::app::MentionCandidateCache {
+                workspace: workspace.clone(),
+                cwd: cwd.clone(),
+                walk_depth,
+                follow_links,
+                collected_at: std::time::Instant::now(),
+                candidates: ws.completion_candidates(),
+            });
+        }
+        let ranked = match app.composer.mention_candidate_cache.as_ref() {
+            Some(cache) => {
+                crate::working_set::rank_completion_candidates(&cache.candidates, &partial, limit)
+            }
+            None => Vec::new(),
+        };
+        let entries = super::file_frecency::rerank_by_frecency(ranked);
+        app.composer.mention_completion_cache = Some(MentionCompletionCache {
+            workspace,
+            cwd,
+            partial,
+            limit,
+            walk_depth,
+            behavior,
+            follow_links,
+            entries: entries.clone(),
+        });
+        return entries;
+    }
+
+    let ws = Workspace::with_cwd_depth_and_follow_links(
+        workspace.clone(),
+        cwd.clone(),
+        walk_depth,
+        app.workspace_follow_symlinks,
+    );
+    let entries = if behavior == "browser" {
+        find_file_mention_browser_completions(&ws, &partial, limit)
+    } else {
+        find_file_mention_completions(&ws, &partial, limit)
+    };
 
     app.composer.mention_completion_cache = Some(MentionCompletionCache {
         workspace,
         cwd,
         partial,
         limit,
+        walk_depth,
+        behavior,
+        follow_links,
         entries: entries.clone(),
     });
 
@@ -261,9 +358,16 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
         return false;
     };
     let ws = workspace_for_app(app);
-    let candidates = find_file_mention_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT);
+    let candidates = if app.mention_menu_behavior == "browser" {
+        find_file_mention_browser_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT)
+    } else {
+        find_file_mention_completions(&ws, &partial, FILE_MENTION_COMPLETION_LIMIT)
+    };
     if candidates.is_empty() {
-        app.status_message = Some(format!("No files match @{partial}"));
+        app.status_message = Some(no_file_mention_matches_status(
+            &partial,
+            app.mention_walk_depth,
+        ));
         return true;
     }
     if candidates.len() == 1 {
@@ -288,6 +392,27 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
         .join(", ");
     app.status_message = Some(format!("Matches: {preview}"));
     true
+}
+
+fn no_file_mention_matches_status(partial: &str, walk_depth: usize) -> String {
+    if path_partial_reaches_walk_depth(partial, walk_depth) {
+        format!(
+            "No files match @{partial} (mention_walk_depth={walk_depth}; use /config set mention_walk_depth 0 to search deeper)"
+        )
+    } else {
+        format!("No files match @{partial}")
+    }
+}
+
+fn path_partial_reaches_walk_depth(partial: &str, walk_depth: usize) -> bool {
+    if walk_depth == 0 {
+        return false;
+    }
+    let component_count = partial
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .count();
+    component_count >= walk_depth
 }
 
 /// Splice a completion into the input, replacing the `@<partial>` token at

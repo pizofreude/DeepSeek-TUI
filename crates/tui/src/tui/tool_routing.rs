@@ -5,15 +5,17 @@ use std::time::Instant;
 
 use crate::hooks::HookEvent;
 use crate::tools::ReviewOutput;
+use crate::tools::plan::PlanSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
-use crate::tui::app::{App, ToolDetailRecord};
+use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
     DiffPreviewCell, ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell,
-    McpToolCell, PatchSummaryCell, PlanStep, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus,
-    ViewImageCell, WebSearchCell, output_looks_like_diff, summarize_mcp_output,
-    summarize_tool_args, summarize_tool_output,
+    McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
+    WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
+    summarize_tool_output,
 };
+use crate::tui::workspace_context;
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn handle_tool_call_started(
@@ -22,19 +24,11 @@ pub(super) fn handle_tool_call_started(
     name: &str,
     input: &serde_json::Value,
 ) {
-    // #455 (observer-only): fire `tool_call_before` hooks here, before
-    // any UI bookkeeping. Hooks are read-only observers in this slice
-    // — they can log, notify, or audit, but cannot mutate the args.
-    // Fast-path skip when no hooks are configured so per-tool
-    // dispatch doesn't pay for context construction in the common
-    // case (most users have no hooks).
-    if app.hooks.has_hooks_for_event(HookEvent::ToolCallBefore) {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_args(input);
-        let _ = app.execute_hooks(HookEvent::ToolCallBefore, &context);
-    }
+    // #2511: ToolCallBefore gate moved to turn-loop planning loop
+    // (Engine::handle_deepseek_turn). Removing observer-only firing
+    // here to avoid double-firing hooks for each tool call.
+    // Hooks that need observation can configure ToolCallBefore on
+    // the turn-loop gate — it processes the denial (exit code 2).
 
     let id = id.to_string();
 
@@ -107,6 +101,10 @@ pub(super) fn handle_tool_call_started(
                     command,
                     status: ToolStatus::Running,
                     output: None,
+                    live_output: None,
+                    shell_task_id: None,
+                    owner_agent_id: None,
+                    owner_agent_name: None,
                     started_at: Some(Instant::now()),
                     duration_ms: None,
                     source,
@@ -139,6 +137,10 @@ pub(super) fn handle_tool_call_started(
                 command,
                 status: ToolStatus::Running,
                 output: None,
+                live_output: None,
+                shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
                 started_at: Some(Instant::now()),
                 duration_ms: None,
                 source,
@@ -150,15 +152,14 @@ pub(super) fn handle_tool_call_started(
     }
 
     if name == "update_plan" {
-        let (explanation, steps) = parse_plan_input(input);
+        let snapshot = parse_plan_input(input);
         push_active_tool_cell(
             app,
             &id,
             name,
             input,
             HistoryCell::Tool(ToolCell::PlanUpdate(PlanUpdateCell {
-                explanation,
-                steps,
+                snapshot,
                 status: ToolStatus::Running,
             })),
         );
@@ -249,7 +250,30 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    let input_summary = summarize_tool_args(input);
+    let mut input_summary = summarize_tool_args(input);
+    // Lead the `agent` args summary with the non-default action so renderers
+    // can tell inspections (peek/status/wait) apart from spawns without a
+    // schema change — a peek must not draw the same "delegate done" line as
+    // a launch (#4112, dogfood A5).
+    if name == "agent"
+        && let Some(action) = input.get("action").and_then(serde_json::Value::as_str)
+    {
+        let action = action.trim().to_ascii_lowercase();
+        let already_leads = input_summary
+            .as_deref()
+            .is_some_and(|summary| summary.starts_with("action:"));
+        if !action.is_empty()
+            && !already_leads
+            && action != "start"
+            && action != "spawn"
+            && action != "run"
+        {
+            input_summary = Some(match input_summary {
+                Some(rest) => format!("action: {action} {rest}"),
+                None => format!("action: {action}"),
+            });
+        }
+    }
     push_active_tool_cell(
         app,
         &id,
@@ -383,11 +407,22 @@ fn accrue_child_token_cost_if_any(app: &mut App, result: &Result<ToolResult, Too
         output_tokens: u32::try_from(output_tokens).unwrap_or(u32::MAX),
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
+        prompt_cache_write_tokens: None,
         reasoning_tokens: None,
         reasoning_replay_tokens: None,
         server_tool_use: None,
     };
-    if let Some(cost) = crate::pricing::calculate_turn_cost_estimate_from_usage(model, &usage) {
+    let provider = metadata
+        .get("child_provider")
+        .or_else(|| metadata.get("resolved_provider"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::config::ApiProvider::parse)
+        .unwrap_or(app.api_provider);
+    let billing =
+        crate::route_billing::for_child_route(app.api_provider, app.billing_presentation, provider);
+    if let Some(cost) =
+        crate::pricing::calculate_turn_cost_estimate_for_route(provider, model, &usage, billing)
+    {
         app.accrue_subagent_cost_estimate(cost);
     }
 }
@@ -452,6 +487,19 @@ fn record_spillover_artifact_if_any(
         ));
 }
 
+/// #3031: shell/tasks tools embed the literal `"(no output)"` into successful
+/// `ToolResult` content (the model-facing transcript needs a non-empty tool
+/// result). Treat it as no output on the TUI side so the compact-mode
+/// suppression gate in `history.rs` actually fires; the raw content remains
+/// available through the tool-detail store.
+fn visible_tool_output(content: &str) -> Option<String> {
+    if content.trim() == "(no output)" {
+        None
+    } else {
+        Some(content.to_string())
+    }
+}
+
 pub(super) fn handle_tool_call_complete(
     app: &mut App,
     id: &str,
@@ -477,10 +525,7 @@ pub(super) fn handle_tool_call_complete(
             app.cell_at_virtual_index_mut(cell_index)
             && let Some(entry) = cell.entries.get_mut(entry_index)
         {
-            entry.status = match result.as_ref() {
-                Ok(tool_result) if tool_result.success => ToolStatus::Success,
-                Ok(_) | Err(_) => ToolStatus::Failed,
-            };
+            entry.status = tool_status_from_result(result);
             app.mark_history_updated();
             // Mutating the in-flight exploring cell needs an active-cell
             // revision bump so the transcript cache invalidates the synthetic
@@ -509,43 +554,49 @@ pub(super) fn handle_tool_call_complete(
     store_tool_detail_output(app, id, cell_index, result);
     let in_active = cell_index >= app.history.len();
 
-    let status = match result.as_ref() {
-        Ok(tool_result) => match tool_result.metadata.as_ref() {
-            Some(meta)
-                if meta
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s == "Running") =>
-            {
-                ToolStatus::Running
-            }
-            _ => {
-                if tool_result.success {
-                    ToolStatus::Success
-                } else {
-                    ToolStatus::Failed
-                }
-            }
-        },
-        Err(_) => ToolStatus::Failed,
-    };
+    let status = tool_status_from_result(result);
+    let mut workflow_panel_output: Option<String> = None;
 
     if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
         match cell {
             HistoryCell::Tool(ToolCell::Exec(exec)) => {
                 exec.status = status;
                 if let Ok(tool_result) = result.as_ref() {
+                    let shell_task_id = tool_result
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("task_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|task_id| !task_id.trim().is_empty())
+                        .map(str::to_string);
+                    if shell_task_id.is_some() {
+                        exec.shell_task_id = shell_task_id;
+                    }
+                    exec.owner_agent_id = tool_result
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("owner_agent_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|agent_id| !agent_id.trim().is_empty())
+                        .map(str::to_string);
+                    exec.owner_agent_name = tool_result
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("owner_agent_name"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|agent_name| !agent_name.trim().is_empty())
+                        .map(str::to_string);
                     if let Some(meta_command) = tool_result
                         .metadata
                         .as_ref()
                         .and_then(|m| m.get("command"))
                         .and_then(serde_json::Value::as_str)
                         && !meta_command.trim().is_empty()
-                        && (exec.command == "shell job" || exec.command.starts_with("shell job "))
+                        && (exec.command == "command" || exec.command.starts_with("command "))
                     {
                         exec.command = meta_command.to_string();
                         if exec.interaction.as_deref().is_some_and(|interaction| {
-                            interaction.starts_with("Waiting for shell job")
+                            interaction.starts_with("Waiting for command")
                         }) {
                             let task_suffix = tool_result
                                 .metadata
@@ -564,9 +615,17 @@ pub(super) fn handle_tool_call_complete(
                         .and_then(|m| m.get("duration_ms"))
                         .and_then(serde_json::Value::as_u64);
                     if status != ToolStatus::Running && exec.interaction.is_none() {
-                        exec.output = Some(tool_result.content.clone());
-                        exec.output_summary =
-                            Some(super::history::summarize_tool_output(&tool_result.content));
+                        exec.output = visible_tool_output(&tool_result.content);
+                        exec.output_summary = exec
+                            .output
+                            .as_deref()
+                            .map(super::history::summarize_tool_output);
+                        exec.live_output = None;
+                    } else if status == ToolStatus::Running
+                        && exec.interaction.is_none()
+                        && !tool_result.content.is_empty()
+                    {
+                        exec.live_output = Some(tool_result.content.clone());
                     }
                 } else if let Err(err) = result.as_ref()
                     && exec.interaction.is_none()
@@ -618,7 +677,9 @@ pub(super) fn handle_tool_call_complete(
                 match result.as_ref() {
                     Ok(tool_result) => {
                         let summary = summarize_mcp_output(&tool_result.content);
-                        if summary.is_error == Some(true) {
+                        if status == ToolStatus::Hydrated {
+                            mcp.status = status;
+                        } else if summary.is_error == Some(true) {
                             mcp.status = ToolStatus::Failed;
                         } else {
                             mcp.status = status;
@@ -649,8 +710,9 @@ pub(super) fn handle_tool_call_complete(
                 generic.status = status;
                 match result.as_ref() {
                     Ok(tool_result) => {
-                        generic.output = Some(tool_result.content.clone());
-                        generic.output_summary = Some(summarize_tool_output(&tool_result.content));
+                        generic.output = visible_tool_output(&tool_result.content);
+                        generic.output_summary =
+                            generic.output.as_deref().map(summarize_tool_output);
                         generic.is_diff = output_looks_like_diff(&tool_result.content);
                     }
                     Err(err) => {
@@ -659,10 +721,22 @@ pub(super) fn handle_tool_call_complete(
                         generic.is_diff = false;
                     }
                 }
+                // #4121: capture workflow JSON before releasing the cell borrow
+                // so we can hydrate the panel without overlapping borrows.
+                if generic.name == "workflow" {
+                    workflow_panel_output = generic.output.clone();
+                }
                 app.mark_history_updated();
             }
             _ => {}
         }
+    }
+
+    // #4121 / #4122: feed typed workflow events into the panel *and* keep the
+    // history card snapshot in sync. Live streaming also arrives via
+    // `Event::WorkflowUi`; this path covers tool-complete hydration.
+    if let Some(output) = workflow_panel_output.as_deref() {
+        apply_workflow_output_to_panel(app, output);
     }
 
     // If the mutated cell lived inside the active group, bump the active-cell
@@ -673,6 +747,10 @@ pub(super) fn handle_tool_call_complete(
             active.bump_revision();
         }
         refresh_active_tool_completion_timestamp(app, cell_index);
+    }
+
+    if refreshes_workspace_context_on_completion(name) && status != ToolStatus::Running {
+        workspace_context::refresh_now(app, Instant::now());
     }
 
     // #455 (observer-only): fire `tool_call_after` hooks once the
@@ -692,6 +770,267 @@ pub(super) fn handle_tool_call_complete(
             .with_tool_name(name)
             .with_tool_result(&result_text, success, None);
         let _ = app.execute_hooks(HookEvent::ToolCallAfter, &context);
+    }
+
+    // Collect evidence for the post-turn receipt.
+    let evidence_summary = match result.as_ref() {
+        Ok(tool_result) => {
+            if tool_result.success {
+                summarize_tool_output(&tool_result.content)
+            } else {
+                format!("failed: {}", summarize_tool_output(&tool_result.content))
+            }
+        }
+        Err(err) => format!("error: {err}"),
+    };
+    app.tool_evidence.push(ToolEvidence {
+        tool_name: name.to_string(),
+        summary: evidence_summary,
+    });
+}
+
+/// Hydrate or advance the WorkflowPanel from a workflow tool JSON payload.
+/// Accepts a single run record (with optional `events` array) or a status
+/// list. Log-only events are filtered by the panel itself so the transcript
+/// stays free of progress spam (#4121). Also keeps the matching history card
+/// snapshot aligned (#4122).
+fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return;
+    };
+
+    // Prefer the typed event stream when present.
+    if let Some(events) = value.get("events").and_then(|e| e.as_array()) {
+        // Ensure a panel exists before applying — seed from run_id/goal if needed.
+        if app.workflow_panel.is_none() {
+            let run_id = value
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("workflow")
+                .to_string();
+            let label = value
+                .get("workflow_goal")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
+                .unwrap_or("workflow")
+                .to_string();
+            let at_ms = value
+                .get("started_at_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let mut panel =
+                crate::tui::widgets::workflow_panel::WorkflowPanel::new(run_id, label, at_ms);
+            panel.locale = app.ui_locale;
+            app.workflow_panel = Some(panel);
+        }
+        if let Some(panel) = app.workflow_panel.as_mut() {
+            let run_id = value
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&panel.run_id)
+                .to_string();
+            let mut injected = Vec::with_capacity(events.len());
+            for event in events {
+                let mut event = event.clone();
+                if let Some(obj) = event.as_object_mut() {
+                    obj.entry("run_id".to_string())
+                        .or_insert_with(|| serde_json::Value::String(run_id.clone()));
+                }
+                injected.push(event);
+            }
+            panel.apply_json_events(&injected);
+            // Carry final result / source into panel for expanded history card.
+            if let Some(summary) = value
+                .get("result")
+                .map(|v| v.to_string())
+                .filter(|s| s != "null")
+            {
+                panel.result_summary = Some(summary);
+            }
+            if let Some(path) = value.get("source_path").and_then(|v| v.as_str()) {
+                panel.source_path = Some(PathBuf::from(path));
+            }
+            app.needs_redraw = true;
+        }
+        sync_workflow_history_card_from_panel(app);
+        return;
+    }
+
+    // Fallback: status list — show the most recent run as a shell panel.
+    if value.get("action").and_then(|v| v.as_str()) == Some("status") {
+        if let Some(runs) = value.get("runs").and_then(|r| r.as_array())
+            && let Some(run) = runs.last()
+        {
+            apply_workflow_output_to_panel(app, &run.to_string());
+        }
+        return;
+    }
+
+    // Prefer full panel hydration from summary/phases snapshot when present.
+    if let Some(mut panel) =
+        crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&value)
+    {
+        panel.locale = app.ui_locale;
+        app.workflow_panel = Some(panel);
+        app.needs_redraw = true;
+        sync_workflow_history_card_from_panel(app);
+        return;
+    }
+
+    // Fallback: bare run record without events — at least surface header state.
+    if let Some(run_id) = value.get("run_id").and_then(|v| v.as_str()) {
+        use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowPanelLifecycle};
+        let label = value
+            .get("workflow_goal")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("workflow_id").and_then(|v| v.as_str()))
+            .unwrap_or(run_id)
+            .to_string();
+        let at_ms = value
+            .get("started_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let status = value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("running");
+        app.apply_workflow_panel_event(WorkflowPanelEvent::RunStarted {
+            run_id: run_id.to_string(),
+            workflow_id: value
+                .get("workflow_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            workflow_goal: Some(label),
+            source_path: value
+                .get("source_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from),
+            token_budget: value.get("token_budget").and_then(|v| v.as_u64()),
+            at_ms,
+        });
+        if status != "running" {
+            let life = match status {
+                "completed" | "succeeded" => WorkflowPanelLifecycle::Succeeded,
+                "failed" => WorkflowPanelLifecycle::Failed,
+                "cancelled" | "canceled" => WorkflowPanelLifecycle::Cancelled,
+                _ => WorkflowPanelLifecycle::Running,
+            };
+            if life != WorkflowPanelLifecycle::Running {
+                app.apply_workflow_panel_event(WorkflowPanelEvent::RunCompleted {
+                    status: life,
+                    error: value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    at_ms: value
+                        .get("completed_at_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(at_ms),
+                });
+            }
+        }
+        sync_workflow_history_card_from_panel(app);
+    }
+}
+
+/// Apply one live `WorkflowUi` engine event to the panel and history card.
+pub(super) fn apply_workflow_ui_event(app: &mut App, run_id: &str, event: &serde_json::Value) {
+    use crate::tui::widgets::workflow_panel::WorkflowPanelEvent;
+
+    let mut event = event.clone();
+    if let Some(obj) = event.as_object_mut() {
+        obj.entry("run_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(run_id.to_string()));
+    }
+    if let Some(panel_event) = WorkflowPanelEvent::from_json_value(&event) {
+        app.apply_workflow_panel_event(panel_event);
+    }
+    sync_workflow_history_card_from_panel(app);
+}
+
+/// Mirror the live WorkflowPanel snapshot into the in-flight (or most recent)
+/// workflow history tool cell so compact/expanded cards stay current.
+fn sync_workflow_history_card_from_panel(app: &mut App) {
+    let Some(panel) = app.workflow_panel.as_ref() else {
+        return;
+    };
+    let run_id = panel.run_id.clone();
+    let snapshot = panel.to_run_json().to_string();
+
+    // Prefer an in-flight Generic(workflow) cell whose output already carries
+    // this run_id, else the newest running workflow cell, else any workflow
+    // cell (tool-complete path already wrote the final output).
+    let mut target: Option<usize> = None;
+    let history_len = app.history.len();
+    let total = history_len
+        + app
+            .active_cell
+            .as_ref()
+            .map(|a| a.entries().len())
+            .unwrap_or(0);
+
+    for idx in (0..total).rev() {
+        let Some(cell) = app.cell_at_virtual_index(idx) else {
+            continue;
+        };
+        let HistoryCell::Tool(ToolCell::Generic(generic)) = cell else {
+            continue;
+        };
+        if generic.name != "workflow" {
+            continue;
+        }
+        let matches_run = generic
+            .output
+            .as_deref()
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
+            .and_then(|v| {
+                v.get("run_id")
+                    .and_then(|id| id.as_str())
+                    .map(|id| id == run_id)
+            })
+            .unwrap_or(false);
+        let is_running = generic.status == ToolStatus::Running;
+        if matches_run || (is_running && target.is_none()) {
+            target = Some(idx);
+            if matches_run {
+                break;
+            }
+        }
+    }
+
+    let Some(idx) = target else {
+        return;
+    };
+    if let Some(HistoryCell::Tool(ToolCell::Generic(generic))) = app.cell_at_virtual_index_mut(idx)
+    {
+        // Preserve a richer final output if the tool completion already wrote
+        // a full run record with an events array longer than the snapshot.
+        let replace = match generic.output.as_deref() {
+            None => true,
+            Some(existing) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(existing) else {
+                    return;
+                };
+                let existing_run = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+                if !existing_run.is_empty() && existing_run != run_id {
+                    return;
+                }
+                // Prefer full event-bearing records when the tool has completed.
+                if generic.status == ToolStatus::Running {
+                    true
+                } else {
+                    value
+                        .get("events")
+                        .and_then(|e| e.as_array())
+                        .is_none_or(|e| e.is_empty())
+                }
+            }
+        };
+        if replace {
+            generic.output = Some(snapshot);
+            generic.output_summary = Some(format!("workflow {}", run_id));
+            app.mark_history_updated();
+        }
     }
 }
 
@@ -756,16 +1095,7 @@ fn push_orphan_tool_completion(
     name: &str,
     result: &Result<ToolResult, ToolError>,
 ) {
-    let status = match result.as_ref() {
-        Ok(tool_result) => {
-            if tool_result.success {
-                ToolStatus::Success
-            } else {
-                ToolStatus::Failed
-            }
-        }
-        Err(_) => ToolStatus::Failed,
-    };
+    let status = tool_status_from_result(result);
     let output = match result.as_ref() {
         Ok(tool_result) => Some(summarize_tool_output(&tool_result.content)),
         Err(err) => Some(err.to_string()),
@@ -828,6 +1158,47 @@ fn push_orphan_tool_completion(
     }
 }
 
+fn tool_status_from_result(result: &Result<ToolResult, ToolError>) -> ToolStatus {
+    match result.as_ref() {
+        Ok(tool_result) if is_deferred_schema_hydration(tool_result) => ToolStatus::Hydrated,
+        Ok(tool_result) => match tool_result.metadata.as_ref() {
+            Some(meta)
+                if meta
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s == "Running") =>
+            {
+                ToolStatus::Running
+            }
+            _ => {
+                if tool_result.success {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Failed
+                }
+            }
+        },
+        Err(_) => ToolStatus::Failed,
+    }
+}
+
+fn is_deferred_schema_hydration(tool_result: &ToolResult) -> bool {
+    if !tool_result.success {
+        return false;
+    }
+    let Some(metadata) = tool_result.metadata.as_ref() else {
+        return false;
+    };
+    metadata
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|event| event == "tool.schema_hydrated")
+        && metadata
+            .get("executed")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|executed| !executed)
+}
+
 fn is_exploring_tool(name: &str) -> bool {
     matches!(name, "read_file" | "list_dir" | "grep_files" | "list_files")
 }
@@ -836,6 +1207,19 @@ fn is_exec_tool(name: &str) -> bool {
     matches!(
         name,
         "exec_shell" | "exec_shell_wait" | "exec_shell_interact" | "exec_wait" | "exec_interact"
+    )
+}
+
+pub(super) fn refreshes_workspace_context_on_completion(name: &str) -> bool {
+    matches!(
+        name,
+        "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_wait"
+            | "exec_interact"
+            | "task_shell_start"
+            | "task_shell_wait"
     )
 }
 
@@ -928,28 +1312,8 @@ fn review_target_label(input: &serde_json::Value) -> String {
     target.to_string()
 }
 
-fn parse_plan_input(input: &serde_json::Value) -> (Option<String>, Vec<PlanStep>) {
-    let explanation = input
-        .get("explanation")
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string);
-    let mut steps = Vec::new();
-    if let Some(items) = input.get("plan").and_then(|v| v.as_array()) {
-        for item in items {
-            let step = item.get("step").and_then(|v| v.as_str()).unwrap_or("");
-            let status = item
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("pending");
-            if !step.is_empty() {
-                steps.push(PlanStep {
-                    step: step.to_string(),
-                    status: status.to_string(),
-                });
-            }
-        }
-    }
-    (explanation, steps)
+fn parse_plan_input(input: &serde_json::Value) -> PlanSnapshot {
+    PlanSnapshot::from_tool_input(input)
 }
 
 fn parse_patch_summary(input: &serde_json::Value) -> (String, String) {
@@ -1107,8 +1471,8 @@ fn exec_target_from_input(input: &serde_json::Value) -> String {
             .get("task_id")
             .or_else(|| input.get("id"))
             .and_then(|v| v.as_str())
-            .map(|task_id| format!("shell job {task_id}"))
-            .unwrap_or_else(|| "shell job".to_string())
+            .map(|task_id| format!("command {task_id}"))
+            .unwrap_or_else(|| "command".to_string())
     })
 }
 
@@ -1148,7 +1512,7 @@ fn exec_interaction_summary(name: &str, input: &serde_json::Value) -> Option<(St
                 .or_else(|| input.get("id"))
                 .and_then(|v| v.as_str())
         {
-            return Some((format!("Waiting for shell job {task_id}"), true));
+            return Some((format!("Waiting for command {task_id}"), true));
         }
         return Some((format!("Waited for {command_display}"), true));
     }
@@ -1177,4 +1541,124 @@ fn exec_is_background(input: &serde_json::Value) -> bool {
         .get("background")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::plan::StepStatus;
+    use serde_json::json;
+
+    #[test]
+    fn parse_plan_input_accepts_legacy_payload() {
+        let snapshot = parse_plan_input(&json!({
+            "explanation": "Legacy explanation",
+            "plan": [
+                { "step": "inspect", "status": "completed" },
+                { "step": "patch", "status": "in_progress" }
+            ]
+        }));
+
+        assert_eq!(snapshot.explanation.as_deref(), Some("Legacy explanation"));
+        assert_eq!(snapshot.items.len(), 2);
+        assert_eq!(snapshot.items[0].status, StepStatus::Completed);
+        assert_eq!(snapshot.items[1].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn parse_plan_input_extracts_rich_artifact_fields() {
+        let snapshot = parse_plan_input(&json!({
+            "title": " PlanArtifact ",
+            "objective": "Make Plan mode reviewable",
+            "context_summary": "Grounded in issue #2691",
+            "sources_used": [" gh issue view 2691 ", ""],
+            "critical_files": ["crates/tui/src/tools/plan.rs"],
+            "constraints": ["No secrets"],
+            "recommended_approach": "Enrich update_plan",
+            "verification_plan": "Run focused tests",
+            "risks_and_unknowns": "Replay may drift",
+            "handoff_packet": "Continue with session replay",
+            "plan": [
+                { "step": " ", "status": "completed" },
+                { "step": "render all fields", "status": "weird" }
+            ]
+        }));
+
+        assert_eq!(snapshot.title.as_deref(), Some("PlanArtifact"));
+        assert_eq!(snapshot.sources_used, vec!["gh issue view 2691"]);
+        assert_eq!(
+            snapshot.critical_files,
+            vec!["crates/tui/src/tools/plan.rs"]
+        );
+        assert_eq!(snapshot.constraints, vec!["No secrets"]);
+        assert_eq!(
+            snapshot.verification_plan.as_deref(),
+            Some("Run focused tests")
+        );
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].step, "render all fields");
+        assert_eq!(snapshot.items[0].status, StepStatus::Pending);
+    }
+
+    // ── #3031: "(no output)" placeholder must not defeat compact rendering ─
+
+    #[test]
+    fn visible_tool_output_maps_no_output_placeholder_to_none() {
+        assert_eq!(visible_tool_output("(no output)"), None);
+        assert_eq!(visible_tool_output("  (no output)\n"), None);
+    }
+
+    #[test]
+    fn visible_tool_output_preserves_real_content() {
+        assert_eq!(
+            visible_tool_output("compiled 3 crates").as_deref(),
+            Some("compiled 3 crates")
+        );
+        // Output that merely CONTAINS the placeholder is real output.
+        assert_eq!(
+            visible_tool_output("step 1: (no output) — continuing").as_deref(),
+            Some("step 1: (no output) — continuing")
+        );
+        assert_eq!(visible_tool_output("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn exec_cell_without_output_suppresses_placeholder_in_live_mode() {
+        use crate::tui::history::{ExecCell, ExecSource, ToolCell, ToolStatus};
+
+        let cell = ToolCell::Exec(ExecCell {
+            command: "true".to_string(),
+            status: ToolStatus::Success,
+            output: None,
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: Some(120),
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        });
+
+        let live: String = cell
+            .lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !live.contains("(no output)"),
+            "Live mode must suppress the placeholder: {live:?}"
+        );
+
+        let transcript: String = cell
+            .transcript_lines(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            transcript.contains("(no output)"),
+            "Transcript mode still records the placeholder: {transcript:?}"
+        );
+    }
 }

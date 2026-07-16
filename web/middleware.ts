@@ -19,11 +19,16 @@ function applySecurityHeaders(res: NextResponse): NextResponse {
 function detectLocale(req: NextRequest): string {
   // 1. Cookie
   const cookie = req.cookies.get(COOKIE)?.value;
-  if (cookie && locales.includes(cookie as typeof locales[number])) return cookie;
+  if (cookie && (locales as readonly string[]).includes(cookie)) return cookie;
 
-  // 2. Accept-Language header
+  // 2. Accept-Language header — match against all shipped locales
   const accept = req.headers.get("accept-language") ?? "";
-  if (/^zh/i.test(accept.split(",")[0])) return "zh";
+  if (accept) {
+    const preferred = accept.split(",").map((s) => s.split(";")[0].trim().split("-")[0].toLowerCase());
+    for (const lang of preferred) {
+      if ((locales as readonly string[]).includes(lang)) return lang;
+    }
+  }
 
   return defaultLocale;
 }
@@ -31,10 +36,12 @@ function detectLocale(req: NextRequest): string {
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // Skip API routes, static files, _next (but still apply security headers).
+  // Skip API routes, static files, _next, and the dot-less metadata route
+  // for the shared OG image (but still apply security headers).
   if (
     pathname.startsWith("/api/") ||
     pathname.startsWith("/_next/") ||
+    pathname === "/opengraph-image" ||
     pathname.includes(".")
   ) {
     return applySecurityHeaders(NextResponse.next());

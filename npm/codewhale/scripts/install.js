@@ -78,12 +78,18 @@ class DownloadTimeoutError extends Error {
   }
 }
 
-function resolvePackageVersion() {
+// Binary-version precedence must match run.js and verify-release-assets.js so
+// install-time asset resolution agrees with runtime and release verification.
+// `codewhaleBinaryVersion` lets a packaging-only npm release target a specific
+// CodeWhale binary; legacy env vars and `deepseekBinaryVersion` stay supported
+// for backward compatibility (#3769). `pkgObj`/`env` are injectable for tests.
+function resolvePackageVersion(pkgObj = pkg, env = process.env) {
   const configuredVersion =
-    process.env.DEEPSEEK_TUI_VERSION ||
-    process.env.DEEPSEEK_VERSION ||
-    pkg.deepseekBinaryVersion ||
-    pkg.version;
+    env.DEEPSEEK_TUI_VERSION ||
+    env.DEEPSEEK_VERSION ||
+    pkgObj.codewhaleBinaryVersion ||
+    pkgObj.deepseekBinaryVersion ||
+    pkgObj.version;
   return String(configuredVersion).trim();
 }
 
@@ -577,6 +583,7 @@ function httpRequest(rawUrl, opts = {}) {
       try {
         req = client.request(reqOptions, (response) => {
           res = response;
+          response.pause();
           armStallTimer();
           response.on("data", () => {
             armStallTimer();
@@ -649,6 +656,7 @@ function httpRequest(rawUrl, opts = {}) {
             },
             (response) => {
               res = response;
+              response.pause();
               armStallTimer();
               response.on("data", () => armStallTimer());
               response.on("end", () => cleanup());
@@ -712,6 +720,7 @@ function httpRequest(rawUrl, opts = {}) {
             try {
               req = https.request(reqOptions, (response) => {
                 res = response;
+                response.pause();
                 armStallTimer();
                 response.on("data", () => armStallTimer());
                 response.on("end", () => cleanup());
@@ -944,6 +953,7 @@ async function downloadText(url, options = {}) {
         resolve(chunks.join(""));
       });
       response.on("error", reject);
+      response.resume();
     });
   }, context);
 }
@@ -1144,6 +1154,7 @@ module.exports = {
   installFailureHint,
   run,
   _internal: {
+    resolvePackageVersion,
     isOptionalInstall,
     adoptExistingBinaryIfValid,
     shouldIgnoreInstallFailure,

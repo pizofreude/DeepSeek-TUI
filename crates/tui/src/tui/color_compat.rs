@@ -6,6 +6,8 @@
 //! as stray green/cyan backgrounds. This backend adapts every cell to the
 //! detected color depth before handing it to crossterm.
 
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 
 use ratatui::{
@@ -15,6 +17,10 @@ use ratatui::{
 };
 
 use crate::palette::{self, ColorDepth, PaletteMode, ThemeId, UiTheme};
+
+const RENDER_DEBUG_ENV: &str = "CODEWHALE_TUI_DEBUG";
+const ASCII_SAFE_ENV: &str = "CODEWHALE_ASCII_SAFE";
+const RENDER_DEBUG_SAMPLE_LIMIT: usize = 24;
 
 #[derive(Debug)]
 pub(crate) struct ColorCompatBackend<W: Write> {
@@ -38,6 +44,13 @@ pub(crate) struct ColorCompatBackend<W: Write> {
     /// Forcing the expected size prevents ratatui's internal `autoresize` from
     /// shrinking the viewport back to the stale dimension inside `draw()`.
     forced_size: Option<Size>,
+    /// Cached terminal size from `crossterm::terminal::size()`, set after
+    /// re-entering alt-screen to avoid stale buffer dimensions on Windows.
+    /// Used as the primary fallback in `size()` before falling through to
+    /// the live crossterm query.
+    terminal_size: Option<Size>,
+    render_debug: Option<RenderDebugLog>,
+    ascii_safe: bool,
 }
 
 impl<W: Write> ColorCompatBackend<W> {
@@ -53,6 +66,9 @@ impl<W: Write> ColorCompatBackend<W> {
             // to a community preset.
             active_ui_theme: UiTheme::detect(),
             forced_size: None,
+            terminal_size: None,
+            render_debug: RenderDebugLog::from_env(),
+            ascii_safe: env_flag_enabled(std::env::var(ASCII_SAFE_ENV).ok().as_deref()),
         }
     }
 
@@ -62,6 +78,10 @@ impl<W: Write> ColorCompatBackend<W> {
 
     pub(crate) fn clear_forced_size(&mut self) {
         self.forced_size = None;
+    }
+
+    pub(crate) fn set_terminal_size(&mut self, size: Size) {
+        self.terminal_size = Some(size);
     }
 
     pub(crate) fn set_palette_mode(&mut self, palette_mode: PaletteMode) {
@@ -101,11 +121,66 @@ impl<W: Write> Backend for ColorCompatBackend<W> {
                     self.theme_id,
                     &self.active_ui_theme,
                 );
+                if self.ascii_safe {
+                    adapt_cell_symbol_for_ascii(&mut cell);
+                }
                 (x, y, cell)
             })
             .collect::<Vec<_>>();
-        self.inner
-            .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))
+        let viewport = if self.render_debug.is_some() {
+            self.size().ok()
+        } else {
+            None
+        };
+        if let Some(render_debug) = &mut self.render_debug {
+            render_debug.record(viewport, &adapted);
+        }
+        // #3029: Emit OSC 8 hyperlinks out-of-band through the backend's
+        // Write impl.  ratatui's buffer pipeline strips ESC bytes, so the
+        // open/close sequences must be interleaved with the cell stream
+        // here.  OSC 8 is stateful and last-writer-wins: every cell painted
+        // between an open and the next close links to that open's target,
+        // so each region's cells must be bracketed by their OWN open/close
+        // pair — never batched.
+        let mut frame_links = crate::tui::osc8::take_frame_links();
+        if frame_links.is_empty() || !crate::tui::osc8::enabled() {
+            self.inner
+                .draw(adapted.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+            return Ok(());
+        }
+        // Deterministic region lookup when regions are adjacent/overlapping:
+        // the first (top-left-most) region wins.
+        frame_links.sort_unstable_by_key(|link| (link.row, link.col_start));
+        let region_for = |x: u16, y: u16| -> Option<usize> {
+            frame_links
+                .iter()
+                .position(|link| y == link.row && x >= link.col_start && x <= link.col_end)
+        };
+
+        // Walk the diff in its original order and split it into runs at
+        // region boundaries, so the visible byte stream stays identical to
+        // a no-link render apart from the inserted OSC 8 sequences.
+        let mut idx = 0;
+        while idx < adapted.len() {
+            let current_region = region_for(adapted[idx].0, adapted[idx].1);
+            let run_start = idx;
+            while idx < adapted.len()
+                && region_for(adapted[idx].0, adapted[idx].1) == current_region
+            {
+                idx += 1;
+            }
+            let run = &adapted[run_start..idx];
+            if let Some(region_idx) = current_region {
+                crate::tui::osc8::write_osc8_open(self, &frame_links[region_idx].target)?;
+                self.inner
+                    .draw(run.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+                crate::tui::osc8::write_osc8_close(self)?;
+            } else {
+                self.inner
+                    .draw(run.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+            }
+        }
+        Ok(())
     }
 
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
@@ -137,10 +212,14 @@ impl<W: Write> Backend for ColorCompatBackend<W> {
     }
 
     fn size(&self) -> io::Result<Size> {
-        match self.forced_size {
-            Some(size) => Ok(size),
-            None => self.inner.size(),
+        // forced_size takes priority: it is set during resize events to prevent
+        // ratatui's autoresize from shrinking the viewport back to a stale
+        // dimension. terminal_size is the cached real terminal size used as a
+        // fallback after alt-screen re-entry (Windows buffer width workaround).
+        if let Some(size) = self.forced_size.or(self.terminal_size) {
+            return Ok(size);
         }
+        self.inner.size()
     }
 
     fn window_size(&mut self) -> io::Result<WindowSize> {
@@ -150,6 +229,157 @@ impl<W: Write> Backend for ColorCompatBackend<W> {
     fn flush(&mut self) -> io::Result<()> {
         Backend::flush(&mut self.inner)
     }
+}
+
+#[derive(Debug)]
+struct RenderDebugLog {
+    file: File,
+    frame: u64,
+}
+
+impl RenderDebugLog {
+    fn from_env() -> Option<Self> {
+        if !render_debug_enabled_from_value(std::env::var(RENDER_DEBUG_ENV).ok().as_deref()) {
+            return None;
+        }
+
+        let log_dir = crate::runtime_log::log_directory()?;
+        if let Err(err) = fs::create_dir_all(&log_dir) {
+            tracing::debug!(?err, "failed to create TUI render debug log directory");
+            return None;
+        }
+        let path = log_dir.join("tui-render.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| {
+                tracing::debug!(?err, path = %path.display(), "failed to open TUI render debug log");
+                err
+            })
+            .ok()?;
+
+        Some(Self { file, frame: 0 })
+    }
+
+    fn record(&mut self, viewport: Option<Size>, diff: &[(u16, u16, Cell)]) {
+        self.frame = self.frame.saturating_add(1);
+        let sample = diff
+            .iter()
+            .take(RENDER_DEBUG_SAMPLE_LIMIT)
+            .map(|(x, y, _)| (*x, *y))
+            .collect::<Vec<_>>();
+        let line = render_debug_line(self.frame, viewport, diff.len(), &sample);
+        let _ = self.file.write_all(line.as_bytes());
+    }
+}
+
+fn render_debug_enabled_from_value(value: Option<&str>) -> bool {
+    env_flag_enabled(value)
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Narrow every CodeWhale-authored decorative glyph to a semantic ASCII
+/// alternative. Scope is deliberate: box drawing, block elements (whale
+/// mark, meters, rails), braille state markers, geometric role/state marks,
+/// arrows, and typographic chrome. Language text — CJK labels, accented
+/// letters, user and model content outside those decorative classes —
+/// passes through untouched.
+pub(crate) fn adapt_cell_symbol_for_ascii(cell: &mut Cell) {
+    // Braille (U+2800–U+28FF): the working bubble fills from the bottom and
+    // the verifying tick walks a ring. Map by dot density so the clock still
+    // reads as a rising fill in ASCII instead of collapsing to one glyph.
+    let mut chars = cell.symbol().chars();
+    if let (Some(ch), None) = (chars.next(), chars.next())
+        && ('\u{2800}'..='\u{28FF}').contains(&ch)
+    {
+        let dots = ((ch as u32) - 0x2800).count_ones();
+        let replacement = match dots {
+            0 => " ",
+            1..=2 => ".",
+            3..=4 => ":",
+            5..=6 => "+",
+            _ => "#",
+        };
+        cell.set_symbol(replacement);
+        return;
+    }
+    let replacement = match cell.symbol() {
+        "─" | "━" | "═" | "╌" | "╍" | "┄" | "┅" | "┈" | "┉" | "—" | "–" => {
+            "-"
+        }
+        "│" | "┃" | "║" | "╎" | "╏" | "▏" | "▎" | "▍" | "▌" | "▐" | "▕" => {
+            "|"
+        }
+        "┌" | "┐" | "└" | "┘" | "╭" | "╮" | "╰" | "╯" | "├" | "┤" | "┬" | "┴" | "┼" => {
+            "+"
+        }
+        // Block elements: the whale mark, context meter, and scroll thumbs.
+        "█" | "▉" | "▊" | "▋" | "▀" | "▄" | "▅" | "▆" | "▇" | "▙" | "▛" | "▜" | "▟" | "▰" => {
+            "#"
+        }
+        "▁" | "▂" | "▃" => "_",
+        "▖" | "▗" | "▘" | "▝" => ".",
+        "▚" => "\\",
+        "▞" => "/",
+        "░" | "▒" | "▓" => ":",
+        "▱" => "-",
+        "▶" | "▸" | "›" | "❯" | "→" | "↗" | "↘" | "»" => ">",
+        "◀" | "◂" | "‹" | "❮" | "←" | "↖" | "↙" | "«" => "<",
+        "▼" | "▾" | "▽" | "↓" => "v",
+        "▲" | "△" | "↑" => "^",
+        "◆" | "◇" | "♦" | "✦" | "◍" | "◉" | "★" | "☆" => "*",
+        "■" | "□" | "▪" | "▫" | "◼" | "◻" => "#",
+        "●" | "○" | "∘" | "•" | "·" | "☐" => ".",
+        "◌" | "˚" | "°" | "◦" => "o",
+        "✓" | "✔" | "☑" => "Y",
+        "✕" | "×" | "⊘" | "✗" | "✘" | "☒" => "X",
+        "⏸" => "=",
+        // The legacy opt-in whale status indicator; the brand mark survives
+        // as a letter rather than an emoji tofu box.
+        "🐳" | "🐋" => "w",
+        "…" => ".",
+        _ => return,
+    };
+    cell.set_symbol(replacement);
+}
+
+fn render_debug_line(
+    frame: u64,
+    viewport: Option<Size>,
+    diff_cells: usize,
+    sample: &[(u16, u16)],
+) -> String {
+    let mut line = String::new();
+    match viewport {
+        Some(size) => {
+            let _ = write!(
+                &mut line,
+                "frame={frame} size={}x{} diff_cells={diff_cells} sample=",
+                size.width, size.height
+            );
+        }
+        None => {
+            let _ = write!(
+                &mut line,
+                "frame={frame} size=unknown diff_cells={diff_cells} sample="
+            );
+        }
+    }
+    for (index, (x, y)) in sample.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        let _ = write!(&mut line, "{x}:{y}");
+    }
+    line.push('\n');
+    line
 }
 
 fn adapt_cell_colors(
@@ -177,12 +407,13 @@ fn adapt_cell_colors(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, io::Write, rc::Rc};
+    use std::{cell::RefCell, env, ffi::OsString, fs, io::Write, rc::Rc};
 
     use ratatui::backend::Backend;
     use ratatui::{buffer::Cell, style::Color};
 
     use super::*;
+    use crate::test_support::lock_test_env;
 
     #[derive(Clone, Default)]
     struct SharedWriter(Rc<RefCell<Vec<u8>>>);
@@ -195,6 +426,32 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: environment mutation is serialized by lock_test_env.
+            unsafe {
+                match &self.value {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
         }
     }
 
@@ -235,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn ascii_safe_symbol_adapter_preserves_meaning_with_narrow_glyphs() {
+        for (rich, safe) in [
+            ("─", "-"),
+            ("│", "|"),
+            ("┌", "+"),
+            ("▶", ">"),
+            ("▼", "v"),
+            ("✓", "Y"),
+            ("✕", "X"),
+        ] {
+            let mut cell = Cell::default();
+            cell.set_symbol(rich);
+            adapt_cell_symbol_for_ascii(&mut cell);
+            assert_eq!(cell.symbol(), safe, "{rich} should map to {safe}");
+            assert!(cell.symbol().is_ascii());
+        }
+    }
+
+    #[test]
     fn ansi256_backend_output_does_not_emit_truecolor_sgr() {
         let writer = SharedWriter::default();
         let capture = writer.0.clone();
@@ -255,7 +531,7 @@ mod tests {
     fn light_palette_maps_dark_cells_before_depth_adaptation() {
         let mut cell = Cell::default();
         cell.set_fg(Color::White);
-        cell.set_bg(Color::Rgb(11, 21, 38));
+        cell.set_bg(palette::WHALE_BG);
 
         adapt_cell_colors(
             &mut cell,
@@ -272,8 +548,8 @@ mod tests {
     #[test]
     fn grayscale_palette_maps_hued_cells_before_depth_adaptation() {
         let mut cell = Cell::default();
-        cell.set_fg(palette::DEEPSEEK_SKY);
-        cell.set_bg(palette::DEEPSEEK_INK);
+        cell.set_fg(palette::WHALE_INFO);
+        cell.set_bg(palette::WHALE_BG);
 
         adapt_cell_colors(
             &mut cell,
@@ -290,11 +566,11 @@ mod tests {
     #[test]
     fn community_theme_remap_honors_background_color_override() {
         // Tokyo Night + a custom black surface: the remap must rewrite
-        // `palette::DEEPSEEK_INK` to the *active* UiTheme's overridden
+        // `palette::WHALE_BG` to the *active* UiTheme's overridden
         // surface, not to tokyo-night's default surface.
         let active = palette::TOKYO_NIGHT_UI_THEME.with_background_color(Color::Rgb(0, 0, 0));
         let mut cell = Cell::default();
-        cell.set_bg(palette::DEEPSEEK_INK);
+        cell.set_bg(palette::WHALE_BG);
 
         adapt_cell_colors(
             &mut cell,
@@ -317,5 +593,324 @@ mod tests {
         assert_eq!(backend.palette_mode, PaletteMode::Light);
         backend.set_palette_mode(PaletteMode::Grayscale);
         assert_eq!(backend.palette_mode, PaletteMode::Grayscale);
+    }
+
+    #[test]
+    fn render_debug_env_parser_accepts_truthy_values_only() {
+        assert!(!render_debug_enabled_from_value(None));
+        assert!(!render_debug_enabled_from_value(Some("")));
+        assert!(!render_debug_enabled_from_value(Some("0")));
+        assert!(!render_debug_enabled_from_value(Some("false")));
+        assert!(render_debug_enabled_from_value(Some("1")));
+        assert!(render_debug_enabled_from_value(Some("true")));
+        assert!(render_debug_enabled_from_value(Some("YES")));
+        assert!(render_debug_enabled_from_value(Some("on")));
+    }
+
+    #[test]
+    fn render_debug_line_records_frame_size_and_diff_sample() {
+        let line = render_debug_line(7, Some(Size::new(80, 24)), 42, &[(0, 0), (12, 3), (79, 23)]);
+
+        assert_eq!(
+            line,
+            "frame=7 size=80x24 diff_cells=42 sample=0:0,12:3,79:23\n"
+        );
+    }
+
+    #[test]
+    fn backend_writes_render_debug_log_when_enabled() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = EnvRestore::capture("HOME");
+        let _userprofile = EnvRestore::capture("USERPROFILE");
+        let _debug = EnvRestore::capture(RENDER_DEBUG_ENV);
+
+        // SAFETY: environment mutation is serialized by lock_test_env.
+        unsafe {
+            env::set_var("HOME", tmp.path());
+            env::set_var("USERPROFILE", "");
+            env::set_var(RENDER_DEBUG_ENV, "1");
+        }
+
+        let writer = SharedWriter::default();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        let mut cell = Cell::default();
+        cell.set_symbol("x");
+        backend.draw(std::iter::once((3, 4, &cell))).unwrap();
+
+        let log_path = tmp
+            .path()
+            .join(".codewhale")
+            .join("logs")
+            .join("tui-render.log");
+        let body = fs::read_to_string(log_path).expect("render debug log");
+        assert!(body.contains("frame=1"), "{body}");
+        assert!(body.contains("diff_cells=1"), "{body}");
+        assert!(body.contains("sample=3:4"), "{body}");
+    }
+
+    #[test]
+    fn size_returns_terminal_size_when_set() {
+        let writer = SharedWriter::default();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+
+        backend.set_terminal_size(Size::new(120, 40));
+        assert_eq!(backend.size().unwrap(), Size::new(120, 40));
+    }
+
+    #[test]
+    fn forced_size_takes_priority_over_terminal_size() {
+        let writer = SharedWriter::default();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+
+        // forced_size is set during resize events to temporarily override the
+        // cached terminal_size — it must win to prevent viewport shrinking.
+        backend.set_terminal_size(Size::new(120, 40));
+        backend.force_size(Size::new(80, 25));
+        assert_eq!(backend.size().unwrap(), Size::new(80, 25));
+    }
+
+    #[test]
+    fn size_falls_back_to_forced_size_when_terminal_size_unset() {
+        let writer = SharedWriter::default();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+
+        backend.force_size(Size::new(80, 25));
+        assert_eq!(backend.size().unwrap(), Size::new(80, 25));
+    }
+
+    // ── #3029: OSC 8 emission through the backend byte stream ──────────────
+
+    fn row_cells(symbols: &str) -> Vec<(u16, u16, Cell)> {
+        symbols
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                let mut cell = Cell::default();
+                cell.set_symbol(&ch.to_string());
+                (u16::try_from(i).unwrap(), 0u16, cell)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc8_open_close_bracket_only_their_region_cells() {
+        use crate::tui::osc8::LinkRegion;
+
+        // Baseline: identical cells, no link regions.
+        let baseline_writer = SharedWriter::default();
+        let baseline_capture = baseline_writer.0.clone();
+        let mut baseline =
+            ColorCompatBackend::new(baseline_writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        let cells = row_cells("ABCDE");
+        baseline
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+        let baseline_out = String::from_utf8_lossy(&baseline_capture.borrow()).to_string();
+
+        // Linked render: columns 2..=3 ("CD") carry one link region.
+        crate::tui::osc8::set_frame_links(vec![LinkRegion {
+            row: 0,
+            col_start: 2,
+            col_end: 3,
+            target: "https://example.test/1".to_string(),
+        }]);
+        let writer = SharedWriter::default();
+        let capture = writer.0.clone();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        let cells = row_cells("ABCDE");
+        backend
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+        let out = String::from_utf8_lossy(&capture.borrow()).to_string();
+
+        let open = "\x1b]8;;https://example.test/1\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(out.matches(open).count(), 1, "exactly one open: {out:?}");
+        assert_eq!(out.matches(close).count(), 1, "exactly one close: {out:?}");
+
+        // The open must precede the first linked glyph and the close must sit
+        // between the last linked glyph and the first glyph after the region.
+        let open_at = out.find(open).expect("open present");
+        let close_at = out.find(close).expect("close present");
+        let c_at = out.find('C').expect("glyph C");
+        let d_at = out.find('D').expect("glyph D");
+        let e_at = out.find('E').expect("glyph E");
+        assert!(open_at < c_at, "open before linked cells: {out:?}");
+        assert!(d_at < close_at, "close after linked cells: {out:?}");
+        assert!(
+            close_at < e_at,
+            "cells after the region must not inherit the link: {out:?}"
+        );
+
+        // Visible glyph stream is unchanged by link insertion.
+        let mut baseline_visible = String::new();
+        crate::tui::osc8::strip_ansi_into(&baseline_out, &mut baseline_visible);
+        let mut linked_visible = String::new();
+        crate::tui::osc8::strip_ansi_into(&out, &mut linked_visible);
+        assert_eq!(
+            baseline_visible, linked_visible,
+            "link emission must not move or alter visible cells"
+        );
+    }
+
+    #[test]
+    fn osc8_two_regions_link_to_their_own_targets() {
+        use crate::tui::osc8::LinkRegion;
+
+        crate::tui::osc8::set_frame_links(vec![
+            LinkRegion {
+                row: 0,
+                col_start: 0,
+                col_end: 1,
+                target: "https://example.test/first".to_string(),
+            },
+            LinkRegion {
+                row: 0,
+                col_start: 3,
+                col_end: 4,
+                target: "https://example.test/second".to_string(),
+            },
+        ]);
+        let writer = SharedWriter::default();
+        let capture = writer.0.clone();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        let cells = row_cells("ABZCD");
+        backend
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+        let out = String::from_utf8_lossy(&capture.borrow()).to_string();
+
+        let first = "\x1b]8;;https://example.test/first\x1b\\";
+        let second = "\x1b]8;;https://example.test/second\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(out.matches(first).count(), 1, "{out:?}");
+        assert_eq!(out.matches(second).count(), 1, "{out:?}");
+        assert_eq!(out.matches(close).count(), 2, "{out:?}");
+
+        // Pre-#3029-audit bug: both opens were emitted before any cell, so
+        // the whole frame linked to the LAST region's target. Each region's
+        // open must close before the next region's open begins.
+        let first_at = out.find(first).expect("first open");
+        let first_close_at = out[first_at..].find(close).expect("first close") + first_at;
+        let second_at = out.find(second).expect("second open");
+        assert!(
+            first_close_at < second_at,
+            "region one must close before region two opens: {out:?}"
+        );
+        // The unlinked middle glyph sits between the two link spans.
+        let z_at = out.find('Z').expect("unlinked glyph");
+        assert!(first_close_at < z_at && z_at < second_at, "{out:?}");
+    }
+
+    /// #3029 end-to-end: a long bare URL hard-wraps at narrow width while its
+    /// full target travels beside every visible chunk. No escape payload enters
+    /// the buffer, and the backend re-emits one OSC 8 pair per row without
+    /// altering the visible byte stream.
+    #[test]
+    fn osc8_metadata_feeds_backend_for_every_wrapped_url_chunk() {
+        use crate::tui::{markdown_render, osc8};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::Style;
+        use ratatui::widgets::{Paragraph, Widget};
+        use unicode_width::UnicodeWidthStr;
+
+        let target = "https://example.test/a/very/long/path/that/wraps/across/rows";
+        let rendered = markdown_render::render_markdown_tagged(target, 12, Style::default());
+        assert!(rendered.len() > 2, "fixture must wrap at narrow width");
+        let lines = rendered
+            .iter()
+            .map(|rendered| rendered.line.clone())
+            .collect::<Vec<_>>();
+        let line_links = rendered
+            .iter()
+            .map(|rendered| rendered.links.clone())
+            .collect::<Vec<_>>();
+        let visible = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible.concat(), target);
+
+        let area = Rect::new(3, 2, 12, u16::try_from(lines.len()).unwrap());
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buf);
+
+        // Visible cells start at the area's real x offset and contain exactly
+        // the URL chunks — never the historical `]8;;` payload bytes.
+        for (row_index, text) in visible.iter().enumerate() {
+            let y = area.y + u16::try_from(row_index).unwrap();
+            let row = (0..u16::try_from(text.width()).unwrap())
+                .map(|offset| buf[(area.x + offset, y)].symbol().to_string())
+                .collect::<String>();
+            assert_eq!(row, *text);
+        }
+        assert!((area.y..area.bottom()).all(|y| {
+            (area.x..area.right()).all(|x| {
+                let symbol = buf[(x, y)].symbol();
+                !symbol.contains('\x1b') && !symbol.contains("]8;;")
+            })
+        }));
+
+        let regions = osc8::link_regions_for_lines(area, &line_links);
+        assert_eq!(regions.len(), rendered.len());
+        for ((region, text), row_index) in regions.iter().zip(&visible).zip(0u16..) {
+            assert_eq!(region.row, area.y + row_index);
+            assert_eq!(region.col_start, area.x);
+            assert_eq!(
+                region.col_end,
+                area.x + u16::try_from(text.width()).unwrap() - 1
+            );
+            assert_eq!(region.target, target);
+        }
+
+        let buf_ref = &buf;
+        let cells = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y, buf_ref[(x, y)].clone())))
+            .collect::<Vec<_>>();
+
+        // Capture an unlinked baseline from the exact same cells.
+        let _ = osc8::take_frame_links();
+        let baseline_writer = SharedWriter::default();
+        let baseline_capture = baseline_writer.0.clone();
+        let mut baseline =
+            ColorCompatBackend::new(baseline_writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        baseline
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+
+        osc8::set_frame_links(regions);
+        let writer = SharedWriter::default();
+        let capture = writer.0.clone();
+        let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        backend
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+        let out = String::from_utf8_lossy(&capture.borrow()).to_string();
+
+        let open = format!("\x1b]8;;{target}\x1b\\");
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(
+            out.matches(open.as_str()).count(),
+            rendered.len(),
+            "each row reopens the full target: {out:?}"
+        );
+        assert_eq!(out.matches(close).count(), rendered.len());
+
+        let baseline_out = String::from_utf8_lossy(&baseline_capture.borrow()).to_string();
+        let mut baseline_visible = String::new();
+        osc8::strip_ansi_into(&baseline_out, &mut baseline_visible);
+        let mut linked_visible = String::new();
+        osc8::strip_ansi_into(&out, &mut linked_visible);
+        assert_eq!(
+            linked_visible, baseline_visible,
+            "OSC 8 insertion must not move or alter any rendered cell"
+        );
     }
 }

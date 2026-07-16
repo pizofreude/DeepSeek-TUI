@@ -14,7 +14,7 @@
 import type { RepoFacts, ProviderFact } from "./facts.generated";
 import { FACTS as BUILD_FACTS } from "./facts.generated";
 
-const RAW_BASE = "https://raw.githubusercontent.com/Hmbown/deepseek-tui/main";
+const RAW_BASE = "https://raw.githubusercontent.com/Hmbown/CodeWhale/main";
 const KV_KEY = "facts:current";
 const LOG_KEY = "facts:drift-log";
 
@@ -25,7 +25,7 @@ interface KVNamespace {
 
 async function fetchText(path: string, ghToken?: string): Promise<string | null> {
   const headers: Record<string, string> = {
-    "User-Agent": "deepseek-tui-web-drift",
+    "User-Agent": "codewhale-web-drift",
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
@@ -39,10 +39,10 @@ async function fetchText(path: string, ghToken?: string): Promise<string | null>
 
 async function fetchListing(dir: string, ghToken?: string): Promise<string[] | null> {
   // Use GitHub Contents API to list a directory.
-  const url = `https://api.github.com/repos/Hmbown/deepseek-tui/contents/${dir}?ref=main`;
+  const url = `https://api.github.com/repos/Hmbown/CodeWhale/contents/${dir}?ref=main`;
   const headers: Record<string, string> = {
     "Accept": "application/vnd.github+json",
-    "User-Agent": "deepseek-tui-web-drift",
+    "User-Agent": "codewhale-web-drift",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
@@ -77,20 +77,58 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
   // so the binary rejects it — keep it out of the docs. Issue #1104.
   const labelMap: Record<string, ProviderFact> = {
     Deepseek: { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
-    NvidiaNim: { id: "nvidia-nim", label: "NVIDIA NIM", env: "NVIDIA_API_KEY" },
-    Openai: { id: "openai", label: "OpenAI", env: "OPENAI_API_KEY" },
+    DeepseekAnthropic: { id: "deepseek-anthropic", label: "DeepSeek Anthropic", env: "DEEPSEEK_API_KEY / ANTHROPIC_API_KEY" },
+    NvidiaNim: { id: "nvidia-nim", label: "NVIDIA NIM", env: "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY" },
+    Openai: { id: "openai", label: "OpenAI-compatible", env: "OPENAI_API_KEY" },
+    Atlascloud: { id: "atlascloud", label: "AtlasCloud", env: "ATLASCLOUD_API_KEY" },
+    WanjieArk: { id: "wanjie-ark", label: "Wanjie Ark", env: "WANJIE_ARK_API_KEY / WANJIE_API_KEY / WANJIE_MAAS_API_KEY" },
+    Volcengine: { id: "volcengine", label: "Volcengine Ark", env: "VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY" },
     Openrouter: { id: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY" },
-    Novita: { id: "novita", label: "Novita", env: "NOVITA_API_KEY" },
-    Fireworks: { id: "fireworks", label: "Fireworks", env: "FIREWORKS_API_KEY" },
-    Sglang: { id: "sglang", label: "sglang", env: "SGLANG_API_KEY" },
+    XiaomiMimo: { id: "xiaomi-mimo", label: "Xiaomi MiMo", env: "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY" },
+    Novita: { id: "novita", label: "Novita AI", env: "NOVITA_API_KEY" },
+    Fireworks: { id: "fireworks", label: "Fireworks AI", env: "FIREWORKS_API_KEY" },
+    Siliconflow: { id: "siliconflow", label: "SiliconFlow", env: "SILICONFLOW_API_KEY" },
+    SiliconflowCn: { id: "siliconflow-CN", label: "SiliconFlow CN", env: "SILICONFLOW_API_KEY" },
+    Arcee: { id: "arcee", label: "Arcee AI", env: "ARCEE_API_KEY" },
+    Moonshot: { id: "moonshot", label: "Moonshot/Kimi", env: "MOONSHOT_API_KEY / KIMI_API_KEY" },
+    Sglang: { id: "sglang", label: "SGLang", env: "SGLANG_API_KEY" },
     Vllm: { id: "vllm", label: "vLLM", env: "VLLM_API_KEY" },
     Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
+    Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
+    Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
+    Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
+    Qianfan: { id: "qianfan", label: "Baidu Qianfan", env: "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY" },
+    OpenaiCodex: { id: "openai-codex", label: "OpenAI Codex", env: "ChatGPT/Codex OAuth via `codex login` (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)" },
+    Anthropic: { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
+    Zai: { id: "zai", label: "Z.ai", env: "ZAI_API_KEY / Z_AI_API_KEY" },
+    Stepfun: { id: "stepfun", label: "StepFun", env: "STEPFUN_API_KEY / STEP_API_KEY" },
+    Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
+    MinimaxAnthropic: { id: "minimax-anthropic", label: "MiniMax (Anthropic-compatible)", env: "MINIMAX_API_KEY" },
+    Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
+    Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
+    LongCat: { id: "longcat", label: "LongCat", env: "LONGCAT_API_KEY" },
+    Meta: { id: "meta", label: "Meta Model API", env: "META_MODEL_API_KEY / MODEL_API_KEY" },
+    Xai: { id: "xai", label: "xAI", env: "XAI_API_KEY" },
   };
+  // Log loudly on unmapped variants so a new provider can never be silently
+  // dropped from the drift-derived facts again. DeepseekCN (#1104) and the
+  // dynamic Custom meta-provider (#1519, user-defined endpoints) are the
+  // deliberate exclusions.
+  const EXCLUDED = new Set(["DeepseekCN", "Custom"]);
+  const unmapped = variants.filter((v) => !EXCLUDED.has(v) && !labelMap[v]);
+  if (unmapped.length > 0) {
+    console.warn(
+      `[facts-drift] ApiProvider variants missing from labelMap: ${unmapped.join(", ")}. ` +
+        "Add them to labelMap here AND PROVIDER_LABEL_MAP in web/scripts/facts-lib.mjs (or to EXCLUDED if intentionally hidden).",
+    );
+  }
   return variants.map((v) => labelMap[v]).filter(Boolean);
 }
 
 function deriveDefaultModel(cfg: string): string | null {
-  const m = cfg.match(/DEFAULT_TEXT_MODEL[^"]*"([^"]+)"/);
+  // Match the const *definition* (`= "..."`); the definition moved to
+  // config/models.rs in the #3311 split, so callers pass config.rs + models.rs.
+  const m = cfg.match(/DEFAULT_TEXT_MODEL\s*(?::\s*&str\s*)?=\s*"([^"]+)"/);
   return m ? m[1] : null;
 }
 
@@ -98,7 +136,6 @@ function deriveSandboxBackends(files: string[]): string[] {
   const map: Record<string, string> = {
     seatbelt: "seatbelt (macOS)",
     landlock: "landlock (Linux)",
-    windows: "AppContainer / restricted tokens (Windows)",
   };
   return files
     .map((f) => f.replace(/\.rs$/, ""))
@@ -110,12 +147,12 @@ function deriveSandboxBackends(files: string[]): string[] {
 async function fetchLatestRelease(ghToken?: string): Promise<string | null> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "deepseek-tui-web-drift",
+    "User-Agent": "codewhale-web-drift",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch("https://api.github.com/repos/Hmbown/deepseek-tui/releases/latest", { headers });
+    const r = await fetch("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest", { headers });
     if (!r.ok) return null;
     const j = (await r.json()) as { tag_name?: string };
     return j.tag_name ?? null;
@@ -133,11 +170,12 @@ function deriveLicense(licText: string): string | null {
 }
 
 export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts | null> {
-  const [cargo, configRs, sandboxFiles, npmPkg, licText, toolFiles, latestRelease] = await Promise.all([
+  const [cargo, configRs, configModels, sandboxFiles, npmPkg, licText, toolFiles, latestRelease] = await Promise.all([
     fetchText("Cargo.toml", ghToken),
     fetchText("crates/tui/src/config.rs", ghToken),
+    fetchText("crates/tui/src/config/models.rs", ghToken),
     fetchListing("crates/tui/src/sandbox", ghToken),
-    fetchText("npm/deepseek-tui/package.json", ghToken),
+    fetchText("npm/codewhale/package.json", ghToken),
     fetchText("LICENSE", ghToken),
     fetchListing("crates/tui/src/tools", ghToken),
     fetchLatestRelease(ghToken),
@@ -152,7 +190,7 @@ export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts
     crates: deriveCrates(cargo),
     sandboxBackends: sandboxFiles ? deriveSandboxBackends(sandboxFiles) : BUILD_FACTS.sandboxBackends,
     providers: deriveProvidersFromConfig(configRs),
-    defaultModel: deriveDefaultModel(configRs),
+    defaultModel: deriveDefaultModel(`${configRs}\n${configModels ?? ""}`),
     nodeEngines: (() => {
       try { return npmPkg ? JSON.parse(npmPkg).engines?.node ?? null : null; } catch { return null; }
     })(),

@@ -1,4 +1,4 @@
-//! Byte-sequence builders for keys, paste, and resize.
+//! Byte-sequence builders for keys and paste.
 //!
 //! These produce the raw bytes a real terminal would deliver to the child's
 //! PTY slave. They match crossterm's input-decoding tables (keyboard
@@ -15,47 +15,40 @@ pub mod key {
         b"\r".to_vec()
     }
 
-    pub fn tab() -> Vec<u8> {
-        b"\t".to_vec()
-    }
-
-    pub fn shift_tab() -> Vec<u8> {
-        b"\x1b[Z".to_vec()
-    }
-
     pub fn esc() -> Vec<u8> {
-        b"\x1b".to_vec()
-    }
-
-    pub fn backspace() -> Vec<u8> {
-        b"\x7f".to_vec()
-    }
-
-    pub fn ctrl(c: char) -> Vec<u8> {
-        // Ctrl+letter is the ASCII control byte: ctrl('a') = 0x01, ctrl('c') = 0x03, …
-        let upper = c.to_ascii_uppercase() as u8;
-        if upper.is_ascii_uppercase() {
-            vec![upper - b'A' + 1]
-        } else {
-            vec![]
-        }
-    }
-
-    pub fn up() -> Vec<u8> {
-        b"\x1b[A".to_vec()
-    }
-    pub fn down() -> Vec<u8> {
-        b"\x1b[B".to_vec()
-    }
-    pub fn right() -> Vec<u8> {
-        b"\x1b[C".to_vec()
-    }
-    pub fn left() -> Vec<u8> {
-        b"\x1b[D".to_vec()
+        vec![0x1b]
     }
 
     pub fn text(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
+    }
+
+    pub fn alt(c: char) -> Vec<u8> {
+        let mut out = vec![0x1b];
+        out.extend(ch(c));
+        out
+    }
+}
+
+/// SGR mouse sequences use one-based terminal coordinates.
+pub mod mouse {
+    pub fn click(row: u16, col: u16) -> Vec<u8> {
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            col + 1,
+            row + 1,
+            col + 1,
+            row + 1
+        )
+        .into_bytes()
+    }
+
+    pub fn wheel_down(row: u16, col: u16) -> Vec<u8> {
+        format!("\x1b[<65;{};{}M", col + 1, row + 1).into_bytes()
+    }
+
+    pub fn wheel_up(row: u16, col: u16) -> Vec<u8> {
+        format!("\x1b[<64;{};{}M", col + 1, row + 1).into_bytes()
     }
 }
 

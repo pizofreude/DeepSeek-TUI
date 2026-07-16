@@ -45,7 +45,7 @@ impl TodoStatus {
 }
 
 /// A single todo item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoItem {
     pub id: u32,
     pub content: String,
@@ -53,11 +53,21 @@ pub struct TodoItem {
 }
 
 /// Snapshot of a todo list for display or serialization.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoListSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<TodoItem>,
+    #[serde(default)]
     pub completion_pct: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_progress_id: Option<u32>,
+}
+
+impl TodoListSnapshot {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 /// Mutable list of todo items with helper operations.
@@ -85,6 +95,48 @@ impl TodoList {
             completion_pct: self.completion_percentage(),
             in_progress_id: self.in_progress_id(),
         }
+    }
+
+    /// Rebuild a mutable list from a persisted snapshot.
+    ///
+    /// Derived snapshot fields are deliberately recomputed. IDs and the
+    /// single-in-progress invariant are validated before any live state is
+    /// replaced, so malformed session data cannot leave a half-restored list.
+    pub fn from_snapshot(snapshot: &TodoListSnapshot) -> Result<Self, String> {
+        let mut seen = std::collections::HashSet::with_capacity(snapshot.items.len());
+        let mut in_progress_count = 0usize;
+        let mut max_id = 0u32;
+        let mut items = Vec::with_capacity(snapshot.items.len());
+
+        for item in &snapshot.items {
+            if item.id == 0 {
+                return Err("To-do item IDs must be greater than zero".to_string());
+            }
+            if !seen.insert(item.id) {
+                return Err(format!("Duplicate To-do item ID {}", item.id));
+            }
+            if item.status == TodoStatus::InProgress {
+                in_progress_count += 1;
+                if in_progress_count > 1 {
+                    return Err("Only one To-do item may be in progress".to_string());
+                }
+            }
+            max_id = max_id.max(item.id);
+            items.push(TodoItem {
+                id: item.id,
+                content: item.content.clone(),
+                status: item.status,
+            });
+        }
+
+        let next_id = if items.is_empty() {
+            1
+        } else {
+            max_id
+                .checked_add(1)
+                .ok_or_else(|| "To-do item IDs are exhausted".to_string())?
+        };
+        Ok(Self { items, next_id })
     }
 
     /// Add a new todo item.
@@ -174,6 +226,10 @@ pub fn new_shared_todo_list() -> SharedTodoList {
     Arc::new(Mutex::new(TodoList::new()))
 }
 
+const CANONICAL_WORK_SURFACE: &str = "work";
+const CANONICAL_PROGRESS_TOOL: &str = "work_update";
+const DURABLE_WORK_OWNER: &str = "fleet_workflow_ledger";
+
 /// Tool for writing and updating the todo list
 pub struct TodoWriteTool {
     todo_list: SharedTodoList,
@@ -181,17 +237,27 @@ pub struct TodoWriteTool {
 }
 
 impl TodoWriteTool {
-    pub fn new(todo_list: SharedTodoList) -> Self {
+    /// Canonical model-facing progress surface (#4132).
+    pub fn work_update(todo_list: SharedTodoList) -> Self {
         Self {
             todo_list,
-            tool_name: "todo_write",
+            tool_name: CANONICAL_PROGRESS_TOOL,
         }
     }
 
+    /// Legacy spelling kept for transcript replay and older prompts.
     pub fn checklist(todo_list: SharedTodoList) -> Self {
         Self {
             todo_list,
             tool_name: "checklist_write",
+        }
+    }
+
+    /// Pre-checklist `todo_*` spelling kept for transcript replay.
+    pub fn todo(todo_list: SharedTodoList) -> Self {
+        Self {
+            todo_list,
+            tool_name: "todo_write",
         }
     }
 }
@@ -203,17 +269,17 @@ pub struct TodoAddTool {
 }
 
 impl TodoAddTool {
-    pub fn new(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_add",
-        }
-    }
-
     pub fn checklist(todo_list: SharedTodoList) -> Self {
         Self {
             todo_list,
             tool_name: "checklist_add",
+        }
+    }
+
+    pub fn todo(todo_list: SharedTodoList) -> Self {
+        Self {
+            todo_list,
+            tool_name: "todo_add",
         }
     }
 }
@@ -226,9 +292,9 @@ impl ToolSpec for TodoAddTool {
 
     fn description(&self) -> &'static str {
         if self.tool_name == "todo_add" {
-            "Compatibility alias for checklist_add. Adds one checklist item on the active thread/task."
+            "Compatibility alias for work_update/checklist_add. Adds one To-do item on the active thread/task."
         } else {
-            "Add one checklist item on the active thread/task. Durable tasks persist this checklist as subordinate work progress."
+            "Compatibility alias for work_update. Adds one To-do item on the active thread/task. Prefer work_update to replace the full list."
         }
     }
 
@@ -258,6 +324,11 @@ impl ToolSpec for TodoAddTool {
         ApprovalRequirement::Auto
     }
 
+    fn model_visible(&self) -> bool {
+        // Granular add stays callable for replay; models should use work_update.
+        false
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -284,7 +355,7 @@ impl ToolSpec for TodoAddTool {
             item.status.as_str(),
             result
         ))
-        .with_metadata(checklist_metadata(&snapshot, self.tool_name)))
+        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
     }
 }
 
@@ -295,17 +366,17 @@ pub struct TodoUpdateTool {
 }
 
 impl TodoUpdateTool {
-    pub fn new(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_update",
-        }
-    }
-
     pub fn checklist(todo_list: SharedTodoList) -> Self {
         Self {
             todo_list,
             tool_name: "checklist_update",
+        }
+    }
+
+    pub fn todo(todo_list: SharedTodoList) -> Self {
+        Self {
+            todo_list,
+            tool_name: "todo_update",
         }
     }
 }
@@ -318,9 +389,9 @@ impl ToolSpec for TodoUpdateTool {
 
     fn description(&self) -> &'static str {
         if self.tool_name == "todo_update" {
-            "Compatibility alias for checklist_update. Updates one checklist item by id on the active thread/task."
+            "Compatibility alias for work_update/checklist_update. Updates one To-do item by id on the active thread/task."
         } else {
-            "Update one checklist item's status by id on the active thread/task."
+            "Compatibility alias for work_update. Updates one To-do item's status by id on the active thread/task."
         }
     }
 
@@ -348,6 +419,10 @@ impl ToolSpec for TodoUpdateTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Auto
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     async fn execute(
@@ -378,7 +453,7 @@ impl ToolSpec for TodoUpdateTool {
                 item.status.as_str(),
                 result
             ))
-            .with_metadata(checklist_metadata(&snapshot, self.tool_name))),
+            .with_metadata(work_progress_metadata(&snapshot, self.tool_name))),
             None => Ok(ToolResult::error(format!("Todo id {id} not found"))),
         }
     }
@@ -391,17 +466,17 @@ pub struct TodoListTool {
 }
 
 impl TodoListTool {
-    pub fn new(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_list",
-        }
-    }
-
     pub fn checklist(todo_list: SharedTodoList) -> Self {
         Self {
             todo_list,
             tool_name: "checklist_list",
+        }
+    }
+
+    pub fn todo(todo_list: SharedTodoList) -> Self {
+        Self {
+            todo_list,
+            tool_name: "todo_list",
         }
     }
 }
@@ -414,9 +489,9 @@ impl ToolSpec for TodoListTool {
 
     fn description(&self) -> &'static str {
         if self.tool_name == "todo_list" {
-            "Compatibility alias for checklist_list. Lists current checklist progress."
+            "Compatibility alias for work_update/checklist_list. Lists current To-do progress."
         } else {
-            "List current checklist progress for the active thread/task."
+            "Compatibility alias for work_update. Lists current To-do progress for the active thread/task."
         }
     }
 
@@ -435,6 +510,10 @@ impl ToolSpec for TodoListTool {
         ApprovalRequirement::Auto
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         _input: serde_json::Value,
@@ -448,7 +527,8 @@ impl ToolSpec for TodoListTool {
             snapshot.items.len(),
             snapshot.completion_pct,
             result
-        )))
+        ))
+        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
     }
 }
 
@@ -459,10 +539,16 @@ impl ToolSpec for TodoWriteTool {
     }
 
     fn description(&self) -> &'static str {
-        if self.tool_name == "todo_write" {
-            "Compatibility alias for checklist_write. Replace the active thread/task checklist; durable tasks are the real executable work object."
-        } else {
-            "Replace the active thread/task checklist. Use this for granular progress under the current durable task or runtime thread; durable tasks remain the real executable work object."
+        match self.tool_name {
+            "todo_write" => {
+                "Compatibility alias for work_update. Replace the active thread/task To-do list; durable tasks are the real executable work object."
+            }
+            "checklist_write" => {
+                "Compatibility alias for work_update. Replace the active thread/task To-do list; durable tasks are the real executable work object."
+            }
+            _ => {
+                "Replace the active thread/task To-do list (concrete current work items). This is the canonical progress surface — use it for ordinary in-flight work. Use update_plan only for Strategy metadata/context/route, not as a second checklist. Durable tasks remain the real executable work object."
+            }
         }
     }
 
@@ -472,7 +558,7 @@ impl ToolSpec for TodoWriteTool {
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "The complete list of todo items. This replaces the existing list.",
+                    "description": "The complete list of To-do items. This replaces the existing list.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -500,6 +586,11 @@ impl ToolSpec for TodoWriteTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Auto
+    }
+
+    fn model_visible(&self) -> bool {
+        // Only the canonical work_update spelling is advertised to models.
+        self.tool_name == CANONICAL_PROGRESS_TOOL
     }
 
     async fn execute(
@@ -542,11 +633,15 @@ impl ToolSpec for TodoWriteTool {
             snapshot.completion_pct,
             result
         ))
-        .with_metadata(checklist_metadata(&snapshot, self.tool_name)))
+        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
     }
 }
 
-fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_json::Value {
+fn is_compat_alias(tool_name: &str) -> bool {
+    tool_name != CANONICAL_PROGRESS_TOOL
+}
+
+fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_json::Value {
     let items = snapshot
         .items
         .iter()
@@ -559,8 +654,15 @@ fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_jso
         })
         .collect::<Vec<_>>();
     json!({
-        "canonical_tool": "checklist_write",
-        "compat_alias": tool_name.starts_with("todo_"),
+        "canonical_tool": CANONICAL_PROGRESS_TOOL,
+        "invoked_as": tool_name,
+        "compat_alias": is_compat_alias(tool_name),
+        "work_surface": {
+            "canonical": CANONICAL_WORK_SURFACE,
+            "model_visible": tool_name == CANONICAL_PROGRESS_TOOL,
+            "durable_owner": DURABLE_WORK_OWNER,
+            "progress_key": "task_updates.checklist"
+        },
         "task_updates": {
             "checklist": {
                 "items": items,
@@ -576,9 +678,84 @@ fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_jso
 mod tests {
     use super::*;
 
+    #[test]
+    fn persisted_snapshot_restores_ids_status_and_recomputes_metrics() {
+        let snapshot = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 4,
+                    content: " inspect ".to_string(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: 9,
+                    content: "patch".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+            completion_pct: 0,
+            in_progress_id: None,
+        };
+
+        let mut restored = TodoList::from_snapshot(&snapshot).expect("restore");
+        let restored_snapshot = restored.snapshot();
+        assert_eq!(restored_snapshot.items[0].id, 4);
+        assert_eq!(restored_snapshot.items[0].content, " inspect ");
+        assert_eq!(restored_snapshot.items[1].id, 9);
+        assert_eq!(restored_snapshot.completion_pct, 50);
+        assert_eq!(restored_snapshot.in_progress_id, Some(9));
+        assert_eq!(
+            restored.add("verify".to_string(), TodoStatus::Pending).id,
+            10
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_snapshot_is_rejected_deterministically() {
+        let duplicate = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "one".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 1,
+                    content: "two".to_string(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+            ..TodoListSnapshot::default()
+        };
+        assert_eq!(
+            TodoList::from_snapshot(&duplicate).unwrap_err(),
+            "Duplicate To-do item ID 1"
+        );
+
+        let multiple_active = TodoListSnapshot {
+            items: vec![
+                TodoItem {
+                    id: 1,
+                    content: "one".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: 2,
+                    content: "two".to_string(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+            ..TodoListSnapshot::default()
+        };
+        assert_eq!(
+            TodoList::from_snapshot(&multiple_active).unwrap_err(),
+            "Only one To-do item may be in progress"
+        );
+    }
+
     #[tokio::test]
-    async fn checklist_write_returns_task_update_metadata() {
-        let tool = TodoWriteTool::checklist(new_shared_todo_list());
+    async fn work_update_returns_canonical_task_update_metadata() {
+        let tool = TodoWriteTool::work_update(new_shared_todo_list());
         let context = ToolContext::new(std::env::temp_dir());
         let result = tool
             .execute(
@@ -591,11 +768,23 @@ mod tests {
                 &context,
             )
             .await
-            .expect("checklist write succeeds");
+            .expect("work_update succeeds");
 
+        assert!(tool.model_visible());
         let metadata = result.metadata.expect("metadata");
-        assert_eq!(metadata["canonical_tool"], "checklist_write");
+        assert_eq!(metadata["canonical_tool"], "work_update");
+        assert_eq!(metadata["invoked_as"], "work_update");
         assert_eq!(metadata["compat_alias"], false);
+        assert_eq!(metadata["work_surface"]["canonical"], "work");
+        assert_eq!(metadata["work_surface"]["model_visible"], true);
+        assert_eq!(
+            metadata["work_surface"]["durable_owner"],
+            "fleet_workflow_ledger"
+        );
+        assert_eq!(
+            metadata["work_surface"]["progress_key"],
+            "task_updates.checklist"
+        );
         assert_eq!(
             metadata["task_updates"]["checklist"]["in_progress_id"],
             json!(1)
@@ -607,24 +796,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_write_remains_compat_alias() {
-        let tool = TodoWriteTool::new(new_shared_todo_list());
+    async fn checklist_write_compat_alias_still_replays() {
+        let tool = TodoWriteTool::checklist(new_shared_todo_list());
         let context = ToolContext::new(std::env::temp_dir());
         let result = tool
             .execute(
                 json!({
                     "todos": [
-                        { "content": "legacy caller", "status": "completed" }
+                        { "content": "legacy checklist payload", "status": "completed" }
                     ]
                 }),
                 &context,
             )
             .await
-            .expect("todo write succeeds");
+            .expect("checklist_write compat succeeds");
 
+        assert!(!tool.model_visible());
         let metadata = result.metadata.expect("metadata");
-        assert_eq!(tool.name(), "todo_write");
-        assert_eq!(metadata["canonical_tool"], "checklist_write");
+        assert_eq!(metadata["canonical_tool"], "work_update");
+        assert_eq!(metadata["invoked_as"], "checklist_write");
+        assert_eq!(metadata["compat_alias"], true);
+        assert_eq!(metadata["work_surface"]["canonical"], "work");
+        assert_eq!(metadata["work_surface"]["model_visible"], false);
+        assert_eq!(
+            metadata["task_updates"]["checklist"]["items"][0]["content"],
+            "legacy checklist payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_write_compat_alias_still_replays() {
+        let tool = TodoWriteTool::todo(new_shared_todo_list());
+        let context = ToolContext::new(std::env::temp_dir());
+        let result = tool
+            .execute(
+                json!({
+                    "todos": [
+                        { "content": "legacy todo payload", "status": "pending" }
+                    ]
+                }),
+                &context,
+            )
+            .await
+            .expect("todo_write compat succeeds");
+
+        assert!(!tool.model_visible());
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["canonical_tool"], "work_update");
+        assert_eq!(metadata["invoked_as"], "todo_write");
         assert_eq!(metadata["compat_alias"], true);
     }
 }

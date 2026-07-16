@@ -22,7 +22,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS};
+use crate::config::{Config, DEFAULT_TEXT_MODEL};
 use crate::runtime_threads::{
     CreateThreadRequest, RuntimeThreadManager, RuntimeThreadManagerConfig, RuntimeTurnStatus,
     SharedRuntimeThreadManager, StartTurnRequest,
@@ -196,6 +196,8 @@ pub struct TaskRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +236,8 @@ pub struct TaskSummary {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +258,7 @@ impl From<&TaskRecord> for TaskSummary {
             started_at: value.started_at,
             ended_at: value.ended_at,
             duration_ms: value.duration_ms,
+            hunt_verdict: value.hunt_verdict.clone(),
             error: value.error.clone(),
             thread_id: value.thread_id.clone(),
             turn_id: value.turn_id.clone(),
@@ -309,8 +314,6 @@ pub struct TaskManagerConfig {
     pub default_mode: String,
     pub allow_shell: bool,
     pub trust_mode: bool,
-    #[allow(dead_code)]
-    pub max_subagents: usize,
 }
 
 impl TaskManagerConfig {
@@ -334,7 +337,6 @@ impl TaskManagerConfig {
             default_mode: "agent".to_string(),
             allow_shell: config.allow_shell(),
             trust_mode: false,
-            max_subagents: config.max_subagents().clamp(1, MAX_SUBAGENTS),
         }
     }
 }
@@ -441,6 +443,7 @@ impl TaskExecutor for EngineTaskExecutor {
                 archived: false,
                 system_prompt: None,
                 task_id: Some(task.id.clone()),
+                ..Default::default()
             })
             .await
         {
@@ -466,6 +469,7 @@ impl TaskExecutor for EngineTaskExecutor {
                     allow_shell: Some(task.allow_shell),
                     trust_mode: Some(task.trust_mode),
                     auto_approve: Some(task.auto_approve),
+                    ..Default::default()
                 },
             )
             .await
@@ -764,7 +768,11 @@ impl TaskManager {
             )
         })?;
 
-        let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
+        let LoadedTaskState {
+            tasks,
+            queue,
+            recovered,
+        } = load_state(&tasks_dir, &queue_path)?;
 
         let cancel_token = CancellationToken::new();
         let default_workspace = cfg.default_workspace.clone();
@@ -785,8 +793,16 @@ impl TaskManager {
         });
 
         {
+            // Persist only what boot actually changed: the reconciled queue
+            // and any running->failed recoveries. Rewriting every task record
+            // on every launch was a full-store write storm (#3757).
             let state = manager.state.lock().await;
-            manager.persist_all_locked(&state)?;
+            manager.persist_queue_locked(&state.queue)?;
+            for id in &recovered {
+                if let Some(task) = state.tasks.get(id) {
+                    manager.persist_task_locked(task)?;
+                }
+            }
         }
 
         for _ in 0..workers {
@@ -831,7 +847,13 @@ impl TaskManager {
 
         let task = TaskRecord {
             schema_version: CURRENT_TASK_SCHEMA_VERSION,
-            id: format!("task_{}", &Uuid::new_v4().to_string()[..8]),
+            // 16 random hex chars (was 8; ~60 bits of entropy once UUIDv4's
+            // fixed version nibble is discounted): task ids live in durable
+            // state that accumulates across restarts, and a collision
+            // overwrites a record while leaving a duplicate queue entry.
+            // `resolve_task_id` matches by prefix, so short references still
+            // work.
+            id: format!("task_{}", &Uuid::new_v4().simple().to_string()[..16]),
             prompt,
             model: req.model.unwrap_or_else(|| self.cfg.default_model.clone()),
             workspace: match req.workspace {
@@ -849,6 +871,7 @@ impl TaskManager {
             started_at: None,
             ended_at: None,
             duration_ms: None,
+            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -1357,6 +1380,7 @@ impl TaskManager {
     }
 
     fn write_artifact(&self, task_id: &str, label: &str, content: &str) -> Result<PathBuf> {
+        ensure_safe_storage_id("task id", task_id)?;
         let artifact_dir = self.artifacts_dir.join(task_id);
         fs::create_dir_all(&artifact_dir)
             .with_context(|| format!("Failed to create artifact dir {}", artifact_dir.display()))?;
@@ -1411,6 +1435,22 @@ impl TaskManager {
                 summary: summarize_text(&summary, TIMELINE_SUMMARY_LIMIT),
                 detail_path: gate.log_path,
             });
+        }
+
+        if let Some(value) = updates.get("hunt_verdict") {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("hunt_verdict task update must be a string"))?;
+            let verdict = normalize_hunt_verdict(raw)?;
+            if task.hunt_verdict.as_deref() != Some(verdict) {
+                task.hunt_verdict = Some(verdict.to_string());
+                task.timeline.push(TaskTimelineEntry {
+                    timestamp: now,
+                    kind: "hunt_verdict".to_string(),
+                    summary: format!("Hunt verdict updated: {verdict}"),
+                    detail_path: None,
+                });
+            }
         }
 
         if let Some(value) = updates.get("attempt") {
@@ -1486,11 +1526,30 @@ impl TaskManager {
     }
 }
 
-fn load_state(
-    tasks_dir: &Path,
-    queue_path: &Path,
-) -> Result<(HashMap<String, TaskRecord>, VecDeque<String>)> {
+fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
+    match raw.trim() {
+        "hunting" => Ok("hunting"),
+        "hunted" => Ok("hunted"),
+        "wounded" => Ok("wounded"),
+        "escaped" => Ok("escaped"),
+        other => bail!(
+            "unsupported hunt_verdict task update '{other}'. Expected one of: hunting, hunted, wounded, escaped"
+        ),
+    }
+}
+
+/// Outcome of loading the persisted task store at boot: the reconciled task
+/// map + queue, plus the ids whose status was flipped running->failed by
+/// crash recovery (the only records boot needs to re-persist).
+struct LoadedTaskState {
+    tasks: HashMap<String, TaskRecord>,
+    queue: VecDeque<String>,
+    recovered: Vec<String>,
+}
+
+fn load_state(tasks_dir: &Path, queue_path: &Path) -> Result<LoadedTaskState> {
     let mut tasks = HashMap::new();
+    let mut recovered = Vec::new();
     if tasks_dir.exists() {
         for entry in fs::read_dir(tasks_dir)
             .with_context(|| format!("Failed to read tasks dir {}", tasks_dir.display()))?
@@ -1512,16 +1571,37 @@ fn load_state(
                 );
             }
             if task.status == TaskStatus::Running {
-                task.status = TaskStatus::Queued;
-                task.started_at = None;
-                task.ended_at = None;
-                task.duration_ms = None;
+                let now = Utc::now();
+                let duration_ms = task.started_at.and_then(|started| {
+                    u64::try_from(now.signed_duration_since(started).num_milliseconds()).ok()
+                });
+                task.status = TaskStatus::Failed;
+                task.ended_at = Some(now);
+                task.duration_ms = duration_ms;
+                task.error = Some(
+                    "Interrupted by process restart; prior process is not attached".to_string(),
+                );
+                for tool in &mut task.tool_calls {
+                    if tool.status == TaskToolStatus::Running {
+                        tool.status = TaskToolStatus::Failed;
+                        tool.ended_at = Some(now);
+                        tool.duration_ms = duration_ms.or_else(|| {
+                            u64::try_from(
+                                now.signed_duration_since(tool.started_at)
+                                    .num_milliseconds(),
+                            )
+                            .ok()
+                        });
+                    }
+                }
                 task.timeline.push(TaskTimelineEntry {
-                    timestamp: Utc::now(),
+                    timestamp: now,
                     kind: "recovered".to_string(),
-                    summary: "Recovered from restart and re-queued".to_string(),
+                    summary: "Interrupted by process restart; prior process is not attached"
+                        .to_string(),
                     detail_path: None,
                 });
+                recovered.push(task.id.clone());
             }
             tasks.insert(task.id.clone(), task);
         }
@@ -1554,7 +1634,11 @@ fn load_state(
         queue.push_back(id);
     }
 
-    Ok((tasks, queue))
+    Ok(LoadedTaskState {
+        tasks,
+        queue,
+        recovered,
+    })
 }
 
 fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> Result<String> {
@@ -1600,6 +1684,17 @@ fn summarize_text(text: &str, limit: usize) -> String {
     out
 }
 
+fn ensure_safe_storage_id(kind: &str, value: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    let Some(component) = components.next() else {
+        bail!("{kind} must not be empty");
+    };
+    if components.next().is_some() || !matches!(component, std::path::Component::Normal(_)) {
+        bail!("{kind} must be a single path component");
+    }
+    Ok(())
+}
+
 fn sanitize_filename(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
@@ -1639,7 +1734,8 @@ fn default_auto_approve() -> bool {
     true
 }
 
-/// Default task persistence location (`~/.deepseek/tasks`).
+/// Default task manager data location (`~/.codewhale/tasks`, or legacy
+/// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
 pub fn default_tasks_dir() -> PathBuf {
     if let Ok(path) = std::env::var("DEEPSEEK_TASKS_DIR")
@@ -1647,10 +1743,21 @@ pub fn default_tasks_dir() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".deepseek").join("tasks");
+    dirs::home_dir()
+        .map(|home| default_tasks_dir_for_home(&home))
+        .unwrap_or_else(|| PathBuf::from(".codewhale").join("tasks"))
+}
+
+fn default_tasks_dir_for_home(home: &Path) -> PathBuf {
+    let primary = home.join(".codewhale").join("tasks");
+    if primary.is_dir() {
+        return primary;
     }
-    PathBuf::from(".deepseek").join("tasks")
+    let legacy = home.join(".deepseek").join("tasks");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    primary
 }
 
 /// Wait for a task to reach a terminal status (tests and API helpers).
@@ -1745,7 +1852,6 @@ mod tests {
             default_mode: "agent".to_string(),
             allow_shell: false,
             trust_mode: false,
-            max_subagents: 2,
         }
     }
 
@@ -1775,6 +1881,134 @@ mod tests {
         assert_eq!(loaded.status, TaskStatus::Completed);
         assert!(!loaded.timeline.is_empty());
         assert_eq!(loaded.checklist.items[0].content, "read fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boot_does_not_rewrite_non_recovered_task_files() -> Result<()> {
+        // #3757 boot-persist narrowing: TaskManager::start must persist only
+        // the reconciled queue and the running->failed recoveries — a
+        // completed task's file must be byte-identical across a restart.
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("finish then persist"))
+            .await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+        assert_eq!(finished.status, TaskStatus::Completed);
+        drop(manager);
+
+        let task_file = root.join("tasks").join(format!("{}.json", task.id));
+        let before = fs::read(&task_file)?;
+
+        let recovered =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+        // Give start() a beat to run its (narrowed) boot persist.
+        sleep(Duration::from_millis(50)).await;
+        drop(recovered);
+
+        let after = fs::read(&task_file)?;
+        assert_eq!(
+            before, after,
+            "a completed task file must not be rewritten on boot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn running_tasks_are_not_requeued_after_restart() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let tasks_dir = root.join("tasks");
+        fs::create_dir_all(&tasks_dir)?;
+        let queue_path = root.join("queue.json");
+        let task_id = "task_stale_running".to_string();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let task = TaskRecord {
+            schema_version: CURRENT_TASK_SCHEMA_VERSION,
+            id: task_id.clone(),
+            prompt: "long-running shell work".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            workspace: PathBuf::from("."),
+            mode: "agent".to_string(),
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            status: TaskStatus::Running,
+            created_at: started_at,
+            started_at: Some(started_at),
+            ended_at: None,
+            duration_ms: None,
+            hunt_verdict: None,
+            result_summary: None,
+            result_detail_path: None,
+            error: None,
+            thread_id: Some("thr_stale".to_string()),
+            turn_id: Some("turn_stale".to_string()),
+            runtime_event_count: 0,
+            checklist: TaskChecklistState::default(),
+            gates: Vec::new(),
+            attempts: Vec::new(),
+            artifacts: Vec::new(),
+            github_events: Vec::new(),
+            tool_calls: vec![TaskToolCallSummary {
+                id: "tool_shell".to_string(),
+                name: "task_shell_start".to_string(),
+                status: TaskToolStatus::Running,
+                started_at,
+                ended_at: None,
+                duration_ms: None,
+                input_summary: Some("shell: sleep 999".to_string()),
+                output_summary: None,
+                detail_path: None,
+                patch_ref: None,
+            }],
+            timeline: vec![TaskTimelineEntry {
+                timestamp: started_at,
+                kind: "running".to_string(),
+                summary: "Task started".to_string(),
+                detail_path: None,
+            }],
+        };
+        fs::write(
+            tasks_dir.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&task)?,
+        )?;
+        fs::write(
+            &queue_path,
+            serde_json::to_string_pretty(&QueueFile {
+                queue: vec![task_id.clone()],
+            })?,
+        )?;
+
+        let loaded = load_state(&tasks_dir, &queue_path)?;
+        let queue = loaded.queue;
+        let recovered = loaded.tasks.get(&task_id).expect("task loaded");
+
+        assert!(queue.is_empty(), "stale running task must not be requeued");
+        assert_eq!(recovered.status, TaskStatus::Failed);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("prior process is not attached")),
+            "recovered task should explain stale process ownership: {recovered:?}"
+        );
+        assert!(recovered.ended_at.is_some());
+        assert!(recovered.duration_ms.is_some());
+        assert_eq!(recovered.tool_calls[0].status, TaskToolStatus::Failed);
+        assert!(recovered.tool_calls[0].ended_at.is_some());
+        assert!(
+            recovered
+                .timeline
+                .iter()
+                .any(|entry| entry.kind == "recovered"
+                    && entry.summary.contains("prior process is not attached")),
+            "recovery timeline should explain why the task is terminal: {:?}",
+            recovered.timeline
+        );
         Ok(())
     }
 
@@ -1831,6 +2065,55 @@ mod tests {
 
         assert_eq!(updated.gates.len(), 1);
         assert_eq!(updated.gates[0].classification, "passed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_tool_metadata_updates_hunt_verdict_summary() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("test verdict metadata"))
+            .await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+        let updated = manager
+            .record_tool_metadata(
+                &finished.id,
+                &serde_json::json!({
+                    "task_updates": {
+                        "hunt_verdict": "wounded"
+                    }
+                }),
+            )
+            .await?;
+
+        assert_eq!(updated.hunt_verdict.as_deref(), Some("wounded"));
+        let summaries = manager.list_tasks(Some(10)).await;
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == updated.id)
+            .expect("updated task summary");
+        assert_eq!(summary.hunt_verdict.as_deref(), Some("wounded"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_task_artifact_rejects_traversal_task_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("tasks-root");
+        let escaped = temp.path().join("escape");
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        let err = manager
+            .write_task_artifact("../escape", "result", "artifact body")
+            .expect_err("traversal task ids must be rejected");
+
+        assert!(err.to_string().contains("single path component"));
+        assert!(!escaped.exists(), "artifact write escaped the task root");
         Ok(())
     }
 
@@ -1909,5 +2192,63 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("newer than supported")),
         }
         Ok(())
+    }
+
+    #[test]
+    fn default_tasks_dir_falls_back_to_legacy_deepseek_tasks() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), legacy_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_prefers_existing_codewhale_tasks() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(&primary_tasks).unwrap();
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), primary_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_falls_back_to_legacy_when_primary_is_file() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(primary_tasks.parent().unwrap()).unwrap();
+        std::fs::write(&primary_tasks, "not a directory").unwrap();
+        std::fs::create_dir_all(&legacy_tasks).unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), legacy_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_ignores_legacy_file_for_new_installs() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+        let primary_tasks = home.join(".codewhale").join("tasks");
+        let legacy_tasks = home.join(".deepseek").join("tasks");
+        std::fs::create_dir_all(legacy_tasks.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_tasks, "not a directory").unwrap();
+
+        assert_eq!(default_tasks_dir_for_home(home), primary_tasks);
+    }
+
+    #[test]
+    fn default_tasks_dir_uses_codewhale_tasks_for_new_installs() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let home = temp_home.path();
+
+        assert_eq!(
+            default_tasks_dir_for_home(home),
+            home.join(".codewhale").join("tasks")
+        );
     }
 }

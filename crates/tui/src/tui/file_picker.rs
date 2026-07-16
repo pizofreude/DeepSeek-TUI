@@ -1,7 +1,8 @@
 //! Fuzzy file-picker modal (Ctrl+P).
 //!
 //! Opens an overlay populated with workspace-relative paths discovered by a
-//! single-pass `WalkBuilder` walk (depth 6, hidden=true, follow_links=false,
+//! single-pass `WalkBuilder` walk (depth from `mention_walk_depth`, default
+//! 10, `0` = unlimited; hidden=true, follow_links=false,
 //! `.gitignore` honored). Subsequent keystrokes filter the cached candidate
 //! list in memory using a small subsequence + first-letter-bonus scorer — no
 //! per-keystroke disk traversal.
@@ -9,29 +10,39 @@
 //! Enter emits a [`ViewEvent::FilePickerSelected`] which the UI handler turns
 //! into an `@<path>` insertion at the composer cursor.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ignore::WalkBuilder;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Paragraph, Widget},
 };
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+    render_panel_scroll_rail, render_underwater_surface,
+};
+use crate::workspace_discovery::{DISCOVERY_ALWAYS_DIRS, path_is_excluded_from_discovery};
 
 /// Maximum number of candidates collected from the initial walk. Keeps memory
 /// bounded for very large monorepos; matches the limits codex-rs uses for the
 /// equivalent overlay.
 const MAX_CANDIDATES: usize = 20_000;
 
-/// Walk depth for the initial scan. Mirrors the `Workspace` fuzzy index.
-const WALK_DEPTH: usize = 6;
+/// Default walk depth used by the picker's own tests. Production callers pass
+/// the configured `mention_walk_depth` (default 10, `0` = unlimited) through
+/// [`FilePickerView::new_with_relevance_and_depth`], mirroring the `Workspace`
+/// fuzzy index default (`DEFAULT_COMPLETIONS_WALK_DEPTH`).
+#[cfg(test)]
+const WALK_DEPTH: usize = 10;
 
 /// Visible candidate rows in the overlay.
 const VISIBLE_ROWS: usize = 14;
@@ -117,12 +128,37 @@ pub struct FilePickerView {
     selected: usize,
     /// Top of the visible window within `filtered`.
     scroll: usize,
+    /// Exact visible row targets from the last render for mouse parity.
+    last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl FilePickerView {
-    /// Build a picker with working-set relevance hints.
+    /// Build a picker with working-set relevance hints, using the default
+    /// walk depth ([`WALK_DEPTH`]). Test-only convenience; production code uses
+    /// [`FilePickerView::new_with_relevance_and_depth`] with the configured
+    /// `mention_walk_depth`.
+    #[cfg(test)]
     pub fn new_with_relevance(workspace_root: &Path, relevance: FilePickerRelevance) -> Self {
-        let candidates = collect_candidates(workspace_root);
+        Self::new_with_relevance_and_depth(workspace_root, relevance, WALK_DEPTH, Locale::En)
+    }
+
+    /// Build a picker with working-set relevance hints and an explicit walk
+    /// depth. A depth of `0` disables the depth limit so files in deeply
+    /// nested workspaces (>= 6 levels) remain discoverable (#2488).
+    pub fn new_with_relevance_and_depth(
+        workspace_root: &Path,
+        relevance: FilePickerRelevance,
+        walk_depth: usize,
+        locale: Locale,
+    ) -> Self {
+        let max_depth = if walk_depth == 0 {
+            None
+        } else {
+            Some(walk_depth)
+        };
+        let candidates = collect_candidates(workspace_root, max_depth);
         let mut view = Self {
             candidates,
             relevance,
@@ -130,6 +166,8 @@ impl FilePickerView {
             query: String::new(),
             selected: 0,
             scroll: 0,
+            last_row_hitboxes: RefCell::new(Vec::new()),
+            locale,
         };
         view.refilter();
         view
@@ -296,60 +334,86 @@ impl ModalView for FilePickerView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_selection(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_selection(1);
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .last_row_hitboxes
+                    .borrow()
+                    .iter()
+                    .find_map(|(y, idx)| (*y == mouse.row).then_some(*idx));
+                let Some(idx) = hit else {
+                    return ViewAction::None;
+                };
+                if idx == self.selected {
+                    if let Some(path) = self.selected_path() {
+                        return ViewAction::EmitAndClose(ViewEvent::FilePickerSelected {
+                            path: path.to_string(),
+                        });
+                    }
+                } else {
+                    self.selected = idx;
+                    self.adjust_scroll();
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 80.min(area.width.saturating_sub(4));
-        let popup_height = ((VISIBLE_ROWS as u16) + 6).min(area.height.saturating_sub(4));
-
-        let popup_area = Rect {
-            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
+        let match_count = self.filtered.len();
+        let title = if match_count == 1 {
+            tr(self.locale, MessageId::FilePickerMatchSingular).into_owned()
+        } else {
+            tr(self.locale, MessageId::FilePickerMatchesPlural)
+                .replace("{count}", &match_count.to_string())
         };
+        let inner = render_underwater_surface(area, buf, title);
 
-        Clear.render(popup_area, buf);
-
-        let title = Line::from(vec![Span::styled(
-            " File Picker ",
-            Style::default()
-                .fg(palette::DEEPSEEK_BLUE)
-                .add_modifier(Modifier::BOLD),
-        )]);
-        let footer_text = format!(
-            " {} match{}  ↑/↓ select  Enter insert @path  Esc close ",
-            self.filtered.len(),
-            if self.filtered.len() == 1 { "" } else { "es" },
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑/↓", "select"),
+                ActionHint::new("Enter", "insert @path"),
+                ActionHint::new("Esc", "close"),
+            ],
         );
-        let block = Block::default()
-            .title(title)
-            .title_bottom(Line::from(Span::styled(
-                footer_text,
-                Style::default().fg(palette::TEXT_MUTED),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
-            .padding(Padding::uniform(1));
-
-        let inner = block.inner(popup_area);
-        block.render(popup_area, buf);
+        let visible = VISIBLE_ROWS.min(content.height.saturating_sub(2) as usize);
+        let content = render_panel_scroll_rail(
+            content,
+            buf,
+            self.filtered.len(),
+            self.scroll,
+            visible,
+            true,
+        );
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         // Query line.
         lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+            Span::styled("> ", Style::default().fg(palette::WHALE_INFO).bold()),
             Span::raw(self.query.clone()),
             Span::styled(
                 " ",
                 Style::default()
-                    .fg(palette::DEEPSEEK_INK)
-                    .bg(palette::DEEPSEEK_SKY),
+                    .fg(palette::WHALE_BG)
+                    .bg(palette::WHALE_INFO),
             ),
         ]));
         lines.push(Line::from(""));
 
-        let visible = VISIBLE_ROWS.min(inner.height.saturating_sub(2) as usize);
         let end = (self.scroll + visible).min(self.filtered.len());
+        self.last_row_hitboxes.borrow_mut().clear();
         if self.filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No matches",
@@ -367,22 +431,27 @@ impl ModalView for FilePickerView {
                     Style::default().fg(palette::TEXT_PRIMARY)
                 };
                 let prefix = if selected { "▶ " } else { "  " };
-                let marker_field = if inner.width >= 18 {
+                let marker_field = if content.width >= 18 {
                     format!("{} ", self.relevance.markers_for(path))
                 } else {
                     String::new()
                 };
                 let reserved = prefix.chars().count() + marker_field.chars().count();
-                let display = truncate_path(path, (inner.width as usize).saturating_sub(reserved));
+                let display =
+                    truncate_path(path, (content.width as usize).saturating_sub(reserved));
                 let mut line = Line::from(format!("{prefix}{marker_field}{display}"));
                 line.style = style;
+                let y = content
+                    .y
+                    .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+                self.last_row_hitboxes.borrow_mut().push((y, idx));
                 lines.push(line);
             }
         }
 
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
-            .render(inner, buf);
+            .render(content, buf);
     }
 }
 
@@ -405,13 +474,15 @@ fn truncate_path(path: &str, max: usize) -> String {
     format!("…{truncated}")
 }
 
-/// Single-pass walk that collects workspace-relative paths.
-fn collect_candidates(root: &Path) -> Vec<String> {
+/// Single-pass walk that collects workspace-relative paths. `max_depth` of
+/// `None` walks the whole tree (still bounded by `MAX_CANDIDATES` and
+/// `.gitignore`); `Some(n)` caps the recursion at `n` levels.
+fn collect_candidates(root: &Path, max_depth: Option<usize>) -> Vec<String> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
         .follow_links(false)
-        .max_depth(Some(WALK_DEPTH))
+        .max_depth(max_depth)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true);
@@ -437,7 +508,7 @@ fn collect_candidates(root: &Path) -> Vec<String> {
 
     // Whitelist AI-tool dot-directories so they're discoverable even when
     // gitignored. Walk each one separately with gitignore disabled.
-    for dir in [".deepseek", ".cursor", ".claude", ".agents"] {
+    for dir in DISCOVERY_ALWAYS_DIRS {
         let dot_dir = root.join(dir);
         if !dot_dir.is_dir() {
             continue;
@@ -448,10 +519,10 @@ fn collect_candidates(root: &Path) -> Vec<String> {
             .follow_links(false)
             .git_ignore(false)
             .ignore(false)
-            .max_depth(Some(WALK_DEPTH.saturating_sub(1)));
+            .max_depth(max_depth.map(|d| d.saturating_sub(1)));
         for entry in dot_builder.build().flatten() {
             // Exclude machine-generated bulk (e.g. .deepseek/snapshots/).
-            if entry.path().starts_with(root.join(".deepseek/snapshots")) {
+            if path_is_excluded_from_discovery(root, entry.path()) {
                 continue;
             }
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -732,5 +803,159 @@ mod tests {
             !visible.iter().any(|p| p.ends_with("skipme.txt")),
             "skipme.txt should be filtered by .ignore: {visible:?}"
         );
+    }
+
+    #[test]
+    fn picker_finds_deeply_nested_files_within_walk_depth() {
+        // #2488: a file inside a 6-level-deep directory sits at component depth
+        // 7 and was excluded by the old depth-6 cap. The default depth (10) now
+        // reaches it, and `0` (unlimited) reaches arbitrarily deep files.
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let nested = root.join("a/b/c/d/e/f");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("deep.rs"), "deep").unwrap();
+        let deeper = root.join("a/b/c/d/e/f/g/h/i/j/k");
+        fs::create_dir_all(&deeper).unwrap();
+        fs::write(deeper.join("very_deep.rs"), "deeper").unwrap();
+
+        // The old default (6) misses the depth-7 file — the reported bug.
+        let shallow = collect_candidates(root, Some(6));
+        assert!(
+            !shallow.iter().any(|p| p == "a/b/c/d/e/f/deep.rs"),
+            "depth-6 cap should miss the depth-7 file: {shallow:?}"
+        );
+
+        // The new default reaches files inside a 6-level-deep directory.
+        let default = collect_candidates(root, Some(WALK_DEPTH));
+        assert!(
+            default.iter().any(|p| p == "a/b/c/d/e/f/deep.rs"),
+            "default walk depth should reach depth-7 files: {default:?}"
+        );
+
+        // Unlimited (mention_walk_depth = 0) reaches arbitrarily deep files.
+        let unlimited = collect_candidates(root, None);
+        assert!(
+            unlimited
+                .iter()
+                .any(|p| p == "a/b/c/d/e/f/g/h/i/j/k/very_deep.rs"),
+            "unlimited walk should reach very deep files: {unlimited:?}"
+        );
+    }
+
+    #[test]
+    fn picker_skips_generated_worktree_bulk_inside_unignored_dot_dirs() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        fs::create_dir_all(root.join(".deepseek/commands")).unwrap();
+        fs::write(root.join(".deepseek/commands/build.md"), "build").unwrap();
+        fs::create_dir_all(root.join(".deepseek/snapshots/deadbeef/.git/objects")).unwrap();
+        fs::write(
+            root.join(".deepseek/snapshots/deadbeef/.git/objects/snapshot.pack"),
+            "pack",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join(".claude/commands")).unwrap();
+        fs::write(root.join(".claude/commands/test.md"), "test").unwrap();
+        fs::create_dir_all(root.join(".claude/worktrees/agent/src")).unwrap();
+        fs::write(
+            root.join(".claude/worktrees/agent/src/agent-only.md"),
+            "agent",
+        )
+        .unwrap();
+
+        let candidates = collect_candidates(root, Some(WALK_DEPTH));
+
+        assert!(candidates.iter().any(|path| path == "src/main.rs"));
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path == ".deepseek/commands/build.md"),
+            "normal .deepseek command files should stay discoverable: {candidates:?}",
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path == ".claude/commands/test.md"),
+            "normal .claude command files should stay discoverable: {candidates:?}",
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|path| !path.starts_with(".deepseek/snapshots/")),
+            "snapshot side repo files must not enter picker candidates: {candidates:?}",
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|path| !path.starts_with(".claude/worktrees/")),
+            ".claude worktree files must not enter picker candidates: {candidates:?}",
+        );
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires
+    /// every overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn file_picker_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        use ratatui::{buffer::Buffer, layout::Rect};
+        use unicode_width::UnicodeWidthStr;
+
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(root.join("README.md"), "").unwrap();
+
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(FilePickerView::new_with_relevance(
+                root,
+                FilePickerRelevance::default(),
+            ));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            for label in ["select", "insert @path", "close"] {
+                assert!(text.contains(label), "{w}x{h}: missing footer '{label}'");
+            }
+            assert!(
+                !text.contains('X'),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::WHALE_BG,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 }

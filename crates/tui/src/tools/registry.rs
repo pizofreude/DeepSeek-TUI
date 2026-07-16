@@ -9,11 +9,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use std::path::{Path, PathBuf};
+
+use codewhale_protocol::runtime::DynamicToolSpec;
 use serde_json::Value;
 
 use crate::client::DeepSeekClient;
 use crate::models::Tool;
+use crate::tools::goal::SharedGoalState;
 
+use super::schema_canonicalize;
 use super::schema_sanitize;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -99,6 +104,7 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name with the given input.
+    #[allow(dead_code)]
     pub async fn execute(&self, name: &str, input: Value) -> Result<String, ToolError> {
         let tool = self
             .get(name)
@@ -219,9 +225,11 @@ impl ToolRegistry {
         tools.sort_by(|a, b| a.name().cmp(b.name()));
         tools
             .into_iter()
+            .filter(|tool| tool.model_visible())
             .map(|tool| {
                 let mut schema = tool.input_schema();
                 schema_sanitize::sanitize(&mut schema);
+                schema_canonicalize::canonicalize_schema(&mut schema);
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
@@ -342,8 +350,8 @@ impl ToolRegistry {
         let names: Vec<&str> = self.tools.keys().map(String::as_str).collect();
         let lower = requested.to_lowercase();
 
-        // 1. lowercase exact
-        if let Some(n) = names.iter().find(|n| n.to_lowercase() == lower) {
+        // 1. ASCII case-insensitive exact
+        if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(requested)) {
             return Some(n);
         }
         // 2. hyphen/space → underscore
@@ -388,11 +396,126 @@ impl ToolRegistry {
         self.tools.clear();
         self.invalidate_api_cache();
     }
+
+    /// Remove a tool from the registry by name. Returns `true` if the tool
+    /// was present and removed, `false` if no tool with that name existed.
+    pub fn remove_tool(&mut self, name: &str) -> bool {
+        let existed = self.tools.remove(name).is_some();
+        if existed {
+            self.invalidate_api_cache();
+        }
+        existed
+    }
+
+    /// Apply config.toml tool overrides to this registry.
+    ///
+    /// For each entry in `overrides`:
+    /// - `Disabled` removes the tool.
+    /// - `Script` / `Command` replaces the tool with the user's implementation.
+    ///
+    /// `plugin_dir` is used as the base for relative script paths.
+    pub fn apply_overrides(
+        &mut self,
+        overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
+        plugin_dir: &Path,
+    ) {
+        for (tool_name, override_cfg) in overrides {
+            match override_cfg {
+                crate::config::ToolOverride::Disabled => {
+                    if self.remove_tool(tool_name) {
+                        tracing::info!("Tool '{}' disabled via config override", tool_name);
+                    } else {
+                        tracing::warn!("Cannot disable tool '{}': not registered", tool_name);
+                    }
+                }
+                _ => {
+                    // Script and Command overrides create replacement tools.
+                    use crate::tools::plugin::tool_from_override;
+                    match tool_from_override(tool_name, override_cfg, plugin_dir) {
+                        Some(replacement) => {
+                            self.register(replacement);
+                            tracing::info!("Tool '{}' replaced via config override", tool_name);
+                        }
+                        None => {
+                            if self.remove_tool(tool_name) {
+                                tracing::warn!(
+                                    "Tool '{}' override did not create a replacement; removed the original tool to avoid override fallthrough",
+                                    tool_name
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Tool '{}' override did not create a replacement and no registered tool existed",
+                                    tool_name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load and register plugin tools from a directory.
+    ///
+    /// Each script with valid frontmatter (`# name:`, `# description:`, etc.)
+    /// becomes a registered `ScriptPluginTool`. Tools whose name matches an
+    /// already-registered tool will overwrite it.
+    pub fn load_plugins(&mut self, plugin_dir: &Path) {
+        if !plugin_dir.exists() {
+            tracing::debug!(
+                "Plugin directory {} does not exist, skipping",
+                plugin_dir.display()
+            );
+            return;
+        }
+        let plugins = crate::tools::plugin::load_plugin_tools(plugin_dir);
+        let count = plugins.len();
+        for tool in plugins {
+            self.register(tool);
+        }
+        if count > 0 {
+            tracing::info!(
+                "Loaded {count} plugin tool(s) from {}",
+                plugin_dir.display()
+            );
+        }
+    }
 }
 
 /// Builder for constructing a `ToolRegistry` with common tools.
 pub struct ToolRegistryBuilder {
     tools: Vec<Arc<dyn ToolSpec>>,
+}
+
+/// Feature/config-dependent native Agent-mode tool surface.
+///
+/// Parent Agent/Yolo turns and default child sub-agents both build through this
+/// options object so the catalog does not drift as new first-party tools are
+/// gated behind feature flags or config state.
+#[derive(Clone)]
+pub struct AgentToolSurfaceOptions {
+    pub shell_policy: crate::worker_profile::ShellPolicy,
+    pub apply_patch_enabled: bool,
+    pub web_search_enabled: bool,
+    pub memory_tool_enabled: bool,
+    pub vision_config: Option<crate::config::VisionModelConfig>,
+    pub speech_output_dir: Option<PathBuf>,
+    pub goal_state: Option<SharedGoalState>,
+}
+
+impl AgentToolSurfaceOptions {
+    #[must_use]
+    pub fn new(shell_policy: crate::worker_profile::ShellPolicy) -> Self {
+        Self {
+            shell_policy,
+            apply_patch_enabled: false,
+            web_search_enabled: false,
+            memory_tool_enabled: false,
+            vision_config: None,
+            speech_output_dir: None,
+            goal_state: None,
+        }
+    }
 }
 
 impl ToolRegistryBuilder {
@@ -406,6 +529,16 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn ToolSpec>) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    #[must_use]
+    pub fn with_dynamic_tools(mut self, dynamic_tools: &[DynamicToolSpec]) -> Self {
+        for tool in dynamic_tools {
+            self = self.with_tool(Arc::new(super::dynamic::RuntimeDynamicTool::new(
+                tool.clone(),
+            )));
+        }
         self
     }
 
@@ -440,6 +573,22 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(ShellCancelTool))
             .with_tool(Arc::new(ShellWaitTool::new("exec_wait")))
             .with_tool(Arc::new(ShellInteractTool::new("exec_interact")))
+            .with_terminal_tools()
+    }
+
+    /// Include the stateful PTY terminal tools. Like `exec_shell`, these are
+    /// only exposed when the active shell policy allows shell access.
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        use super::terminal_session::{
+            TerminalCancelTool, TerminalResetTool, TerminalRunTool, TerminalSendTool,
+            TerminalWaitTool,
+        };
+        self.with_tool(Arc::new(TerminalRunTool))
+            .with_tool(Arc::new(TerminalSendTool))
+            .with_tool(Arc::new(TerminalWaitTool))
+            .with_tool(Arc::new(TerminalCancelTool))
+            .with_tool(Arc::new(TerminalResetTool))
     }
 
     /// Include search tools (`grep_files`).
@@ -524,7 +673,9 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_test_runner_tool(self) -> Self {
         use super::test_runner::RunTestsTool;
+        use super::verifier::RunVerifiersTool;
         self.with_tool(Arc::new(RunTestsTool))
+            .with_tool(Arc::new(RunVerifiersTool))
     }
 
     /// Include structured data validation tool (`validate_data`).
@@ -542,6 +693,10 @@ impl ToolRegistryBuilder {
     }
 
     /// Include durable task, gate, PR-attempt, GitHub, and automation tools.
+    ///
+    /// Shell-related task tools (`task_shell_start`, `task_shell_wait`) are
+    /// *not* included here — use [`with_runtime_task_shell_tools`] to register
+    /// them when `allow_shell` is true.
     #[must_use]
     pub fn with_runtime_task_tools(self) -> Self {
         use super::automation::{
@@ -555,7 +710,6 @@ impl ToolRegistryBuilder {
         use super::tasks::{
             PrAttemptListTool, PrAttemptPreflightTool, PrAttemptReadTool, PrAttemptRecordTool,
             TaskCancelTool, TaskCreateTool, TaskGateRunTool, TaskListTool, TaskReadTool,
-            TaskShellStartTool, TaskShellWaitTool,
         };
 
         self.with_tool(Arc::new(TaskCreateTool))
@@ -563,8 +717,6 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(TaskReadTool))
             .with_tool(Arc::new(TaskCancelTool))
             .with_tool(Arc::new(TaskGateRunTool))
-            .with_tool(Arc::new(TaskShellStartTool))
-            .with_tool(Arc::new(TaskShellWaitTool))
             .with_tool(Arc::new(GithubIssueContextTool))
             .with_tool(Arc::new(GithubPrContextTool))
             .with_tool(Arc::new(PrAttemptRecordTool))
@@ -582,6 +734,18 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(GithubCommentTool))
             .with_tool(Arc::new(GithubCloseIssueTool))
             .with_tool(Arc::new(GithubClosePrTool))
+    }
+
+    /// Include shell-related task tools (`task_shell_start`, `task_shell_wait`).
+    ///
+    /// These are gated behind `allow_shell` because `task_shell_start`
+    /// delegates directly to `ExecShellTool`, providing the same shell
+    /// execution capability as `exec_shell`.
+    #[must_use]
+    pub fn with_runtime_task_shell_tools(self) -> Self {
+        use super::tasks::{TaskShellStartTool, TaskShellWaitTool};
+        self.with_tool(Arc::new(TaskShellStartTool))
+            .with_tool(Arc::new(TaskShellWaitTool))
     }
 
     /// Include only read-only durable task, PR-attempt, GitHub, and automation
@@ -603,17 +767,32 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(AutomationReadTool))
     }
 
-    /// Include web search tools.
+    /// Include web search and fetch tools.
+    ///
+    /// These are feature-gated behind `Feature::WebSearch` in `tool_setup.rs`.
+    /// `finance` is registered separately via `with_finance_tool()` and is
+    /// NOT gated behind the web-search feature.
     #[must_use]
     pub fn with_web_tools(self) -> Self {
+        use super::dev_server_readiness::WaitForDevServerTool;
         use super::fetch_url::FetchUrlTool;
-        use super::finance::FinanceTool;
         use super::web_run::WebRunTool;
         use super::web_search::WebSearchTool;
         self.with_tool(Arc::new(WebSearchTool))
             .with_tool(Arc::new(FetchUrlTool))
-            .with_tool(Arc::new(FinanceTool::new()))
+            .with_tool(Arc::new(WaitForDevServerTool))
             .with_tool(Arc::new(WebRunTool))
+    }
+
+    /// Include the `finance` market-data tool.
+    ///
+    /// This tool is registered unconditionally for agent modes and is NOT
+    /// gated behind `Feature::WebSearch` (it fetches financial data, not
+    /// web search results).
+    #[must_use]
+    pub fn with_finance_tool(self) -> Self {
+        use super::finance::FinanceTool;
+        self.with_tool(Arc::new(FinanceTool::new()))
     }
 
     /// Register the `image_analyze` vision tool.
@@ -660,11 +839,30 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(RevertTurnTool))
     }
 
+    /// Include Xiaomi MiMo speech/TTS tools (`speech`, `tts`).
+    #[must_use]
+    pub fn with_speech_tools(
+        self,
+        client: Option<DeepSeekClient>,
+        output_dir: Option<PathBuf>,
+    ) -> Self {
+        use super::speech::SpeechTool;
+        self.with_tool(Arc::new(SpeechTool::new(
+            "speech",
+            client.clone(),
+            output_dir.clone(),
+        )))
+        .with_tool(Arc::new(SpeechTool::new("tts", client, output_dir)))
+    }
+
     /// Include persistent RLM session tools.
     #[must_use]
     pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, _root_model: String) -> Self {
-        use super::rlm::{RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool};
-        self.with_tool(Arc::new(RlmOpenTool))
+        use super::rlm::{
+            RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool, RlmSessionObjectsTool,
+        };
+        self.with_tool(Arc::new(RlmSessionObjectsTool))
+            .with_tool(Arc::new(RlmOpenTool))
             .with_tool(Arc::new(RlmEvalTool::new(client)))
             .with_tool(Arc::new(RlmConfigureTool))
             .with_tool(Arc::new(RlmCloseTool))
@@ -683,14 +881,6 @@ impl ToolRegistryBuilder {
     pub fn with_review_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
         use super::review::ReviewTool;
         self.with_tool(Arc::new(ReviewTool::new(client, model)))
-    }
-
-    /// Include the `recall_archive` tool — searches prior cycle archives
-    /// produced by the checkpoint-restart system (issue #127).
-    #[must_use]
-    pub fn with_recall_archive_tool(self) -> Self {
-        use super::recall_archive::RecallArchiveTool;
-        self.with_tool(Arc::new(RecallArchiveTool))
     }
 
     /// Include note tool.
@@ -717,6 +907,30 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(RememberTool))
     }
 
+    /// Include the slop ledger tools (#2127) — durable tracking of
+    /// unresolved architectural residue: append, query, update, export.
+    /// Registered unconditionally; the ledger JSON file is auto-created
+    /// on first append.
+    #[must_use]
+    pub fn with_slop_ledger_tools(self) -> Self {
+        use crate::slop_ledger::{
+            SlopLedgerAppendTool, SlopLedgerExportTool, SlopLedgerQueryTool, SlopLedgerUpdateTool,
+        };
+        self.with_tool(Arc::new(SlopLedgerAppendTool))
+            .with_tool(Arc::new(SlopLedgerQueryTool))
+            .with_tool(Arc::new(SlopLedgerUpdateTool))
+            .with_tool(Arc::new(SlopLedgerExportTool))
+    }
+
+    /// Read-only subset of slop ledger tools (#2127) for plan mode:
+    /// only query and export — no append or update.
+    #[must_use]
+    pub fn with_slop_ledger_read_only_tools(self) -> Self {
+        use crate::slop_ledger::{SlopLedgerExportTool, SlopLedgerQueryTool};
+        self.with_tool(Arc::new(SlopLedgerQueryTool))
+            .with_tool(Arc::new(SlopLedgerExportTool))
+    }
+
     /// Include the `notify` tool — model-callable desktop notification
     /// (#1322). Routes through the existing `tui::notifications` OSC 9 /
     /// BEL pipeline so the user's `[notifications].method` config is
@@ -737,7 +951,6 @@ impl ToolRegistryBuilder {
     /// MCP tools are marked `defer_loading` by default (except discovery
     /// helpers) to keep the model-visible catalog compact.
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_mcp_tools(
         mut self,
         mcp_pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
@@ -757,17 +970,45 @@ impl ToolRegistryBuilder {
         self
     }
 
-    /// Include all agent tools (file tools + shell + note + search + patch).
+    /// Register the `start_mcp_server` tool for dynamically adding MCP servers
+    /// from conversation context. Does not register MCP tool adapters — those
+    /// are returned by `pool.to_api_tools()` in `engine.mcp_tools()`.
     #[must_use]
+    pub fn with_runtime_mcp_tool(
+        mut self,
+        mcp_pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+    ) -> Self {
+        self.tools
+            .push(Arc::new(super::runtime_mcp::StartRuntimeMcpServer::new(
+                mcp_pool,
+            )));
+        self
+    }
+
+    /// Include all agent tools (file tools + shell + note + search).
+    ///
+    /// Web and patch tools are NOT registered here — callers must add them
+    /// via `.with_web_tools()` and `.with_patch_tools()` after checking
+    /// feature flags (see `tool_setup.rs`). This prevents double-registration
+    /// when `tool_setup.rs` conditionally registers them on top of
+    /// `with_agent_tools`.
+    #[must_use]
+    #[allow(dead_code)] // legacy allow_shell convenience wrapper; used by tests, prod uses with_agent_tools_policy
     pub fn with_agent_tools(self, allow_shell: bool) -> Self {
+        self.with_agent_tools_policy(crate::worker_profile::ShellPolicy::from_legacy_allow_shell(
+            allow_shell,
+        ))
+    }
+
+    /// Include all agent tools under a typed shell policy.
+    #[must_use]
+    pub fn with_agent_tools_policy(self, shell_policy: crate::worker_profile::ShellPolicy) -> Self {
         let builder = self
             .with_file_tools()
             .with_note_tool()
             .with_search_tools()
-            .with_web_tools()
             .with_user_input_tool()
             .with_parallel_tool()
-            .with_patch_tools()
             .with_git_tools()
             .with_git_history_tools()
             .with_diagnostics_tool()
@@ -780,26 +1021,69 @@ impl ToolRegistryBuilder {
             .with_runtime_task_tools()
             .with_revert_turn_tool()
             .with_pandoc_tools()
-            .with_image_ocr_tools();
+            .with_image_ocr_tools()
+            .with_finance_tool();
 
-        if allow_shell {
-            builder.with_shell_tools()
+        if shell_policy.allows_shell() {
+            builder.with_shell_tools().with_runtime_task_shell_tools()
         } else {
             builder
         }
     }
 
-    /// Include the full agent tool surface: every tool family the parent gets
-    /// in Agent mode, including review, RLM, and the sub-agent management
-    /// family (so children can recurse). Used by both the parent's Agent-mode
-    /// registry build (`core/engine.rs`) and by every sub-agent
-    /// (`subagent::SubAgentToolRegistry`) — keeping them in lockstep.
+    /// Include the native Agent-mode surface shared by the parent runtime and
+    /// default child sub-agents, excluding the `agent` launcher itself.
+    #[must_use]
+    pub fn with_agent_runtime_surface(
+        self,
+        client: Option<DeepSeekClient>,
+        model: String,
+        options: AgentToolSurfaceOptions,
+        todo_list: super::todo::SharedTodoList,
+        plan_state: super::plan::SharedPlanState,
+    ) -> Self {
+        let speech_client = client.clone();
+        let mut builder = self
+            .with_agent_tools_policy(options.shell_policy)
+            .with_todo_tool(todo_list)
+            .with_plan_tool(plan_state)
+            .with_review_tool(client.clone(), model.clone())
+            .with_slop_ledger_tools()
+            .with_rlm_tool(client.clone(), model.clone())
+            .with_fim_tool(client, model)
+            .with_speech_tools(speech_client, options.speech_output_dir.clone());
+
+        if let Some(goal_state) = options.goal_state {
+            builder = builder.with_goal_tools(goal_state);
+        }
+        if options.apply_patch_enabled {
+            builder = builder.with_patch_tools();
+        }
+        if options.web_search_enabled {
+            builder = builder.with_web_tools();
+        }
+        if options.memory_tool_enabled {
+            builder = builder.with_remember_tool();
+        }
+        if let Some(vision_config) = options.vision_config {
+            builder = builder.with_vision_tools(vision_config);
+        }
+
+        builder.with_notify_tool()
+    }
+
+    /// Legacy convenience wrapper for the full child-inherited Agent surface.
+    ///
+    /// New production callers should prefer [`Self::with_full_agent_surface_options`]
+    /// so feature/config-gated families (web, patch, memory, vision, etc.)
+    /// stay in parity with the parent Agent-mode registry.
     ///
     /// `allow_shell` mirrors the session's shell permission. `manager` and
     /// `runtime` are the sub-agent runtime — children pass through their own
     /// runtime so grandchildren can spawn within the same depth/cancellation
     /// envelope.
     #[must_use]
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_full_agent_surface(
         self,
@@ -811,27 +1095,76 @@ impl ToolRegistryBuilder {
         todo_list: super::todo::SharedTodoList,
         plan_state: super::plan::SharedPlanState,
     ) -> Self {
-        self.with_agent_tools(allow_shell)
-            .with_todo_tool(todo_list)
-            .with_plan_tool(plan_state)
-            .with_review_tool(client.clone(), model.clone())
-            .with_rlm_tool(client, model)
-            .with_recall_archive_tool()
+        self.with_full_agent_surface_policy(
+            client,
+            model,
+            manager,
+            runtime,
+            crate::worker_profile::ShellPolicy::from_legacy_allow_shell(allow_shell),
+            todo_list,
+            plan_state,
+        )
+    }
+
+    /// Include the full child-inherited Agent surface under resolved
+    /// feature/config options.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_full_agent_surface_options(
+        self,
+        client: Option<DeepSeekClient>,
+        model: String,
+        manager: super::subagent::SharedSubAgentManager,
+        runtime: super::subagent::SubAgentRuntime,
+        options: AgentToolSurfaceOptions,
+        todo_list: super::todo::SharedTodoList,
+        plan_state: super::plan::SharedPlanState,
+    ) -> Self {
+        self.with_agent_runtime_surface(client, model, options, todo_list, plan_state)
             .with_subagent_tools(manager, runtime)
     }
 
-    /// Include the todo tool with a shared `TodoList`.
+    /// Legacy typed-shell wrapper for the full child-inherited Agent surface.
+    ///
+    /// New production callers should pass resolved [`AgentToolSurfaceOptions`]
+    /// to [`Self::with_full_agent_surface_options`].
+    #[must_use]
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_full_agent_surface_policy(
+        self,
+        client: Option<DeepSeekClient>,
+        model: String,
+        manager: super::subagent::SharedSubAgentManager,
+        runtime: super::subagent::SubAgentRuntime,
+        shell_policy: crate::worker_profile::ShellPolicy,
+        todo_list: super::todo::SharedTodoList,
+        plan_state: super::plan::SharedPlanState,
+    ) -> Self {
+        let mut options = AgentToolSurfaceOptions::new(shell_policy);
+        options.speech_output_dir = runtime.speech_output_dir.clone();
+        self.with_full_agent_surface_options(
+            client, model, manager, runtime, options, todo_list, plan_state,
+        )
+    }
+
+    /// Include the todo / work-progress tools with a shared `TodoList`.
+    ///
+    /// `work_update` is the sole model-visible progress surface (#4132).
+    /// `checklist_*` and `todo_*` remain registered as hidden compat aliases
+    /// so saved transcripts and older prompts still replay.
     #[must_use]
     pub fn with_todo_tool(self, todo_list: super::todo::SharedTodoList) -> Self {
         use super::todo::{TodoAddTool, TodoListTool, TodoUpdateTool, TodoWriteTool};
-        self.with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
+        self.with_tool(Arc::new(TodoWriteTool::work_update(todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoAddTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoUpdateTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoListTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoWriteTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::new(todo_list)))
+            .with_tool(Arc::new(TodoListTool::todo(todo_list.clone())))
     }
 
     /// Include the plan tool with a shared `PlanState`.
@@ -841,6 +1174,15 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(UpdatePlanTool::new(plan_state)))
     }
 
+    /// Include runtime goal tools (`create_goal`, `get_goal`, `update_goal`).
+    #[must_use]
+    pub fn with_goal_tools(self, goal_state: super::goal::SharedGoalState) -> Self {
+        use super::goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
+        self.with_tool(Arc::new(CreateGoalTool::new(goal_state.clone())))
+            .with_tool(Arc::new(GetGoalTool::new(goal_state.clone())))
+            .with_tool(Arc::new(UpdateGoalTool::new(goal_state)))
+    }
+
     /// Include sub-agent management tools.
     #[must_use]
     pub fn with_subagent_tools(
@@ -848,18 +1190,27 @@ impl ToolRegistryBuilder {
         manager: super::subagent::SharedSubAgentManager,
         runtime: super::subagent::SubAgentRuntime,
     ) -> Self {
-        use super::subagent::{AgentCloseTool, AgentEvalTool, AgentOpenTool, ToolAgentTool};
+        use super::subagent::AgentTool;
+        use super::subagent::register_coordination_tools;
+        use super::workflow::WorkflowTool;
+        use super::workflow_trigger::soft_auto_policy_is_linked;
 
-        self.with_tool(Arc::new(AgentOpenTool::new(
-            manager.clone(),
-            runtime.clone(),
-        )))
-        .with_tool(Arc::new(AgentEvalTool::new(manager.clone())))
-        .with_tool(Arc::new(ToolAgentTool::new(
-            manager.clone(),
-            runtime.clone(),
-        )))
-        .with_tool(Arc::new(AgentCloseTool::new(manager)))
+        // Keep soft-auto trigger policy linked in release builds (#4127).
+        debug_assert!(
+            soft_auto_policy_is_linked(),
+            "workflow soft-auto policy must stay linked"
+        );
+
+        let builder = self
+            .with_tool(Arc::new(WorkflowTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )))
+            .with_tool(Arc::new(AgentTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )));
+        register_coordination_tools(builder, manager, runtime)
     }
 
     /// Build the registry with the given context.
@@ -952,7 +1303,7 @@ impl ToolSpec for McpToolAdapter {
             .call_tool(&self.name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
         Ok(ToolResult::success(content))
     }
 }
@@ -961,11 +1312,13 @@ impl ToolSpec for McpToolAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use serde_json::{Value, json};
     use tempfile::tempdir;
 
+    use crate::config::ToolOverride;
     use crate::tools::ToolRegistryBuilder;
     use crate::tools::spec::{
         ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
@@ -1032,6 +1385,105 @@ mod tests {
         assert!(registry.contains("test_tool"));
         assert!(!registry.contains("nonexistent"));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn resolve_exact_match_is_ascii_case_insensitive() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut registry = ToolRegistry::new(ctx);
+
+        registry.register(make_test_tool("read_file"));
+
+        assert_eq!(registry.resolve("READ_FILE"), Some("read_file"));
+    }
+
+    #[test]
+    fn todo_aliases_stay_callable_but_hidden_from_model_catalog() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_todo_tool(crate::tools::todo::new_shared_todo_list())
+            .build(ctx);
+
+        // Canonical + legacy spellings stay callable for replay.
+        for name in [
+            "work_update",
+            "checklist_write",
+            "checklist_add",
+            "checklist_update",
+            "checklist_list",
+            "todo_write",
+            "todo_add",
+            "todo_update",
+            "todo_list",
+        ] {
+            assert!(registry.contains(name), "{name} should remain callable");
+        }
+
+        let api_names = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            api_names.iter().any(|name| name == "work_update"),
+            "work_update should be the sole model-visible progress surface"
+        );
+        for hidden in [
+            "checklist_write",
+            "checklist_add",
+            "checklist_update",
+            "checklist_list",
+            "todo_write",
+            "todo_add",
+            "todo_update",
+            "todo_list",
+        ] {
+            assert!(
+                api_names.iter().all(|name| name != hidden),
+                "{hidden} should be hidden from the model catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_overrides_removes_original_when_replacement_is_missing() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut registry = ToolRegistryBuilder::new()
+            .with_read_only_file_tools()
+            .build(ctx);
+
+        assert!(registry.contains("read_file"));
+        assert!(registry.contains("list_dir"));
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "read_file".to_string(),
+            ToolOverride::Script {
+                path: "missing-wrapper.sh".to_string(),
+                args: None,
+            },
+        );
+
+        registry.apply_overrides(&overrides, tmp.path());
+
+        assert!(!registry.contains("read_file"));
+        assert!(registry.contains("list_dir"));
+    }
+
+    #[test]
+    fn builder_registers_speech_alias_tools() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_speech_tools(None, None)
+            .build(ctx);
+
+        assert!(registry.contains("speech"));
+        assert!(registry.contains("tts"));
     }
 
     #[test]
@@ -1347,11 +1799,27 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_web_tools_includes_finance() {
+    fn test_builder_with_web_tools_no_longer_includes_finance() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
 
         let registry = ToolRegistryBuilder::new().with_web_tools().build(ctx);
+
+        // finance was moved to with_finance_tool() in v0.8.49;
+        // with_web_tools() registers web search/fetch plus local dev-server readiness.
+        assert!(registry.contains("web_search"));
+        assert!(registry.contains("fetch_url"));
+        assert!(registry.contains("wait_for_dev_server"));
+        assert!(registry.contains("web.run"));
+        assert!(!registry.contains("finance"));
+    }
+
+    #[test]
+    fn test_builder_with_finance_tool() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let registry = ToolRegistryBuilder::new().with_finance_tool().build(ctx);
 
         assert!(registry.contains("finance"));
     }
@@ -1366,5 +1834,104 @@ mod tests {
             .build(ctx);
 
         assert!(registry.contains("finance"));
+    }
+
+    #[test]
+    fn agent_tools_with_allow_shell_false_excludes_shell_tools() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let registry = ToolRegistryBuilder::new()
+            .with_agent_tools(false)
+            .build(ctx);
+
+        assert!(
+            !registry.contains("exec_shell"),
+            "exec_shell should be excluded when allow_shell is false"
+        );
+        assert!(
+            !registry.contains("task_shell_start"),
+            "task_shell_start should be excluded when allow_shell is false"
+        );
+        assert!(
+            !registry.contains("task_shell_wait"),
+            "task_shell_wait should be excluded when allow_shell is false"
+        );
+    }
+
+    #[test]
+    fn agent_tools_with_shell_policy_readonly_includes_shell_tools() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let registry = ToolRegistryBuilder::new()
+            .with_agent_tools_policy(crate::worker_profile::ShellPolicy::ReadOnly)
+            .build(ctx);
+
+        assert!(
+            registry.contains("exec_shell"),
+            "read-only shell policy should expose shell tools; execution enforces mutating-command denial"
+        );
+        assert!(registry.contains("task_shell_start"));
+        assert!(registry.contains("task_shell_wait"));
+    }
+
+    #[test]
+    fn agent_tools_with_allow_shell_true_includes_shell_tools() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let registry = ToolRegistryBuilder::new().with_agent_tools(true).build(ctx);
+
+        assert!(
+            registry.contains("exec_shell"),
+            "exec_shell should be included when allow_shell is true"
+        );
+        assert!(
+            registry.contains("task_shell_start"),
+            "task_shell_start should be included when allow_shell is true"
+        );
+        assert!(
+            registry.contains("task_shell_wait"),
+            "task_shell_wait should be included when allow_shell is true"
+        );
+    }
+
+    /// #2683 — `exec_wait` and `exec_interact` are legacy aliases for
+    /// `exec_shell_wait` and `exec_shell_interact`. They must remain
+    /// callable (for saved transcript replay) but hidden from the
+    /// model-facing catalog.
+    #[test]
+    fn shell_alias_tools_hidden_from_model_catalog() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new().with_shell_tools().build(ctx);
+
+        // Legacy aliases stay callable.
+        for alias in ["exec_wait", "exec_interact"] {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+        }
+
+        let api_names: Vec<String> = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        // Canonical names are model-visible.
+        for canonical in ["exec_shell_wait", "exec_shell_interact"] {
+            assert!(
+                api_names.iter().any(|n| n == canonical),
+                "{canonical} should be model-visible"
+            );
+        }
+
+        // Legacy aliases are hidden.
+        for alias in ["exec_wait", "exec_interact"] {
+            assert!(
+                api_names.iter().all(|n| n != alias),
+                "{alias} should be hidden from the model catalog"
+            );
+        }
     }
 }

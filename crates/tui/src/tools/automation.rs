@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::automation_manager::{
-    AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest,
+    AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest, run_now_shared,
 };
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -43,6 +43,10 @@ impl ToolSpec for AutomationCreateTool {
                     "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30"
                 },
                 "cwds": { "type": "array", "items": { "type": "string" } },
+                "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
+                "allow_shell": { "type": "boolean", "default": false },
+                "trust_mode": { "type": "boolean", "default": false },
+                "auto_approve": { "type": "boolean", "default": true },
                 "paused": { "type": "boolean", "default": false }
             },
             "required": ["name", "prompt", "rrule"],
@@ -73,6 +77,10 @@ impl ToolSpec for AutomationCreateTool {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            mode: optional_str(&input, "mode").map(ToString::to_string),
+            allow_shell: optional_bool_value(&input, "allow_shell"),
+            trust_mode: optional_bool_value(&input, "trust_mode"),
+            auto_approve: optional_bool_value(&input, "auto_approve"),
             status: Some(
                 if input
                     .get("paused")
@@ -191,6 +199,10 @@ impl ToolSpec for AutomationUpdateTool {
                 "prompt": { "type": "string" },
                 "rrule": { "type": "string" },
                 "cwds": { "type": "array", "items": { "type": "string" } },
+                "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
+                "allow_shell": { "type": "boolean" },
+                "trust_mode": { "type": "boolean" },
+                "auto_approve": { "type": "boolean" },
                 "status": { "type": "string", "enum": ["active", "paused"] }
             },
             "required": ["automation_id"],
@@ -231,6 +243,10 @@ impl ToolSpec for AutomationUpdateTool {
             } else {
                 None
             },
+            mode: optional_str(&input, "mode").map(ToString::to_string),
+            allow_shell: optional_bool_value(&input, "allow_shell"),
+            trust_mode: optional_bool_value(&input, "trust_mode"),
+            auto_approve: optional_bool_value(&input, "auto_approve"),
             status,
         };
         let automation = manager
@@ -331,11 +347,15 @@ impl ToolSpec for AutomationRunTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        let manager = manager.lock().await;
-        let run = manager
-            .run_now(required_str(&input, "automation_id")?, task_manager)
-            .await
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        // run_now_shared handles its own lock phases so the manager mutex is
+        // never held across the task-manager await.
+        let run = run_now_shared(
+            manager,
+            required_str(&input, "automation_id")?,
+            task_manager,
+        )
+        .await
+        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -366,6 +386,10 @@ fn string_array(input: &Value, field: &str) -> Result<Vec<String>, ToolError> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default())
+}
+
+fn optional_bool_value(input: &Value, field: &str) -> Option<bool> {
+    input.get(field).and_then(Value::as_bool)
 }
 
 #[cfg(test)]

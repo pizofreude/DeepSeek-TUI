@@ -18,28 +18,34 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-05-14T19:43:39.727Z",
-  "version": "0.8.37",
+  "generatedAt": "2026-07-14T04:52:31.545Z",
+  "version": "0.8.68",
   "crates": [
     "agent",
     "app-server",
+    "build-support",
     "cli",
     "config",
     "core",
     "execpolicy",
     "hooks",
+    "lane",
     "mcp",
     "protocol",
+    "release",
     "secrets",
     "state",
     "tools",
     "tui",
-    "tui-core"
+    "workflow",
+    "workflow-js"
   ],
   "sandboxBackends": [
+    "bwrap",
     "landlock (Linux)",
+    "process_hardening",
     "seatbelt (macOS)",
-    "AppContainer / restricted tokens (Windows)"
+    "seccomp"
   ],
   "providers": [
     {
@@ -48,14 +54,34 @@ export const FACTS: RepoFacts = {
       "env": "DEEPSEEK_API_KEY"
     },
     {
+      "id": "deepseek-anthropic",
+      "label": "DeepSeek Anthropic",
+      "env": "DEEPSEEK_API_KEY / ANTHROPIC_API_KEY"
+    },
+    {
       "id": "nvidia-nim",
       "label": "NVIDIA NIM",
-      "env": "NVIDIA_API_KEY"
+      "env": "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY"
     },
     {
       "id": "openai",
-      "label": "OpenAI",
+      "label": "OpenAI-compatible",
       "env": "OPENAI_API_KEY"
+    },
+    {
+      "id": "atlascloud",
+      "label": "AtlasCloud",
+      "env": "ATLASCLOUD_API_KEY"
+    },
+    {
+      "id": "wanjie-ark",
+      "label": "Wanjie Ark",
+      "env": "WANJIE_ARK_API_KEY / WANJIE_API_KEY / WANJIE_MAAS_API_KEY"
+    },
+    {
+      "id": "volcengine",
+      "label": "Volcengine Ark",
+      "env": "VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY"
     },
     {
       "id": "openrouter",
@@ -63,18 +89,43 @@ export const FACTS: RepoFacts = {
       "env": "OPENROUTER_API_KEY"
     },
     {
+      "id": "xiaomi-mimo",
+      "label": "Xiaomi MiMo",
+      "env": "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY"
+    },
+    {
       "id": "novita",
-      "label": "Novita",
+      "label": "Novita AI",
       "env": "NOVITA_API_KEY"
     },
     {
       "id": "fireworks",
-      "label": "Fireworks",
+      "label": "Fireworks AI",
       "env": "FIREWORKS_API_KEY"
     },
     {
+      "id": "siliconflow",
+      "label": "SiliconFlow",
+      "env": "SILICONFLOW_API_KEY"
+    },
+    {
+      "id": "siliconflow-CN",
+      "label": "SiliconFlow CN",
+      "env": "SILICONFLOW_API_KEY"
+    },
+    {
+      "id": "arcee",
+      "label": "Arcee AI",
+      "env": "ARCEE_API_KEY"
+    },
+    {
+      "id": "moonshot",
+      "label": "Moonshot/Kimi",
+      "env": "MOONSHOT_API_KEY / KIMI_API_KEY"
+    },
+    {
       "id": "sglang",
-      "label": "sglang",
+      "label": "SGLang",
       "env": "SGLANG_API_KEY"
     },
     {
@@ -86,11 +137,86 @@ export const FACTS: RepoFacts = {
       "id": "ollama",
       "label": "Ollama",
       "env": "OLLAMA_API_KEY"
+    },
+    {
+      "id": "huggingface",
+      "label": "Hugging Face",
+      "env": "HUGGINGFACE_API_KEY / HF_TOKEN"
+    },
+    {
+      "id": "together",
+      "label": "Together AI",
+      "env": "TOGETHER_API_KEY"
+    },
+    {
+      "id": "qianfan",
+      "label": "Baidu Qianfan",
+      "env": "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY"
+    },
+    {
+      "id": "openai-codex",
+      "label": "OpenAI Codex",
+      "env": "ChatGPT/Codex OAuth via `codex login` (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)"
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "openmodel",
+      "label": "OpenModel",
+      "env": "OPENMODEL_API_KEY"
+    },
+    {
+      "id": "zai",
+      "label": "Z.ai",
+      "env": "ZAI_API_KEY / Z_AI_API_KEY"
+    },
+    {
+      "id": "stepfun",
+      "label": "StepFun",
+      "env": "STEPFUN_API_KEY / STEP_API_KEY"
+    },
+    {
+      "id": "minimax",
+      "label": "MiniMax",
+      "env": "MINIMAX_API_KEY"
+    },
+    {
+      "id": "minimax-anthropic",
+      "label": "MiniMax (Anthropic-compatible)",
+      "env": "MINIMAX_API_KEY"
+    },
+    {
+      "id": "deepinfra",
+      "label": "DeepInfra",
+      "env": "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN"
+    },
+    {
+      "id": "sakana",
+      "label": "Sakana AI",
+      "env": "FUGU_API_KEY / SAKANA_API_KEY"
+    },
+    {
+      "id": "longcat",
+      "label": "Meituan LongCat",
+      "env": "LONGCAT_API_KEY"
+    },
+    {
+      "id": "meta",
+      "label": "Meta Model API",
+      "env": "META_MODEL_API_KEY / MODEL_API_KEY"
+    },
+    {
+      "id": "xai",
+      "label": "xAI",
+      "env": "XAI_API_KEY"
     }
   ],
   "defaultModel": "deepseek-v4-pro",
   "nodeEngines": ">=18",
-  "toolCount": 68,
+  "toolCount": 85,
   "license": "MIT",
   "latestRelease": null
 };

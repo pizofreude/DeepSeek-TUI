@@ -33,6 +33,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
 use crate::tui::osc8;
+use crate::tui::ui_text::CopyLineSeparator;
 
 // Thread-local counter incremented every time `parse` runs. Used by tests to
 // prove that width-only changes hit the cached-AST path and skip parsing.
@@ -100,7 +101,12 @@ pub struct ParsedMarkdown {
 #[derive(Debug, Clone)]
 pub struct RenderedMarkdownLine {
     pub line: Line<'static>,
+    /// Hyperlinks aligned to display columns in `line`. Targets stay
+    /// out-of-band; `Span::content` always contains visible text only.
+    pub links: Vec<osc8::LineLink>,
     pub is_code: bool,
+    pub copy_prefix_width: usize,
+    pub copy_separator_after: CopyLineSeparator,
 }
 
 /// Parse markdown source into a width-independent block AST.
@@ -226,7 +232,10 @@ pub fn render_parsed_tagged(
                     .into_iter()
                     .map(|line| RenderedMarkdownLine {
                         line,
+                        links: Vec::new(),
                         is_code: false,
+                        copy_prefix_width: 0,
+                        copy_separator_after: CopyLineSeparator::Newline,
                     }),
             );
             continue;
@@ -235,7 +244,7 @@ pub fn render_parsed_tagged(
         match &parsed.blocks[i] {
             Block::Heading { text, .. } => {
                 let style = Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD);
                 out.extend(render_wrapped_line_tagged(text, width, style, false, false));
             }
@@ -245,7 +254,10 @@ pub fn render_parsed_tagged(
                         "─".repeat(width.min(40)),
                         Style::default().fg(palette::TEXT_DIM),
                     )),
+                    links: Vec::new(),
                     is_code: false,
+                    copy_prefix_width: 0,
+                    copy_separator_after: CopyLineSeparator::Newline,
                 });
             }
             Block::HorizontalRule => {
@@ -254,23 +266,25 @@ pub fn render_parsed_tagged(
                         "─".repeat(width.min(60)),
                         Style::default().fg(palette::TEXT_DIM),
                     )),
+                    links: Vec::new(),
                     is_code: false,
+                    copy_prefix_width: 0,
+                    copy_separator_after: CopyLineSeparator::Newline,
                 });
             }
             Block::ListItem { bullet, text } => {
-                let bullet_style = Style::default().fg(palette::DEEPSEEK_SKY);
-                out.extend(
-                    render_list_line(bullet, text, width, bullet_style, base_style)
-                        .into_iter()
-                        .map(|line| RenderedMarkdownLine {
-                            line,
-                            is_code: false,
-                        }),
-                );
+                let bullet_style = Style::default().fg(palette::WHALE_INFO);
+                out.extend(render_list_line_tagged(
+                    bullet,
+                    text,
+                    width,
+                    bullet_style,
+                    base_style,
+                ));
             }
             Block::Code { line } => {
                 let code_style = Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::ITALIC);
                 out.extend(render_wrapped_line_tagged(
                     line, width, code_style, true, true,
@@ -278,21 +292,19 @@ pub fn render_parsed_tagged(
             }
             Block::Paragraph { text } => {
                 let link_style = Style::default()
-                    .fg(palette::DEEPSEEK_BLUE)
+                    .fg(palette::WHALE_ACCENT_PRIMARY)
                     .add_modifier(Modifier::UNDERLINED);
-                out.extend(
-                    render_line_with_links(text, width, base_style, link_style)
-                        .into_iter()
-                        .map(|line| RenderedMarkdownLine {
-                            line,
-                            is_code: false,
-                        }),
-                );
+                out.extend(render_line_with_links_tagged(
+                    text, width, base_style, link_style,
+                ));
             }
             Block::Blank => {
                 out.push(RenderedMarkdownLine {
                     line: Line::from(""),
+                    links: Vec::new(),
                     is_code: false,
+                    copy_prefix_width: 0,
+                    copy_separator_after: CopyLineSeparator::Newline,
                 });
             }
             Block::TableRow(_) | Block::TableSeparator => unreachable!(),
@@ -303,7 +315,10 @@ pub fn render_parsed_tagged(
     if out.is_empty() {
         out.push(RenderedMarkdownLine {
             line: Line::from(""),
+            links: Vec::new(),
             is_code: false,
+            copy_prefix_width: 0,
+            copy_separator_after: CopyLineSeparator::Newline,
         });
     }
 
@@ -484,6 +499,7 @@ fn render_wrapped_line_tagged(
     };
     let mut out = Vec::new();
 
+    let last_index = wrapped.len().saturating_sub(1);
     for (idx, chunk) in wrapped.into_iter().enumerate() {
         let line = if idx == 0 {
             Line::from(vec![Span::raw(prefix), Span::styled(chunk, style)])
@@ -493,47 +509,96 @@ fn render_wrapped_line_tagged(
                 Span::styled(chunk, style),
             ])
         };
-        out.push(RenderedMarkdownLine { line, is_code });
+        let copy_separator_after = if idx == last_index {
+            CopyLineSeparator::Newline
+        } else if is_code {
+            CopyLineSeparator::None
+        } else {
+            CopyLineSeparator::Space
+        };
+        out.push(RenderedMarkdownLine {
+            line,
+            links: Vec::new(),
+            is_code,
+            copy_prefix_width: if indent_code { prefix_width } else { 0 },
+            copy_separator_after,
+        });
     }
 
     out
 }
 
-fn render_list_line(
+fn render_list_line_tagged(
     bullet: &str,
     text: &str,
     width: usize,
     bullet_style: Style,
     text_style: Style,
-) -> Vec<Line<'static>> {
+) -> Vec<RenderedMarkdownLine> {
     let bullet_prefix = format!("{bullet} ");
     let bullet_width = bullet_prefix.width();
     let available = width.saturating_sub(bullet_width).max(1);
-    let wrapped = render_line_with_links(text, available, text_style, link_style());
+    let wrapped = render_line_with_links_tagged(text, available, text_style, link_style());
 
     let mut out = Vec::new();
-    for (idx, line) in wrapped.into_iter().enumerate() {
+    for (idx, rendered) in wrapped.into_iter().enumerate() {
+        let links = rendered
+            .links
+            .iter()
+            .map(|link| link.shifted(bullet_width))
+            .collect();
         if idx == 0 {
             let mut spans = vec![Span::styled(bullet_prefix.clone(), bullet_style)];
-            spans.extend(line.spans);
-            out.push(Line::from(spans));
+            spans.extend(rendered.line.spans);
+            out.push(RenderedMarkdownLine {
+                line: Line::from(spans),
+                links,
+                is_code: false,
+                copy_prefix_width: 0,
+                copy_separator_after: rendered.copy_separator_after,
+            });
         } else {
             let mut spans = vec![Span::raw(" ".repeat(bullet_width))];
-            spans.extend(line.spans);
-            out.push(Line::from(spans));
+            spans.extend(rendered.line.spans);
+            out.push(RenderedMarkdownLine {
+                line: Line::from(spans),
+                links,
+                is_code: false,
+                copy_prefix_width: bullet_width,
+                copy_separator_after: rendered.copy_separator_after,
+            });
         }
     }
     out
 }
 
+#[cfg(test)]
 fn render_line_with_links(
     line: &str,
     width: usize,
     base_style: Style,
     link_style: Style,
 ) -> Vec<Line<'static>> {
+    render_line_with_links_tagged(line, width, base_style, link_style)
+        .into_iter()
+        .map(|rendered| rendered.line)
+        .collect()
+}
+
+fn render_line_with_links_tagged(
+    line: &str,
+    width: usize,
+    base_style: Style,
+    link_style: Style,
+) -> Vec<RenderedMarkdownLine> {
     if line.trim().is_empty() {
-        return vec![Line::from("")];
+        return vec![RenderedMarkdownLine {
+            line: Line::from(""),
+            links: Vec::new(),
+            is_code: false,
+            copy_prefix_width: 0,
+            copy_separator_after: CopyLineSeparator::Newline,
+        }];
     }
 
     // Flatten inline tokens into (word, style) pairs preserving inter-token spaces.
@@ -543,9 +608,14 @@ fn render_line_with_links(
         let mut first = true;
         for part in token.text.split(' ') {
             if !first {
-                // The space consumed by split — attach as a plain space word
-                // so the wrap loop can decide whether to keep or break it.
-                words.push(InlineToken::new(" ".to_string(), token.style, None));
+                // The space consumed by split remains part of a markdown-link
+                // label when the surrounding token is linked. It is still a
+                // wrap opportunity and is dropped at a row boundary.
+                words.push(InlineToken::new(
+                    " ".to_string(),
+                    token.style,
+                    token.link_url.clone(),
+                ));
             }
             if !part.is_empty() {
                 words.push(InlineToken::new(
@@ -558,8 +628,9 @@ fn render_line_with_links(
         }
     }
 
-    let mut lines = Vec::new();
-    let mut current_spans: Vec<Span> = Vec::new();
+    let mut lines: Vec<RenderedMarkdownLine> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_links: Vec<osc8::LineLink> = Vec::new();
     let mut current_width = 0usize;
 
     for word in words {
@@ -568,7 +639,8 @@ fn render_line_with_links(
             // Space: emit only if we're mid-line and it fits; otherwise drop
             // (it's a potential wrap point, not content).
             if !current_spans.is_empty() && current_width < width {
-                current_spans.push(Span::raw(" "));
+                current_spans.push(word.span_for(" ".to_string()));
+                record_inline_link(&mut current_links, &word, current_width, 1);
                 current_width += 1;
             }
             continue;
@@ -581,12 +653,12 @@ fn render_line_with_links(
         if ww > width && width > 0 {
             // Flush the in-progress line first.
             if !current_spans.is_empty() {
-                if let Some(last) = current_spans.last()
-                    && last.content.as_ref() == " "
-                {
-                    current_spans.pop();
-                }
-                lines.push(Line::from(std::mem::take(&mut current_spans)));
+                push_inline_line(
+                    &mut lines,
+                    &mut current_spans,
+                    &mut current_links,
+                    CopyLineSeparator::Space,
+                );
                 current_width = 0;
             }
             // Char-break the word into width-sized chunks. Each full chunk
@@ -597,13 +669,23 @@ fn render_line_with_links(
             for ch in word.text.chars() {
                 let cw = ch.width().unwrap_or(1);
                 if chunk_w + cw > width && chunk_w > 0 {
-                    lines.push(Line::from(vec![word.span_for(std::mem::take(&mut chunk))]));
+                    let chunk = std::mem::take(&mut chunk);
+                    let mut links = Vec::new();
+                    record_inline_link(&mut links, &word, 0, chunk_w);
+                    lines.push(RenderedMarkdownLine {
+                        line: Line::from(vec![word.span_for(chunk)]),
+                        links,
+                        is_code: false,
+                        copy_prefix_width: 0,
+                        copy_separator_after: CopyLineSeparator::None,
+                    });
                     chunk_w = 0;
                 }
                 chunk.push(ch);
                 chunk_w += cw;
             }
             if !chunk.is_empty() {
+                record_inline_link(&mut current_links, &word, 0, chunk_w);
                 current_spans.push(word.span_for(chunk));
                 current_width = chunk_w;
             }
@@ -612,26 +694,94 @@ fn render_line_with_links(
         // Wrap before this word if it doesn't fit.
         if current_width > 0 && current_width + ww > width {
             // Trim trailing space span before breaking.
-            if let Some(last) = current_spans.last()
-                && last.content.as_ref() == " "
-            {
-                current_spans.pop();
-            }
-            lines.push(Line::from(current_spans));
-            current_spans = Vec::new();
+            push_inline_line(
+                &mut lines,
+                &mut current_spans,
+                &mut current_links,
+                CopyLineSeparator::Space,
+            );
             current_width = 0;
         }
+        record_inline_link(&mut current_links, &word, current_width, ww);
         current_spans.push(word.into_span());
         current_width += ww;
     }
 
     if !current_spans.is_empty() {
-        lines.push(Line::from(current_spans));
+        push_inline_line(
+            &mut lines,
+            &mut current_spans,
+            &mut current_links,
+            CopyLineSeparator::Newline,
+        );
+    } else if let Some(last) = lines.last_mut() {
+        last.copy_separator_after = CopyLineSeparator::Newline;
     }
     if lines.is_empty() {
-        lines.push(Line::from(""));
+        lines.push(RenderedMarkdownLine {
+            line: Line::from(""),
+            links: Vec::new(),
+            is_code: false,
+            copy_prefix_width: 0,
+            copy_separator_after: CopyLineSeparator::Newline,
+        });
     }
     lines
+}
+
+fn push_inline_line(
+    lines: &mut Vec<RenderedMarkdownLine>,
+    spans: &mut Vec<Span<'static>>,
+    links: &mut Vec<osc8::LineLink>,
+    copy_separator_after: CopyLineSeparator,
+) {
+    if let Some(last) = spans.last()
+        && last.content.as_ref() == " "
+    {
+        spans.pop();
+    }
+    let visible_width = spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum::<usize>();
+    links.retain(|link| link.col_start < visible_width);
+    for link in links.iter_mut() {
+        link.col_end = link.col_end.min(visible_width.saturating_sub(1));
+    }
+    lines.push(RenderedMarkdownLine {
+        line: Line::from(std::mem::take(spans)),
+        links: std::mem::take(links),
+        is_code: false,
+        copy_prefix_width: 0,
+        copy_separator_after,
+    });
+}
+
+fn record_inline_link(
+    links: &mut Vec<osc8::LineLink>,
+    token: &InlineToken,
+    col_start: usize,
+    width: usize,
+) {
+    let Some(target) = token.link_url.as_ref() else {
+        return;
+    };
+    if width == 0 {
+        return;
+    }
+    let col_end = col_start.saturating_add(width).saturating_sub(1);
+    if let Some(last) = links.last_mut()
+        && last.target == *target
+        && last.col_end.saturating_add(1) == col_start
+    {
+        last.col_end = col_end;
+        return;
+    }
+    links.push(osc8::LineLink {
+        col_start,
+        col_end,
+        target: target.clone(),
+    });
 }
 
 #[derive(Clone)]
@@ -651,24 +801,11 @@ impl InlineToken {
     }
 
     fn span_for(&self, text: String) -> Span<'static> {
-        let content = match &self.link_url {
-            Some(url) if osc8::enabled() => osc8::wrap_link(url, &text),
-            _ => text,
-        };
-        Span::styled(content, self.style)
+        Span::styled(text, self.style)
     }
 
     fn into_span(self) -> Span<'static> {
-        let Self {
-            text,
-            style,
-            link_url,
-        } = self;
-        let content = match link_url {
-            Some(url) if osc8::enabled() => osc8::wrap_link(&url, &text),
-            _ => text,
-        };
-        Span::styled(content, style)
+        Span::styled(self.text, self.style)
     }
 }
 
@@ -754,37 +891,38 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
                 && let Some(paren_end) = after_bracket.find(')')
             {
                 let url = &after_bracket[1..paren_end];
-                if osc8::enabled() {
-                    out.push(InlineToken::new(
-                        text.to_string(),
-                        link_style,
-                        Some(url.to_string()),
-                    ));
-                } else {
-                    out.push(InlineToken::new(
-                        format!("{text} ({url})"),
-                        link_style,
-                        None,
-                    ));
-                }
+                // The runtime toggle gates backend emission, not layout.
+                // Keeping the same visible label and metadata in both modes
+                // prevents toggling OSC 8 from reflowing the transcript.
+                out.push(InlineToken::new(
+                    text.to_string(),
+                    link_style,
+                    normalized_http_link_target(url),
+                ));
                 rest = &after_bracket[paren_end + 1..];
                 continue;
             }
         }
-        // URL: consume until whitespace
+        // URL: consume until whitespace, then keep trailing punctuation
+        // visible but outside the hyperlink target.
         if rest.starts_with("http://") || rest.starts_with("https://") {
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            let url = &rest[..end];
-            if osc8::enabled() {
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let token = &rest[..token_end];
+            let url_end = trailing_url_end(token);
+            let url = &token[..url_end];
+            out.push(InlineToken::new(
+                url.to_string(),
+                link_style,
+                normalized_http_link_target(url),
+            ));
+            if url_end < token_end {
                 out.push(InlineToken::new(
-                    url.to_string(),
-                    link_style,
-                    Some(url.to_string()),
+                    token[url_end..].to_string(),
+                    base_style,
+                    None,
                 ));
-            } else {
-                out.push(InlineToken::new(url.to_string(), link_style, None));
             }
-            rest = &rest[end..];
+            rest = &rest[token_end..];
             continue;
         }
         // Plain text: consume until next marker or URL; always advance at least 1 char.
@@ -793,6 +931,64 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
         rest = &rest[next..];
     }
     out
+}
+
+/// OSC 8 targets produced by markdown are deliberately limited to ordinary
+/// web URLs. The browser-opening gesture is user-initiated, but accepting
+/// arbitrary schemes here would still turn untrusted model output into a
+/// `file:`, `javascript:`, or application-protocol link. Normalize the scheme
+/// and reject whitespace/control characters before metadata reaches a frame.
+fn normalized_http_link_target(target: &str) -> Option<String> {
+    let (scheme, rest) = if target
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        ("https://", &target[8..])
+    } else if target
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        ("http://", &target[7..])
+    } else {
+        return None;
+    };
+    if rest.is_empty()
+        || rest.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || rest.split(['/', '?', '#']).next().is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    Some(format!("{scheme}{rest}"))
+}
+
+fn trailing_url_end(candidate: &str) -> usize {
+    let mut end = candidate.len();
+    while end > 0 {
+        let remaining = &candidate[..end];
+        let Some(ch) = remaining.chars().next_back() else {
+            break;
+        };
+        let trim = matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
+            || matches!(ch, ')' | ']' | '}' | '>')
+                && has_unmatched_closing_delimiter(remaining, ch);
+        if !trim {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    end
+}
+
+fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool {
+    let opening = match closing {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        _ => return false,
+    };
+    candidate.chars().filter(|ch| *ch == closing).count()
+        > candidate.chars().filter(|ch| *ch == opening).count()
 }
 
 /// Find the index of the next inline marker (`**`, `__`, `*`, `_`, `http`)
@@ -835,7 +1031,7 @@ fn parse_table_row(line: &str) -> Option<Vec<String>> {
         return None;
     }
     let inner = line.trim_matches('|');
-    let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
+    let cells = split_table_cells(inner);
     // Separator row: every non-empty cell is only dashes/colons/spaces
     if cells
         .iter()
@@ -844,6 +1040,38 @@ fn parse_table_row(line: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(cells)
+}
+
+fn split_table_cells(inner: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    let mut chars = inner.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if matches!(chars.peek(), Some('|')) {
+                    current.push('|');
+                    let _ = chars.next();
+                } else {
+                    current.push(ch);
+                }
+            }
+            '`' => {
+                in_code = !in_code;
+                current.push(ch);
+            }
+            '|' if !in_code => {
+                cells.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    cells.push(current.trim().to_string());
+    cells
 }
 
 /// Word-wrap a single cell's text into one or more visual lines, each
@@ -1020,7 +1248,7 @@ fn render_table_group(blocks: &[Block], width: usize, base_style: Style) -> Vec<
 
 fn link_style() -> Style {
     Style::default()
-        .fg(palette::DEEPSEEK_BLUE)
+        .fg(palette::WHALE_ACCENT_PRIMARY)
         .add_modifier(Modifier::UNDERLINED)
 }
 
@@ -1191,17 +1419,16 @@ mod tests {
 
     #[test]
     fn render_markdown_matches_parse_then_render() {
-        // Both calls run in the same thread under the same OSC8 lock so the
-        // flag is identical for both paths.
         let source = "# Title\n\nA paragraph with a https://example.com link.\n\n- one\n- two\n```\ncode\n```";
-        let direct = render_with_osc8(false, source);
-        let two_step = with_osc8(false, || {
-            let parsed = parse(source);
-            render_parsed(&parsed, 80, Style::default())
-                .iter()
-                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-                .collect::<String>()
-        });
+        let direct = render_markdown(source, 80, Style::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+        let parsed = parse(source);
+        let two_step = render_parsed(&parsed, 80, Style::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
         assert_eq!(direct, two_step);
     }
 
@@ -1389,68 +1616,108 @@ mod tests {
         assert_eq!(items, vec![("-", "alpha"), ("-", "beta"), ("1.", "gamma")]);
     }
 
-    /// Render with the OSC 8 flag pinned to `enabled`, then restore the prior
-    /// value. We serialize through a static mutex because `osc8::ENABLED` is
-    /// process-wide state and other tests touching it would race otherwise.
-    fn render_with_osc8(enabled: bool, source: &str) -> String {
-        render_with_osc8_width(enabled, source, 80)
+    fn tagged_visible(lines: &[RenderedMarkdownLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|rendered| {
+                rendered
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
     }
 
-    fn render_with_osc8_width(enabled: bool, source: &str, width: u16) -> String {
-        with_osc8(enabled, || {
-            render_markdown(source, width, Style::default())
+    #[test]
+    fn http_links_keep_visible_text_and_out_of_band_metadata() {
+        let source = "see https://example.com for details";
+        let rendered = render_markdown_tagged(source, 80, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert!(
+            rendered
                 .iter()
-                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-                .collect::<String>()
-        })
-    }
-
-    fn with_osc8<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
-        use std::sync::Mutex;
-        static OSC8_GUARD: Mutex<()> = Mutex::new(());
-        let _guard = OSC8_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = osc8::enabled();
-        osc8::set_enabled(enabled);
-        let result = f();
-        osc8::set_enabled(prior);
-        result
-    }
-
-    #[test]
-    fn http_links_get_osc_8_wrapped_when_enabled() {
-        let joined = render_with_osc8(true, "see https://example.com for details");
-        assert!(
-            joined.contains("\x1b]8;;https://example.com\x1b\\https://example.com\x1b]8;;\x1b\\"),
-            "expected OSC 8 wrapper around URL; got {joined:?}"
+                .flat_map(|line| &line.line.spans)
+                .all(|span| { !span.content.contains('\x1b') && !span.content.contains("]8;;") }),
+            "escape payloads must never enter visible spans"
+        );
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 4,
+                col_end: 22,
+                target: "https://example.com".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn wrapped_osc_8_url_chunks_keep_full_link_target() {
+    fn bare_http_links_exclude_surrounding_punctuation_from_target() {
+        let source = "see (https://example.com/path).";
+        let rendered = render_markdown_tagged(source, 80, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert_eq!(rendered[0].links.len(), 1);
+        let link = &rendered[0].links[0];
+        assert_eq!(link.target, "https://example.com/path");
+        assert_eq!(link.col_start, 5);
+        assert_eq!(link.col_end, 28);
+    }
+
+    #[test]
+    fn bare_http_links_preserve_balanced_parentheses_in_target() {
+        let url = "https://en.wikipedia.org/wiki/Function_(mathematics)";
+        let source = format!("see {url}.");
+        let rendered = render_markdown_tagged(&source, 100, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert_eq!(rendered[0].links.len(), 1);
+        assert_eq!(rendered[0].links[0].target, url);
+    }
+
+    #[test]
+    fn wrapped_url_chunks_keep_visible_label_and_full_target() {
         let url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
-        let joined = render_with_osc8_width(true, url, 34);
-        let full_target = format!("\x1b]8;;{url}\x1b\\");
+        let rendered = render_markdown_tagged(url, 34, Style::default());
+        let visible = tagged_visible(&rendered);
+        assert!(visible.len() > 1, "fixture must wrap: {visible:?}");
+        assert_eq!(visible.concat(), url);
+        for (line, text) in rendered.iter().zip(&visible) {
+            assert_eq!(line.links.len(), 1, "each wrapped chunk is linked");
+            assert_eq!(line.links[0].target, url);
+            assert_eq!(line.links[0].col_start, 0);
+            assert_eq!(line.links[0].col_end, text.width().saturating_sub(1));
+            assert!(!text.contains('\x1b') && !text.contains("]8;;"));
+        }
+    }
 
-        assert!(
-            joined.matches(&full_target).count() > 1,
-            "expected each wrapped URL chunk to reopen the full OSC 8 target; got {joined:?}"
+    #[test]
+    fn named_link_shows_only_label_and_keeps_target_in_metadata() {
+        let rendered = render_markdown_tagged(
+            "read [the docs](https://example.com/guide) now",
+            80,
+            Style::default(),
         );
-        assert!(
-            !joined.contains(
-                "\x1b]8;;https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/inde\x1b\\"
-            ),
-            "wrapped link must not expose a truncated OSC 8 target: {joined:?}"
+        assert_eq!(tagged_visible(&rendered), vec!["read the docs now"]);
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 5,
+                col_end: 12,
+                target: "https://example.com/guide".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn osc_8_disabled_emits_plain_url() {
-        let joined = render_with_osc8(false, "see https://example.com for details");
-        assert!(
-            !joined.contains("\x1b]8;;"),
-            "expected no OSC 8 wrapper when disabled; got {joined:?}"
-        );
-        assert!(joined.contains("https://example.com"));
+    fn named_links_reject_non_web_schemes_and_normalize_http_scheme() {
+        let unsafe_link = render_markdown_tagged("[run](javascript:alert)", 80, Style::default());
+        assert_eq!(tagged_visible(&unsafe_link), vec!["run"]);
+        assert!(unsafe_link.iter().all(|line| line.links.is_empty()));
+
+        let web_link =
+            render_markdown_tagged("[docs](HTTPS://example.com/guide)", 80, Style::default());
+        assert_eq!(tagged_visible(&web_link), vec!["docs"]);
+        assert_eq!(web_link[0].links[0].target, "https://example.com/guide");
     }
 
     #[test]
@@ -1532,6 +1799,48 @@ mod tests {
         assert!(
             text.contains('\u{2524}'),
             "middle-right junction missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn table_pipes_inside_inline_code_stay_in_the_cell() {
+        let src = "| Check | Result |\n\
+                   |---|---|\n\
+                   | `strings ~/.cargo/bin/codewhale-tui | grep -c \"legacy marker\"` | 0 matches |\n";
+        let parsed = parse(src);
+
+        let rows: Vec<&Vec<String>> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::TableRow(cells) => Some(cells),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rows.len(), 2, "expected header + data row: {rows:?}");
+        assert_eq!(
+            rows[1],
+            &vec![
+                "`strings ~/.cargo/bin/codewhale-tui | grep -c \"legacy marker\"`".to_string(),
+                "0 matches".to_string(),
+            ]
+        );
+
+        let rendered_lines = visible_lines(&render_markdown(src, 200, Style::default()));
+        let rendered = rendered_lines.join("\n");
+        assert!(
+            rendered.contains("grep -c"),
+            "inline-code command was lost: {rendered}"
+        );
+        let data_line = rendered_lines
+            .iter()
+            .find(|line| line.contains("strings ~/.cargo/bin/codewhale-tui"))
+            .expect("data row should render");
+        assert_eq!(
+            data_line.matches('│').count(),
+            3,
+            "two-column table row should have left, middle, and right separators: {data_line:?}"
         );
     }
 
@@ -1637,9 +1946,7 @@ mod tests {
     }
 
     fn render_paragraph_for_test(text: &str, width: usize) -> Vec<Line<'static>> {
-        with_osc8(false, || {
-            render_line_with_links(text, width, Style::default(), Style::default())
-        })
+        render_line_with_links(text, width, Style::default(), Style::default())
     }
 
     #[test]
@@ -1656,6 +1963,27 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert_eq!(combined.matches('a').count(), 200);
+    }
+
+    #[test]
+    fn paragraph_wrap_breaks_no_whitespace_cjk_at_width_40() {
+        // #963: long CJK runs without whitespace must wrap by display width
+        // instead of overflowing or truncating. Each Han character is 2 cols.
+        let long = "界".repeat(300);
+        let rendered = render_paragraph_for_test(&long, 40);
+        for w in rendered_widths(&rendered) {
+            assert!(w <= 40, "rendered width {w} exceeds 40-col window");
+        }
+        let combined: String = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(combined.chars().filter(|&ch| ch == '界').count(), 300);
+        assert!(
+            rendered.len() >= 15,
+            "300 double-width chars should wrap into many rows, got {}",
+            rendered.len()
+        );
     }
 
     #[test]
@@ -1762,5 +2090,136 @@ mod tests {
         let rendered = render_paragraph_for_test("hello world", 0);
         // Any output is acceptable (the path is degenerate); assert no panic.
         let _ = rendered;
+    }
+
+    fn rendered_text(rendered: &[Line<'static>]) -> String {
+        rendered
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect()
+    }
+
+    fn assert_rendered_widths_fit(rendered: &[Line<'static>], width: usize, label: &str) {
+        for line_width in rendered_widths(rendered) {
+            assert!(
+                line_width <= width,
+                "{label} width={width}: rendered line width {line_width} exceeds budget"
+            );
+        }
+    }
+
+    // ── Unicode / CJK / emoji / combining-char width QA (#3488) ────────────
+
+    #[test]
+    fn paragraph_wrap_keeps_unicode_runs_within_qa_widths() {
+        let cases = [
+            ("cjk", "界".repeat(300)),
+            ("emoji", "😀".repeat(200)),
+            ("mixed-cjk-emoji", "界😀世🚀".repeat(90)),
+        ];
+
+        for (label, text) in cases {
+            for &width in &[80usize, 100, 120] {
+                let rendered = render_paragraph_for_test(&text, width);
+                assert_rendered_widths_fit(&rendered, width, label);
+                assert_eq!(
+                    rendered_text(&rendered),
+                    text,
+                    "{label} width={width}: content changed while wrapping"
+                );
+
+                let min_lines = text.width().div_ceil(width);
+                assert!(
+                    rendered.len() >= min_lines,
+                    "{label} width={width}: expected at least {min_lines} lines, got {}",
+                    rendered.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paragraph_wrap_preserves_mixed_unicode_and_ascii_fragments() {
+        let cjk = "这是一个测试字符串".repeat(10); // 80 Han chars = 160 cols
+        let emoji = "🚀".repeat(12);
+        let text = format!("Note: {cjk} done {emoji}");
+
+        for &width in &[80usize, 100, 120] {
+            let rendered = render_paragraph_for_test(&text, width);
+            assert_rendered_widths_fit(&rendered, width, "mixed unicode/ascii");
+
+            let visible = visible_lines(&rendered).join("\n");
+            for fragment in ["Note:", "测试", "done"] {
+                assert!(
+                    visible.contains(fragment),
+                    "width={width}: fragment {fragment:?} missing from output:\n{visible}"
+                );
+            }
+            assert_eq!(
+                visible.matches('🚀').count(),
+                12,
+                "width={width}: emoji content lost"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_level_wrap_text_keeps_unicode_runs_within_qa_widths() {
+        let cases = [
+            ("cjk", "中".repeat(140)),
+            ("emoji", "😀".repeat(110)),
+            ("combining", "e\u{301}".repeat(140)),
+        ];
+
+        for (label, input) in cases {
+            for &width in &[80usize, 100, 120] {
+                let lines = wrap_text(&input, width);
+                for line in &lines {
+                    assert!(
+                        line.width() <= width,
+                        "{label} width={width}: wrap_text line {line:?} exceeds budget"
+                    );
+                }
+                let combined: String = lines.join("");
+                assert_eq!(
+                    combined, input,
+                    "{label} width={width}: wrap_text changed content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_render_keeps_cjk_cells_within_qa_widths() {
+        let cjk = "界".repeat(80);
+        let src = format!("| Name | Value |\n|---|---|\n| CJK | {cjk} |\n");
+
+        for &width in &[80usize, 100, 120] {
+            let rendered = render_markdown(&src, width as u16, Style::default());
+            assert_rendered_widths_fit(&rendered, width, "table cjk");
+            assert_eq!(
+                rendered_text(&rendered).matches('界').count(),
+                80,
+                "width={width}: CJK table cell content lost"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_wrap_keeps_cjk_transcript_within_narrow_widths() {
+        // The seed cases cover 80/100/120; narrow terminals (resize / small
+        // panes) are the other half of #3488's terminal-width lane. A CJK
+        // transcript paragraph must still wrap inside tiny windows without
+        // overflowing the border or dropping content.
+        let text = "实时输出结果显示正常".repeat(6); // 60 Han glyphs, 120 cols
+        for &width in &[20usize, 40] {
+            let rendered = render_paragraph_for_test(&text, width);
+            assert_rendered_widths_fit(&rendered, width, "narrow cjk transcript");
+            assert_eq!(
+                rendered_text(&rendered),
+                text,
+                "width={width}: CJK transcript content changed while wrapping"
+            );
+        }
     }
 }

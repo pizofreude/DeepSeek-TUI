@@ -1,31 +1,36 @@
 //! Settings system - Persistent user preferences
 //!
-//! Settings are stored at ~/.config/deepseek/settings.toml
+//! Settings are stored at ~/.codewhale/settings.toml, with legacy fallbacks.
 //!
 //! TUI-specific preferences (theme, keybinds, font_size) that survive project
-//! switches are stored separately at ~/.deepseek/tui.toml. See [`TuiPrefs`].
+//! switches are stored separately in tui.toml. See [`TuiPrefs`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{expand_path, normalize_model_name};
+use crate::config::{ApiProvider, expand_path, normalize_model_name};
 use crate::localization::normalize_configured_locale;
 use crate::palette::{normalize_hex_rgb_color, normalize_theme_name};
 
+const SETTINGS_FILE_NAME: &str = "settings.toml";
+const TUI_PREFS_FILE_NAME: &str = "tui.toml";
+
 // ============================================================================
-// TuiPrefs — ~/.deepseek/tui.toml
+// TuiPrefs — ~/.codewhale/tui.toml
 // ============================================================================
 
 /// TUI-specific preferences that are decoupled from agent/project config so
 /// they survive project switches (issue #437).
 ///
-/// Stored at `~/.deepseek/tui.toml`. When the file is absent the values fall
-/// back to the `[tui]` section of the normal `config.toml` (via
-/// [`TuiPrefs::load`]), and then to the struct's own defaults.
+/// Stored at `~/.codewhale/tui.toml` on new installs, with
+/// `~/.deepseek/tui.toml` retained as a legacy read fallback. When the file is
+/// absent the values fall back to the `[tui]` section of the normal
+/// `config.toml` (via [`TuiPrefs::load`]), and then to the struct's own
+/// defaults.
 ///
-/// # Example `~/.deepseek/tui.toml`
+/// # Example `~/.codewhale/tui.toml`
 ///
 /// ```toml
 /// theme    = "dark"        # "system" | "dark" | "light" | "grayscale" | "catppuccin-mocha" | ...
@@ -89,7 +94,7 @@ pub struct KeybindPrefs {
 #[allow(dead_code)] // see TuiPrefs note above; deferred to a later settings pass (#657).
 impl TuiPrefs {
     /// Return the canonical path of the TUI preferences file:
-    /// `~/.deepseek/tui.toml`.
+    /// `~/.codewhale/tui.toml`, or legacy `~/.deepseek/tui.toml` when present.
     ///
     /// Tests may override the home directory through the
     /// `DEEPSEEK_CONFIG_PATH` environment variable (the parent directory of
@@ -107,12 +112,22 @@ impl TuiPrefs {
             }
         }
 
-        let home = dirs::home_dir()
-            .context("Failed to resolve home directory: cannot determine tui.toml path.")?;
-        Ok(home.join(".deepseek").join("tui.toml"))
+        let primary = codewhale_config::codewhale_home()
+            .ok()
+            .map(|home| home.join(TUI_PREFS_FILE_NAME));
+        if codewhale_config::codewhale_home_is_explicit() {
+            return primary.ok_or_else(|| {
+                anyhow::anyhow!("Failed to resolve tui.toml path: no CodeWhale home found.")
+            });
+        }
+        let legacy_home = codewhale_config::legacy_deepseek_home()
+            .ok()
+            .map(|home| home.join(TUI_PREFS_FILE_NAME));
+
+        resolve_tui_prefs_path_from_candidates(primary, legacy_home)
     }
 
-    /// Load TUI preferences from `~/.deepseek/tui.toml`.
+    /// Load TUI preferences from `~/.codewhale/tui.toml` or a legacy fallback.
     ///
     /// If the file does not exist the struct defaults are returned — no error
     /// is produced. Parse errors surface as `Err` so the caller can warn the
@@ -124,13 +139,18 @@ impl TuiPrefs {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read tui.toml from {}", path.display()))?;
-        let prefs: TuiPrefs = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse tui.toml from {}", path.display()))?;
+        let prefs: TuiPrefs = match toml::from_str(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to parse {} (using defaults): {e:#}", path.display());
+                return Ok(Self::default());
+            }
+        };
         Ok(prefs)
     }
 
-    /// Save TUI preferences to `~/.deepseek/tui.toml`, creating the
-    /// `~/.deepseek` directory if needed.
+    /// Save TUI preferences to `~/.codewhale/tui.toml` (or a legacy file when
+    /// it already exists), creating the target directory if needed.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
@@ -138,8 +158,18 @@ impl TuiPrefs {
                 format!("Failed to create config directory {}", parent.display())
             })?;
         }
-        let content = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
-        std::fs::write(&path, content)
+        let serialized = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
+        let body = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read tui.toml at {}", path.display()))?;
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge tui.toml comments, saving without them: {e:#}");
+                serialized
+            })
+        } else {
+            serialized
+        };
+        std::fs::write(&path, body)
             .with_context(|| format!("Failed to write tui.toml to {}", path.display()))?;
         Ok(())
     }
@@ -152,7 +182,7 @@ impl TuiPrefs {
         let theme = self.theme.trim().to_ascii_lowercase();
         let Some(theme) = normalize_theme_name(&theme) else {
             anyhow::bail!(
-                "Invalid tui.toml theme '{}': expected system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, or gruvbox-dark.",
+                "Invalid tui.toml theme '{}': expected system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, or solarized-light.",
                 self.theme
             );
         };
@@ -161,27 +191,56 @@ impl TuiPrefs {
     }
 }
 
+fn resolve_tui_prefs_path_from_candidates(
+    primary: Option<PathBuf>,
+    legacy_home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = primary.as_ref()
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    if let Some(path) = legacy_home.as_ref()
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    primary.or(legacy_home).ok_or_else(|| {
+        anyhow::anyhow!("Failed to resolve tui preferences path: no home directory found.")
+    })
+}
+
 /// User settings with defaults
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Auto-compact conversations when they approach the model limit.
     pub auto_compact: bool,
+    /// Context-window percentage that triggers pre-send auto-compaction when
+    /// `auto_compact` is enabled. The hard token floor still applies.
+    pub auto_compact_threshold_percent: f64,
     /// Reduce status noise and collapse details more aggressively
     pub calm_mode: bool,
-    /// Streaming pacing mode. `true` pins the chunker to one-character-per-
-    /// commit-tick (typewriter); `false` drains the upstream cadence (each
-    /// commit flushes everything queued, which matches V4-pro's burst pattern
-    /// when the prefix cache is warm). Has no effect on the footer water-spout
-    /// animation — that is gated independently by [`Self::fancy_animations`].
+    /// Dense tool-run collapse mode: compact, expanded, or calm.
+    pub tool_collapse_mode: String,
+    /// Reduce decorative motion. This must never synthesize model text speed;
+    /// streaming follows upstream deltas in both modes.
     pub low_motion: bool,
-    /// Enable the footer water-spout animation strip during live turns. The
-    /// strip's wave cadence is synchronized with the character-commit rate, so
-    /// the visual flow matches whatever streaming pacing [`Self::low_motion`]
-    /// selects: typewriter mode drips, upstream mode surges, tool calls /
-    /// planning pauses freeze the surface. Set `false` to keep the gap as
-    /// plain whitespace.
+    /// Enable expressive live-state motion. This affects chrome and state
+    /// affordances only; model text always follows upstream stream deltas.
     pub fancy_animations: bool,
+    /// Background treatment: `ombre` paints the terminal-native water column;
+    /// `flat` preserves all state marks on the theme's plain surface.
+    pub ocean_treatment: String,
+    /// Ocean Tasks / To-do / Workers rail placement: top, left, or right.
+    /// The lower edge remains owned by the composer and phase footer.
+    pub work_surface_placement: String,
+    /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
+    /// rates. Separate from accessibility motion and text delivery.
+    #[serde(skip)]
+    pub constrained_frame_rate: bool,
     /// Enable terminal bracketed-paste mode. Default true. Disable if your
     /// terminal mishandles the `\e[?2004h` escape (rare; some legacy
     /// terminals over SSH+screen multiplex without the cap).
@@ -189,6 +248,16 @@ pub struct Settings {
     /// Enable rapid-key paste-burst detection for terminals that do not emit
     /// bracketed-paste events. Independent from `bracketed_paste`.
     pub paste_burst_detection: bool,
+    /// Maximum number of file-mention popup candidates retained before the
+    /// composer renders its visible window. The widget paginates by terminal
+    /// height, so this is a data-side cap rather than a visible-row budget.
+    pub mention_menu_limit: usize,
+    /// Maximum workspace depth for `@`-mention completion walks. `0` means
+    /// unlimited depth; use with care in very large repositories.
+    pub mention_walk_depth: usize,
+    /// `@`-mention completion behavior: fuzzy workspace search or deterministic
+    /// directory browser.
+    pub mention_menu_behavior: String,
     /// Show thinking blocks from the model
     pub show_thinking: bool,
     /// Show detailed tool output
@@ -213,12 +282,20 @@ pub struct Settings {
     pub composer_vim_mode: String,
     /// Transcript spacing rhythm: compact, comfortable, spacious
     pub transcript_spacing: String,
-    /// Default mode: "agent", "plan", "yolo"
+    /// Show the pre-session launch menu. When false, Codewhale enters a new
+    /// session directly; resume remains available in-session.
+    #[serde(default)]
+    pub launch_screen: bool,
+    /// Default mode: "agent" or "plan". Legacy permission
+    /// shorthands are accepted for migration but never advertised as modes.
     pub default_mode: String,
     /// Sidebar width as percentage of terminal width
     pub sidebar_width_percent: u16,
-    /// Sidebar focus mode: auto, work, tasks, agents, context, hidden
+    /// Sidebar focus mode: pinned, auto, tasks, agents, context, hidden
     pub sidebar_focus: String,
+    /// Migration marker for users who explicitly opt into idle auto-collapse.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_auto_collapse_opt_in: bool,
     /// Enable the session-context panel (#504). Shows working set, tokens,
     /// cost, MCP/LSP status, cycle count, and memory info.
     pub context_panel: bool,
@@ -233,12 +310,18 @@ pub struct Settings {
     /// Default reasoning effort selected from the TUI model picker.
     /// `None` falls back to `config.toml` and then the runtime default.
     pub reasoning_effort: Option<String>,
+    /// TUI-only Shift+Tab posture: ask, auto-review, or full-access.
+    /// An explicit/managed `config.toml` approval policy always takes
+    /// precedence, so this preference cannot loosen project requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_posture: Option<String>,
     /// Per-provider model overrides. Key is provider name (e.g. "openai"),
     /// value is the model id. Takes precedence over `default_model`.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
     /// Header status indicator next to the effort chip. Cycles through a
     /// per-turn animation keyed off `App::turn_started_at`:
-    /// - `"whale"` (default): historical `🐳 → 🐋` 12-frame sequence
+    /// - `"cw"` (default): static typographic CodeWhale mark.
+    /// - `"whale"`: historical `🐳 → 🐋` 12-frame sequence
     ///   originally shipped in v0.3.5, removed in v0.8.x's "smoother TUI
     ///   streaming" pass, restored in v0.8.30. Idle frame is a steady `🐳`.
     /// - `"dots"`: the 6-frame geometric sequence (`◍ ◉ ◌ ◌ ◉ ◍`) that
@@ -273,28 +356,60 @@ pub struct Settings {
     /// `binary_unavailable` response with an install hint, matching the
     /// pre-v0.8.32 behavior.
     pub prefer_external_pdftotext: bool,
+    /// Follow symbolic links during workspace file discovery walks (`@`-mention
+    /// completion, fuzzy resolve, and the file-index builder). When `false`
+    /// (default) symlinked directories are skipped, which keeps walks fast and
+    /// avoids accidentally traversing into system paths. Set to `true` to
+    /// support symlink-based multi-project workspaces where several project
+    /// directories are symlinked into a single hub directory.
+    ///
+    /// **Note**: The walker has built-in cycle detection that skips already-
+    /// visited real paths, so symlink loops (A→B→A) will not cause infinite
+    /// recursion. However, enabling this on workspaces with symlinks that
+    /// point to large directory trees (e.g. `/usr`, home directories) can
+    /// significantly increase first-turn latency and memory usage.
+    pub workspace_follow_symlinks: bool,
+    /// One-time Fleet + Hotbar introduction has been shown. Drives a single
+    /// launch nudge (see `App::maybe_show_feature_intro`) so returning users
+    /// see it exactly once and never on subsequent launches.
+    pub feature_intro_shown: bool,
+    /// One-time YOLO deprecation toast has been shown. Suppresses the repeat
+    /// toast after the first sighting per install (persisted across sessions).
+    pub yolo_deprecation_shown: bool,
+    /// True only for the current load when `default_mode = "yolo"` was read
+    /// from an older settings file. App startup uses this provenance to migrate
+    /// the old bundled Full Access choice without weakening project or managed
+    /// approval policy. It is never written back to disk.
+    #[serde(skip)]
+    pub(crate) legacy_yolo_default: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // v0.8.11: default flipped to `false` to stop the engine from
-            // routinely rewriting the prompt prefix, which breaks DeepSeek
-            // V4's prefix cache (~90% discount on cached prefix tokens) and
-            // ends up costing more than the compaction itself saves. With
-            // V4's 1M-token window the user has plenty of headroom to run
-            // long sessions without auto-trimming, and the explicit
-            // `/compact` slash command + `auto_compact = on` opt-in remain
-            // available for users / agents that decide compaction is
-            // worth the cache hit on their workload (#664).
+            // Keep the persisted fallback `false`; startup code enables
+            // auto-compaction by known model window when the user has not saved
+            // an explicit preference. This preserves an explicit opt-out while
+            // making long-session continuity the default runtime behavior.
             auto_compact: false,
-            calm_mode: false,
+            auto_compact_threshold_percent: 80.0,
+            // #4095: default presentation is compact/calm; verbose detail is opt-in.
+            calm_mode: true,
+            tool_collapse_mode: "compact".to_string(),
             low_motion: false,
             fancy_animations: true,
+            ocean_treatment: "ombre".to_string(),
+            work_surface_placement: "top".to_string(),
+            constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
-            show_thinking: true,
-            show_tool_details: true,
+            mention_menu_limit: 128,
+            mention_walk_depth: 10,
+            mention_menu_behavior: "fuzzy".to_string(),
+            // Reasoning is useful when explicitly requested, but it should
+            // never displace the actual conversation in the default TUI.
+            show_thinking: false,
+            show_tool_details: false,
             locale: "auto".to_string(),
             theme: "system".to_string(),
             background_color: None,
@@ -302,60 +417,158 @@ impl Default for Settings {
             composer_border: true,
             composer_vim_mode: "normal".to_string(),
             transcript_spacing: "comfortable".to_string(),
+            launch_screen: false,
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
+            sidebar_auto_collapse_opt_in: true,
             context_panel: false,
             cost_currency: "usd".to_string(),
             max_input_history: 100,
             default_provider: None,
             default_model: None,
             reasoning_effort: None,
+            permission_posture: None,
             provider_models: None,
-            status_indicator: "whale".to_string(),
+            status_indicator: "cw".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
+            workspace_follow_symlinks: false,
+            feature_intro_shown: false,
+            yolo_deprecation_shown: false,
+            legacy_yolo_default: false,
         }
     }
 }
 
-impl Settings {
-    /// Get the settings file path
-    pub fn path() -> Result<PathBuf> {
-        // Allow tests to override the settings directory via the same env var
-        // used for config (DEEPSEEK_CONFIG_PATH points at config.toml; the
-        // settings file lives as a sibling in the same directory).
-        if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-            let config_path = config_path.trim();
-            if !config_path.is_empty() {
-                let p = expand_path(config_path);
-                if let Some(parent) = p.parent() {
-                    return Ok(parent.join("settings.toml"));
-                }
-            }
-        }
+/// The `calm` transcript preset (#3478): a coherent "beautiful/calm" bundle that
+/// favors a quiet, readable transcript over debug-dense output. Presentation
+/// only, and evidence-preserving — `show_thinking` is deliberately left untouched
+/// (thinking stays visible) and tool runs only have their inline detail
+/// collapsed, never hidden. Keyed by [`Settings::set`] names so the preset and a
+/// single-key `/config` set share one validation path.
+pub const CALM_PRESET_FIELDS: &[(&str, &str)] = &[
+    ("calm_mode", "true"),
+    ("tool_collapse", "calm"),
+    ("transcript_spacing", "compact"),
+    ("low_motion", "true"),
+    ("fancy_animations", "false"),
+    ("show_tool_details", "false"),
+];
 
-        let config_dir = dirs::config_dir()
-            .context("Failed to resolve config directory: not found.")?
-            .join("deepseek");
-        Ok(config_dir.join("settings.toml"))
+fn normalize_ocean_treatment(value: &str) -> &'static str {
+    if value.trim().eq_ignore_ascii_case("flat") {
+        "flat"
+    } else {
+        "ombre"
+    }
+}
+
+fn normalize_work_surface_placement(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => "left",
+        "right" => "right",
+        _ => "top",
+    }
+}
+
+/// The `(key, value)` fields a named preset applies, or `None` for an unknown
+/// name. Single source of truth shared by [`Settings::apply_preset`] and the
+/// `/config preset` command so the bundle is never defined twice.
+#[must_use]
+pub fn preset_fields(name: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "calm" => Some(CALM_PRESET_FIELDS),
+        _ => None,
+    }
+}
+
+impl Settings {
+    /// Get the canonical settings file path.
+    ///
+    /// New writes should target `~/.codewhale/settings.toml`. Legacy
+    /// DeepSeek-branded paths remain readable as fallbacks during load, but we
+    /// no longer surface them as the primary path in `/config`.
+    pub fn path() -> Result<PathBuf> {
+        let (primary, _legacy_home, legacy_config_dir) = settings_path_candidates();
+        primary.or(legacy_config_dir).ok_or_else(|| {
+            anyhow::anyhow!("Failed to resolve settings path: no config directory found.")
+        })
     }
 
     /// Load settings from disk, or return defaults if not found
     pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        let mut settings = if !path.exists() {
+        let mut settings = Self::load_persisted()?;
+        settings.apply_env_overrides();
+        Ok(settings)
+    }
+
+    /// Load the normalized values stored on disk without terminal/runtime
+    /// overlays. Configuration editors use this path so a value labelled
+    /// "saved" never silently reports a tmux, SSH, or accessibility override.
+    pub(crate) fn load_persisted() -> Result<Self> {
+        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        Self::load_persisted_from_candidates(primary, legacy_home, legacy_config_dir)
+    }
+
+    fn load_persisted_from_candidates(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        let write_path = primary
+            .as_ref()
+            .cloned()
+            .or_else(|| legacy_config_dir.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Failed to resolve settings path: no config directory found.")
+            })?;
+        let read_path =
+            resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
+                .unwrap_or_else(|_| write_path.clone());
+
+        let settings = if !read_path.exists() {
             Self::default()
         } else {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read settings from {}", path.display()))?;
-            let mut s: Settings = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse settings from {}", path.display()))?;
-            s.default_mode = normalize_mode(&s.default_mode).to_string();
+            let content = std::fs::read_to_string(&read_path)
+                .with_context(|| format!("Failed to read settings from {}", read_path.display()))?;
+            let mut s: Settings = match toml::from_str(&content) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse {} (using defaults): {e:#}",
+                        read_path.display()
+                    );
+                    Self::default()
+                }
+            };
+            // "yolo" used to bundle two independent choices: Agent mode and
+            // unrestricted approvals.  Keep that behavior on upgrade, but
+            // store/show the two choices explicitly so Settings does not claim
+            // the app starts in a fictional mode.
+            let legacy_yolo_default = s.default_mode.trim().eq_ignore_ascii_case("yolo");
+            s.legacy_yolo_default = legacy_yolo_default;
+            s.default_mode = if legacy_yolo_default {
+                "agent".to_string()
+            } else {
+                normalize_mode(&s.default_mode).to_string()
+            };
             s.composer_density = normalize_composer_density(&s.composer_density).to_string();
             s.transcript_spacing = normalize_transcript_spacing(&s.transcript_spacing).to_string();
+            s.tool_collapse_mode = normalize_tool_collapse_mode(&s.tool_collapse_mode).to_string();
             s.sidebar_focus = normalize_sidebar_focus(&s.sidebar_focus).to_string();
+            if s.sidebar_focus == "auto" && !s.sidebar_auto_collapse_opt_in {
+                // v0.8.62 wrote the surprising auto-collapse default into many
+                // full settings files. Treat unmarked saved "auto" as that
+                // legacy default so upgraded users get the sidebar back, while
+                // `/sidebar auto --save` and `/set sidebar_focus auto` below
+                // preserve an explicit opt-in from this release onward (#3328).
+                s.sidebar_focus = "pinned".to_string();
+            }
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
+            s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
+            s.work_surface_placement =
+                normalize_work_surface_placement(&s.work_surface_placement).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
             s.locale = normalize_configured_locale(&s.locale)
@@ -368,10 +581,45 @@ impl Settings {
                 .reasoning_effort
                 .as_deref()
                 .and_then(|value| normalize_reasoning_effort_setting(value).ok().flatten());
+            s.permission_posture = s
+                .permission_posture
+                .as_deref()
+                .and_then(normalize_permission_posture);
+            if legacy_yolo_default && s.permission_posture.is_none() {
+                s.permission_posture = Some("full-access".to_string());
+            }
             s
         };
-        settings.apply_env_overrides();
+        migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
         Ok(settings)
+    }
+
+    /// Whether this load normalized a legacy `default_mode = "yolo"` value.
+    ///
+    /// This is migration provenance, not a user-facing mode. New writes accept
+    /// only Agent or Plan and serialize the independent permission posture.
+    pub(crate) fn legacy_yolo_default_detected(&self) -> bool {
+        self.legacy_yolo_default
+    }
+
+    /// Whether the user explicitly persisted an `auto_compact` preference.
+    /// When absent, callers may choose a model-aware default.
+    pub fn auto_compact_explicitly_configured() -> bool {
+        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        let Ok(path) =
+            resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
+        else {
+            return false;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+            return false;
+        };
+        value
+            .as_table()
+            .is_some_and(|table| table.contains_key("auto_compact"))
     }
 
     /// Apply environment-driven overlays after disk load. Used for
@@ -384,20 +632,26 @@ impl Settings {
             self.low_motion = true;
             self.fancy_animations = false;
         }
-        // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (TERM_PROGRAM=ghostty,
-        // #1445), and a few VTE terminals (#1470) produce visible flicker at
-        // 120 FPS. Drop to the 30 FPS low-motion cap for them automatically.
+        // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (#1445), and a few
+        // VTE terminals (#1470) produce visible flicker at 120 FPS. Cap their
+        // redraw rate without changing motion semantics or model text pacing.
+        // Ghostty may report
+        // either TERM_PROGRAM=Ghostty/ghostty or TERM=xterm-ghostty.
         // Like NO_ANIMATIONS above, this unconditionally overrides any
         // disk-loaded value — consistent precedence: env signals always win.
-        let vte_env_forces_low_motion = std::env::var_os("TILIX_ID").is_some_and(|v| !v.is_empty())
+        let term_program = std::env::var("TERM_PROGRAM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term = std::env::var("TERM")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let term_constrains_frame_rate =
+            matches!(term_program.as_str(), "vscode" | "ghostty") || term.contains("ghostty");
+        let vte_env_constrains_frame_rate = std::env::var_os("TILIX_ID")
+            .is_some_and(|v| !v.is_empty())
             || std::env::var_os("TERMINATOR_UUID").is_some_and(|v| !v.is_empty());
-        if matches!(
-            std::env::var("TERM_PROGRAM").as_deref(),
-            Ok("vscode") | Ok("ghostty")
-        ) || vte_env_forces_low_motion
-        {
-            self.low_motion = true;
-            self.fancy_animations = false;
+        if term_constrains_frame_rate || vte_env_constrains_frame_rate {
+            self.constrained_frame_rate = true;
         }
 
         // Termius (TERM_PROGRAM=Termius) and SSH sessions exhibit the
@@ -419,13 +673,13 @@ impl Settings {
             self.fancy_animations = false;
         }
 
-        // tmux/screen activity monitors treat purely animated redraws as
-        // activity. Keep multiplexer sessions calm by pinning animations.
+        // Multiplexers need a bounded redraw rate, not a different product.
+        // Preserve authored motion and let the frame limiter protect tmux /
+        // screen; NO_ANIMATIONS remains the explicit hard-off contract.
         let in_terminal_multiplexer = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty())
             || std::env::var_os("STY").is_some_and(|v| !v.is_empty());
         if in_terminal_multiplexer {
-            self.low_motion = true;
-            self.fancy_animations = false;
+            self.constrained_frame_rate = true;
         }
 
         // Plain Windows PowerShell / cmd.exe under legacy ConHost exposes none
@@ -454,8 +708,8 @@ impl Settings {
         //
         // Only flip `auto` to `off`; respect an explicit `"on"` so users
         // who upgrade Ptyxis or want to confirm the fix landed upstream
-        // can override the heuristic from `~/.config/deepseek/settings.toml`
-        // or `/set synchronized_output on`.
+        // can override the heuristic from the persisted settings.toml or
+        // `/set synchronized_output on`.
         if self.synchronized_output.eq_ignore_ascii_case("auto") && detected_ptyxis_terminal() {
             self.synchronized_output = "off".to_string();
         }
@@ -472,10 +726,26 @@ impl Settings {
             })?;
         }
 
-        let content = toml::to_string_pretty(self).context("Failed to serialize settings")?;
-        std::fs::write(&path, content)
+        let serialized = toml::to_string_pretty(self).context("Failed to serialize settings")?;
+        let body = if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read settings at {}", path.display()))?;
+            codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
+                tracing::warn!("failed to merge settings comments, saving without them: {e:#}");
+                serialized
+            })
+        } else {
+            serialized
+        };
+        std::fs::write(&path, body)
             .with_context(|| format!("Failed to write settings to {}", path.display()))?;
         Ok(())
+    }
+
+    /// Update and persist sidebar width percentage (10-50) — used by the
+    /// drag-to-resize handle in the TUI.
+    pub fn update_sidebar_width(&mut self, percent: u16) {
+        self.sidebar_width_percent = percent.clamp(10, 50);
     }
 
     /// Set a single setting by key
@@ -484,8 +754,21 @@ impl Settings {
             "auto_compact" | "compact" => {
                 self.auto_compact = parse_bool(value)?;
             }
+            "auto_compact_threshold" | "auto_compact_threshold_percent" => {
+                self.auto_compact_threshold_percent =
+                    parse_percent_setting("auto_compact_threshold_percent", value)?;
+            }
             "calm_mode" | "calm" => {
                 self.calm_mode = parse_bool(value)?;
+            }
+            "tool_collapse" | "tool_collapse_mode" | "collapse" => {
+                let normalized = normalize_tool_collapse_mode(value);
+                if !matches!(normalized, "compact" | "expanded" | "calm") {
+                    return Err(anyhow::anyhow!(
+                        "Failed to update setting: invalid tool collapse mode '{value}'. Expected: compact, expanded, or calm."
+                    ));
+                }
+                self.tool_collapse_mode = normalized.to_string();
             }
             "low_motion" | "motion" => {
                 self.low_motion = parse_bool(value)?;
@@ -493,11 +776,38 @@ impl Settings {
             "fancy_animations" | "fancy" | "animations" => {
                 self.fancy_animations = parse_bool(value)?;
             }
+            "ocean_treatment" | "treatment" | "background_treatment" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "ombre" | "flat") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid ocean treatment '{value}'. Expected: ombre or flat."
+                    );
+                }
+                self.ocean_treatment = normalized;
+            }
+            "work_surface_placement" | "work_surface" | "work_rail" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "top" | "left" | "right") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid work surface placement '{value}'. Expected: top, left, or right."
+                    );
+                }
+                self.work_surface_placement = normalized;
+            }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
             }
             "paste_burst_detection" | "paste_burst" => {
                 self.paste_burst_detection = parse_bool(value)?;
+            }
+            "mention_menu_limit" | "mention_limit" => {
+                self.mention_menu_limit = parse_usize_setting("mention_menu_limit", value)?;
+            }
+            "mention_walk_depth" | "mention_depth" | "completions_walk_depth" => {
+                self.mention_walk_depth = parse_usize_setting("mention_walk_depth", value)?;
+            }
+            "mention_menu_behavior" | "mention_behavior" | "mention_menu" => {
+                self.mention_menu_behavior = normalize_mention_menu_behavior(value)?;
             }
             "show_thinking" | "thinking" => {
                 self.show_thinking = parse_bool(value)?;
@@ -508,7 +818,8 @@ impl Settings {
             "locale" | "language" => {
                 let Some(locale) = normalize_configured_locale(value) else {
                     anyhow::bail!(
-                        "Failed to update setting: invalid locale '{value}'. Expected: auto, en, ja, zh-Hans, pt-BR, es-419."
+                        "Failed to update setting: invalid locale '{value}'. Expected: {}.",
+                        crate::localization::configured_locale_values(", ")
                     );
                 };
                 self.locale = locale.to_string();
@@ -516,7 +827,7 @@ impl Settings {
             "theme" => {
                 let Some(id) = crate::palette::ThemeId::from_name(value) else {
                     anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark."
+                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
                     );
                 };
                 self.theme = id.name().to_string();
@@ -524,7 +835,7 @@ impl Settings {
             "ui_theme" => {
                 let Some(id) = crate::palette::ThemeId::from_name(value) else {
                     anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark."
+                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
                     );
                 };
                 self.theme = id.name().to_string();
@@ -562,11 +873,14 @@ impl Settings {
                 }
                 self.transcript_spacing = normalized.to_string();
             }
+            "launch_screen" | "launch" => {
+                self.launch_screen = parse_bool(value)?;
+            }
             "status_indicator" | "indicator" => {
                 let normalized = normalize_status_indicator(value);
-                if !["whale", "dots", "off"].contains(&normalized) {
+                if !["cw", "whale", "dots", "off"].contains(&normalized) {
                     anyhow::bail!(
-                        "Failed to update setting: invalid status indicator '{value}'. Expected: whale, dots, off."
+                        "Failed to update setting: invalid status indicator '{value}'. Expected: cw, whale, dots, off."
                     );
                 }
                 self.status_indicator = normalized.to_string();
@@ -583,14 +897,20 @@ impl Settings {
             "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => {
                 self.prefer_external_pdftotext = parse_bool(value)?;
             }
+            "workspace_follow_symlinks" | "follow_symlinks" => {
+                self.workspace_follow_symlinks = parse_bool(value)?;
+            }
             "default_mode" | "mode" => {
-                let normalized = normalize_mode(value);
-                if !["agent", "plan", "yolo"].contains(&normalized) {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: agent, plan, yolo."
-                    );
-                }
-                self.default_mode = normalized.to_string();
+                // Loading remains deliberately liberal so old `operate` and
+                // `yolo` files migrate safely. New writes are strict: these
+                // are session actions/permission aliases, not startup modes.
+                self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "agent" | "normal" => "agent".to_string(),
+                    "plan" => "plan".to_string(),
+                    _ => anyhow::bail!(
+                        "Failed to update setting: invalid mode '{value}'. Expected: agent or plan."
+                    ),
+                };
             }
             "sidebar_width" | "sidebar" => {
                 let width: u16 = value
@@ -610,18 +930,20 @@ impl Settings {
             "sidebar_focus" | "focus" => {
                 let normalized = match value.trim().to_ascii_lowercase().as_str() {
                     "auto" => "auto",
-                    "work" | "plan" | "todos" => "work",
-                    "tasks" => "tasks",
+                    "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
+                    // Persist as "tasks"; user-facing panel label is Activity (#4147/#4135).
+                    "tasks" | "activity" | "live" | "running" => "tasks",
                     "agents" | "subagents" | "sub-agents" => "agents",
                     "context" | "session" => "context",
                     "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
                     _ => {
                         anyhow::bail!(
-                            "Failed to update setting: invalid sidebar focus '{value}'. Expected: auto, work, tasks, agents, context, hidden."
+                            "Failed to update setting: invalid sidebar focus '{value}'. Expected: pinned, auto, activity (tasks), agents, context, hidden."
                         )
                     }
                 };
                 self.sidebar_focus = normalized.to_string();
+                self.sidebar_auto_collapse_opt_in = normalized == "auto";
             }
             "context_panel" | "context" | "session_panel" => {
                 self.context_panel = parse_bool(value)?;
@@ -668,11 +990,43 @@ impl Settings {
             "reasoning_effort" | "effort" => {
                 self.reasoning_effort = normalize_reasoning_effort_setting(value)?;
             }
+            "permission_posture" | "permissions" => {
+                self.permission_posture = normalize_permission_posture(value);
+                if self.permission_posture.is_none() {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid permission posture '{value}'. Expected: ask, auto-review, or full-access."
+                    );
+                }
+            }
             _ => {
                 anyhow::bail!("Failed to update setting: unknown setting '{key}'.");
             }
         }
         Ok(())
+    }
+
+    /// Apply a named settings preset (#3478).
+    ///
+    /// Presets are the first bundled-settings mechanism: a single name applies a
+    /// coherent group of presentation knobs. `calm` is the "beautiful/calm
+    /// transcript" preset — it quiets motion and verbose tool output while
+    /// **keeping evidence reachable**: thinking stays visible and tool runs stay
+    /// expandable (only their inline detail is collapsed), so maintainer/release
+    /// work is never blind to failures. Presentation only — no model, provider,
+    /// routing, or safety setting is touched. Reuses [`Settings::set`] so each
+    /// field goes through the same validation as a single-key set.
+    ///
+    /// Returns the keys changed, or an error for an unknown preset.
+    pub fn apply_preset(&mut self, name: &str) -> Result<Vec<&'static str>> {
+        let Some(bundle) = preset_fields(name) else {
+            anyhow::bail!("Unknown preset '{}'. Available presets: calm", name.trim());
+        };
+        let mut changed = Vec::with_capacity(bundle.len());
+        for (key, value) in bundle {
+            self.set(key, value)?;
+            changed.push(*key);
+        }
+        Ok(changed)
     }
 
     /// Get all settings as a displayable string
@@ -682,13 +1036,29 @@ impl Settings {
         lines.push(tr(locale, MessageId::SettingsTitle).to_string());
         lines.push("─────────────────────────────".to_string());
         lines.push(format!("  auto_compact:       {}", self.auto_compact));
+        lines.push(format!(
+            "  auto_compact_pct:   {:.0}",
+            self.auto_compact_threshold_percent
+        ));
         lines.push(format!("  calm_mode:          {}", self.calm_mode));
+        lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
+        lines.push(format!("  ocean_treatment:    {}", self.ocean_treatment));
+        lines.push(format!(
+            "  work_surface:       {}",
+            self.work_surface_placement
+        ));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
             self.paste_burst_detection
+        ));
+        lines.push(format!("  mention_menu_limit: {}", self.mention_menu_limit));
+        lines.push(format!("  mention_walk_depth: {}", self.mention_walk_depth));
+        lines.push(format!(
+            "  mention_behavior:   {}",
+            self.mention_menu_behavior
         ));
         lines.push(format!("  show_thinking:      {}", self.show_thinking));
         lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
@@ -711,7 +1081,12 @@ impl Settings {
             "  prefer_external_pdftotext: {}",
             self.prefer_external_pdftotext
         ));
+        lines.push(format!(
+            "  workspace_follow_symlinks: {}",
+            self.workspace_follow_symlinks
+        ));
         lines.push(format!("  default_mode:       {}", self.default_mode));
+        lines.push(format!("  launch_screen:      {}", self.launch_screen));
         lines.push(format!(
             "  sidebar_width:      {}%",
             self.sidebar_width_percent
@@ -730,6 +1105,12 @@ impl Settings {
                 .as_deref()
                 .unwrap_or("(config/default)")
         ));
+        lines.push(format!(
+            "  permission_posture: {}",
+            self.permission_posture
+                .as_deref()
+                .unwrap_or("(config/default)")
+        ));
         lines.push(String::new());
         lines.push(format!(
             "{} {}",
@@ -745,16 +1126,29 @@ impl Settings {
         vec![
             (
                 "auto_compact",
-                "Auto-compact near the hard context limit: on/off (default off)",
+                "Auto-compact near the hard context limit: on/off (model-aware default)",
+            ),
+            (
+                "auto_compact_threshold_percent",
+                "Auto-compact trigger threshold percent when auto_compact is on: 10-100 (default 80)",
             ),
             ("calm_mode", "Calmer UI defaults: on/off"),
             (
-                "low_motion",
-                "Streaming pacing: on = typewriter (one char/tick), off = upstream cadence",
+                "tool_collapse",
+                "Dense tool-run collapse mode: collapsed (alias compact), expanded, calm",
             ),
             (
-                "fancy_animations",
-                "Footer water-spout strip (wave synced to typing speed): on/off",
+                "low_motion",
+                "Reduce decorative motion without changing model text delivery: on/off",
+            ),
+            ("fancy_animations", "Expressive live-state motion: on/off"),
+            (
+                "ocean_treatment",
+                "Transcript background treatment: ombre/flat (independent of motion)",
+            ),
+            (
+                "work_surface_placement",
+                "Ocean Tasks/To-do/Workers rail placement: top/left/right",
             ),
             (
                 "bracketed_paste",
@@ -764,15 +1158,31 @@ impl Settings {
                 "paste_burst_detection",
                 "Fallback rapid-key paste detection: on/off",
             ),
+            (
+                "mention_menu_limit",
+                "Maximum @-mention popup candidates retained before rendering (default 128)",
+            ),
+            (
+                "mention_walk_depth",
+                "Maximum @-mention workspace walk depth; 0 means unlimited (default 6)",
+            ),
+            (
+                "mention_menu_behavior",
+                "@-mention completion behavior: fuzzy/browser (default fuzzy)",
+            ),
             ("show_thinking", "Show model thinking: on/off"),
             ("show_tool_details", "Show detailed tool output: on/off"),
+            (
+                "base_url",
+                "HTTP base URL for DeepSeek-compatible endpoints.",
+            ),
             (
                 "locale",
                 "UI locale and default model language: auto, en, ja, zh-Hans, pt-BR, es-419",
             ),
             (
                 "theme",
-                "UI theme: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark",
+                "UI theme: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light",
             ),
             (
                 "background_color",
@@ -792,8 +1202,12 @@ impl Settings {
                 "Transcript spacing: compact, comfortable, spacious",
             ),
             (
+                "launch_screen",
+                "Show the pre-session launch menu on startup: on/off",
+            ),
+            (
                 "status_indicator",
-                "Header status indicator next to effort chip: whale, dots, off",
+                "Header status indicator next to effort chip: cw, whale, dots, off",
             ),
             (
                 "synchronized_output",
@@ -803,11 +1217,15 @@ impl Settings {
                 "prefer_external_pdftotext",
                 "Route PDF reads through Poppler's pdftotext instead of the bundled pure-Rust extractor: on/off (default off)",
             ),
-            ("default_mode", "Default mode: agent, plan, yolo"),
+            (
+                "workspace_follow_symlinks",
+                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
+            ),
+            ("default_mode", "Default mode: agent or plan"),
             ("sidebar_width", "Sidebar width percentage: 10-50"),
             (
                 "sidebar_focus",
-                "Sidebar focus: auto, work, tasks, agents, context, hidden",
+                "Sidebar focus: auto, work, activity (tasks), agents, context, hidden",
             ),
             (
                 "context_panel",
@@ -833,6 +1251,60 @@ impl Settings {
             .insert(provider.to_string(), model.to_string());
     }
 
+    /// Persist a provider's model selection.
+    ///
+    /// `persist_as_default` controls the blast radius (#3227):
+    ///
+    /// - `false` (session-local, the default for `/model` and the model
+    ///   picker): record the model only under that provider's scoped entry in
+    ///   [`Self::provider_models`]. The shared `default_provider` and global
+    ///   `default_model` are left untouched, so a model change in one terminal
+    ///   no longer rewrites the global default that a second terminal reads on
+    ///   startup. This is what stopped a GLM/Z.ai session from being dragged
+    ///   onto a DeepSeek model (and vice-versa).
+    /// - `true` (explicit "save as default"): also pin `default_provider`, and
+    ///   for DeepSeek providers the global `default_model`, to this tuple.
+    pub fn set_provider_model_selection(
+        &mut self,
+        provider: ApiProvider,
+        model: &str,
+        persist_as_default: bool,
+    ) -> Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("model cannot be empty");
+        }
+        self.set_model_for_provider(provider.as_str(), model);
+        if persist_as_default {
+            self.default_provider = Some(provider.as_str().to_string());
+            if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+                self.set("default_model", model)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load, update, and save a provider's model selection *without* touching
+    /// the shared global default (the session-local path; see
+    /// [`Self::set_provider_model_selection`]).
+    pub fn persist_provider_model_selection(provider: ApiProvider, model: &str) -> Result<()> {
+        let mut settings = Self::load()?;
+        settings.set_provider_model_selection(provider, model, false)?;
+        settings.save()
+    }
+
+    /// Load, update, and save a provider/model tuple as the global default
+    /// (the explicit "save as default" path).
+    #[allow(dead_code)] // wired to an explicit save-as-default action in a later UX pass (#3227).
+    pub fn persist_provider_model_selection_as_default(
+        provider: ApiProvider,
+        model: &str,
+    ) -> Result<()> {
+        let mut settings = Self::load()?;
+        settings.set_provider_model_selection(provider, model, true)?;
+        settings.save()
+    }
+
     /// Resolved boolean for whether the renderer should wrap each frame in
     /// DEC mode 2026 synchronized output. `auto` and `on` enable; `off`
     /// disables. The `auto` → `off` flip for known-bad terminals happens
@@ -842,6 +1314,101 @@ impl Settings {
     pub fn synchronized_output_enabled(&self) -> bool {
         !self.synchronized_output.eq_ignore_ascii_case("off")
     }
+
+    /// Runtime bracketed-paste mode after terminal-host quirks are applied.
+    ///
+    /// This deliberately does not mutate [`Settings::bracketed_paste`]:
+    /// `apply_env_overrides()` can run before saving settings, and a legacy
+    /// conhost runtime fallback must not permanently disable bracketed paste
+    /// when the same config is later used in Windows Terminal or another
+    /// modern terminal.
+    #[must_use]
+    pub fn effective_bracketed_paste(&self) -> bool {
+        self.bracketed_paste && !detected_legacy_windows_console_host()
+    }
+}
+
+fn resolve_settings_path_from_candidates(
+    primary: Option<PathBuf>,
+    legacy_home: Option<PathBuf>,
+    legacy_config_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = primary.as_ref()
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    if let Some(path) = legacy_home
+        && path.exists()
+    {
+        return Ok(path);
+    }
+
+    if let Some(path) = legacy_config_dir.as_ref()
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    primary.or(legacy_config_dir).ok_or_else(|| {
+        anyhow::anyhow!("Failed to resolve settings path: no config directory found.")
+    })
+}
+
+fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    // Allow tests to override the settings directory via the same env var
+    // used for config (DEEPSEEK_CONFIG_PATH points at config.toml; the
+    // settings file lives as a sibling in the same directory).
+    if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
+        let config_path = config_path.trim();
+        if !config_path.is_empty() {
+            let p = expand_path(config_path);
+            if let Some(parent) = p.parent() {
+                return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
+            }
+        }
+    }
+
+    let primary = codewhale_config::codewhale_home()
+        .ok()
+        .map(|home| home.join(SETTINGS_FILE_NAME));
+    if codewhale_config::codewhale_home_is_explicit() {
+        return (primary, None, None);
+    }
+    let legacy_home = codewhale_config::legacy_deepseek_home()
+        .ok()
+        .map(|home| home.join(SETTINGS_FILE_NAME));
+    let legacy_config_dir =
+        dirs::config_dir().map(|dir| dir.join("deepseek").join(SETTINGS_FILE_NAME));
+
+    (primary, legacy_home, legacy_config_dir)
+}
+
+fn migrate_settings_file_to_primary_if_needed(primary: &Path, active_read_path: &Path) {
+    if primary == active_read_path || primary.exists() || !active_read_path.exists() {
+        return;
+    }
+
+    let Some(parent) = primary.parent() else {
+        return;
+    };
+
+    if let Err(err) = std::fs::create_dir_all(parent) {
+        tracing::warn!(
+            "failed to create settings migration directory {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+
+    if let Err(err) = std::fs::copy(active_read_path, primary) {
+        tracing::warn!(
+            "failed to migrate settings from {} to {}: {err}",
+            active_read_path.display(),
+            primary.display()
+        );
+    }
 }
 
 fn normalize_default_model(value: &str) -> Option<String> {
@@ -850,6 +1417,15 @@ fn normalize_default_model(value: &str) -> Option<String> {
         Some("auto".to_string())
     } else {
         normalize_model_name(trimmed)
+    }
+}
+
+fn normalize_permission_posture(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ask" | "suggest" | "on-request" | "untrusted" => Some("ask".to_string()),
+        "auto" | "auto-review" | "auto_review" => Some("auto-review".to_string()),
+        "full" | "full-access" | "full_access" | "bypass" => Some("full-access".to_string()),
+        _ => None,
     }
 }
 
@@ -870,10 +1446,10 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
         "medium" | "mid" => "medium",
         "high" => "high",
         "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" => "max",
+        "max" | "maximum" | "xhigh" | "ultracode" => "max",
         _ => {
             anyhow::bail!(
-                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, or default."
+                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, xhigh, ultracode, or default."
             );
         }
     };
@@ -891,13 +1467,53 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_usize_setting(key: &str, value: &str) -> Result<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to update setting: invalid {key} '{value}'. Expected 0 or a positive integer."
+        )
+    })
+}
+
+fn parse_percent_setting(key: &str, value: &str) -> Result<f64> {
+    let trimmed = value.trim().trim_end_matches('%').trim();
+    let percent = trimmed.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "Failed to update setting: invalid {key} '{value}'. Expected a number from 10 to 100."
+        )
+    })?;
+    if !(10.0..=100.0).contains(&percent) {
+        anyhow::bail!(
+            "Failed to update setting: invalid {key} '{value}'. Expected a number from 10 to 100."
+        );
+    }
+    Ok(percent)
+}
+
+fn normalize_mention_menu_behavior(value: &str) -> Result<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fuzzy" | "default" => Ok("fuzzy".to_string()),
+        "browser" | "browse" | "file-browser" | "file_browser" => Ok("browser".to_string()),
+        _ => {
+            anyhow::bail!(
+                "Failed to update setting: invalid mention_menu_behavior '{value}'. Expected: fuzzy, browser."
+            )
+        }
+    }
+}
+
 fn normalize_mode(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "edit" => "agent",
         "normal" => "agent",
         "agent" => "agent",
         "plan" => "plan",
-        "yolo" => "yolo",
+        // Operate is a session action, not a startup personality. Old saved
+        // values fall back to the safe general-purpose Agent startup mode.
+        "operate" | "operation" | "ops" => "agent",
+        // Kept as a migration input in `load_persisted`; new settings never
+        // advertise it as a mode because permission posture is separate.
+        "yolo" => "agent",
         _ => value,
     }
 }
@@ -920,12 +1536,22 @@ fn normalize_transcript_spacing(value: &str) -> &str {
     }
 }
 
+fn normalize_tool_collapse_mode(value: &str) -> &str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compact" | "collapsed" | "collapse" | "default" | "on" | "true" => "compact",
+        "expanded" | "expand" | "off" | "none" | "false" => "expanded",
+        "calm" | "calm_mode" | "calm-mode" | "calm_only" | "calm-only" => "calm",
+        _ => value,
+    }
+}
+
 /// Normalize the `status_indicator` header chip setting. Accepts the
 /// canonical names plus common aliases ("none"/"hidden" → "off",
 /// "dot" → "dots"). Unknown values fall through unchanged so the parser
 /// in `update_setting` can surface a clear error.
 fn normalize_status_indicator(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
+        "cw" | "mark" | "text" => "cw",
         "whale" | "🐳" | "🐋" => "whale",
         "dots" | "dot" => "dots",
         "off" | "none" | "hidden" | "false" => "off",
@@ -1025,13 +1651,17 @@ fn normalize_background_color_setting(value: &str) -> Result<Option<String>> {
 
 fn normalize_sidebar_focus(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
-        "work" | "plan" | "todos" => "work",
-        "tasks" => "tasks",
+        "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
+        "tasks" | "activity" | "live" | "running" => "tasks",
         "agents" | "subagents" | "sub-agents" => "agents",
         "context" | "session" => "context",
         "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
         _ => "auto",
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Resolve an environment variable as a boolean. Recognises the
@@ -1053,15 +1683,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_disable_auto_compact_to_protect_v4_prefix_cache() {
+    fn ocean_treatment_is_appearance_not_motion() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.ocean_treatment, "ombre");
+        assert!(!settings.low_motion);
+
+        settings.set("ocean_treatment", "flat").unwrap();
+        assert_eq!(settings.ocean_treatment, "flat");
+        assert!(!settings.low_motion, "appearance must not change motion");
+
+        let err = settings.set("ocean_treatment", "kelp").unwrap_err();
+        assert!(err.to_string().contains("ombre or flat"));
+    }
+
+    #[test]
+    fn work_surface_placement_persists_only_top_left_or_right() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.work_surface_placement, "top");
+
+        for placement in ["left", "right", "top"] {
+            settings
+                .set("work_surface_placement", placement)
+                .expect("valid placement");
+            assert_eq!(settings.work_surface_placement, placement);
+            let body = toml::to_string(&settings).expect("serialize settings");
+            let restored: Settings = toml::from_str(&body).expect("restore settings");
+            assert_eq!(restored.work_surface_placement, placement);
+        }
+
+        let err = settings
+            .set("work_surface_placement", "bottom")
+            .expect_err("bottom is owned by composer/footer");
+        assert!(err.to_string().contains("top, left, or right"));
+        assert_eq!(settings.work_surface_placement, "top");
+    }
+
+    /// Explicit animated baseline for env-force tests (#4095 flipped defaults to calm).
+    fn animated_settings() -> Settings {
+        Settings {
+            calm_mode: false,
+            low_motion: false,
+            fancy_animations: true,
+            show_tool_details: true,
+            transcript_spacing: "comfortable".to_string(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn apply_preset_calm_sets_bundle_and_preserves_evidence() {
+        let mut settings = Settings::default();
+        // Density is calm by default; motion is an independent axis.
+        assert!(settings.calm_mode);
+        assert!(!settings.show_thinking);
+
+        let changed = settings.apply_preset("CALM").expect("calm preset applies");
+        assert_eq!(
+            changed,
+            CALM_PRESET_FIELDS
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+        );
+
+        assert!(settings.calm_mode);
+        assert_eq!(settings.tool_collapse_mode, "calm");
+        assert_eq!(settings.transcript_spacing, "compact");
+        assert!(settings.low_motion);
+        assert!(!settings.fancy_animations);
+        assert!(!settings.show_tool_details);
+        // Calm does not override the user's reasoning preference.
+        assert!(!settings.show_thinking);
+    }
+
+    #[test]
+    fn default_settings_use_comfortable_transcript_spacing() {
         let settings = Settings::default();
-        // v0.8.11: default is `false` to stop the engine from routinely
-        // rewriting the prompt prefix, which breaks V4's prefix-cache
-        // discount. The explicit `/compact` command and the
-        // `auto_compact = on` opt-in stay available; the default is
-        // flipped so the cache-friendly path is the one users get
-        // without configuring anything (#664).
+        assert!(settings.calm_mode);
+        assert!(!settings.show_tool_details);
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
+        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert_eq!(settings.tool_collapse_mode, "compact");
+        // Thinking is opt-in so the transcript stays focused on the chat.
+        assert!(!settings.show_thinking);
+    }
+
+    #[test]
+    fn apply_preset_rejects_unknown_name() {
+        let mut settings = Settings::default();
+        let err = settings.apply_preset("turbo").expect_err("unknown preset");
+        assert!(err.to_string().contains("Unknown preset"));
+        assert!(preset_fields("calm").is_some());
+        assert!(preset_fields("turbo").is_none());
+    }
+
+    #[test]
+    fn default_settings_keep_auto_compact_as_unset_fallback() {
+        let settings = Settings::default();
+        // The persisted fallback remains false so a missing settings file does
+        // not look like an explicit user preference. Startup resolves the
+        // runtime default from the active model window unless the file contains
+        // `auto_compact`.
         assert!(!settings.auto_compact);
+        assert_eq!(settings.auto_compact_threshold_percent, 80.0);
     }
 
     #[test]
@@ -1074,9 +1799,51 @@ mod tests {
     }
 
     #[test]
+    fn auto_compact_threshold_is_validated() {
+        let mut settings = Settings::default();
+        settings
+            .set("auto_compact_threshold", "65%")
+            .expect("threshold");
+        assert_eq!(settings.auto_compact_threshold_percent, 65.0);
+        assert!(settings.set("auto_compact_threshold", "9").is_err());
+        assert!(settings.set("auto_compact_threshold", "101").is_err());
+    }
+
+    #[test]
     fn default_settings_show_footer_water_strip() {
         let settings = Settings::default();
-        assert!(settings.fancy_animations);
+        assert!(
+            settings.fancy_animations,
+            "underwater presentation is the default"
+        );
+        assert!(!settings.low_motion);
+        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert!(
+            !settings.launch_screen,
+            "returning users enter a session directly"
+        );
+    }
+
+    #[test]
+    fn default_settings_keep_the_water_field_open_until_inspection_is_needed() {
+        let settings = Settings::default();
+        assert_eq!(settings.sidebar_focus, "auto");
+        assert!(settings.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
+    fn sidebar_auto_opt_in_marker_is_serialized_only_when_enabled() {
+        let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
+        assert!(default_body.contains("sidebar_auto_collapse_opt_in = true"));
+
+        let mut settings = Settings::default();
+        settings
+            .set("sidebar_focus", "auto")
+            .expect("enable auto collapse");
+
+        let auto_body = toml::to_string_pretty(&settings).expect("serialize");
+        assert!(auto_body.contains("sidebar_focus = \"auto\""));
+        assert!(auto_body.contains("sidebar_auto_collapse_opt_in = true"));
     }
 
     #[test]
@@ -1085,6 +1852,10 @@ mod tests {
         settings
             .set("reasoning_effort", "xhigh")
             .expect("normalize xhigh");
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
+        settings
+            .set("reasoning_effort", "ultracode")
+            .expect("normalize ultracode");
         assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
         settings
             .set("reasoning_effort", "default")
@@ -1109,6 +1880,38 @@ mod tests {
             .expect("disable bracketed paste");
         assert!(!settings.bracketed_paste);
         assert!(!settings.paste_burst_detection);
+    }
+
+    #[test]
+    fn mention_completion_caps_are_configurable() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.mention_menu_limit, 128);
+        assert_eq!(settings.mention_walk_depth, 10);
+        assert_eq!(settings.mention_menu_behavior, "fuzzy");
+
+        settings
+            .set("mention_menu_limit", "256")
+            .expect("set mention menu limit");
+        settings
+            .set("mention_walk_depth", "0")
+            .expect("allow unlimited walk depth");
+        settings
+            .set("mention_menu_behavior", "browser")
+            .expect("set mention menu behavior");
+
+        assert_eq!(settings.mention_menu_limit, 256);
+        assert_eq!(settings.mention_walk_depth, 0);
+        assert_eq!(settings.mention_menu_behavior, "browser");
+
+        let err = settings
+            .set("mention_walk_depth", "deep")
+            .expect_err("non-numeric depth should fail");
+        assert!(err.to_string().contains("invalid mention_walk_depth"));
+
+        let err = settings
+            .set("mention_menu_behavior", "random")
+            .expect_err("unknown mention behavior should fail");
+        assert!(err.to_string().contains("invalid mention_menu_behavior"));
     }
 
     #[test]
@@ -1145,8 +1948,13 @@ mod tests {
             .expect("set community theme alias");
         assert_eq!(settings.theme, "tokyo-night");
 
-        let err = settings
+        settings
             .set("theme", "solarized")
+            .expect("set solarized alias");
+        assert_eq!(settings.theme, "solarized-light");
+
+        let err = settings
+            .set("theme", "nord")
             .expect_err("unknown theme should fail");
         assert!(err.to_string().contains("invalid theme"));
     }
@@ -1192,17 +2000,20 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_focus_accepts_work_values_and_legacy_aliases() {
+    fn sidebar_focus_accepts_pinned_values_and_legacy_aliases() {
         let mut settings = Settings::default();
 
+        settings.set("sidebar_focus", "pinned").expect("set pinned");
+        assert_eq!(settings.sidebar_focus, "pinned");
+
         settings.set("sidebar_focus", "work").expect("set work");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "plan").expect("legacy plan alias");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "todos").expect("legacy todos alias");
-        assert_eq!(settings.sidebar_focus, "work");
+        assert_eq!(settings.sidebar_focus, "pinned");
 
         settings.set("focus", "context").expect("context focus");
         assert_eq!(settings.sidebar_focus, "context");
@@ -1212,11 +2023,34 @@ mod tests {
 
         settings.set("focus", "off").expect("off alias");
         assert_eq!(settings.sidebar_focus, "hidden");
+        assert!(!settings.sidebar_auto_collapse_opt_in);
+
+        settings.set("focus", "auto").expect("auto focus");
+        assert_eq!(settings.sidebar_focus, "auto");
+        assert!(settings.sidebar_auto_collapse_opt_in);
+
+        settings
+            .set("focus", "visible")
+            .expect("pinned alias clears auto marker");
+        assert_eq!(settings.sidebar_focus, "pinned");
+        assert!(!settings.sidebar_auto_collapse_opt_in);
+
+        // Activity is the user-facing panel name; config key remains "tasks" (#4135).
+        settings
+            .set("focus", "activity")
+            .expect("activity alias for Activity panel");
+        assert_eq!(settings.sidebar_focus, "tasks");
+        settings.set("focus", "live").expect("live alias");
+        assert_eq!(settings.sidebar_focus, "tasks");
 
         let err = settings
             .set("sidebar_focus", "classic")
             .expect_err("classic is not a supported public focus");
         assert!(err.to_string().contains("invalid sidebar focus"));
+        assert!(
+            err.to_string().contains("activity (tasks)"),
+            "error should teach the Activity alias: {err}"
+        );
     }
 
     #[test]
@@ -1233,6 +2067,40 @@ mod tests {
             .set("session_panel", "off")
             .expect("disable context panel via alias");
         assert!(!settings.context_panel);
+    }
+
+    #[test]
+    fn tool_collapse_mode_is_configurable() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.tool_collapse_mode, "compact");
+
+        settings
+            .set("tool_collapse", "expanded")
+            .expect("expanded mode");
+        assert_eq!(settings.tool_collapse_mode, "expanded");
+
+        settings.set("collapse", "calm-only").expect("calm alias");
+        assert_eq!(settings.tool_collapse_mode, "calm");
+
+        settings.set("collapse", "off").expect("off alias");
+        assert_eq!(settings.tool_collapse_mode, "expanded");
+
+        // Issue #3256 proposes `collapsed` as the default verbosity name;
+        // accept it (and the bare verb) as an alias of the canonical `compact`.
+        settings
+            .set("tool_collapse", "collapsed")
+            .expect("collapsed alias");
+        assert_eq!(settings.tool_collapse_mode, "compact");
+        settings.set("tool_collapse", "expanded").expect("reset");
+        settings
+            .set("tool_collapse", "collapse")
+            .expect("collapse alias");
+        assert_eq!(settings.tool_collapse_mode, "compact");
+
+        let err = settings
+            .set("tool_collapse", "mystery")
+            .expect_err("invalid collapse mode");
+        assert!(err.to_string().contains("invalid tool collapse mode"));
     }
 
     #[test]
@@ -1271,7 +2139,7 @@ mod tests {
         unsafe {
             std::env::set_var("NO_ANIMATIONS", "1");
         }
-        let mut settings = Settings::default();
+        let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         assert!(settings.fancy_animations, "default shows the water strip");
         settings.apply_env_overrides();
@@ -1316,15 +2184,30 @@ mod tests {
         let prev_wt_session = std::env::var_os("WT_SESSION");
         let prev_tmux = std::env::var_os("TMUX");
         let prev_sty = std::env::var_os("STY");
+        let prev_term_program = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
+        let prev_ssh_client = std::env::var_os("SSH_CLIENT");
+        let prev_ssh_tty = std::env::var_os("SSH_TTY");
+        let prev_tilix_id = std::env::var_os("TILIX_ID");
+        let prev_terminator_uuid = std::env::var_os("TERMINATOR_UUID");
+
         // The test is about NO_ANIMATIONS only. On Windows CI, an unmarked
         // console host now independently enables low_motion, so mark the host
         // as non-legacy while checking falsy spellings.
         // Clear multiplexer markers for the same reason: they also force
         // low_motion independently of NO_ANIMATIONS.
+        // Clear TERM_PROGRAM, SSH, and other terminal-specific variables as they
+        // also force low_motion independently of NO_ANIMATIONS.
         // SAFETY: serialised by the guard.
         unsafe {
             std::env::remove_var("TMUX");
             std::env::remove_var("STY");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("TERM");
+            std::env::remove_var("SSH_CLIENT");
+            std::env::remove_var("SSH_TTY");
+            std::env::remove_var("TILIX_ID");
+            std::env::remove_var("TERMINATOR_UUID");
         }
         #[cfg(windows)]
         unsafe {
@@ -1335,7 +2218,7 @@ mod tests {
             unsafe {
                 std::env::set_var("NO_ANIMATIONS", truthy);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(s.low_motion, "{truthy:?} should be truthy");
         }
@@ -1344,7 +2227,7 @@ mod tests {
             unsafe {
                 std::env::set_var("NO_ANIMATIONS", falsy);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(!s.low_motion, "{falsy:?} should be falsy");
         }
@@ -1363,13 +2246,37 @@ mod tests {
                 Some(v) => std::env::set_var("STY", v),
                 None => std::env::remove_var("STY"),
             }
+            match prev_term_program {
+                Some(v) => std::env::set_var("TERM_PROGRAM", v),
+                None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
+            }
+            match prev_ssh_client {
+                Some(v) => std::env::set_var("SSH_CLIENT", v),
+                None => std::env::remove_var("SSH_CLIENT"),
+            }
+            match prev_ssh_tty {
+                Some(v) => std::env::set_var("SSH_TTY", v),
+                None => std::env::remove_var("SSH_TTY"),
+            }
+            match prev_tilix_id {
+                Some(v) => std::env::set_var("TILIX_ID", v),
+                None => std::env::remove_var("TILIX_ID"),
+            }
+            match prev_terminator_uuid {
+                Some(v) => std::env::set_var("TERMINATOR_UUID", v),
+                None => std::env::remove_var("TERMINATOR_UUID"),
+            }
         }
     }
 
     /// Serialise tests that mutate `TERM_PROGRAM` through this guard.
     /// Uses the process-wide test env lock so this serializes not just
     /// with itself but with every other env-mutating test in the suite
-    /// — otherwise a concurrent test that calls `Settings::default()`
+    /// — otherwise a concurrent test that calls `animated_settings()`
     /// can read whatever value our two `set_var`s have raced into the
     /// env at that instant.
     fn term_program_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1377,23 +2284,21 @@ mod tests {
     }
 
     #[test]
-    fn vscode_term_program_forces_low_motion_on() {
+    fn vscode_caps_redraws_without_disabling_motion_or_text_cadence() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
         unsafe {
             std::env::set_var("TERM_PROGRAM", "vscode");
         }
-        let mut settings = Settings::default();
+        let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
         assert!(
-            settings.low_motion,
-            "TERM_PROGRAM=vscode must enable low_motion to prevent flickering (#1356)"
-        );
-        assert!(
-            !settings.fancy_animations,
-            "TERM_PROGRAM=vscode must disable fancy_animations"
+            settings.constrained_frame_rate,
+            "TERM_PROGRAM=vscode should cap redraws without changing animation semantics"
         );
         // SAFETY: cleanup under the guard.
         unsafe {
@@ -1405,29 +2310,52 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_program_forces_low_motion_on() {
+    fn ghostty_term_program_caps_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
         unsafe {
-            std::env::set_var("TERM_PROGRAM", "ghostty");
+            std::env::set_var("TERM_PROGRAM", "Ghostty");
         }
-        let mut settings = Settings::default();
+        let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
-        assert!(
-            settings.low_motion,
-            "TERM_PROGRAM=ghostty must enable low_motion to prevent flickering (#1445)"
-        );
-        assert!(
-            !settings.fancy_animations,
-            "TERM_PROGRAM=ghostty must disable fancy_animations"
-        );
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
+        assert!(settings.constrained_frame_rate);
         // SAFETY: cleanup under the guard.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("TERM_PROGRAM", v),
                 None => std::env::remove_var("TERM_PROGRAM"),
+            }
+        }
+    }
+
+    #[test]
+    fn ghostty_term_fallback_caps_redraws_without_disabling_motion() {
+        let _g = term_program_test_guard();
+        let prev_program = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
+        // SAFETY: serialised by the guard.
+        unsafe {
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::set_var("TERM", "xterm-ghostty");
+        }
+        let mut settings = Settings::default();
+        settings.apply_env_overrides();
+        assert!(!settings.low_motion);
+        assert!(settings.fancy_animations);
+        assert!(settings.constrained_frame_rate);
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            match prev_program {
+                Some(v) => std::env::set_var("TERM_PROGRAM", v),
+                None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
             }
         }
     }
@@ -1436,6 +2364,7 @@ mod tests {
     fn non_vscode_term_program_does_not_force_low_motion() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
+        let prev_term = std::env::var_os("TERM");
         let prev_ssh_client = std::env::var_os("SSH_CLIENT");
         let prev_ssh_tty = std::env::var_os("SSH_TTY");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
@@ -1449,6 +2378,7 @@ mod tests {
         unsafe {
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
+            std::env::remove_var("TERM");
             std::env::remove_var("TILIX_ID");
             std::env::remove_var("TERMINATOR_UUID");
             std::env::remove_var("TMUX");
@@ -1459,7 +2389,7 @@ mod tests {
             unsafe {
                 std::env::set_var("TERM_PROGRAM", program);
             }
-            let mut s = Settings::default();
+            let mut s = animated_settings();
             s.apply_env_overrides();
             assert!(
                 !s.low_motion,
@@ -1471,6 +2401,10 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("TERM_PROGRAM", v),
                 None => std::env::remove_var("TERM_PROGRAM"),
+            }
+            match prev_term {
+                Some(v) => std::env::set_var("TERM", v),
+                None => std::env::remove_var("TERM"),
             }
             if let Some(v) = prev_ssh_client {
                 std::env::set_var("SSH_CLIENT", v);
@@ -1494,11 +2428,12 @@ mod tests {
     }
 
     #[test]
-    fn tilix_and_terminator_env_force_low_motion_on() {
+    fn tilix_and_terminator_cap_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let prev_term_program = std::env::var_os("TERM_PROGRAM");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
         let prev_terminator_uuid = std::env::var_os("TERMINATOR_UUID");
+        let prev_wt_session = std::env::var_os("WT_SESSION");
 
         for (var, val) in [
             ("TILIX_ID", "d5b5b5d6-tilix-session"),
@@ -1510,17 +2445,27 @@ mod tests {
                 std::env::remove_var("TILIX_ID");
                 std::env::remove_var("TERMINATOR_UUID");
                 std::env::set_var(var, val);
+                // A native Windows test process without any modern-terminal
+                // marker is intentionally treated as legacy ConHost. This
+                // test isolates the VTE signal instead, so keep that separate
+                // platform heuristic from changing its motion assertions.
+                #[cfg(windows)]
+                std::env::set_var("WT_SESSION", "codewhale-test");
             }
-            let mut settings = Settings::default();
+            let mut settings = animated_settings();
             assert!(!settings.low_motion, "default is animated");
             settings.apply_env_overrides();
             assert!(
-                settings.low_motion,
-                "{var} must enable low_motion to prevent VTE flicker (#1470)"
+                settings.constrained_frame_rate,
+                "{var} must cap redraws to prevent VTE flicker (#1470)"
             );
             assert!(
-                !settings.fancy_animations,
-                "{var} must disable fancy_animations"
+                !settings.low_motion,
+                "{var} must not change motion semantics"
+            );
+            assert!(
+                settings.fancy_animations,
+                "{var} must not disable the ocean treatment"
             );
         }
 
@@ -1538,6 +2483,10 @@ mod tests {
                 Some(v) => std::env::set_var("TERMINATOR_UUID", v),
                 None => std::env::remove_var("TERMINATOR_UUID"),
             }
+            match prev_wt_session {
+                Some(v) => std::env::set_var("WT_SESSION", v),
+                None => std::env::remove_var("WT_SESSION"),
+            }
         }
     }
 
@@ -1549,7 +2498,7 @@ mod tests {
         unsafe {
             std::env::set_var("TERM_PROGRAM", "Termius");
         }
-        let mut settings = Settings::default();
+        let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
         assert!(
@@ -1637,13 +2586,21 @@ mod tests {
             }
         }
 
-        let mut settings = Settings::default();
+        let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         assert!(settings.fancy_animations, "default shows the water strip");
         assert_eq!(settings.synchronized_output, "auto");
         settings.apply_env_overrides();
         assert!(settings.low_motion);
         assert!(!settings.fancy_animations);
+        assert!(
+            settings.bracketed_paste,
+            "env-only conhost fallback must not persistently mutate bracketed_paste (#1102)"
+        );
+        assert!(
+            !settings.effective_bracketed_paste(),
+            "legacy Windows console hosts do not support crossterm bracketed paste (#1102)"
+        );
         assert_eq!(settings.synchronized_output, "off");
 
         // SAFETY: cleanup under the guard.
@@ -1707,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_multiplexer_env_forces_low_motion_on() {
+    fn terminal_multiplexer_caps_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let vars = [
             "TMUX",
@@ -1718,6 +2675,7 @@ mod tests {
             "TILIX_ID",
             "TERMINATOR_UUID",
             "NO_ANIMATIONS",
+            "WT_SESSION",
         ];
         let prev: Vec<_> = vars
             .iter()
@@ -1734,18 +2692,21 @@ mod tests {
                     std::env::remove_var(name);
                 }
                 std::env::set_var(var, val);
+                #[cfg(windows)]
+                std::env::set_var("WT_SESSION", "codewhale-test");
             }
-            let mut settings = Settings::default();
+            let mut settings = animated_settings();
             assert!(!settings.low_motion, "default is animated");
             assert!(settings.fancy_animations, "default shows the water strip");
             settings.apply_env_overrides();
+            assert!(!settings.low_motion, "{var} must preserve authored motion");
             assert!(
-                settings.low_motion,
-                "{var}={val:?} must enable low_motion under terminal multiplexers (#1925)"
+                settings.fancy_animations,
+                "{var} must preserve Ocean motion"
             );
             assert!(
-                !settings.fancy_animations,
-                "{var}={val:?} must disable fancy_animations under terminal multiplexers (#1925)"
+                settings.constrained_frame_rate,
+                "{var}={val:?} must cap redraws under terminal multiplexers"
             );
         }
 
@@ -1991,6 +2952,305 @@ mod tests {
         crate::test_support::lock_test_env()
     }
 
+    struct EnvVarRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests using this helper hold config_path_test_guard.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests using this helper hold config_path_test_guard.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            // SAFETY: tests using this helper hold config_path_test_guard.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_mode_writes_only_accept_agent_or_plan() {
+        let mut settings = Settings::default();
+
+        settings.set("default_mode", "plan").expect("plan mode");
+        assert_eq!(settings.default_mode, "plan");
+        settings
+            .set("default_mode", "normal")
+            .expect("legacy normal alias remains harmless");
+        assert_eq!(settings.default_mode, "agent");
+
+        for removed in ["operate", "ops", "yolo"] {
+            let err = settings
+                .set("default_mode", removed)
+                .expect_err("session actions must not become saved startup modes");
+            assert!(err.to_string().contains("agent or plan"), "{err}");
+        }
+    }
+
+    #[test]
+    fn legacy_startup_modes_migrate_without_losing_permission_intent() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        std::fs::create_dir_all(&codewhale_home).expect("codewhale home");
+        std::fs::write(
+            codewhale_home.join("settings.toml"),
+            "default_mode = \"yolo\"\n",
+        )
+        .expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &codewhale_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let loaded = Settings::load_persisted().expect("load legacy settings");
+
+        assert_eq!(loaded.default_mode, "agent");
+        assert_eq!(loaded.permission_posture.as_deref(), Some("full-access"));
+
+        std::fs::write(
+            codewhale_home.join("settings.toml"),
+            "default_mode = \"operate\"\n",
+        )
+        .expect("legacy operate settings");
+        let loaded = Settings::load_persisted().expect("load legacy operate settings");
+        assert_eq!(loaded.default_mode, "agent");
+        assert_eq!(loaded.permission_posture, None);
+    }
+
+    #[test]
+    fn settings_path_defaults_to_codewhale_home_for_new_writes() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = Settings::path().expect("settings path");
+
+        assert_eq!(got, tmp.path().join(".codewhale").join("settings.toml"));
+    }
+
+    #[test]
+    fn settings_path_prefers_codewhale_home_even_when_legacy_exists() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(legacy_dir.join("settings.toml"), "low_motion = true\n")
+            .expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = Settings::path().expect("settings path");
+
+        assert_eq!(got, tmp.path().join(".codewhale").join("settings.toml"));
+    }
+
+    #[test]
+    fn settings_load_migrates_legacy_deepseek_home_into_codewhale_home_without_explicit_home() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join(".codewhale").join("settings.toml");
+        let legacy_dir = tmp.path().join(".deepseek");
+        let legacy_home = legacy_dir.join("settings.toml");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(&legacy_home, "low_motion = true\n").expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let loaded = Settings::load_persisted().expect("load persisted settings");
+
+        assert!(loaded.low_motion, "legacy settings should still be read");
+        assert!(
+            primary.exists(),
+            "settings load should migrate to primary path"
+        );
+        let display = loaded.display(crate::localization::Locale::En);
+        assert!(
+            display.contains(&format!("Config file: {}", primary.display())),
+            "settings display should surface the canonical codewhale path:\n{display}"
+        );
+    }
+
+    #[test]
+    fn settings_load_migrates_platform_legacy_fallback_into_codewhale_home_without_explicit_home() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join(".codewhale").join("settings.toml");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home =
+            EnvVarRestore::set("CODEWHALE_HOME", primary.parent().expect("primary parent"));
+        let legacy_config_dir = tmp
+            .path()
+            .join("platform-config")
+            .join("deepseek")
+            .join("settings.toml");
+        std::fs::create_dir_all(legacy_config_dir.parent().expect("parent"))
+            .expect("legacy config dir");
+        std::fs::write(&legacy_config_dir, "low_motion = true\n").expect("legacy settings");
+
+        // Exercise the same load and migration path with explicit candidates.
+        // `dirs::config_dir()` uses the Win32 known-folder API on Windows, so
+        // APPDATA/XDG environment overrides cannot isolate that process-global
+        // location in a parallel test runner.
+        let loaded = Settings::load_persisted_from_candidates(
+            Some(primary.clone()),
+            None,
+            Some(legacy_config_dir),
+        )
+        .expect("load persisted settings");
+
+        assert!(loaded.low_motion, "legacy settings should still be read");
+        assert!(
+            primary.exists(),
+            "legacy fallback should be copied into primary"
+        );
+        let display = loaded.display(crate::localization::Locale::En);
+        assert!(
+            display.contains(&format!("Config file: {}", primary.display())),
+            "settings display should surface the canonical codewhale path:\n{display}"
+        );
+    }
+
+    #[test]
+    fn settings_load_ignores_legacy_files_when_codewhale_home_is_explicit() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let explicit_home = tmp.path().join("isolated-codewhale");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(
+            legacy_dir.join("settings.toml"),
+            "theme = \"dracula\"\ncomposer_density = \"spacious\"\nsidebar_width_percent = 42\n",
+        )
+        .expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(
+            loaded.theme, "system",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.composer_density, "comfortable",
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert_eq!(
+            loaded.sidebar_width_percent, 28,
+            "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
+        );
+        assert!(
+            !explicit_home.join("settings.toml").exists(),
+            "ambient legacy settings must not be migrated into explicit CODEWHALE_HOME"
+        );
+    }
+
+    #[test]
+    fn settings_load_migrates_legacy_saved_auto_sidebar_focus_to_pinned() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        std::fs::write(&settings_path, "sidebar_focus = \"auto\"\n").expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(loaded.sidebar_focus, "pinned");
+        assert!(!loaded.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
+    fn settings_load_preserves_explicit_auto_sidebar_opt_in() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &settings_path,
+            "sidebar_focus = \"auto\"\nsidebar_auto_collapse_opt_in = true\n",
+        )
+        .expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(loaded.sidebar_focus, "auto");
+        assert!(loaded.sidebar_auto_collapse_opt_in);
+    }
+
+    #[test]
+    fn tui_prefs_path_defaults_to_codewhale_home_for_new_writes() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = TuiPrefs::path().expect("tui prefs path");
+
+        assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
+    }
+
+    #[test]
+    fn tui_prefs_path_ignores_legacy_home_when_codewhale_home_is_explicit() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let explicit_home = tmp.path().join("isolated-codewhale");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(legacy_dir.join("tui.toml"), "theme = \"light\"\n").expect("legacy prefs");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &explicit_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = TuiPrefs::path().expect("tui prefs path");
+
+        assert_eq!(got, explicit_home.join("tui.toml"));
+    }
+
+    #[test]
+    fn tui_prefs_path_reads_legacy_deepseek_home_when_present() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join(".codewhale").join("tui.toml");
+        let legacy_dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        let legacy_home = legacy_dir.join("tui.toml");
+        std::fs::write(&legacy_home, "theme = \"light\"\n").expect("legacy prefs");
+
+        let got = resolve_tui_prefs_path_from_candidates(Some(primary), Some(legacy_home.clone()))
+            .expect("tui prefs path");
+
+        assert_eq!(got, legacy_home);
+    }
+
     #[test]
     fn tui_prefs_defaults_are_dark_theme_zero_font() {
         let prefs = TuiPrefs::default();
@@ -2011,6 +3271,7 @@ mod tests {
             "tokyo-night",
             "dracula",
             "gruvbox-dark",
+            "solarized-light",
         ] {
             let mut prefs = TuiPrefs {
                 theme: theme.to_string(),
@@ -2038,17 +3299,16 @@ mod tests {
     #[test]
     fn tui_prefs_validate_rejects_unknown_theme() {
         let mut prefs = TuiPrefs {
-            theme: "solarized".to_string(),
+            theme: "nord".to_string(),
             ..TuiPrefs::default()
         };
-        let err = prefs
-            .validate()
-            .expect_err("solarized is not a valid theme");
+        let err = prefs.validate().expect_err("nord is not a valid theme");
         assert!(err.to_string().contains("Invalid tui.toml theme"));
         assert!(
             err.to_string()
                 .contains("expected system, dark, light, grayscale")
         );
+        assert!(err.to_string().contains("solarized-light"));
     }
 
     #[test]
@@ -2131,18 +3391,88 @@ mod tests {
     }
 
     #[test]
-    fn tui_prefs_path_uses_home_deepseek_subdir_by_default() {
+    fn tui_prefs_save_preserves_comments() {
         let _g = config_path_test_guard();
-        // Without DEEPSEEK_CONFIG_PATH the path should end with
-        // .deepseek/tui.toml relative to the home directory.
-        // We skip this check if home_dir() is unavailable (CI without HOME).
-        if let Some(home) = dirs::home_dir() {
-            let expected = home.join(".deepseek").join("tui.toml");
-            // Only compare when no env override is active.
-            if std::env::var("DEEPSEEK_CONFIG_PATH").is_err() {
-                let got = TuiPrefs::path().expect("path should resolve");
-                assert_eq!(got, expected);
-            }
+        let tmp = std::env::temp_dir().join("dst_tui_prefs_comment_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_file = tmp.join("config.toml");
+        // SAFETY: test-only env mutation guarded by config_path_test_guard.
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
         }
+
+        // tui.toml lives next to config.toml
+        let tui_path = tmp.join("tui.toml");
+        std::fs::write(
+            &tui_path,
+            "# my theme comment\ntheme = \"dark\"\n# footer note\n",
+        )
+        .unwrap();
+
+        let prefs = TuiPrefs {
+            theme: "light".to_string(),
+            ..TuiPrefs::default()
+        };
+        prefs.save().expect("save should succeed");
+
+        let body = std::fs::read_to_string(&tui_path).expect("read tui.toml");
+        assert!(body.contains("# my theme comment"), "comment lost: {body}");
+        assert!(body.contains("# footer note"), "footer lost: {body}");
+        assert!(body.contains("light"), "new value not written: {body}");
+
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn settings_save_preserves_comments() {
+        let _g = config_path_test_guard();
+        let tmp = std::env::temp_dir().join("dst_settings_comment_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_file = tmp.join("config.toml");
+        // SAFETY: test-only env mutation guarded by config_path_test_guard.
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
+        }
+
+        // settings.toml lives next to config.toml
+        let settings_path = tmp.join("settings.toml");
+        std::fs::write(
+            &settings_path,
+            "# my setting\ncost_currency = \"usd\"\n# trailing\n",
+        )
+        .unwrap();
+
+        // Load the existing file so we have a real struct to modify.
+        let mut settings = Settings::load().expect("load settings");
+        settings.cost_currency = "cny".to_string();
+        settings.save().expect("save should succeed");
+
+        let body = std::fs::read_to_string(&settings_path).expect("read settings.toml");
+        assert!(body.contains("# my setting"), "comment lost: {body}");
+        assert!(body.contains("# trailing"), "trailing lost: {body}");
+        assert!(body.contains("cny"), "new value not written: {body}");
+
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tui_prefs_path_uses_home_codewhale_subdir_by_default() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let got = TuiPrefs::path().expect("path should resolve");
+
+        assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
     }
 }

@@ -10,7 +10,7 @@
 //!    the user can open it in `$EDITOR`.
 //!
 //! This module owns the disk side. Files land in
-//! `~/.deepseek/tool_outputs/<sanitised-id>.txt`. The id is the tool
+//! `~/.codewhale/tool_outputs/<sanitised-id>.txt`. The id is the tool
 //! call id the engine assigns; we sanitise it conservatively (ASCII
 //! alphanumeric + `-`/`_`) so a hostile id can't escape the directory
 //! via `..` or absolute-path tricks.
@@ -31,8 +31,7 @@
 //! UI-side rendering of the inline `full output: <path>` annotation
 //! is owned by `tui/history.rs::render_spillover_annotation`. The
 //! tool-details pager opens the spillover file when the user
-//! presses `Alt+V` (or plain `v` with empty composer) on a spilled
-//! tool cell.
+//! presses the tool-details shortcut on a spilled tool cell.
 
 use std::fs;
 use std::io;
@@ -45,7 +44,7 @@ use crate::tools::spec::ToolResult;
 #[cfg(test)]
 use std::path::Path;
 
-/// Name of the spillover directory under `~/.deepseek/`.
+/// Name of the spillover directory under the CodeWhale home.
 pub const SPILLOVER_DIR_NAME: &str = "tool_outputs";
 
 /// Default threshold above which a tool result is a candidate for
@@ -56,7 +55,7 @@ pub const SPILLOVER_DIR_NAME: &str = "tool_outputs";
 pub const SPILLOVER_THRESHOLD_BYTES: usize = 100 * 1024; // 100 KiB
 
 /// Default boot-prune age. Older spillover files are deleted on
-/// startup to keep `~/.deepseek/tool_outputs/` from growing without
+/// startup to keep `~/.codewhale/tool_outputs/` from growing without
 /// bound. Mirrors the workspace-snapshot 7-day default.
 pub const SPILLOVER_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -66,7 +65,7 @@ static TEST_SPILLOVER_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex
 #[cfg(test)]
 pub(crate) static TEST_SPILLOVER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Resolve `~/.deepseek/tool_outputs/`. Returns `None` if the home
+/// Resolve `~/.codewhale/tool_outputs/`. Returns `None` if the home
 /// directory can't be determined (CI containers occasionally hit
 /// this). Callers should treat `None` as "spillover unavailable" and
 /// degrade gracefully rather than fail the tool call.
@@ -81,7 +80,13 @@ pub fn spillover_root() -> Option<PathBuf> {
         return Some(root);
     }
 
-    Some(dirs::home_dir()?.join(".deepseek").join(SPILLOVER_DIR_NAME))
+    let home = dirs::home_dir()?;
+    let primary = home.join(".codewhale").join(SPILLOVER_DIR_NAME);
+    let legacy = home.join(".deepseek").join(SPILLOVER_DIR_NAME);
+    if primary.exists() || !legacy.exists() {
+        return Some(primary);
+    }
+    Some(legacy)
 }
 
 /// Override the spillover root for tests without mutating `$HOME`.
@@ -253,10 +258,21 @@ pub fn maybe_spillover(
 /// the per-turn context budget. The full output is preserved on
 /// disk; the model can `read_file` it back if it needs the tail.
 pub const SPILLOVER_HEAD_BYTES: usize = 32 * 1024;
+/// Inline tail retained alongside the head so compiler summaries and final
+/// test failures are not systematically hidden by truncation.
+pub const SPILLOVER_TAIL_BYTES: usize = 8 * 1024;
+
+fn retained_tail(content: &str, max_bytes: usize) -> &str {
+    let floor = content.len().saturating_sub(max_bytes);
+    let start = (floor..=content.len())
+        .find(|&index| content.is_char_boundary(index))
+        .unwrap_or(content.len());
+    &content[start..]
+}
 
 /// Apply spillover to a tool result in place. If the result's
 /// content exceeds [`SPILLOVER_THRESHOLD_BYTES`], writes the full
-/// content to a sibling file under `~/.deepseek/tool_outputs/`,
+/// content to a sibling file under `~/.codewhale/tool_outputs/`,
 /// replaces `result.content` with a [`SPILLOVER_HEAD_BYTES`] head
 /// plus a footer pointing the model at the spillover file, and
 /// stamps `metadata.spillover_path` so the UI can render its
@@ -279,10 +295,10 @@ pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf
 
 /// Apply spillover and emit a session-scoped artifact reference.
 ///
-/// The legacy `~/.deepseek/tool_outputs/<tool-id>.txt` file is still written
+/// The home-level `tool_outputs/<tool-id>.txt` file is still written
 /// so `retrieve_tool_result ref=<tool-id>` keeps working during the
 /// transition. The canonical artifact content is also written under
-/// `~/.deepseek/sessions/<session-id>/artifacts/`, and the inline tool result
+/// `~/.codewhale/sessions/<session-id>/artifacts/`, and the inline tool result
 /// becomes a fixed-format artifact reference block.
 pub fn apply_spillover_with_artifact(
     result: &mut ToolResult,
@@ -337,6 +353,8 @@ fn apply_spillover_inner(
         }
     };
     let (head, path) = outcome;
+    let tail = retained_tail(&original_content, SPILLOVER_TAIL_BYTES);
+    let digest = crate::hashing::sha256_hex(original_content.as_bytes());
     let path_str = path.display().to_string();
 
     let mut artifact_path = None;
@@ -356,7 +374,12 @@ fn apply_spillover_inner(
                     &original_content,
                 );
                 let transcript_ref = crate::artifacts::TranscriptArtifactRef::from(&record);
-                result.content = crate::artifacts::render_transcript_artifact_ref(&transcript_ref);
+                let reference = crate::artifacts::render_transcript_artifact_ref(&transcript_ref);
+                result.content = format!(
+                    "{reference}\n\n[retained head: {} bytes]\n{head}\n\n[retained tail: {} bytes]\n{tail}",
+                    head.len(),
+                    tail.len(),
+                );
                 artifact_path = Some((absolute_path, relative_path, record));
             }
             Err(err) => {
@@ -380,7 +403,10 @@ fn apply_spillover_inner(
             head_kib = head.len() / 1024,
             total_kib = total / 1024,
         );
-        result.content = format!("{head}{footer}");
+        result.content = format!(
+            "{head}\n\n[retained tail: {} bytes]\n{tail}{footer}",
+            tail.len()
+        );
     }
 
     let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
@@ -474,6 +500,29 @@ fn apply_spillover_inner(
             }
         }
     }
+    if let Some(obj) = result
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        obj.insert("truncated".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "content_digest".into(),
+            serde_json::Value::String(format!("sha256:{digest}")),
+        );
+        obj.insert(
+            "original_byte_count".into(),
+            serde_json::Value::Number(serde_json::Number::from(total as u64)),
+        );
+        obj.insert(
+            "retained_head_bytes".into(),
+            serde_json::Value::Number(serde_json::Number::from(head.len() as u64)),
+        );
+        obj.insert(
+            "retained_tail_bytes".into(),
+            serde_json::Value::Number(serde_json::Number::from(tail.len() as u64)),
+        );
+    }
     artifact_path
         .map(|(absolute_path, _, _)| absolute_path)
         .or(Some(path))
@@ -496,7 +545,7 @@ fn sanitise_id(id: &str) -> Option<String> {
 }
 
 /// Override the storage roots for tests so they don't pollute the
-/// user's real `~/.deepseek/` directory. This uses explicit test hooks instead
+/// user's real `~/.codewhale/` directory. This uses explicit test hooks instead
 /// of `$HOME` because Windows home-dir resolution can ignore environment
 /// overrides and return the runner profile directory.
 #[cfg(test)]
@@ -524,9 +573,9 @@ where
     // artifact guard above protects the session-artifact root shared with
     // artifacts.rs tests.
     let prior_spillover =
-        set_test_spillover_root(Some(home.join(".deepseek").join(SPILLOVER_DIR_NAME)));
+        set_test_spillover_root(Some(home.join(".codewhale").join(SPILLOVER_DIR_NAME)));
     let prior_artifacts = crate::artifacts::set_test_artifact_sessions_root(Some(
-        home.join(".deepseek").join("sessions"),
+        home.join(".codewhale").join("sessions"),
     ));
     let _restore = StorageRootOverride {
         prior_spillover,
@@ -557,7 +606,7 @@ mod tests {
         with_test_home(tmp.path(), || {
             assert_eq!(
                 spillover_root().as_deref(),
-                Some(tmp.path().join(".deepseek").join("tool_outputs").as_path())
+                Some(tmp.path().join(".codewhale").join("tool_outputs").as_path())
             );
             assert_eq!(
                 crate::artifacts::session_artifact_absolute_path(
@@ -567,7 +616,7 @@ mod tests {
                 .as_deref(),
                 Some(
                     tmp.path()
-                        .join(".deepseek")
+                        .join(".codewhale")
                         .join("sessions")
                         .join("session-123")
                         .join("artifacts")
@@ -598,7 +647,7 @@ mod tests {
             assert!(path.exists(), "{path:?} missing");
             let body = fs::read_to_string(&path).unwrap();
             assert_eq!(body, "hello world");
-            // Directory landed under `<HOME>/.deepseek/tool_outputs/`.
+            // Directory landed under `<HOME>/.codewhale/tool_outputs/`.
             // Compare components instead of a substring on `to_string_lossy`
             // — Windows uses `\` as the separator so a `/` substring match
             // would falsely fail there.
@@ -607,8 +656,8 @@ mod tests {
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
             assert!(
-                components.contains(&".deepseek") && components.contains(&"tool_outputs"),
-                "spillover path missing expected `.deepseek/tool_outputs/...` segments: {path:?}"
+                components.contains(&".codewhale") && components.contains(&"tool_outputs"),
+                "spillover path missing expected `.codewhale/tool_outputs/...` segments: {path:?}"
             );
         });
     }
@@ -806,6 +855,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .expect("spillover_path key present");
             assert_eq!(stamped, path.display().to_string());
+            assert_eq!(metadata["truncated"], true);
+            assert_eq!(metadata["original_byte_count"], 200 * 1024);
+            assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
+            assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
+            assert!(
+                metadata["content_digest"]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("sha256:"))
+            );
         });
     }
 
@@ -822,7 +880,7 @@ mod tests {
 
             let session_artifact = tmp
                 .path()
-                .join(".deepseek")
+                .join(".codewhale")
                 .join("sessions")
                 .join("session-123")
                 .join("artifacts")
@@ -831,9 +889,9 @@ mod tests {
             assert_eq!(fs::read_to_string(&session_artifact).unwrap(), big);
             assert!(
                 tmp.path()
-                    .join(".deepseek/tool_outputs/call-big.txt")
+                    .join(".codewhale/tool_outputs/call-big.txt")
                     .exists(),
-                "legacy spillover file should remain during transition"
+                "home-level spillover file should remain during transition"
             );
 
             assert!(result.content.starts_with("[artifact: exec_shell]"));
@@ -845,6 +903,8 @@ mod tests {
                     .contains("path:         artifacts/art_call-big.txt")
             );
             assert!(!result.content.contains("Output truncated:"));
+            assert!(result.content.contains("[retained head:"));
+            assert!(result.content.contains("[retained tail:"));
 
             let metadata = result.metadata.expect("metadata stamped");
             assert_eq!(
@@ -865,6 +925,9 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 Some("session-123")
             );
+            assert_eq!(metadata["original_byte_count"], big.len());
+            assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
+            assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
         });
     }
 

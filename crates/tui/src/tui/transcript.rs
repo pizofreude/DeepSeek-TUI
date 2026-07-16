@@ -16,6 +16,7 @@
 //! Width or render-option changes still bust the entire cache (correct: wrap
 //! layout depends on width and which cells are visible at all).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ratatui::{
@@ -26,6 +27,7 @@ use ratatui::{
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
 use crate::tui::scrolling::TranscriptLineMeta;
+use crate::tui::ui_text::CopyLineSeparator;
 
 /// Per-cell cached render output. Reused across `ensure` calls when the
 /// upstream cell's revision counter hasn't changed.
@@ -45,6 +47,15 @@ struct CachedCell {
     /// Rendered lines for this cell (without trailing inter-cell spacers),
     /// shared via `Arc` so cache enumeration is O(N) not O(N*lines).
     lines: Arc<Vec<Line<'static>>>,
+    /// Hyperlinks aligned with `lines`, in display columns relative to each
+    /// line. Targets never enter the ratatui cell buffer.
+    links: Arc<Vec<Vec<crate::tui::osc8::LineLink>>>,
+    /// Copy separators aligned with `lines`. These preserve source hard
+    /// newlines while allowing copy to remove visual soft-wrap breaks.
+    copy_separators: Arc<Vec<CopyLineSeparator>>,
+    /// Display-column widths of visual prefixes that should be omitted from
+    /// clipboard text, aligned with `lines`.
+    copy_prefix_widths: Arc<Vec<usize>>,
     /// Whether this cell's rendered output was empty (e.g. Thinking hidden).
     /// Cached so we can skip empty cells without re-rendering.
     is_empty: bool,
@@ -66,11 +77,17 @@ struct CachedCell {
 pub struct TranscriptViewCache {
     width: u16,
     options: TranscriptRenderOptions,
+    /// Snapshot of folded_thinking indices from the last `ensure` call.
+    /// When this changes, all cells must be re-rendered because the fold
+    /// state affects the rendered output but not the cell revision.
+    folded_cells: HashSet<usize>,
     /// Per-cell rendered output, indexed by current cell position.
     /// Length always equals the cell count seen on the last `ensure` call.
     per_cell: Vec<CachedCell>,
     /// Flattened lines reassembled from `per_cell` plus spacers.
     lines: Vec<Line<'static>>,
+    /// Per-line hyperlink metadata aligned with `lines`.
+    line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
     /// Per-line metadata aligned with `lines`.
     line_meta: Vec<TranscriptLineMeta>,
     /// Per-line rail-prefix display-column count (`0` or `2`), aligned with
@@ -87,8 +104,10 @@ impl TranscriptViewCache {
         Self {
             width: 0,
             options: TranscriptRenderOptions::default(),
+            folded_cells: HashSet::new(),
             per_cell: Vec::new(),
             lines: Vec::new(),
+            line_links: Vec::new(),
             line_meta: Vec::new(),
             rail_prefix_widths: Vec::new(),
         }
@@ -115,33 +134,100 @@ impl TranscriptViewCache {
         width: u16,
         options: TranscriptRenderOptions,
     ) {
-        self.ensure_split(&[cells], cell_revisions, width, options);
+        self.ensure_split(
+            &[cells],
+            cell_revisions,
+            width,
+            options,
+            &HashSet::new(),
+            None,
+        );
     }
 
     /// Ensure cached lines match the provided cell shards (logically
     /// concatenated) plus per-cell revisions. Avoids the
     /// `concat-into-Vec<HistoryCell>` clone the caller would otherwise pay
     /// every frame on long transcripts.
+    ///
+    /// `folded_cells` contains original virtual indices of thinking cells
+    /// that should render in their folded (summary) form.
+    ///
+    /// `original_index_map` maps filtered (positional) indices to original
+    /// virtual indices. Required when `collapsed_cells` filtering is active
+    /// so that `folded_cells` lookups resolve to the correct original index.
     pub fn ensure_split(
         &mut self,
         cell_shards: &[&[HistoryCell]],
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
+        folded_cells: &HashSet<usize>,
+        original_index_map: Option<&[usize]>,
     ) {
         let total_cells: usize = cell_shards.iter().map(|s| s.len()).sum();
+        self.ensure_iter(
+            total_cells,
+            cell_shards.iter().flat_map(|shard| shard.iter()),
+            cell_revisions,
+            width,
+            options,
+            folded_cells,
+            original_index_map,
+        );
+    }
 
+    /// `ensure_split` over an already-filtered list of borrowed cells.
+    ///
+    /// The collapse path substitutes synthetic tool-run summary cells and
+    /// skips collapsed cells, so it cannot hand over contiguous shard
+    /// slices. Accepting `&[&HistoryCell]` lets it pass borrows instead of
+    /// deep-cloning every visible cell into a fresh `Vec<HistoryCell>` each
+    /// frame (#3896).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_filtered(
+        &mut self,
+        cells: &[&HistoryCell],
+        cell_revisions: &[u64],
+        width: u16,
+        options: TranscriptRenderOptions,
+        folded_cells: &HashSet<usize>,
+        original_index_map: Option<&[usize]>,
+    ) {
+        self.ensure_iter(
+            cells.len(),
+            cells.iter().copied(),
+            cell_revisions,
+            width,
+            options,
+            folded_cells,
+            original_index_map,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_iter<'a>(
+        &mut self,
+        total_cells: usize,
+        cells: impl Iterator<Item = &'a HistoryCell>,
+        cell_revisions: &[u64],
+        width: u16,
+        options: TranscriptRenderOptions,
+        folded_cells: &HashSet<usize>,
+        original_index_map: Option<&[usize]>,
+    ) {
         let layout_changed = self.width != width || self.options != options;
-        if layout_changed {
+        let folded_changed = self.folded_cells != *folded_cells;
+        if layout_changed || folded_changed {
             self.per_cell.clear();
         }
         self.width = width;
         self.options = options;
+        self.folded_cells = folded_cells.clone();
 
         // Track whether anything actually changed; if all cells are reused at
         // the same indices, we can skip the reflatten.
         let old_len = self.per_cell.len();
-        let mut any_dirty = layout_changed || old_len != total_cells;
+        let mut any_dirty = layout_changed || folded_changed || old_len != total_cells;
         let mut first_dirty: Option<usize> = if old_len != total_cells {
             Some(old_len.min(total_cells))
         } else {
@@ -152,57 +238,76 @@ impl TranscriptViewCache {
         let revisions_match = cell_revisions.len() == total_cells;
 
         let mut idx: usize = 0;
-        for shard in cell_shards {
-            for cell in *shard {
-                let current_rev = if revisions_match {
-                    cell_revisions[idx]
-                } else {
-                    // No matching revisions — force a re-render this cycle.
-                    u64::MAX
-                };
+        for cell in cells {
+            let current_rev = if revisions_match {
+                cell_revisions[idx]
+            } else {
+                // No matching revisions — force a re-render this cycle.
+                u64::MAX
+            };
 
-                // Reuse cached entry if the revision matches AND it's at the
-                // same index (cells can shift on insert/remove, so we only
-                // reuse when the index is identical — a stricter invariant
-                // codex also uses for its active-cell tail).
-                if let Some(prev) = self.per_cell.get(idx)
-                    && !layout_changed
-                    && prev.revision == current_rev
-                    && revisions_match
-                {
-                    new_per_cell.push(prev.clone());
-                    idx += 1;
-                    continue;
-                }
-
-                any_dirty = true;
-                first_dirty = Some(first_dirty.map_or(idx, |current| current.min(idx)));
-                let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
-                let render_width = if is_tool_groupable {
-                    width.saturating_sub(2).max(1)
-                } else {
-                    width
-                };
-                let rendered = cell.lines_with_options(render_width, options);
-                let is_empty = rendered.is_empty();
-                new_per_cell.push(CachedCell {
-                    revision: current_rev,
-                    lines: Arc::new(rendered),
-                    is_empty,
-                    is_stream_continuation: cell.is_stream_continuation(),
-                    is_conversational: cell.is_conversational(),
-                    is_system_or_tool: matches!(
-                        cell,
-                        HistoryCell::System { .. }
-                            | HistoryCell::Error { .. }
-                            | HistoryCell::Tool(_)
-                            | HistoryCell::SubAgent(_)
-                            | HistoryCell::ArchivedContext { .. }
-                    ),
-                    is_tool_groupable,
-                });
+            // Reuse cached entry if the revision matches AND it's at the
+            // same index (cells can shift on insert/remove, so we only
+            // reuse when the index is identical — a stricter invariant
+            // codex also uses for its active-cell tail).
+            if let Some(prev) = self.per_cell.get(idx)
+                && !layout_changed
+                && prev.revision == current_rev
+                && revisions_match
+            {
+                new_per_cell.push(prev.clone());
                 idx += 1;
+                continue;
             }
+
+            any_dirty = true;
+            first_dirty = Some(first_dirty.map_or(idx, |current| current.min(idx)));
+            let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
+            let render_width = if is_tool_groupable {
+                width.saturating_sub(2).max(1)
+            } else {
+                width
+            };
+            let original_idx = original_index_map
+                .map(|m| *m.get(idx).unwrap_or(&idx))
+                .unwrap_or(idx);
+            let folded = folded_cells.contains(&original_idx);
+            let rendered = cell.lines_with_copy_metadata_folded(render_width, options, folded);
+            let mut lines = Vec::with_capacity(rendered.len());
+            let mut links = Vec::with_capacity(rendered.len());
+            let mut copy_separators = Vec::with_capacity(rendered.len());
+            let mut copy_prefix_widths = Vec::with_capacity(rendered.len());
+            for rendered_line in rendered {
+                let mut line = rendered_line.line;
+                if is_tool_groupable {
+                    strip_cell_local_tool_rail(&mut line);
+                }
+                lines.push(line);
+                links.push(rendered_line.links);
+                copy_prefix_widths.push(rendered_line.copy_prefix_width);
+                copy_separators.push(rendered_line.copy_separator_after);
+            }
+            let is_empty = lines.is_empty();
+            new_per_cell.push(CachedCell {
+                revision: current_rev,
+                lines: Arc::new(lines),
+                links: Arc::new(links),
+                copy_separators: Arc::new(copy_separators),
+                copy_prefix_widths: Arc::new(copy_prefix_widths),
+                is_empty,
+                is_stream_continuation: cell.is_stream_continuation(),
+                is_conversational: cell.is_conversational(),
+                is_system_or_tool: matches!(
+                    cell,
+                    HistoryCell::System { .. }
+                        | HistoryCell::Error { .. }
+                        | HistoryCell::Tool(_)
+                        | HistoryCell::SubAgent(_)
+                        | HistoryCell::ArchivedContext { .. }
+                ),
+                is_tool_groupable,
+            });
+            idx += 1;
         }
 
         self.per_cell = new_per_cell;
@@ -224,6 +329,7 @@ impl TranscriptViewCache {
     /// Reassemble flat `lines` / `line_meta` from `per_cell` plus spacers.
     fn flatten(&mut self, spacing: TranscriptSpacing) {
         self.lines.clear();
+        self.line_links.clear();
         self.line_meta.clear();
         self.rail_prefix_widths.clear();
         self.append_flattened_cells(spacing, 0);
@@ -249,6 +355,7 @@ impl TranscriptViewCache {
             })
             .unwrap_or(self.lines.len());
         self.lines.truncate(truncate_at);
+        self.line_links.truncate(truncate_at);
         self.line_meta.truncate(truncate_at);
         self.rail_prefix_widths.truncate(truncate_at);
         self.append_flattened_cells(spacing, first_cell);
@@ -264,22 +371,35 @@ impl TranscriptViewCache {
             // Deref is zero-cost and gives us &[Line].
             let rendered_line_count = cached.lines.len();
             for (line_in_cell, line) in cached.lines.iter().enumerate() {
-                let final_line = line_with_group_rail(
-                    line,
-                    tool_group_rail(
-                        self.per_cell.as_slice(),
-                        cell_index,
-                        line_in_cell,
-                        rendered_line_count,
-                    ),
+                let rail = tool_group_rail(
+                    self.per_cell.as_slice(),
+                    cell_index,
+                    line_in_cell,
+                    rendered_line_count,
+                );
+                let final_line = line_with_group_rail(line, rail, usize::from(self.width));
+                let final_links = links_with_group_rail(
+                    cached.links.get(line_in_cell).map_or(&[], Vec::as_slice),
+                    rail,
                     usize::from(self.width),
                 );
                 self.rail_prefix_widths
                     .push(compute_rail_prefix_width(&final_line));
                 self.lines.push(final_line);
+                self.line_links.push(final_links);
                 self.line_meta.push(TranscriptLineMeta::CellLine {
                     cell_index,
                     line_in_cell,
+                    copy_prefix_width: cached
+                        .copy_prefix_widths
+                        .get(line_in_cell)
+                        .copied()
+                        .unwrap_or(0),
+                    copy_separator_after: cached
+                        .copy_separators
+                        .get(line_in_cell)
+                        .copied()
+                        .unwrap_or(CopyLineSeparator::Newline),
                 });
             }
 
@@ -287,6 +407,7 @@ impl TranscriptViewCache {
                 let spacer_rows = spacer_rows_between(cached, next, spacing);
                 for _ in 0..spacer_rows {
                     self.lines.push(Line::from(""));
+                    self.line_links.push(Vec::new());
                     self.line_meta.push(TranscriptLineMeta::Spacer);
                     self.rail_prefix_widths.push(0);
                 }
@@ -298,6 +419,12 @@ impl TranscriptViewCache {
     #[must_use]
     pub fn lines(&self) -> &[Line<'static>] {
         &self.lines
+    }
+
+    /// Return hyperlinks aligned with [`Self::lines`].
+    #[must_use]
+    pub fn line_links(&self) -> &[Vec<crate::tui::osc8::LineLink>] {
+        &self.line_links
     }
 
     /// Return cached line metadata.
@@ -322,6 +449,21 @@ impl TranscriptViewCache {
             .get(line_index)
             .copied()
             .unwrap_or(0)
+    }
+}
+
+/// Tool cells still render their own rail when used outside the transcript
+/// cache (pager, clipboard, focused detail). Inside the live transcript this
+/// cache owns grouping across adjacent cells, so retaining both rails produces
+/// doubled prefixes such as `╭ ╭`. Replace the cell-local decoration with the
+/// group rail added by `line_with_group_rail` during flattening.
+fn strip_cell_local_tool_rail(line: &mut Line<'static>) {
+    if line
+        .spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        line.spans.remove(0);
     }
 }
 
@@ -413,6 +555,26 @@ fn line_with_group_rail(
     spans.extend(rendered.spans);
     rendered.spans = truncate_spans_to_width(spans, max_width);
     rendered
+}
+
+fn links_with_group_rail(
+    links: &[crate::tui::osc8::LineLink],
+    rail: Option<crate::tui::widgets::tool_card::CardRail>,
+    max_width: usize,
+) -> Vec<crate::tui::osc8::LineLink> {
+    let shift = rail
+        .map(crate::tui::widgets::tool_card::rail_glyph)
+        .filter(|glyph| !glyph.is_empty())
+        .map_or(0, |glyph| unicode_width::UnicodeWidthStr::width(glyph) + 1);
+    links
+        .iter()
+        .map(|link| link.shifted(shift))
+        .filter(|link| link.col_start < max_width)
+        .map(|mut link| {
+            link.col_end = link.col_end.min(max_width.saturating_sub(1));
+            link
+        })
+        .collect()
 }
 
 /// Return the display-column count of consecutive visual-only decorative
@@ -527,6 +689,7 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::palette;
     use crate::tui::history::{ExecCell, ExecSource, HistoryCell, ToolCell, ToolStatus};
 
     fn plain_lines(cache: &TranscriptViewCache) -> Vec<String> {
@@ -560,12 +723,30 @@ mod tests {
             command: command.to_string(),
             status: ToolStatus::Running,
             output: None,
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
             started_at: None,
             duration_ms: None,
             source: ExecSource::Assistant,
             interaction: None,
             output_summary: None,
         }))
+    }
+
+    #[test]
+    fn cache_renders_user_cells_with_highlight_background() {
+        let cells = vec![user_cell("# literal user prompt")];
+        let revisions = vec![1u64];
+
+        let mut cache = TranscriptViewCache::new();
+        cache.ensure(&cells, &revisions, 40, TranscriptRenderOptions::default());
+
+        let lines = cache.lines();
+        assert_eq!(lines[0].style.bg, Some(palette::SURFACE_ELEVATED));
+        assert_eq!(lines[0].width(), 40);
+        assert_eq!(plain_lines(&cache)[0].trim_end(), "▎ # literal user prompt");
     }
 
     #[test]
@@ -865,8 +1046,14 @@ mod tests {
 
     #[test]
     fn adjacent_tool_cells_render_as_one_railed_group() {
-        let cells = vec![exec_tool_cell("cargo test"), exec_tool_cell("cargo clippy")];
-        let revisions = vec![1u64, 1];
+        // Live foreground exec cells collapse to a single header line (copy
+        // dedupe #17), so a third cell is needed for a rail-continuation row.
+        let cells = vec![
+            exec_tool_cell("cargo test"),
+            exec_tool_cell("cargo clippy"),
+            exec_tool_cell("cargo fmt"),
+        ];
+        let revisions = vec![1u64, 1, 1];
         let mut cache = TranscriptViewCache::new();
 
         cache.ensure(&cells, &revisions, 80, TranscriptRenderOptions::default());
@@ -978,5 +1165,208 @@ mod tests {
             "rail_prefix_widths memory unexpectedly large: {memory_kb:.1} KB"
         );
         eprintln!("  ✓ well under 1 MB even for very long sessions");
+    }
+
+    #[test]
+    fn ensure_filtered_matches_ensure_split_output() {
+        let cells = vec![
+            user_cell("hello"),
+            assistant_cell("some **markdown** body", false),
+            exec_tool_cell("cargo test"),
+            user_cell("again"),
+        ];
+        let revisions = vec![1u64, 2, 3, 4];
+        let index_map: Vec<usize> = vec![0, 1, 2, 3];
+
+        let mut split_cache = TranscriptViewCache::new();
+        split_cache.ensure_split(
+            &[&cells],
+            &revisions,
+            40,
+            TranscriptRenderOptions::default(),
+            &HashSet::new(),
+            Some(&index_map),
+        );
+
+        let refs: Vec<&HistoryCell> = cells.iter().collect();
+        let mut filtered_cache = TranscriptViewCache::new();
+        filtered_cache.ensure_filtered(
+            &refs,
+            &revisions,
+            40,
+            TranscriptRenderOptions::default(),
+            &HashSet::new(),
+            Some(&index_map),
+        );
+
+        assert_eq!(plain_lines(&split_cache), plain_lines(&filtered_cache));
+        assert_eq!(
+            split_cache.line_meta().len(),
+            filtered_cache.line_meta().len()
+        );
+    }
+
+    #[test]
+    fn ensure_filtered_reuses_unchanged_cells() {
+        let cells = [
+            user_cell("hello"),
+            assistant_cell("streaming", true),
+            user_cell("again"),
+        ];
+        let mut revisions = vec![1u64, 1, 1];
+        let refs: Vec<&HistoryCell> = cells.iter().collect();
+
+        let mut cache = TranscriptViewCache::new();
+        cache.ensure_filtered(
+            &refs,
+            &revisions,
+            80,
+            TranscriptRenderOptions::default(),
+            &HashSet::new(),
+            None,
+        );
+        let first = plain_lines(&cache);
+
+        cache.ensure_filtered(
+            &refs,
+            &revisions,
+            80,
+            TranscriptRenderOptions::default(),
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(first, plain_lines(&cache));
+        for (idx, cached) in cache.per_cell.iter().enumerate() {
+            assert_eq!(
+                cached.revision, 1,
+                "cell {idx} must be reused, not re-rendered"
+            );
+        }
+
+        // Bump one revision: only that entry re-renders.
+        revisions[1] = 2;
+        cache.ensure_filtered(
+            &refs,
+            &revisions,
+            80,
+            TranscriptRenderOptions::default(),
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(cache.per_cell[0].revision, 1);
+        assert_eq!(cache.per_cell[1].revision, 2);
+        assert_eq!(cache.per_cell[2].revision, 1);
+    }
+
+    #[test]
+    fn folded_thinking_cache_invalidation() {
+        let long_content = "reasoning line\n".repeat(50);
+        let cells = [HistoryCell::Thinking {
+            content: long_content.clone(),
+            streaming: false,
+            duration_secs: Some(1.5),
+        }];
+        let revisions = [1u64];
+        let options = TranscriptRenderOptions {
+            verbose: true, // expanded by default
+            ..TranscriptRenderOptions::default()
+        };
+        let width = 80u16;
+
+        // First render: no folding → full content.
+        let mut cache = TranscriptViewCache::new();
+        cache.ensure_split(&[&cells], &revisions, width, options, &HashSet::new(), None);
+        let full_line_count = cache.total_lines();
+
+        // Second render: fold the thinking cell → should invalidate and
+        // produce fewer lines (collapsed summary).
+        let mut folded = HashSet::new();
+        folded.insert(0usize);
+        cache.ensure_split(&[&cells], &revisions, width, options, &folded, None);
+        let folded_line_count = cache.total_lines();
+
+        assert!(
+            folded_line_count < full_line_count,
+            "folded thinking should render fewer lines: folded={folded_line_count} full={full_line_count}"
+        );
+
+        // Third render: unfold → should restore full content.
+        cache.ensure_split(&[&cells], &revisions, width, options, &HashSet::new(), None);
+        let restored_line_count = cache.total_lines();
+        assert_eq!(
+            restored_line_count, full_line_count,
+            "unfolded thinking should restore full line count"
+        );
+    }
+
+    #[test]
+    fn folded_thinking_with_collapsed_cells_uses_original_indices() {
+        // Two thinking cells: cell 0 and cell 1. Cell 0 is collapsed (hidden).
+        // Fold cell 1 (original index 1). With the filtered index map,
+        // the cache should still fold the correct cell.
+        let cells = [
+            HistoryCell::Thinking {
+                content: "first thinking block\n".repeat(20),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Thinking {
+                content: "second thinking block\n".repeat(20),
+                streaming: false,
+                duration_secs: Some(2.0),
+            },
+        ];
+        let revisions = [1u64, 2u64];
+        let options = TranscriptRenderOptions {
+            verbose: true,
+            ..TranscriptRenderOptions::default()
+        };
+        let width = 80u16;
+
+        // No collapsing, no folding — baseline.
+        let mut cache = TranscriptViewCache::new();
+        cache.ensure_split(&[&cells], &revisions, width, options, &HashSet::new(), None);
+        let baseline = cache.total_lines();
+        assert!(baseline > 0, "baseline render should contain visible lines");
+
+        // Collapse cell 0, fold cell 1. The filtered list has only cell 1
+        // at filtered index 0, but it maps to original index 1.
+        let filtered_cells = [cells[1].clone()];
+        let filtered_revs = [2u64];
+        let index_map: Vec<usize> = vec![1]; // filtered 0 → original 1
+
+        let mut folded = HashSet::new();
+        folded.insert(1usize); // fold original index 1
+
+        let mut cache2 = TranscriptViewCache::new();
+        cache2.ensure_split(
+            &[&filtered_cells],
+            &filtered_revs,
+            width,
+            options,
+            &folded,
+            Some(&index_map),
+        );
+        let folded_filtered = cache2.total_lines();
+
+        // Cell 1 was expanded in baseline; now it should be folded.
+        // We can't compare directly to baseline because baseline had both
+        // cells, but folded_filtered should be less than if cell 1 were
+        // expanded in the filtered view.
+        let mut cache3 = TranscriptViewCache::new();
+        cache3.ensure_split(
+            &[&filtered_cells],
+            &filtered_revs,
+            width,
+            options,
+            &HashSet::new(),
+            Some(&index_map),
+        );
+        let expanded_filtered = cache3.total_lines();
+
+        assert!(
+            folded_filtered < expanded_filtered,
+            "folded cell via index map should render fewer lines: folded={folded_filtered} expanded={expanded_filtered}"
+        );
     }
 }

@@ -1,14 +1,14 @@
 //! Pseudo-terminal session wrapping `portable-pty`.
 //!
 //! Spawns a binary in a real PTY, pumps the child's stdout into an in-memory
-//! buffer on a background thread, and exposes write/resize/wait/kill primitives
+//! buffer on a background thread, and exposes write/wait/kill primitives
 //! the test harness composes.
 //!
 //! The reader thread is necessary because `portable-pty`'s reader is blocking
 //! and the test thread must remain free to send input + poll for screen
 //! changes.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -17,13 +17,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub struct PtySession {
+    /// Held (not read) so the PTY master stays open for the child's lifetime.
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     buffer: Arc<Mutex<Vec<u8>>>,
     reader_handle: Option<JoinHandle<()>>,
-    rows: u16,
-    cols: u16,
 }
 
 pub struct PtySessionBuilder<'a> {
@@ -47,11 +46,6 @@ impl<'a> PtySessionBuilder<'a> {
             cols: 120,
             clear_env: false,
         }
-    }
-
-    pub fn arg(mut self, a: impl Into<String>) -> Self {
-        self.args.push(a.into());
-        self
     }
 
     pub fn args<I, S>(mut self, args: I) -> Self
@@ -107,6 +101,9 @@ impl<'a> PtySessionBuilder<'a> {
         }
         if self.clear_env {
             cmd.env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", path);
+            }
         }
         // TERM must be set to something xterm-ish so crossterm enables the
         // capabilities the TUI assumes (256 color, bracketed paste, …).
@@ -149,8 +146,6 @@ impl<'a> PtySessionBuilder<'a> {
             writer,
             buffer,
             reader_handle: Some(reader_handle),
-            rows: self.rows,
-            cols: self.cols,
         })
     }
 }
@@ -160,13 +155,17 @@ impl PtySession {
         PtySessionBuilder::new(program)
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_all(bytes).context("pty write")?;
         self.writer.flush().context("pty flush")?;
         Ok(())
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master
             .resize(PtySize {
                 rows,
@@ -174,14 +173,7 @@ impl PtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| anyhow!("pty resize failed: {e}"))?;
-        self.rows = rows;
-        self.cols = cols;
-        Ok(())
-    }
-
-    pub fn size(&self) -> (u16, u16) {
-        (self.rows, self.cols)
+            .context("pty resize")
     }
 
     /// Drain any bytes the reader thread has pushed into the buffer. Returns

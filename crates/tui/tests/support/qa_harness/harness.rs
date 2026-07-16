@@ -1,9 +1,9 @@
 //! End-to-end harness composing [`PtySession`] + [`Frame`].
 //!
 //! Tests build a [`Harness`] via [`Harness::builder`], drive the TUI with
-//! [`Harness::send`] / [`Harness::paste`] / [`Harness::resize`], poll the
-//! parsed terminal state with [`Harness::wait_for`], and assert on
-//! [`Harness::frame`] / filesystem state.
+//! [`Harness::send`] / [`Harness::paste`], poll the parsed terminal state
+//! with [`Harness::wait_for`], and assert on [`Harness::frame`] /
+//! filesystem state.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,11 +44,6 @@ impl HarnessBuilder {
         }
     }
 
-    pub fn arg(mut self, a: impl Into<String>) -> Self {
-        self.args.push(a.into());
-        self
-    }
-
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -79,8 +74,8 @@ impl HarnessBuilder {
         self
     }
 
-    /// Point `$HOME` (and `XDG_*` defaults) at a fresh dir so the spawned
-    /// binary cannot read or mutate the developer's real `~/.deepseek/`.
+    /// Point `$HOME` (and config/cache defaults) at a fresh dir so the spawned
+    /// binary cannot read or mutate the developer's real user config.
     pub fn seal_home(mut self, home: impl Into<PathBuf>) -> Self {
         self.seal_home = Some(home.into());
         self
@@ -98,12 +93,16 @@ impl HarnessBuilder {
         }
         if let Some(home) = self.seal_home.as_deref() {
             std::fs::create_dir_all(home).context("create sealed HOME")?;
+            let codewhale_config = home.join(".codewhale").join("config.toml");
+            let deepseek_config = home.join(".deepseek").join("config.toml");
             builder = builder
                 .env("HOME", home.to_string_lossy())
                 .env("XDG_CONFIG_HOME", home.join(".config").to_string_lossy())
                 .env("XDG_DATA_HOME", home.join(".local/share").to_string_lossy())
                 .env("XDG_CACHE_HOME", home.join(".cache").to_string_lossy())
-                .env("USERPROFILE", home.to_string_lossy());
+                .env("USERPROFILE", home.to_string_lossy())
+                .env("CODEWHALE_CONFIG_PATH", codewhale_config.to_string_lossy())
+                .env("DEEPSEEK_CONFIG_PATH", deepseek_config.to_string_lossy());
         }
         for (k, v) in &self.env {
             builder = builder.env(k, v);
@@ -124,8 +123,18 @@ impl Harness {
         HarnessBuilder::new(program)
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.pty.pid()
+    }
+
     pub fn send(&mut self, bytes: impl AsRef<[u8]>) -> Result<()> {
         self.pty.write_bytes(bytes.as_ref())
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.pty.resize(rows, cols)?;
+        self.frame.resize(rows, cols);
+        Ok(())
     }
 
     pub fn paste(&mut self, text: &str) -> Result<()> {
@@ -134,12 +143,6 @@ impl Harness {
 
     pub fn paste_unbracketed(&mut self, text: &str) -> Result<()> {
         self.pty.write_bytes(&super::paste::unbracketed(text))
-    }
-
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.pty.resize(rows, cols)?;
-        self.frame.resize(rows, cols);
-        Ok(())
     }
 
     /// Pull whatever the child has written since last call into the frame
@@ -226,18 +229,17 @@ impl Harness {
         {
             return PathBuf::from(path);
         }
-        // Legacy fallback for callers still referencing the old bin name.
-        if name == "codewhale-tui"
-            && let Some(path) = option_env!("CARGO_BIN_EXE_deepseek-tui")
-        {
-            return PathBuf::from(path);
-        }
         panic!("env {key} not set; is the binary declared in this crate?")
     }
 
     /// Best-effort cooperative shutdown.
     pub fn shutdown(self) -> Option<i32> {
         self.pty.shutdown(Duration::from_secs(2))
+    }
+
+    /// Wait for the child process to exit without sending it a signal.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<i32> {
+        self.pty.wait_until(Instant::now() + timeout)
     }
 
     pub fn debug_dump(&mut self) -> String {
@@ -253,6 +255,7 @@ pub fn make_sealed_workspace() -> Result<SealedWorkspace> {
     let workspace = tmp.path().join("workspace");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&workspace).context("mkdir workspace")?;
+    std::fs::create_dir_all(home.join(".codewhale")).context("mkdir home/.codewhale")?;
     std::fs::create_dir_all(home.join(".deepseek")).context("mkdir home/.deepseek")?;
     Ok(SealedWorkspace {
         _tmp: tmp,

@@ -31,11 +31,11 @@ fn format_elapsed(ms: u64) -> String {
 
 pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
     if jobs.is_empty() {
-        return "No live background shell jobs. Jobs are process-local; after a restart, inspect durable task artifacts for prior command output.".to_string();
+        return "No live Bash jobs. Bash jobs are process-local; after a restart, inspect durable task artifacts for prior command output.".to_string();
     }
 
     let mut lines = vec![
-        format!("Background shell jobs ({})", jobs.len()),
+        format!("Bash jobs ({})", jobs.len()),
         "----------------------------------------".to_string(),
     ];
     for job in jobs {
@@ -73,7 +73,7 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
 pub(super) fn format_shell_poll(result: &ShellResult) -> String {
     let mut lines = vec![
         format!(
-            "Shell job {}: {} exit={:?} elapsed={}",
+            "Bash job {}: {} exit={:?} elapsed={}",
             result.task_id.as_deref().unwrap_or("(unknown)"),
             status_label(&result.status, false),
             result.exit_code,
@@ -104,7 +104,7 @@ pub(super) fn open_shell_job_pager(app: &mut App, detail: &ShellJobDetail) {
         .unwrap_or(100)
         .saturating_sub(4);
     app.view_stack.push(PagerView::from_text(
-        format!("Shell Job {}", detail.snapshot.id),
+        format!("Bash Job {}", detail.snapshot.id),
         &format_shell_job_detail(detail),
         width.max(60),
     ));
@@ -125,7 +125,9 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         lines.push(format!("Linked Task: {task_id}"));
     }
     if job.stale {
-        lines.push("Completion State: stale after restart; process is not attached.".to_string());
+        lines.push(
+            "Completion state: stale after restart; the process is no longer running.".to_string(),
+        );
     } else {
         lines.push("Completion State: live in this TUI process.".to_string());
     }
@@ -171,9 +173,14 @@ mod tests {
             stderr_len: 8,
             stdin_available: false,
             stale: true,
+            elapsed_since_output_ms: None,
             linked_task_id: Some("task_1".to_string()),
+            owner_agent_id: None,
+            owner_agent_name: None,
         }];
         let formatted = format_shell_job_list(&jobs);
+        assert!(formatted.contains("Bash jobs (1)"));
+        assert!(!formatted.contains("Background commands"));
         assert!(formatted.contains("shell_dead"));
         assert!(formatted.contains("stale"));
         assert!(formatted.contains("/jobs poll <id>"));

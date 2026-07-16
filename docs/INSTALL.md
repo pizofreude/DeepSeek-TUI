@@ -5,35 +5,86 @@ This page covers every supported install path and the most common
 common platforms.
 
 If you just want the short version, see the
-[main README](../README.md#quickstart) or
-[简体中文 README](../README.zh-CN.md#快速开始).
+[main README](../README.md#install) or
+[简体中文 README](../README.zh-CN.md#安装).
+
+On macOS and Linux, the website installer is the shortest install/update path:
+
+```bash
+curl -fsSL https://codewhale.net/install.sh | sh
+```
+
+It downloads the matching `codewhale`, `codew`, and `codewhale-tui` release binaries,
+verifies them against `codewhale-artifacts-sha256.txt`, installs to
+`~/.local/bin` by default, and exposes the `codew` convenience command.
 
 ---
 
 ## 1. Supported platforms
 
-`codewhale-tui` ships prebuilt binaries for these
-platform/architecture combinations from v0.8.8 onward:
+CodeWhale ships matched `codewhale`, `codew`, and `codewhale-tui` prebuilt binaries for
+these platform/architecture combinations. Linux ARM64 is available from
+v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
+`rquickjs-sys` dependency does not ship `riscv64gc-unknown-linux-gnu` bindings.
 
 | Platform     | Architecture | npm install | `cargo install` | GitHub release asset                                  |
 | ------------ | ------------ | :---------: | :-------------: | ----------------------------------------------------- |
-| Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codewhale-tui-linux-x64`        |
-| Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codewhale-tui-linux-arm64`    |
-| macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codewhale-tui-macos-x64`        |
-| macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codewhale-tui-macos-arm64`    |
-| Windows      | x64          |     ✅      |       ✅        | `codewhale-windows-x64.exe`, `codewhale-tui-windows-x64.exe` |
-| Other Linux (musl, riscv64, …) | — |   ❌¹    |       ✅²       | build from source                                     |
+| Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codew-linux-x64`, `codewhale-tui-linux-x64`        |
+| Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codew-linux-arm64`, `codewhale-tui-linux-arm64`    |
+| Android / Termux | arm64 (aarch64) | ❌¹ | ✅² | `codewhale-android-arm64.tar.gz` Termux archive when published |
+| Linux        | riscv64      |     ❌¹     |       ❌³       | temporarily unsupported until upstream bindings land |
+| macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codew-macos-x64`, `codewhale-tui-macos-x64`        |
+| macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codew-macos-arm64`, `codewhale-tui-macos-arm64`    |
+| Windows      | x64          |     ✅      |       ✅        | `codewhale-windows-x64.exe`, `codew-windows-x64.exe`, `codewhale-tui-windows-x64.exe` |
+| Linux x64 on musl (Alpine) | ✅ (static) |    ✅      |       ✅        | static `codewhale-tui-linux-x64` (musl) asset           |
+| Other Linux (musl non-x64, other arches) | — | ❌¹ | ✅² | build from source                                     |
 | FreeBSD / OpenBSD              | — |   ❌      |       ✅²       | build from source                                     |
 
 ¹ The npm package will exit with a clear error and point you here.
 ² Provided your toolchain can compile a recent Rust workspace; see
   [Build from source](#7-build-from-source) below.
+³ RISC-V source builds currently need upstream `rquickjs-sys` RISC-V bindings or
+  a bindgen-enabled dependency build.
 
-The Linux release assets are glibc builds, not musl builds. They dynamically
-link normal Linux runtime libraries such as `libdbus-1` and `libc`; SQLite is
-currently bundled into the binary through `rusqlite` so users do not need a
-separate `libsqlite3` runtime package for official release assets. Musl-based
-systems such as Alpine should use [Build from source](#7-build-from-source).
+Android / Termux is not the same target as Linux arm64. Do not install the
+GNU libc `codewhale-linux-arm64` archive in Termux; use the Termux-specific
+Android archive when a release or release candidate publishes one, or build
+from source inside Termux.
+
+The Linux **x64** release assets have been **static (musl) builds** since v0.8.65.
+They have no glibc dependency and run on any x86_64 Linux, including Ubuntu
+22.04, Debian stable, RHEL/CentOS, and Alpine/musl. SQLite is bundled into the
+binary through `rusqlite`, so no separate `libsqlite3` runtime package is needed.
+
+The Linux **arm64** release assets are still GNU libc (glibc) builds. They
+dynamically link normal Linux runtime libraries such as `libdbus-1` and `libc`,
+and are built on Ubuntu 24.04, so they can require `GLIBC_2.39`.
+
+### Linux glibc floor (arm64)
+
+This floor applies only to the **GNU libc** arm64 asset. The static x64 (musl)
+asset has no `GLIBC_*` symbols, so it passes the install preflight and runs on
+older systems without error. In the current v0.8.67 release lane, the GNU asset
+is built on Ubuntu 24.04 and can require `GLIBC_2.39`. Ubuntu 22.04 ships glibc
+2.35, so those arm64 binaries fail with errors such as:
+
+```text
+version `GLIBC_2.39' not found
+```
+
+The npm wrapper, `codewhale update`, and the Unix archive installer preflight
+Linux GNU binaries before installing them and point older systems to Cargo/source
+builds. If you are on Ubuntu 22.04 arm64, Debian stable, RHEL/CentOS, or another
+older GNU base for a non-x64 asset, use:
+
+```bash
+cargo install codewhale-cli --locked
+cargo install codewhale-tui --locked
+```
+
+Future release engineering may add static (musl) arm64 assets so the glibc floor
+goes away entirely; until then, x64 is static and arm64 users on older distros
+should build from source.
 
 > **Linux ARM64 note (v0.8.7 and earlier).** v0.8.7 and earlier do **not**
 > publish a Linux ARM64 prebuilt; users on HarmonyOS thin-and-light, Asahi
@@ -42,6 +93,86 @@ systems such as Alpine should use [Build from source](#7-build-from-source).
 > and `codewhale-tui-linux-arm64`, so a plain `npm i -g codewhale` works
 > on any glibc-based ARM64 Linux. If you're stuck on v0.8.7, jump to
 > [Build from source](#7-build-from-source) — `cargo install` works fine.
+> For HarmonyOS PC and OpenHarmony cross-build setup, see
+> [HarmonyOS and OpenHarmony](HarmonyOS.md).
+
+### Android / Termux arm64
+
+Termux runs on Android's Bionic libc and uses `$PREFIX` as its Unix prefix, so
+it needs a Termux-specific Android arm64 archive. The Linux arm64 release asset
+is a GNU libc build for normal Linux distributions and should not be used on
+Android.
+
+Install the minimum archive/runtime tools first:
+
+```bash
+pkg update
+pkg install -y ca-certificates curl tar gzip coreutils
+```
+
+When the release includes `codewhale-android-arm64.tar.gz`, install it with the
+archive's bundled installer. Passing `PREFIX="$PREFIX"` matters: the installer
+defaults to `~/.local`, while Termux users normally expect commands under
+`$PREFIX/bin`.
+
+```bash
+cd "$HOME"
+curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-android-arm64.tar.gz
+curl -L -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-bundles-sha256.txt
+sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
+
+tar xzf codewhale-android-arm64.tar.gz
+cd codewhale-android-arm64
+PREFIX="$PREFIX" ./install.sh
+hash -r
+```
+
+If you are validating from source or building a release candidate locally,
+install the build packages before running Cargo:
+
+```bash
+pkg install -y rust clang pkg-config make git
+cargo install codewhale-cli --locked
+cargo install codewhale-tui --locked
+```
+
+First-run setup is the same as other platforms. Prefer `codewhale auth set` or
+provider environment variables; do not assume a desktop Secret Service keyring
+exists inside Termux.
+
+```bash
+codewhale auth set --provider deepseek
+codewhale auth status
+codewhale doctor
+```
+
+Maintainers should use this repeatable smoke checklist for a Termux / Android
+arm64 release candidate:
+
+```bash
+command -v codewhale codew codewhale-tui
+test -x "$PREFIX/bin/codewhale"
+test -x "$PREFIX/bin/codew"
+test -x "$PREFIX/bin/codewhale-tui"
+
+codewhale --version
+codewhale doctor
+codewhale exec --auto "run pwd"
+codewhale-tui --version
+```
+
+Known limitations:
+
+- Sandbox behavior must be verified on-device. Android kernels and Termux
+  packaging may not expose the same Landlock, seccomp, or Bubblewrap behavior
+  documented for desktop/server Linux.
+- OS keyring behavior is best-effort. If Termux cannot provide a usable secret
+  store, use `codewhale auth status` to confirm the actual source and fall back
+  to provider env vars or config-backed auth.
+- Terminal rendering varies by Android terminal app. The TUI always owns the
+  alternate screen; `--no-alt-screen` is accepted only as a deprecated
+  compatibility no-op. If a terminal app cannot render the full-screen TUI,
+  use `codewhale exec` for headless runs instead.
 
 ---
 
@@ -49,11 +180,13 @@ systems such as Alpine should use [Build from source](#7-build-from-source).
 
 Official release binaries are published only from
 `https://github.com/Hmbown/CodeWhale/releases` and the npm package named
-`codewhale-tui`. Do not install release assets from look-alike repositories,
+`codewhale`. Do not install release assets from look-alike repositories,
 archives, or search-result mirrors unless you deliberately trust that mirror.
 
-Every GitHub release includes `codewhale-artifacts-sha256.txt`. If you download
-binaries manually, verify them before running:
+Every GitHub release includes checksum manifests. Use
+`codewhale-artifacts-sha256.txt` for bare binaries and
+`codewhale-bundles-sha256.txt` for `.tar.gz` / `.zip` platform archives. If you
+download binaries manually, verify them before running:
 
 ```bash
 # Run from the directory containing the downloaded binaries.
@@ -79,22 +212,26 @@ a download sourced from an impersonating repository or mirror.
 
 ---
 
-## 3. Install via npm (recommended)
+## 3. Install via npm
+
+npm is the recommended install path. The `codewhale` wrapper is published at
+v0.8.68 (Node 18+; wrapper available for v0.8.56 and later).
 
 ```bash
 npm install -g codewhale
-codewhale
+codewhale --version   # 0.8.68
 ```
 
 `postinstall` downloads the right pair of binaries from the matching GitHub
-release, verifies a SHA-256 manifest, and exposes both `codewhale` and
+release, verifies a SHA-256 manifest, and exposes `codewhale`, `codew`, and
 `codewhale-tui` on your `PATH`.
 
 Useful environment variables:
 
 | Variable                            | Purpose                                                                                |
 | ----------------------------------- | -------------------------------------------------------------------------------------- |
-| `DEEPSEEK_TUI_VERSION`              | Pin which release the wrapper downloads (defaults to `deepseekBinaryVersion`)          |
+| `CODEWHALE_VERSION`                 | Pin which release the wrapper downloads (canonical)                                    |
+| `DEEPSEEK_TUI_VERSION`              | Legacy alias for `CODEWHALE_VERSION` (defaults to `codewhaleBinaryVersion`)            |
 | `DEEPSEEK_TUI_GITHUB_REPO`          | Point the downloader at a fork (`owner/repo`)                                          |
 | `DEEPSEEK_TUI_RELEASE_BASE_URL`     | Override the download root (e.g. an internal mirror or release-asset proxy)            |
 | `DEEPSEEK_TUI_FORCE_DOWNLOAD=1`     | Re-download even if a cached binary marker matches                                     |
@@ -120,10 +257,28 @@ delegates to the TUI runtime at runtime.
 
 ```bash
 # Requires Rust 1.88+ (https://rustup.rs)
-cargo install codewhale-cli --locked   # provides `codewhale`
+cargo install codewhale-cli --locked   # provides `codewhale` and `codew`
 cargo install codewhale-tui     --locked   # provides `codewhale-tui`
 codewhale --version
 ```
+
+> **Linux: install build-time dependencies first.** `cargo install` compiles
+> from source, and on Linux the `codewhale-tui` crate links against
+> `libdbus-1` (used by the D-Bus secret-service backend for credential
+> storage). Install the required system packages before running `cargo install`:
+>
+> ```bash
+> # Debian / Ubuntu
+> sudo apt-get install -y build-essential pkg-config libdbus-1-dev
+>
+> # Fedora / RHEL
+> sudo dnf install -y gcc make pkgconf-pkg-config dbus-devel
+> ```
+>
+> If you use the npm wrapper or download GitHub Release binaries, these
+> build-time packages are **not** required — the prebuilt binary only
+> needs the runtime library (`libdbus-1`), which is already present on
+> most desktop Linux installs.
 
 ### China / mirror-friendly install
 
@@ -175,21 +330,6 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 
 `rsproxy`, Tencent COS, and Aliyun OSS mirrors work the same way; pick whichever
 is fastest from your network.
-
-### Tencent Cloud remote-first setup
-
-For an always-on workspace that can be controlled from a phone, use the
-Tencent-native path instead of treating install as a single laptop step:
-
-- CNB mirror/source: `https://cnb.cool/codewhale.net/codewhale.git`
-- Tencent Lighthouse HK: `/opt/whalebro` remote workspace
-- Feishu/Lark: long-connection phone bridge
-- EdgeOne: optional public HTTPS edge for docs/status/webhook surfaces
-
-Start with [Tencent Cloud Remote-First Quickstart](TENCENT_CLOUD_REMOTE_FIRST.md),
-then follow [Tencent Lighthouse Hong Kong Phone Setup](TENCENT_LIGHTHOUSE_HK.md).
-
----
 
 ## 5. Install via Nix
 
@@ -249,9 +389,33 @@ Install into a NixOS module:
 
 ---
 
+## Homebrew (legacy tap)
+
+Homebrew currently ships only the legacy `deepseek-tui` tap, kept for
+compatibility while the formula is renamed to `codewhale`. It installs the
+same current-release binaries:
+
+```bash
+brew tap Hmbown/deepseek-tui
+brew install deepseek-tui
+```
+
+Update with `brew upgrade deepseek-tui`. There is no `codewhale` formula yet;
+once the rename lands, this section will switch to it.
+
+---
+
 ## 6. Manual download from GitHub Releases
 
-Grab the matching pair of binaries for your platform from the
+Each platform appears on the Releases page in **two forms** (this is intentional — see #3208):
+the **bare binaries** (`codewhale-<platform>`, `codew-<platform>`, and
+`codewhale-tui-<platform>`, no extension) and a **`.tar.gz` / `.zip` archive**
+(`codewhale-<platform>.tar.gz`) that bundles the same commands plus an
+`install.sh`. The npm wrapper and the in-app `codewhale update` download the
+matched runtime binaries; the archive is the easiest manual install (see §5).
+The steps below use the bare binaries directly.
+
+Grab the matching command set for your platform from the
 [Releases page](https://github.com/Hmbown/CodeWhale/releases) and drop them
 side by side into a directory on your `PATH` (e.g. `~/.local/bin`):
 
@@ -260,11 +424,20 @@ side by side into a directory on your `PATH` (e.g. `~/.local/bin`):
 mkdir -p ~/.local/bin
 curl -L -o ~/.local/bin/codewhale      \
     https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-linux-arm64
+curl -L -o ~/.local/bin/codew          \
+    https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-linux-arm64
 curl -L -o ~/.local/bin/codewhale-tui  \
     https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-tui-linux-arm64
-chmod +x ~/.local/bin/codewhale ~/.local/bin/codewhale-tui
+chmod +x ~/.local/bin/codewhale ~/.local/bin/codew ~/.local/bin/codewhale-tui
 codewhale --version
 ```
+
+> **macOS Gatekeeper note.** If you downloaded the binaries with a browser,
+> macOS may block them with "Apple cannot verify" warnings. Clear the quarantine
+> attribute on all three binaries and retry:
+> ```bash
+> xattr -d com.apple.quarantine ~/.local/bin/codewhale ~/.local/bin/codew ~/.local/bin/codewhale-tui 2>/dev/null || true
+> ```
 
 Verify integrity against the per-release SHA-256 manifest:
 
@@ -276,13 +449,45 @@ curl -L -o /tmp/codewhale-artifacts-sha256.txt \
 
 (Use `shasum -a 256 -c` instead of `sha256sum` on macOS.)
 
+### Roll back to a previous release
+
+If a new release is bad on your machine, install the last known-good version
+explicitly. Replace `X.Y.Z` with the version you want to restore.
+
+```bash
+# npm wrapper, only for versions that were published to npm
+npm install -g codewhale@X.Y.Z
+
+# Cargo install path; both crates are required
+cargo install codewhale-cli --version X.Y.Z --locked --force
+cargo install codewhale-tui --version X.Y.Z --locked --force
+```
+
+For manual installs, download the matched binaries or the platform archive from the
+exact release tag and verify the matching checksum manifest from that same tag:
+
+```bash
+# individual binaries
+curl -L -o codewhale-artifacts-sha256.txt \
+  https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-artifacts-sha256.txt
+
+# platform archives
+curl -L -o codewhale-bundles-sha256.txt \
+  https://github.com/Hmbown/CodeWhale/releases/download/vX.Y.Z/codewhale-bundles-sha256.txt
+```
+
+Inside a CodeWhale workspace, `/restore list [N]` lists side-git file snapshots
+and `/restore <N>` restores files from the chosen snapshot. That workspace
+rollback does not change your installed binary version and does not rewrite
+conversation history.
+
 ### Windows Scoop
 
 The `codewhale` package is listed in Scoop's main bucket:
 
 ```powershell
 scoop update
-scoop install deepseek-tui
+scoop install codewhale
 codewhale --version
 ```
 
@@ -290,12 +495,61 @@ Scoop manifests are maintained outside this repository's release workflow and
 can lag GitHub/npm/Cargo releases. Use npm or manual GitHub release downloads
 when you need the newest version immediately.
 
+### Windows NSIS Installer
+
+A standalone NSIS-based installer is available starting with v0.8.50 for
+Windows users who prefer a traditional double-click setup (no npm, no Scoop, no
+Cargo required).
+
+**Download** `CodeWhaleSetup.exe` from the
+[Releases page](https://github.com/Hmbown/CodeWhale/releases/latest).
+
+**Install** by double-clicking the setup executable. The installer:
+
+- Installs `codewhale.exe`, `codew.exe`, and `codewhale-tui.exe` side-by-side into
+  `%LOCALAPPDATA%\Programs\CodeWhale\bin`
+- Adds the install directory to the **current user** `PATH`
+- Registers in Windows **Apps & Features** for easy uninstall
+
+**Silent install** (for IT admins, SCCM, Intune):
+
+```powershell
+CodeWhaleSetup.exe /S
+```
+
+The installer is per-user and does not request elevation. Run silent installs in
+the target user's context, or use a deployment tool that can run the installer
+for each user profile that needs CodeWhale.
+
+The release-built installer is currently unsigned and may trigger Windows
+SmartScreen. Verify the SHA-256 checksum from `codewhale-artifacts-sha256.txt`
+before deploying, and sign the installer in your internal deployment pipeline if
+your environment requires signed application packages.
+
+**Build the installer yourself** (requires [NSIS](https://nsis.sourceforge.io)):
+
+```powershell
+cd scripts\installer
+# Place codewhale.exe and codewhale-tui.exe here, then:
+makensis /DVERSION=<version> codewhale.nsi
+```
+
+**Manual fallback** — if the installer is blocked by group policy, see the
+[CLASSROOM_INSTALL.md](CLASSROOM_INSTALL.md) guide for step-by-step PowerShell
+commands.
+
+> **Deploying to a classroom or lab?** See the full
+> [Classroom Install Checklist](CLASSROOM_INSTALL.md) for silent install,
+> API key provisioning, imaging notes, and troubleshooting.
+
 ---
 
 ## 7. Build from source
 
-This is the catch-all for any platform we don't ship — including musl, riscv64,
-LoongArch, FreeBSD, and pre-2024 ARM64 distros.
+This is the catch-all for platforms we don't ship, including musl non-x64,
+LoongArch, FreeBSD, and pre-2024 ARM64 distros. Linux RISC-V currently also
+needs upstream `rquickjs-sys` RISC-V bindings or a bindgen-enabled dependency
+build before source builds are expected to work.
 
 ### Prerequisites
 
@@ -314,13 +568,13 @@ LoongArch, FreeBSD, and pre-2024 ARM64 distros.
 git clone https://github.com/Hmbown/CodeWhale.git
 cd CodeWhale
 
-cargo install --path crates/cli --locked   # provides `codewhale`
+cargo install --path crates/cli --locked   # provides `codewhale` and `codew`
 cargo install --path crates/tui --locked   # provides `codewhale-tui`
 
 codewhale --version
 ```
 
-Both binaries land in `~/.cargo/bin/` by default; make sure that directory is
+The commands land in `~/.cargo/bin/` by default; make sure that directory is
 on your `PATH`.
 
 ### Cross-compiling from x64 to ARM64 Linux
@@ -420,12 +674,11 @@ set CARGO_HTTP_CHECK_REVOKE=false   # may be needed behind some Chinese ISPs
 cargo build --release
 ```
 
-Both binaries appear in `target\release\codewhale.exe` and
-`target\release\codewhale-tui.exe`.
+The binaries appear in `target\release\codewhale.exe`,
+`target\release\codew.exe`, and `target\release\codewhale-tui.exe`.
 
-> **Prefer `npm install -g` on Windows unless you need to modify source.**
-> The npm package pulls prebuilt binaries and avoids the C toolchain
-> dependency entirely — see [Section 3](#3-install-via-npm-recommended).
+> Prefer not to build? Install via npm, Cargo, GitHub Releases, or the CNB
+> mirror — see the sections above.
 
 ---
 
@@ -462,15 +715,19 @@ cargo install codewhale-cli --locked
 
 ### npm download is slow or times out from mainland China
 
-Set `DEEPSEEK_TUI_RELEASE_BASE_URL` to a mirrored release-asset directory
+Set `CODEWHALE_RELEASE_BASE_URL` to a mirrored release-asset directory
 (rsproxy, TUNA, Tencent COS, Aliyun OSS), or skip npm entirely and use the
 Cargo mirror setup in [Section 4](#4-install-via-cargo-any-tier-1-rust-target).
+The legacy `DEEPSEEK_TUI_RELEASE_BASE_URL` name is still accepted.
 
 ### `codewhale update` is blocked by GitHub from mainland China
 
 `codewhale update` normally contacts GitHub Releases for metadata and binary
 assets. On networks where GitHub is blocked or unreliable, use the CNB source
 mirror instead and install both binaries from the release tag:
+
+To check the latest release without downloading or replacing binaries, run
+`codewhale update --check`.
 
 ```bash
 cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewhale-cli --locked --force
@@ -480,13 +737,14 @@ cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewh
 If you operate a binary asset mirror, `codewhale update` can use it directly:
 
 ```bash
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
 DEEPSEEK_TUI_VERSION=X.Y.Z \
-DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/DeepSeek-TUI/vX.Y.Z/ \
 codewhale update
 ```
 
 The mirror directory must contain `codewhale-artifacts-sha256.txt` and the
-platform binaries from the GitHub release.
+platform binaries from the GitHub release. The legacy
+`DEEPSEEK_TUI_RELEASE_BASE_URL` mirror variable remains supported as an alias.
 
 ### Debian/Ubuntu: `feature edition2024 is required` from `cargo install`
 
@@ -525,6 +783,23 @@ Install the C toolchain:
 ```bash
 sudo apt-get install -y build-essential pkg-config libdbus-1-dev
 ```
+
+### WSL2 / Ubuntu: `dbus-1` or `pkg-config` not found while building
+
+WSL2 uses the same Linux source-build path as Ubuntu. If `cargo install
+codewhale-tui --locked` fails while compiling the keyring or D-Bus secret
+storage crates, install the Linux build dependencies inside the WSL distro,
+then rerun both Cargo install commands:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libdbus-1-dev
+cargo install codewhale-cli --locked
+cargo install codewhale-tui --locked
+```
+
+The prebuilt npm/GitHub binaries do not need these build-time packages; they
+only apply when WSL2 is compiling CodeWhale from source.
 
 ### Wrapper installs but `codewhale` isn't found
 
@@ -573,9 +848,9 @@ path-agnostic — moving `target-dir` does not help.
 
 1. **Add the project's `target/` directory to your AV exclusions list.**
 2. **Close the antivirus software temporarily** during `cargo build`.
-3. **Use `npm install -g codewhale` instead** — the npm package ships
-   prebuilt binaries and skips the Cargo build entirely
-   ([Section 3](#3-install-via-npm-recommended)).
+3. **Use the GitHub Release installer/archive instead** — the release assets
+   ship prebuilt binaries and skip the Cargo build entirely
+   ([Section 6](#6-manual-download-from-github-releases)).
 4. **Use `cargo install codewhale-cli --locked`** from crates.io — this
    changes the binary path, which some AV tools treat differently.
 
@@ -608,7 +883,7 @@ Use one of these paths:
 2. Mirror the release assets internally and set `DEEPSEEK_TUI_RELEASE_BASE_URL`:
 
    ```bash
-   export DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/DeepSeek-TUI/
+   export DEEPSEEK_TUI_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/
    codewhale
    ```
 

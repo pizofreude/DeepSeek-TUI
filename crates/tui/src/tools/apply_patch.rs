@@ -19,6 +19,35 @@ use super::spec::{
 
 /// Maximum lines of context for fuzzy matching (increased for better tolerance)
 const MAX_FUZZ: usize = 50;
+/// Default fuzz when the caller does not specify one. Matches the tool schema's
+/// documented default. Previously the default was `MAX_FUZZ` (50), so a hunk
+/// with no `fuzz` argument could silently apply up to 50 lines from its stated
+/// position — landing in the wrong region of a file with repeated blocks.
+const DEFAULT_FUZZ: usize = 3;
+
+/// Reassemble hunk-processed logical lines back into file content, preserving
+/// the base file's line-ending style (CRLF vs LF) and its trailing-newline
+/// state. Processing round-trips through `str::lines()`, which strips both the
+/// trailing `\n` and any `\r`; naively `join("\n")`-ing would silently delete
+/// the file's final newline and flip a CRLF file to LF on every patch.
+fn reassemble_preserving_newlines(lines: &[String], base_content: &str) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let terminator = if base_content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    // A newly created file (empty base) gets a conventional trailing newline;
+    // an existing file preserves whether it had one.
+    let trailing = base_content.is_empty() || base_content.ends_with('\n');
+    let mut out = lines.join(terminator);
+    if trailing {
+        out.push_str(terminator);
+    }
+    out
+}
 /// Limit how much context we print in error messages.
 const HUNK_PREVIEW_LINES: usize = 4;
 const SNIPPET_RADIUS: usize = 2;
@@ -54,6 +83,22 @@ pub struct FileSummary {
     pub hunks_with_fuzz: usize,
     pub created: bool,
     pub deleted: bool,
+}
+
+/// No-mutation summary of what an `apply_patch` input intends to touch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyPatchPreflight {
+    pub touched_files: Vec<String>,
+    pub files_total: usize,
+    pub hunks_total: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_path_mismatch: Option<String>,
 }
 
 /// A single hunk in a unified diff
@@ -130,6 +175,19 @@ struct HunkApplyStats {
     hunks_applied: usize,
     fuzz_used: usize,
     hunks_with_fuzz: usize,
+}
+
+#[derive(Debug, Clone)]
+enum ApplyPatchPreflightKind {
+    Changes,
+    PathOverride { path: String, hunks: Vec<Hunk> },
+    FilePatches(Vec<FilePatch>),
+}
+
+#[derive(Debug, Clone)]
+struct ApplyPatchPreflightPlan {
+    summary: ApplyPatchPreflight,
+    kind: ApplyPatchPreflightKind,
 }
 
 // === Errors ===
@@ -209,9 +267,10 @@ impl ToolSpec for ApplyPatchTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let fuzz = optional_u64(&input, "fuzz", MAX_FUZZ as u64).min(MAX_FUZZ as u64);
-        let fuzz = usize::try_from(fuzz).unwrap_or(MAX_FUZZ);
+        let fuzz = optional_u64(&input, "fuzz", DEFAULT_FUZZ as u64).min(MAX_FUZZ as u64);
+        let fuzz = usize::try_from(fuzz).unwrap_or(DEFAULT_FUZZ);
         let create_if_missing = optional_bool(&input, "create_if_missing", false);
+        let preflight = preflight_apply_patch_plan(&input)?;
 
         if let Some(changes_value) = input.get("changes") {
             let (pending, stats) = build_pending_writes_from_changes(changes_value, context)?;
@@ -233,6 +292,8 @@ impl ToolSpec for ApplyPatchTool {
             };
             let mut tool_result = ToolResult::json(&result)
                 .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+            tool_result =
+                tool_result.with_metadata(apply_patch_preflight_metadata(&preflight.summary));
             if !diag_block.is_empty() {
                 tool_result.content.push('\n');
                 tool_result.content.push_str(&diag_block);
@@ -240,38 +301,21 @@ impl ToolSpec for ApplyPatchTool {
             return Ok(tool_result);
         }
 
-        let patch_text = required_str(&input, "patch")?;
-        let path_override = optional_str(&input, "path");
-        let patch_shape = inspect_patch_shape(patch_text);
-        validate_patch_shape(&patch_shape, path_override)?;
-        let mismatch_note = path_override.and_then(|path| diff_header_mismatch(path, &patch_shape));
-        let file_patches = if let Some(path) = path_override {
-            let hunks = parse_unified_diff(patch_text)?;
-            if hunks.is_empty() {
-                return Err(ToolError::invalid_input(
-                    "Patch did not contain any hunks (`@@ ... @@`). Provide a unified diff hunk.",
-                ));
+        let file_patches = match preflight.kind {
+            ApplyPatchPreflightKind::Changes => {
+                unreachable!("changes input returned before patch execution")
             }
-            vec![FilePatch {
-                path: path.to_string(),
+            ApplyPatchPreflightKind::PathOverride { path, hunks } => vec![FilePatch {
+                path,
                 hunks,
                 delete_after: false,
                 create_if_missing,
-            }]
-        } else {
-            let file_patches = parse_unified_diff_files(patch_text, create_if_missing)?;
-            if file_patches.is_empty() {
-                return Err(ToolError::invalid_input(
-                    "No valid file patches found. Ensure the patch includes `---`/`+++` headers or provide `path`.",
-                ));
-            }
-            file_patches
+            }],
+            ApplyPatchPreflightKind::FilePatches(file_patches) => file_patches,
         };
 
         let (pending, mut stats) = build_pending_writes_from_patches(file_patches, context, fuzz)?;
-        if stats.header_path_mismatch.is_none() {
-            stats.header_path_mismatch = mismatch_note;
-        }
+        stats.header_path_mismatch = preflight.summary.header_path_mismatch.clone();
         apply_pending_writes(&pending)?;
         // Resolve absolute paths for LSP diagnostics query.
         let abs_paths: Vec<PathBuf> = pending
@@ -294,12 +338,150 @@ impl ToolSpec for ApplyPatchTool {
         };
         let mut tool_result =
             ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        tool_result = tool_result.with_metadata(apply_patch_preflight_metadata(&preflight.summary));
         if !diag_block.is_empty() {
             tool_result.content.push('\n');
             tool_result.content.push_str(&diag_block);
         }
         Ok(tool_result)
     }
+}
+
+/// Parse `apply_patch` input into a reusable, no-mutation preflight summary.
+///
+/// This deliberately stops before workspace resolution or file reads. It is
+/// suitable for policy checks, audit logs, diagnostics hooks, and future undo
+/// planning that must know the target files before mutation.
+pub fn preflight_apply_patch(input: &Value) -> Result<ApplyPatchPreflight, ToolError> {
+    Ok(preflight_apply_patch_plan(input)?.summary)
+}
+
+fn preflight_apply_patch_plan(input: &Value) -> Result<ApplyPatchPreflightPlan, ToolError> {
+    let create_if_missing = optional_bool(input, "create_if_missing", false);
+
+    if let Some(changes_value) = input.get("changes") {
+        return Ok(ApplyPatchPreflightPlan {
+            summary: preflight_changes(changes_value)?,
+            kind: ApplyPatchPreflightKind::Changes,
+        });
+    }
+
+    let patch_text = required_str(input, "patch")?;
+    let path_override = optional_str(input, "path");
+    let patch_shape = inspect_patch_shape(patch_text);
+    validate_patch_shape(&patch_shape, path_override)?;
+    let header_path_mismatch =
+        path_override.and_then(|path| diff_header_mismatch(path, &patch_shape));
+
+    if let Some(path) = path_override {
+        let hunks = parse_unified_diff(patch_text)?;
+        if hunks.is_empty() {
+            return Err(ToolError::invalid_input(
+                "Patch did not contain any hunks (`@@ ... @@`). Provide a unified diff hunk.",
+            ));
+        }
+        return Ok(ApplyPatchPreflightPlan {
+            summary: ApplyPatchPreflight {
+                touched_files: vec![path.to_string()],
+                files_total: 1,
+                hunks_total: hunks.len(),
+                creates: if create_if_missing {
+                    vec![path.to_string()]
+                } else {
+                    Vec::new()
+                },
+                deletes: Vec::new(),
+                path_override: Some(path.to_string()),
+                header_path_mismatch,
+            },
+            kind: ApplyPatchPreflightKind::PathOverride {
+                path: path.to_string(),
+                hunks,
+            },
+        });
+    }
+
+    let file_patches = parse_unified_diff_files(patch_text, create_if_missing)?;
+    if file_patches.is_empty() {
+        return Err(ToolError::invalid_input(
+            "No valid file patches found. Ensure the patch includes `---`/`+++` headers or provide `path`.",
+        ));
+    }
+
+    let mut touched_files = Vec::new();
+    let mut creates = Vec::new();
+    let mut deletes = Vec::new();
+    let mut hunks_total = 0;
+    for file_patch in &file_patches {
+        if file_patch.hunks.is_empty() {
+            return Err(ToolError::invalid_input(format!(
+                "Patch section for `{}` has no hunks (`@@ ... @@`).",
+                file_patch.path
+            )));
+        }
+        push_unique(&mut touched_files, file_patch.path.clone());
+        hunks_total += file_patch.hunks.len();
+        if file_patch.create_if_missing && !file_patch.delete_after {
+            push_unique(&mut creates, file_patch.path.clone());
+        }
+        if file_patch.delete_after {
+            push_unique(&mut deletes, file_patch.path.clone());
+        }
+    }
+
+    Ok(ApplyPatchPreflightPlan {
+        summary: ApplyPatchPreflight {
+            files_total: file_patches.len(),
+            touched_files,
+            hunks_total,
+            creates,
+            deletes,
+            path_override: None,
+            header_path_mismatch,
+        },
+        kind: ApplyPatchPreflightKind::FilePatches(file_patches),
+    })
+}
+
+fn preflight_changes(changes_value: &Value) -> Result<ApplyPatchPreflight, ToolError> {
+    let changes = changes_value.as_array().ok_or_else(|| {
+        ToolError::invalid_input("`changes` must be an array of objects like {path, content}")
+    })?;
+    if changes.is_empty() {
+        return Err(ToolError::invalid_input("`changes` cannot be empty"));
+    }
+
+    let mut touched_files = Vec::new();
+    for change in changes {
+        let path = change
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::missing_field("changes[].path"))?;
+        let _content = change
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::missing_field("changes[].content"))?;
+        push_unique(&mut touched_files, path.to_string());
+    }
+
+    Ok(ApplyPatchPreflight {
+        files_total: changes.len(),
+        touched_files,
+        hunks_total: 0,
+        creates: Vec::new(),
+        deletes: Vec::new(),
+        path_override: None,
+        header_path_mismatch: None,
+    })
+}
+
+fn apply_patch_preflight_metadata(preflight: &ApplyPatchPreflight) -> Value {
+    let mut metadata =
+        serde_json::to_value(preflight).expect("ApplyPatchPreflight should serialize");
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("event".to_string(), json!("apply_patch.preflight"));
+    }
+    metadata
 }
 
 /// Parse a unified diff into hunks
@@ -405,6 +587,7 @@ fn resolve_diff_paths(
 }
 
 fn normalize_diff_path(raw: &str) -> Option<String> {
+    let raw = raw.split_once('\t').map_or(raw, |(path, _timestamp)| path);
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -517,10 +700,22 @@ fn inspect_patch_shape(patch: &str) -> PatchShape {
     let mut shape = PatchShape::default();
     let mut seen = HashSet::new();
     let mut old_path: Option<String> = None;
+    let mut hunk_old_remaining = 0usize;
+    let mut hunk_new_remaining = 0usize;
 
     for line in patch.lines() {
         if line.starts_with("@@") {
             shape.has_hunks = true;
+            if let Some((old_count, new_count)) = hunk_line_counts_for_shape(line) {
+                hunk_old_remaining = old_count;
+                hunk_new_remaining = new_count;
+            }
+            continue;
+        }
+
+        if hunk_old_remaining > 0 || hunk_new_remaining > 0 {
+            advance_hunk_shape_counts(line, &mut hunk_old_remaining, &mut hunk_new_remaining);
+            continue;
         }
 
         if let Some(stripped) = line.strip_prefix("--- ") {
@@ -541,6 +736,30 @@ fn inspect_patch_shape(patch: &str) -> PatchShape {
     }
 
     shape
+}
+
+fn hunk_line_counts_for_shape(header: &str) -> Option<(usize, usize)> {
+    let parts: Vec<&str> = header.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let (_, old_count) = parse_range(parts[1].trim_start_matches('-')).ok()?;
+    let (_, new_count) = parse_range(parts[2].trim_start_matches('+')).ok()?;
+    Some((old_count, new_count))
+}
+
+fn advance_hunk_shape_counts(line: &str, old_remaining: &mut usize, new_remaining: &mut usize) {
+    if line.starts_with('\\') {
+        return;
+    }
+    if line.starts_with('+') {
+        *new_remaining = new_remaining.saturating_sub(1);
+    } else if line.starts_with('-') {
+        *old_remaining = old_remaining.saturating_sub(1);
+    } else {
+        *old_remaining = old_remaining.saturating_sub(1);
+        *new_remaining = new_remaining.saturating_sub(1);
+    }
 }
 
 fn validate_patch_shape(shape: &PatchShape, path_override: Option<&str>) -> Result<(), ToolError> {
@@ -756,7 +975,7 @@ fn build_pending_writes_from_patches(
                 original,
             });
         } else {
-            let new_content = lines.join("\n");
+            let new_content = reassemble_preserving_newlines(&lines, &base_content);
             pending.push(PendingWrite {
                 path: resolved,
                 content: Some(new_content),
@@ -773,21 +992,26 @@ fn apply_pending_writes(pending: &[PendingWrite]) -> Result<(), ToolError> {
 
     for entry in pending {
         let result = if let Some(content) = entry.content.as_ref() {
-            if let Some(parent) = entry.path.parent() {
+            let parent_result = if let Some(parent) = entry.path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
                     ToolError::execution_failed(format!(
                         "Failed to create directory {}: {}",
                         parent.display(),
                         e
                     ))
-                })?;
-            }
-            fs::write(&entry.path, content).map_err(|e| {
-                ToolError::execution_failed(format!(
-                    "Failed to write {}: {}",
-                    entry.path.display(),
-                    e
-                ))
+                })
+            } else {
+                Ok(())
+            };
+
+            parent_result.and_then(|()| {
+                crate::utils::write_atomic(&entry.path, content.as_bytes()).map_err(|e| {
+                    ToolError::execution_failed(format!(
+                        "Failed to write {}: {}",
+                        entry.path.display(),
+                        e
+                    ))
+                })
             })
         } else if entry.path.exists() {
             fs::remove_file(&entry.path).map_err(|e| {
@@ -816,7 +1040,7 @@ fn rollback_pending_writes(applied: &[PendingWrite]) {
     for entry in applied.iter().rev() {
         match entry.original.as_ref() {
             Some(content) => {
-                let _ = fs::write(&entry.path, content);
+                let _ = crate::utils::write_atomic(&entry.path, content.as_bytes());
             }
             None => {
                 let _ = fs::remove_file(&entry.path);
@@ -953,13 +1177,18 @@ fn apply_hunk(
         .collect();
 
     // Try to find the location with fuzzy matching
-    // Apply cumulative offset from previous hunks
+    // Apply cumulative offset from previous hunks, clamping to valid range.
     let base_idx = if hunk.old_start > 0 {
         hunk.old_start - 1
     } else {
         0
     };
-    let start_idx = ((base_idx as isize) + *cumulative_offset).max(0) as usize;
+    // Use checked_add_signed to safely handle negative offsets without
+    // risking isize overflow on adversarial input.
+    let start_idx = base_idx
+        .checked_add_signed(*cumulative_offset)
+        .unwrap_or(0)
+        .min(lines.len());
 
     for fuzz in 0..=max_fuzz {
         // Try at exact position first, then nearby
@@ -1054,6 +1283,138 @@ mod tests {
         assert_eq!(hunks[0].old_count, 3);
         assert_eq!(hunks[0].new_start, 1);
         assert_eq!(hunks[0].new_count, 3);
+    }
+
+    #[test]
+    fn test_preflight_apply_patch_with_path_override() {
+        let patch = r"@@ -1,2 +1,2 @@
+ old
+-value
++new-value
+";
+
+        let preflight = preflight_apply_patch(&json!({
+            "path": "src/lib.rs",
+            "patch": patch
+        }))
+        .expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["src/lib.rs"]);
+        assert_eq!(preflight.files_total, 1);
+        assert_eq!(preflight.hunks_total, 1);
+        assert_eq!(preflight.path_override.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_preflight_apply_patch_multi_file_create_and_delete() {
+        let patch = r"diff --git a/new.rs b/new.rs
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1 @@
++fn added() {}
+diff --git a/old.rs b/old.rs
+--- a/old.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn old() {}
+";
+
+        let preflight = preflight_apply_patch(&json!({ "patch": patch })).expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["new.rs", "old.rs"]);
+        assert_eq!(preflight.files_total, 2);
+        assert_eq!(preflight.hunks_total, 2);
+        assert_eq!(preflight.creates, vec!["new.rs"]);
+        assert_eq!(preflight.deletes, vec!["old.rs"]);
+    }
+
+    #[test]
+    fn test_preflight_apply_patch_timestamp_headers_strip_metadata() {
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n\
+--- a/src/lib.rs\t2026-06-26 10:00:00 +0000\n\
++++ b/src/lib.rs\t2026-06-26 10:01:00 +0000\n\
+@@ -1,1 +1,1 @@\n\
+-old\n\
++new\n";
+
+        let preflight = preflight_apply_patch(&json!({ "patch": patch })).expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["src/lib.rs"]);
+        assert_eq!(preflight.files_total, 1);
+        assert_eq!(preflight.hunks_total, 1);
+    }
+
+    #[test]
+    fn test_preflight_apply_patch_ignores_forged_headers_inside_hunk_shape() {
+        let patch = r"--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+ line1
+--- a/forged.rs
++++ b/forged.rs
+ line3
+";
+
+        let preflight = preflight_apply_patch(&json!({
+            "path": "src/lib.rs",
+            "patch": patch
+        }))
+        .expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["src/lib.rs"]);
+        assert_eq!(preflight.header_path_mismatch, None);
+    }
+
+    #[test]
+    fn test_preflight_apply_patch_changes_list() {
+        let preflight = preflight_apply_patch(&json!({
+            "changes": [
+                { "path": "one.txt", "content": "one" },
+                { "path": "two.txt", "content": "two" }
+            ]
+        }))
+        .expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["one.txt", "two.txt"]);
+        assert_eq!(preflight.files_total, 2);
+        assert_eq!(preflight.hunks_total, 0);
+    }
+
+    #[test]
+    fn test_preflight_changes_files_total_counts_entries() {
+        let preflight = preflight_apply_patch(&json!({
+            "changes": [
+                { "path": "same.txt", "content": "one" },
+                { "path": "same.txt", "content": "two" }
+            ]
+        }))
+        .expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["same.txt"]);
+        assert_eq!(preflight.files_total, 2);
+    }
+
+    #[test]
+    fn test_preflight_patch_files_total_counts_sections() {
+        let patch = r"diff --git a/same.txt b/same.txt
+--- a/same.txt
++++ b/same.txt
+@@ -1,1 +1,1 @@
+-one
++two
+diff --git a/same.txt b/same.txt
+--- a/same.txt
++++ b/same.txt
+@@ -2,1 +2,1 @@
+-three
++four
+";
+
+        let preflight = preflight_apply_patch(&json!({ "patch": patch })).expect("preflight");
+
+        assert_eq!(preflight.touched_files, vec!["same.txt"]);
+        assert_eq!(preflight.files_total, 2);
+        assert_eq!(preflight.hunks_total, 2);
     }
 
     #[test]
@@ -1160,6 +1521,30 @@ mod tests {
             .expect("execute");
 
         assert!(result.success);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["event"],
+            "apply_patch.preflight"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["touched_files"],
+            json!(["test.txt"])
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("header_path_mismatch")
+                .is_none()
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("path_override")
+                .is_some()
+        );
         let patch_result = parse_patch_result(result);
         assert_eq!(patch_result.touched_files, vec!["test.txt"]);
         assert_eq!(patch_result.hunks_applied, 1);
@@ -1168,6 +1553,49 @@ mod tests {
         let content = fs::read_to_string(tmp.path().join("test.txt")).expect("read");
         assert!(content.contains("modified"));
         assert!(!content.contains("line2"));
+        // Regression: the file's trailing newline must survive the patch.
+        assert!(content.ends_with('\n'), "trailing newline was dropped");
+    }
+
+    #[test]
+    fn reassemble_preserving_newlines_keeps_style() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        // LF with trailing newline.
+        assert_eq!(reassemble_preserving_newlines(&lines, "x\ny\n"), "a\nb\n");
+        // LF without trailing newline.
+        assert_eq!(reassemble_preserving_newlines(&lines, "x\ny"), "a\nb");
+        // CRLF is preserved (endings and trailing).
+        assert_eq!(
+            reassemble_preserving_newlines(&lines, "x\r\ny\r\n"),
+            "a\r\nb\r\n"
+        );
+        // New/empty file gets a conventional trailing newline.
+        assert_eq!(reassemble_preserving_newlines(&lines, ""), "a\nb\n");
+        // Empty result stays empty.
+        assert_eq!(reassemble_preserving_newlines(&[], "x\n"), "");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_preserves_crlf_line_endings() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("crlf.txt"), "line1\r\nline2\r\nline3\r\n").expect("write");
+        let patch =
+            "--- a/crlf.txt\n+++ b/crlf.txt\n@@ -1,3 +1,3 @@\n line1\n-line2\n+modified\n line3\n";
+        let result = ApplyPatchTool
+            .execute(json!({"path": "crlf.txt", "patch": patch}), &ctx)
+            .await
+            .expect("execute");
+        assert!(result.success);
+        let content = fs::read_to_string(tmp.path().join("crlf.txt")).expect("read");
+        assert!(content.contains("modified"));
+        // Regression: a CRLF file must not be flipped to LF.
+        assert!(
+            content.contains("\r\n"),
+            "CRLF was flipped to LF: {content:?}"
+        );
+        assert!(!content.contains("\n\n"), "spurious bare LF introduced");
+        assert!(content.ends_with("\r\n"), "trailing CRLF dropped");
     }
 
     #[tokio::test]
@@ -1246,6 +1674,12 @@ mod tests {
             .expect("execute");
 
         assert!(result.success);
+        let metadata = result.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["event"], "apply_patch.preflight");
+        assert_eq!(metadata["touched_files"], json!(["one.txt", "two.txt"]));
+        assert_eq!(metadata["files_total"], 2);
+        assert_eq!(metadata["hunks_total"], 0);
+        assert!(metadata.get("path_override").is_none());
         let patch_result = parse_patch_result(result);
         let mut touched = patch_result.touched_files.clone();
         touched.sort();
@@ -1259,6 +1693,37 @@ mod tests {
             fs::read_to_string(tmp.path().join("two.txt")).unwrap(),
             "second\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_changes_list_rolls_back_on_write_failure() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        fs::write(tmp.path().join("one.txt"), "old\n").expect("write");
+        fs::write(tmp.path().join("blocked"), "not a dir\n").expect("write blocker");
+
+        let tool = ApplyPatchTool;
+        let err = tool
+            .execute(
+                json!({
+                    "changes": [
+                        { "path": "one.txt", "content": "new\n" },
+                        { "path": "blocked/two.txt", "content": "second\n" }
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("second write should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("blocked"), "{message}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("one.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(!tmp.path().join("blocked").join("two.txt").exists());
     }
 
     #[tokio::test]
@@ -1292,6 +1757,12 @@ diff --git a/b.txt b/b.txt
             .expect("execute");
 
         assert!(result.success);
+        let metadata = result.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["event"], "apply_patch.preflight");
+        assert_eq!(metadata["touched_files"], json!(["a.txt", "b.txt"]));
+        assert_eq!(metadata["files_total"], 2);
+        assert_eq!(metadata["hunks_total"], 2);
+        assert!(metadata.get("path_override").is_none());
         let patch_result = parse_patch_result(result);
         let mut touched = patch_result.touched_files.clone();
         touched.sort();
@@ -1407,6 +1878,13 @@ diff --git a/b.txt b/b.txt
             .execute(json!({"path": "override.txt", "patch": patch}), &ctx)
             .await
             .expect("execute");
+        let metadata = result.metadata.as_ref().expect("metadata");
+        assert!(
+            metadata["header_path_mismatch"]
+                .as_str()
+                .unwrap()
+                .contains("headers reference `other.txt`")
+        );
         let patch_result = parse_patch_result(result);
         assert!(
             patch_result

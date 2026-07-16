@@ -11,6 +11,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::command_safety::{SafetyLevel, analyze_command};
+use crate::dependencies::ExternalTool;
 use crate::task_manager::{
     NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord,
 };
@@ -23,6 +24,23 @@ use crate::tools::spec::{
 const MAX_SUMMARY_CHARS: usize = 900;
 const DEFAULT_GATE_TIMEOUT_MS: u64 = 120_000;
 const MAX_GATE_TIMEOUT_MS: u64 = 600_000;
+
+fn build_gate_command_parts(command: &str) -> (String, Vec<String>) {
+    (
+        "/bin/sh".to_string(),
+        vec!["-lc".to_string(), command.to_string()],
+    )
+}
+
+fn build_gate_command(command: &str, cwd: &Path) -> Command {
+    let (program, args) = build_gate_command_parts(command);
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
 
 pub struct TaskCreateTool;
 pub struct TaskListTool;
@@ -287,12 +305,7 @@ impl ToolSpec for TaskGateRunTool {
         }
 
         let started = Instant::now();
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-lc")
-            .arg(&command)
-            .current_dir(&cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut cmd = build_gate_command(&command, &cwd);
         let output =
             tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await;
 
@@ -340,7 +353,7 @@ impl ToolSpec for TaskGateRunTool {
             "failed"
         };
         let classification = classify_gate_failure(&gate, status, timed_out, &stderr, &stdout);
-        let log_path = write_runtime_artifact(context, "gate", &full_log)?;
+        let log_path = write_runtime_artifact(context, "gate", &full_log).await?;
         let gate_record = TaskGateRecord {
             id: format!("gate_{}", &Uuid::new_v4().to_string()[..8]),
             gate: gate.clone(),
@@ -387,7 +400,7 @@ impl ToolSpec for TaskShellStartTool {
     }
 
     fn description(&self) -> &'static str {
-        "Start a long-running shell command in the background and return a shell task_id immediately. Use task_shell_wait to poll and optionally record gate evidence on the active durable task."
+        "Start a long-running shell command in the background and return a shell task_id immediately. Completion is tracked in the task/status surface; use task_shell_wait for early output, explicit barriers, or gate evidence on the active durable task."
     }
 
     fn input_schema(&self) -> Value {
@@ -414,6 +427,10 @@ impl ToolSpec for TaskShellStartTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Required
+    }
+
+    fn starts_detached_for(&self, input: &Value) -> bool {
+        input.get("command").and_then(Value::as_str).is_some()
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -504,7 +521,7 @@ impl ToolSpec for TaskShellWaitTool {
             .and_then(Value::as_u64)
             .unwrap_or_default();
         let command = optional_str(&input, "command").unwrap_or("(background shell)");
-        let log_path = write_runtime_artifact(context, "background_gate", &result.content)?;
+        let log_path = write_runtime_artifact(context, "background_gate", &result.content).await?;
         let gate_status = if exit_code == Some(0) {
             "passed"
         } else if status == "TimedOut" {
@@ -577,21 +594,26 @@ impl ToolSpec for PrAttemptRecordTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let task_id = task_id_from_input_or_context(&input, context)?;
-        let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"]).ok();
+        let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"])
+            .await
+            .ok();
         let head_sha = base_sha.clone();
-        let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
-        let diff = git_output(&context.workspace, &["diff", "--binary", "--no-color"])?;
+        let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .ok();
+        let diff = git_output(&context.workspace, &["diff", "--binary", "--no-color"]).await?;
         if diff.trim().is_empty() {
             return Ok(ToolResult::error(
                 "No working-tree diff to record as an attempt.",
             ));
         }
-        let changed_files = git_output(&context.workspace, &["diff", "--name-only"])?
+        let changed_files = git_output(&context.workspace, &["diff", "--name-only"])
+            .await?
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff)?;
+        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff).await?;
         let attempt = TaskAttemptRecord {
             id: format!("attempt_{}", &Uuid::new_v4().to_string()[..8]),
             attempt_group_id: optional_str(&input, "attempt_group_id")
@@ -748,13 +770,23 @@ impl ToolSpec for PrAttemptPreflightTool {
             .as_ref()
             .ok_or_else(|| ToolError::invalid_input("Attempt has no patch artifact"))?;
         let patch_path = manager.artifact_absolute_path(patch_ref);
-        let out = Command::new("git")
-            .args(["apply", "--check"])
-            .arg(&patch_path)
-            .current_dir(&context.workspace)
-            .output()
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("git apply --check failed: {e}")))?;
+        let workspace = context.workspace.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            crate::dependencies::Git::command()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "git not found"))?
+                .args(["apply", "--check"])
+                .arg(&patch_path)
+                .current_dir(&workspace)
+                .output()
+        })
+        .await
+        .map_err(|join_err| {
+            // Surface the otherwise-discarded join error for debugging; the
+            // returned ToolError (and thus user-facing behavior) is unchanged.
+            tracing::debug!(error = %join_err, "git apply --check spawn_blocking task failed to join");
+            ToolError::execution_failed(format!("git apply --check panicked: {join_err}"))
+        })?
+        .map_err(|e| ToolError::execution_failed(format!("git apply --check failed: {e}")))?;
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         Ok(ToolResult::json(&json!({
@@ -794,7 +826,7 @@ fn resolve_cwd(context: &ToolContext, raw: Option<&str>) -> Result<PathBuf, Tool
     }
 }
 
-fn write_runtime_artifact(
+async fn write_runtime_artifact(
     context: &ToolContext,
     label: &str,
     content: &str,
@@ -813,16 +845,27 @@ fn write_runtime_artifact(
         return Ok(None);
     };
     let artifact_dir = data_dir.join("artifacts").join(task_id);
-    std::fs::create_dir_all(&artifact_dir)
-        .map_err(|e| ToolError::execution_failed(format!("create artifact dir: {e}")))?;
     let filename = format!(
         "{}_{}.txt",
         Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
         sanitize_filename(label)
     );
     let absolute = artifact_dir.join(filename);
-    std::fs::write(&absolute, content)
-        .map_err(|e| ToolError::execution_failed(format!("write artifact: {e}")))?;
+    let content_owned = content.to_owned();
+    let abs = absolute.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&artifact_dir)?;
+        std::fs::write(&abs, content_owned)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| {
+        // Surface the otherwise-discarded join error for debugging; the
+        // returned ToolError (and thus user-facing behavior) is unchanged.
+        tracing::debug!(error = %e, "artifact write spawn_blocking task failed to join");
+        ToolError::execution_failed(format!("artifact write task panicked: {e}"))
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("write artifact: {e}")))?;
     Ok(Some(
         absolute
             .strip_prefix(data_dir)
@@ -831,7 +874,7 @@ fn write_runtime_artifact(
     ))
 }
 
-fn write_task_artifact_for(
+async fn write_task_artifact_for(
     context: &ToolContext,
     task_id: &str,
     label: &str,
@@ -846,7 +889,7 @@ fn write_task_artifact_for(
     if context.runtime.active_task_id.as_deref() != Some(task_id) {
         return Ok(None);
     }
-    write_runtime_artifact(context, label, content)
+    write_runtime_artifact(context, label, content).await
 }
 
 fn artifact_updates(label: &str, path: Option<PathBuf>, summary: &str) -> Value {
@@ -899,12 +942,21 @@ fn task_id_schema() -> Value {
     })
 }
 
-fn git_output(workspace: &Path, args: &[&str]) -> Result<String, ToolError> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .output()
-        .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
+async fn git_output(workspace: &Path, args: &[&str]) -> Result<String, ToolError> {
+    let args_owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    let cwd = workspace.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        crate::dependencies::Git::output(&arg_refs, &cwd)
+    })
+    .await
+    .map_err(|e| {
+        // Surface the otherwise-discarded join error for debugging; the
+        // returned ToolError (and thus user-facing behavior) is unchanged.
+        tracing::debug!(error = %e, "git spawn_blocking task failed to join");
+        ToolError::execution_failed(format!("git task panicked: {e}"))
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
     if !out.status.success() {
         return Err(ToolError::execution_failed(format!(
             "git {} failed: {}",
@@ -1008,5 +1060,12 @@ mod tests {
         let wait_schema = TaskShellWaitTool.input_schema();
         assert_eq!(wait_schema["required"][0], "task_id");
         assert!(wait_schema["properties"]["gate"].is_object());
+    }
+
+    #[test]
+    fn gate_command_uses_login_shell_invocation() {
+        let (program, args) = build_gate_command_parts("echo hello");
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args, vec!["-lc".to_string(), "echo hello".to_string()]);
     }
 }

@@ -15,8 +15,10 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::dependencies::ExternalTool;
 
 use super::paths::{ensure_snapshot_dir, snapshot_git_dir};
 
@@ -182,6 +184,23 @@ __pycache__/
 ";
 
 impl SnapshotRepo {
+    /// Open an existing snapshot repo for `workspace` without creating or
+    /// initializing anything on disk.
+    ///
+    /// This is useful for read-only UI surfaces that want to report checkpoint
+    /// availability without paying the first-init size walk or surprising the
+    /// user by creating a side repo from a view action.
+    pub fn open_existing(workspace: &Path) -> io::Result<Option<Self>> {
+        let work_tree = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let git_dir = snapshot_git_dir(&work_tree);
+        if !git_dir.exists() || !git_dir.join("HEAD").exists() {
+            return Ok(None);
+        }
+        Ok(Some(Self { git_dir, work_tree }))
+    }
+
     /// Open or initialize the snapshot repo for `workspace`.
     ///
     /// On first use this:
@@ -249,7 +268,8 @@ impl SnapshotRepo {
             // and stores metadata in `.git`. We then continue to use
             // explicit `--git-dir` / `--work-tree` flags for every other
             // command so behaviour is invariant of cwd.
-            let init = Command::new("git")
+            let init = crate::dependencies::Git::command()
+                .ok_or_else(|| io_other("git not found on PATH"))?
                 .arg("init")
                 .arg("--quiet")
                 .arg(parent)
@@ -815,7 +835,8 @@ fn cleanup_stale_pack_temps_in(
 }
 
 fn run_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> io::Result<Output> {
-    Command::new("git")
+    crate::dependencies::Git::command()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
         .arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")
@@ -1010,6 +1031,28 @@ mod tests {
     }
 
     #[test]
+    fn open_existing_is_read_only_and_does_not_initialize() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let _home = scoped_home(tmp.path());
+
+        let before = SnapshotRepo::open_existing(&workspace).expect("open existing");
+        assert!(before.is_none());
+        assert!(
+            !snapshot_git_dir(&workspace).exists(),
+            "read-only open must not create the side repo"
+        );
+
+        let repo = SnapshotRepo::open_or_init(&workspace).expect("open_or_init");
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        repo.snapshot("pre-turn:1").expect("snapshot");
+
+        let after = SnapshotRepo::open_existing(&workspace).expect("open existing");
+        assert!(after.is_some());
+    }
+
+    #[test]
     fn restore_reverts_workspace_files() {
         let tmp = tempdir().unwrap();
         let (repo, _home) = make_repo(tmp.path());
@@ -1049,7 +1092,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        Command::new("git")
+        crate::dependencies::Git::command()
+            .expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .arg("init")
@@ -1057,14 +1101,16 @@ mod tests {
             .status()
             .unwrap();
         std::fs::write(workspace.join("tracked.txt"), b"committed").unwrap();
-        Command::new("git")
+        crate::dependencies::Git::command()
+            .expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .arg("add")
             .arg("tracked.txt")
             .status()
             .unwrap();
-        Command::new("git")
+        crate::dependencies::Git::command()
+            .expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .arg("-c")
@@ -1077,7 +1123,8 @@ mod tests {
             .arg("init")
             .status()
             .unwrap();
-        let user_head_before = Command::new("git")
+        let user_head_before = crate::dependencies::Git::command()
+            .expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .args(["rev-parse", "HEAD"])
@@ -1093,7 +1140,8 @@ mod tests {
         repo.snapshot("post-turn:1").unwrap();
         repo.restore(&id).unwrap();
 
-        let user_head_after = Command::new("git")
+        let user_head_after = crate::dependencies::Git::command()
+            .expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .args(["rev-parse", "HEAD"])

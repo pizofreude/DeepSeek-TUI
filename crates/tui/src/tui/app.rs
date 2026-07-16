@@ -1,47 +1,67 @@
 //! Application state for the `DeepSeek` TUI.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use codewhale_config::{ProviderChain, route::RouteLimits};
+
 use crate::artifacts::ArtifactRecord;
-use crate::client::PromptInspection;
+use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, save_api_key,
+    ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, has_api_key_for,
+    save_api_key, save_api_key_for,
 };
 use crate::config_ui::ConfigUiMode;
-use crate::core::coherence::CoherenceState;
-use crate::cycle_manager::{CycleBriefing, CycleConfig};
+use crate::core::authority::{ModeSessionPrefs, base_policy_for_mode};
+use crate::core::events::TurnRoute;
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookResult};
 use crate::localization::{Locale, MessageId, resolve_locale, tr};
-use crate::models::{Message, SystemPrompt, compaction_threshold_for_model_and_effort};
+use crate::models::{Message, SystemPrompt, Tool};
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
-use crate::session_manager::SessionContextReference;
+use crate::resource_telemetry::TokenThroughput;
+use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
 use crate::settings::Settings;
-use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
+use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::subagent::SubAgentResult;
-use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
+use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
+use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
+use crate::tui::sidebar::SidebarWorkSummary;
 use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
 
 // === Types ===
+
+/// Lifecycle identity retained until the matching `TurnComplete` arrives.
+///
+/// This survives local cancellation clearing the visible runtime status, so
+/// observer records still carry a stable id, start time, and effective route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTurnMetadata {
+    pub turn_id: String,
+    pub created_at: DateTime<Utc>,
+    pub route: Option<TurnRoute>,
+}
 
 /// State machine for onboarding new users.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +69,9 @@ pub enum OnboardingState {
     Welcome,
     /// Pick the UI locale before any other config decisions (#566).
     /// Defaults to auto-detection from `LC_ALL` / `LANG`; explicit picks
-    /// land in `~/.deepseek/settings.toml` via `Settings::set("locale", …)`.
+    /// land in the persisted settings.toml via `Settings::set("locale", …)`.
     Language,
+    Provider,
     ApiKey,
     TrustDirectory,
     Tips,
@@ -62,6 +83,17 @@ pub(crate) fn resolve_skills_dir(
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    if config.skills_config().scan_codewhale_only() {
+        if config.skills_dir.is_some() {
+            return global_skills_dir.to_path_buf();
+        }
+        if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+        {
+            return codewhale_skills_dir;
+        }
+        return global_skills_dir.to_path_buf();
+    }
+
     let agents_skills_dir = workspace.join(".agents").join("skills");
     if agents_skills_dir.exists() {
         return agents_skills_dir;
@@ -83,14 +115,34 @@ pub(crate) fn resolve_skills_dir(
 }
 
 pub(crate) fn looks_like_slash_command_input(input: &str) -> bool {
-    let Some(rest) = input.trim_start().strip_prefix('/') else {
+    let trimmed = input.trim_start();
+    // `$skillname` at the start of input is treated like a slash command so the
+    // skill-completion menu appears.
+    let Some(rest) = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix('$'))
+    else {
         return false;
     };
+    if rest.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+        return false;
+    }
     let Some(command) = rest.split_whitespace().next() else {
         return rest.is_empty();
     };
 
     !command.contains('/')
+}
+
+pub(crate) fn shell_command_from_bang_input(input: &str) -> Result<Option<&str>, &'static str> {
+    let Some(rest) = input.trim_start().strip_prefix('!') else {
+        return Ok(None);
+    };
+    let command = rest.trim();
+    if command.is_empty() {
+        return Err("Usage: ! <shell command>");
+    }
+    Ok(Some(command))
 }
 
 fn initial_onboarding_state(
@@ -125,13 +177,25 @@ fn onboarding_is_workspace_trust_gate(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     Agent,
+    #[allow(dead_code)]
+    Auto,
+    /// Legacy compatibility alias; resolves to [`Self::Agent`] + bypass approvals.
     Yolo,
     Plan,
+    Operate,
 }
 
 /// One row in the per-turn cache-telemetry ring (`/cache` debug surface, #263).
 #[derive(Debug, Clone)]
 pub struct TurnCacheRecord {
+    /// API provider used for the turn. This is recorded so cache misses can be
+    /// correlated with provider/model route changes.
+    pub provider: Option<ApiProvider>,
+    /// Concrete model used for the turn. For auto-model turns this is the
+    /// routed model, not the literal `auto` setting.
+    pub model: Option<String>,
+    /// Whether the route came from the auto-model selector.
+    pub auto_model: bool,
     /// Provider-reported total input tokens for the turn (cache-hit +
     ///   cache-miss + uncategorized). Useful for sanity-checking that hits +
     ///   misses sum back to roughly the prompt size.
@@ -155,13 +219,15 @@ pub struct TurnCacheRecord {
     pub recorded_at: Instant,
 }
 
-/// DeepSeek reasoning-effort tier, mirrored on ChatGPT/Claude effort pickers.
+/// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
 ///
 /// The config file accepts all five string values for forward-compat with
 /// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high` and `Max` → `max` at the API boundary. The
-/// keyboard cycler (Shift+Tab) walks only the three behaviorally distinct
-/// tiers: `Off` → `High` → `Max` → `Off`.
+/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
+/// `Off` to `Low` and displays/sends `Max` as `xhigh` at the provider
+/// boundary. The default keyboard cycler walks the three DeepSeek-distinct
+/// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
+/// [`ReasoningEffort::cycle_next_for_provider`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Off,
@@ -184,9 +250,14 @@ impl ReasoningEffort {
             "medium" | "mid" => Self::Medium,
             "high" => Self::High,
             "auto" | "automatic" => Self::Auto,
-            "max" | "maximum" | "xhigh" => Self::Max,
+            "max" | "maximum" | "xhigh" | "ultracode" => Self::Max,
             _ => Self::default(),
         }
+    }
+
+    #[must_use]
+    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
+        Self::from_setting(value).normalize_for_provider(provider)
     }
 
     /// Canonical lowercase label used for config storage and UI hints.
@@ -215,12 +286,57 @@ impl ReasoningEffort {
         }
     }
 
+    /// Provider-facing label for user-visible surfaces.
+    #[must_use]
+    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
+        match (provider, self.normalize_for_provider(provider)) {
+            (ApiProvider::OpenaiCodex, Self::Low) => "low",
+            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
+            (ApiProvider::OpenaiCodex, Self::High) => "high",
+            (ApiProvider::OpenaiCodex, Self::Max) => "xhigh",
+            (_, effort) => effort.short_label(),
+        }
+    }
+
     /// Value forwarded to the engine/client. `None` means "provider default"
     /// (for `Off` we still emit `"off"` so the client can inject
     /// `thinking = {"type": "disabled"}`).
     #[must_use]
     pub fn api_value(self) -> Option<&'static str> {
         Some(self.as_setting())
+    }
+
+    #[must_use]
+    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
+        if provider != ApiProvider::OpenaiCodex {
+            return self;
+        }
+        match self {
+            Self::Off => Self::Low,
+            Self::Auto => Self::Medium,
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
+        if provider != ApiProvider::OpenaiCodex {
+            return self.api_value();
+        }
+        Some(match self.normalize_for_provider(provider) {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "xhigh",
+            Self::Off => "low",
+            Self::Auto => "medium",
+        })
+    }
+
+    #[must_use]
+    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
+        self.api_value_for_provider(provider)
+            .unwrap_or_else(|| self.as_setting())
     }
 
     /// Cycle through the three behaviorally distinct tiers.
@@ -233,17 +349,90 @@ impl ReasoningEffort {
             Self::Max => Self::Off,
         }
     }
+
+    #[must_use]
+    pub fn cycle_next_for_provider(self, provider: ApiProvider) -> Self {
+        if provider != ApiProvider::OpenaiCodex {
+            return self.cycle_next();
+        }
+        match self.normalize_for_provider(provider) {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Max,
+            Self::Max => Self::Low,
+            Self::Off | Self::Auto => Self::Low,
+        }
+    }
 }
 
 /// Sidebar content focus mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarFocus {
     Auto,
-    Work,
+    Pinned,
     Tasks,
     Agents,
     Context,
     Hidden,
+}
+
+/// Browsing context captured when the `/model` picker is dismissed (#4109).
+/// Plain data so `App` does not depend on the picker's internal view enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPickerMemory {
+    /// True when the user left the picker in the full-catalog view
+    /// (`A` toggle), false for the configured-only default view.
+    ///
+    /// Kept for backward compatibility with older dismiss events; prefer
+    /// [`Self::view`] when present (#4115).
+    pub catalog_view: bool,
+    /// Named catalog view left open (`configured` / `catalog` / `recent` /
+    /// `coding` / `cheap` / `long_context`). When `None`, [`Self::catalog_view`]
+    /// is the fallback.
+    pub view: Option<String>,
+    /// Model row id highlighted at dismissal, if it was a real row.
+    pub selected_row_id: Option<String>,
+}
+
+/// Browsing context captured when the `/provider` picker is dismissed.
+/// Mirrors [`ModelPickerMemory`] so reopen restores view + highlight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderPickerMemory {
+    /// True when the user left the picker in the full-catalog view
+    /// (`A` toggle), false for the configured-only default view.
+    pub catalog_view: bool,
+    /// Provider id highlighted at dismissal, if it was a real row.
+    pub selected_provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentProgressMeta {
+    pub parent_run_id: Option<String>,
+    pub spawn_depth: u32,
+}
+
+/// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
+/// Observable state only — no raw diagnostic text or prompt internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspRepairState {
+    pub diagnostics_found: usize,
+    pub files_touched: usize,
+    pub injected: bool,
+    pub repair_attempted: bool,
+    /// "resolved" | "still_failing" | "unknown" | "unavailable"
+    pub latest: &'static str,
+}
+
+impl Default for LspRepairState {
+    fn default() -> Self {
+        Self {
+            diagnostics_found: 0,
+            files_touched: 0,
+            injected: false,
+            repair_attempted: false,
+            latest: "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,8 +475,9 @@ impl SidebarFocus {
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "work" | "plan" | "todos" => Self::Work,
-            "tasks" => Self::Tasks,
+            "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => Self::Pinned,
+            // Persist/compat key remains "tasks"; user-facing panel is Activity (#4147/#4135).
+            "tasks" | "activity" | "live" | "running" => Self::Tasks,
             "agents" | "subagents" | "sub-agents" => Self::Agents,
             "context" | "session" => Self::Context,
             "hidden" | "hide" | "closed" | "off" | "none" => Self::Hidden,
@@ -300,11 +490,53 @@ impl SidebarFocus {
     pub fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Work => "work",
+            Self::Pinned => "pinned",
             Self::Tasks => "tasks",
             Self::Agents => "agents",
             Self::Context => "context",
             Self::Hidden => "hidden",
+        }
+    }
+}
+
+/// Controls how dense tool-call runs are collapsed in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCollapseMode {
+    /// Collapse qualifying tool runs by default.
+    Compact,
+    /// Never collapse tool runs automatically.
+    Expanded,
+    /// Collapse only when calm mode is active.
+    Calm,
+}
+
+impl ToolCollapseMode {
+    #[must_use]
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expanded" | "off" | "none" => Self::Expanded,
+            "calm" | "calm-mode" | "calm_only" | "calm-only" => Self::Calm,
+            // `collapsed`/`collapse` are issue #3256's preferred names for the
+            // default; treat them like the canonical `compact`.
+            _ => Self::Compact,
+        }
+    }
+
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+            Self::Calm => "calm",
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(self, calm_mode: bool) -> bool {
+        match self {
+            Self::Compact => true,
+            Self::Expanded => false,
+            Self::Calm => calm_mode,
         }
     }
 }
@@ -368,7 +600,7 @@ pub(crate) struct InputHistoryDraft {
     cursor: usize,
 }
 
-fn char_count(text: &str) -> usize {
+pub(crate) fn char_count(text: &str) -> usize {
     text.chars().count()
 }
 
@@ -591,7 +823,7 @@ fn looks_like_raw_mouse_report_fragment(run: &[char]) -> bool {
 ///   first BEL (`\x07`), `\x1b\\`, lone `\\`, or the next `\x1b]8;`
 ///   block — terminator characters are optional because crossterm may
 ///   have already consumed them.
-/// - **Kitty CSI**: `(\x1b?) [ (? | > | =) ... u` — the `?`/`>`/`=`
+/// - **Kitty CSI**: `(\x1b?) [ (? | > | < | =) ... u` — the
 ///   private-parameter prefix is what distinguishes a Kitty response
 ///   from a user-typed `[…u` (which is exceedingly rare and would
 ///   need an explicit private-parameter byte to be a real CSI).
@@ -695,10 +927,16 @@ fn match_osc8_fragment(chars: &[char], start: usize) -> Option<usize> {
     Some(end)
 }
 
-/// If a Kitty keyboard protocol CSI fragment starts at `chars[start]`,
-/// return its end index (exclusive). Shape: `(ESC)? [ (? | > | =)
-/// [0-9;:]* u`. The private-parameter byte (`?`, `>`, `=`) is what
-/// keeps this distinct from text the user might plausibly type.
+/// If a private-parameter CSI fragment starts at `chars[start]`, return its
+/// end index (exclusive). Shape: `(ESC)? [ (? | > | < | =) [0-9;:]* <final>`
+/// where `<final>` is any ASCII letter. This covers the Kitty keyboard
+/// protocol (`…u`) *and* the DEC private mode set/reset sequences a terminal
+/// emits during a session — bracketed paste (`[?2004h`/`[?2004l`), mouse
+/// capture (`[?1000h`), focus reporting (`[?1004h`), and synchronized output
+/// (`[?2026h`). Those end in `h`/`l`, not `u`, so the old `u`-only terminator
+/// let the leading `[` leak into the composer during dense streaming (#2592,
+/// regression of #1915). The private-parameter byte (`?`, `>`, `<`, `=`) is
+/// what keeps this distinct from text the user might plausibly type.
 fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
     let after_csi = if chars.get(start) == Some(&'\x1b') && chars.get(start + 1) == Some(&'[') {
         start + 2
@@ -709,35 +947,72 @@ fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
     };
 
     let priv_byte = chars.get(after_csi)?;
-    if !matches!(priv_byte, '?' | '>' | '=') {
+    if !matches!(priv_byte, '?' | '>' | '<' | '=') {
         return None;
     }
 
     let mut end = after_csi + 1;
+    let mut saw_param = false;
     while end < chars.len() {
         let ch = chars[end];
-        if ch == 'u' {
-            return Some(end + 1);
-        }
         if ch.is_ascii_digit() || ch == ';' || ch == ':' {
+            saw_param = true;
             end += 1;
             continue;
         }
-        return None;
+        // Final byte. The Kitty keyboard protocol ends in `u` and is valid
+        // with no parameters (`[?u`). DEC private mode set/reset ends in
+        // `h`/`l` and always carries a numeric mode — bracketed paste
+        // (`[?2004h`/`l`), mouse capture (`[?1000h`), focus reporting
+        // (`[?1004h`), synchronized output (`[?2026h`). Require a parameter
+        // before `h`/`l` so ordinary text like `[?help]` is left untouched.
+        return match ch {
+            'u' => Some(end + 1),
+            'h' | 'l' if saw_param => Some(end + 1),
+            _ => None,
+        };
     }
     None
 }
 
 const MAX_SUBMITTED_INPUT_CHARS: usize = 16_000;
+/// Maximum characters displayed in the composer for oversized input.
+/// Beyond this, the text is truncated for rendering but the full content
+/// is preserved for model submission (#3263).
+const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
+    /// Productive keyboard cycle: Plan -> Act -> Plan.
+    ///
+    /// `Auto` remains an internal variant while the real implementation is
+    /// redesigned; do not expose it through user-facing mode selection (#3733).
+    /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
+    /// Operate remains parseable for restored sessions and compatibility, but
+    /// user-facing selection must not offer a fail-closed mode whose control
+    /// board and host-enforced workflow receipts are not shipped yet.
+    pub const CYCLE: [Self; 2] = [Self::Plan, Self::Agent];
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "agent" | "act" | "auto" | "1" => Some(Self::Agent),
+            "plan" | "2" => Some(Self::Plan),
+            "operate" | "operation" | "ops" | "3" => Some(Self::Operate),
+            // Invisible one-way permission shorthand only — never a visible mode.
+            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
+                Some(Self::Yolo)
+            }
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn from_setting(value: &str) -> Self {
+        // Unreleased Multitask never shipped; normalize leftover settings to Operate.
         match value.trim().to_ascii_lowercase().as_str() {
-            "plan" => Self::Plan,
-            "yolo" => Self::Yolo,
-            _ => Self::Agent,
+            "multitask" | "multi" | "5" => Self::Operate,
+            other => Self::parse(other).unwrap_or(Self::Agent),
         }
     }
 
@@ -745,28 +1020,113 @@ impl AppMode {
     pub fn as_setting(self) -> &'static str {
         match self {
             Self::Agent => "agent",
-            Self::Yolo => "yolo",
+            Self::Auto => "agent",
+            // Write current permission vocabulary, not the legacy YOLO label.
+            Self::Yolo => "agent",
             Self::Plan => "plan",
+            Self::Operate => "operate",
         }
     }
 
     /// Short label used in the UI footer.
     pub fn label(self) -> &'static str {
         match self {
-            AppMode::Agent => "AGENT",
-            AppMode::Yolo => "YOLO",
+            AppMode::Agent => "ACT",
+            AppMode::Auto => "ACT",
+            AppMode::Yolo => "ACT",
             AppMode::Plan => "PLAN",
+            AppMode::Operate => "OPERATE",
         }
+    }
+
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AppMode::Agent => "Act",
+            AppMode::Auto => "Act",
+            AppMode::Yolo => "Act",
+            AppMode::Plan => "Plan",
+            AppMode::Operate => "Operate",
+        }
+    }
+
+    #[must_use]
+    pub fn number(self) -> char {
+        match self {
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => '1',
+            AppMode::Plan => '2',
+            AppMode::Operate => '3',
+        }
+    }
+
+    #[must_use]
+    pub fn uses_agent_baseline(self) -> bool {
+        matches!(self, Self::Agent | Self::Auto | Self::Operate)
+    }
+
+    /// Operate gets a higher parallel launch floor so background fan-out is
+    /// not throttled to a single slot when config is low.
+    #[must_use]
+    pub fn mode_delegation_launch_floor(self) -> usize {
+        match self {
+            Self::Operate => 4,
+            _ => 1,
+        }
+    }
+
+    /// Localized short name for the mode picker (user-facing surface only).
+    #[must_use]
+    pub fn display_name_localized(self, locale: Locale) -> Cow<'static, str> {
+        tr(
+            locale,
+            match self {
+                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgent,
+                AppMode::Plan => MessageId::AppModePlan,
+                AppMode::Operate => MessageId::AppModeOperate,
+            },
+        )
+    }
+
+    /// Localized one-line hint for the mode picker (user-facing surface only).
+    #[must_use]
+    pub fn picker_hint_localized(self, locale: Locale) -> Cow<'static, str> {
+        tr(
+            locale,
+            match self {
+                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgentHint,
+                AppMode::Plan => MessageId::AppModePlanHint,
+                AppMode::Operate => MessageId::AppModeOperateHint,
+            },
+        )
     }
 
     #[allow(dead_code)]
     /// Description shown in help or onboarding text.
     pub fn description(self) -> &'static str {
         match self {
-            AppMode::Agent => "Agent mode - autonomous task execution with tools",
-            AppMode::Yolo => "YOLO mode - full tool access without approvals",
-            AppMode::Plan => "Plan mode - design before implementing",
+            AppMode::Agent | AppMode::Auto => {
+                "Act mode - direct work in the current session with tools"
+            }
+            AppMode::Yolo => "Act mode with Full Access (legacy compatibility setting)",
+            AppMode::Plan => "Plan mode - research and design before implementing",
+            AppMode::Operate => "Operate mode - coordinate a Fleet for multi-step work",
         }
+    }
+
+    #[must_use]
+    pub fn next(self) -> Self {
+        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Agent;
+        };
+        Self::CYCLE[(index + 1) % Self::CYCLE.len()]
+    }
+
+    #[must_use]
+    pub fn previous(self) -> Self {
+        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Agent;
+        };
+        Self::CYCLE[(index + Self::CYCLE.len() - 1) % Self::CYCLE.len()]
     }
 }
 
@@ -811,14 +1171,70 @@ pub struct TuiOptions {
     /// Used by `deepseek pr <N>` (#451) to drop the model into a
     /// session with the PR context already typed — the user can edit
     /// before sending or hit Enter to fire as-is.
-    pub initial_input: Option<String>,
+    pub initial_input: Option<InitialInput>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct YoloRestoreState {
-    allow_shell: bool,
-    trust_mode: bool,
-    approval_mode: ApprovalMode,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitialInput {
+    /// Pre-populate the composer and wait for the user to press Enter.
+    ///
+    /// Used by `codewhale pr <N>` (#451) to drop the model into a session
+    /// with the PR context already typed so the user can edit before sending.
+    Prefill(String),
+    /// Pre-populate the composer, submit it once startup is ready, then keep
+    /// the interactive session open for follow-up messages (#2370).
+    Submit(String),
+}
+
+/// Pre-session launch menu state for the underwater shell.
+///
+/// This is deliberately separate from onboarding and from the post-launch
+/// empty session. It selects real session/worktree actions before the
+/// transcript and composer become active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchState {
+    pub visible: bool,
+    pub selected: usize,
+    pub worktree_input: Option<String>,
+    pub status: Option<String>,
+    pub workspace_session_count: usize,
+    pub worktree_available: bool,
+    /// Row hitboxes from the most recent launch render.
+    pub row_areas: Vec<Rect>,
+}
+
+impl LaunchState {
+    #[must_use]
+    pub fn new(visible: bool, workspace: &std::path::Path) -> Self {
+        let workspace_session_count = crate::session_manager::SessionManager::default_location()
+            .and_then(|manager| manager.list_sessions())
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| {
+                        crate::session_manager::workspace_scope_matches(
+                            &session.workspace,
+                            workspace,
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let worktree_available = std::process::Command::new("git")
+            .current_dir(workspace)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        Self {
+            visible,
+            selected: 0,
+            worktree_input: None,
+            status: None,
+            workspace_session_count,
+            worktree_available,
+            row_areas: Vec::new(),
+        }
+    }
 }
 
 // === Sub-state structs for App field organization (#377) ===
@@ -843,14 +1259,17 @@ pub enum VimMode {
 }
 
 impl VimMode {
-    /// Short status-bar label shown in the composer border.
+    /// Localized status-bar label shown in the composer border (user-facing).
     #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "-- NORMAL --",
-            Self::Insert => "-- INSERT --",
-            Self::Visual => "-- VISUAL --",
-        }
+    pub fn label_localized(self, locale: Locale) -> Cow<'static, str> {
+        tr(
+            locale,
+            match self {
+                Self::Normal => MessageId::VimModeNormal,
+                Self::Insert => MessageId::VimModeInsert,
+                Self::Visual => MessageId::VimModeVisual,
+            },
+        )
     }
 }
 
@@ -866,8 +1285,33 @@ pub struct MentionCompletionCache {
     pub partial: String,
     /// Candidate limit used for this completion walk.
     pub limit: usize,
+    /// Workspace depth limit used for this completion walk. Included so live
+    /// config changes invalidate cached popup results.
+    pub walk_depth: usize,
+    /// Completion behavior used for this walk. Included so live config changes
+    /// invalidate cached popup results.
+    pub behavior: String,
+    /// Whether symlink following was enabled for this completion walk.
+    /// Included so live config changes invalidate cached popup results.
+    pub follow_links: bool,
     /// Cached completion entries.
     pub entries: Vec<String>,
+}
+
+/// Cached full candidate walk for @-mention completions. One workspace walk
+/// serves every subsequent keystroke of the same mention token — the
+/// per-keystroke synchronous re-walk was the dominant composer latency on
+/// large repos (#3757). Path-like partials (containing `/` or starting with
+/// `.`) bypass this cache because local path-reference completions are
+/// needle-dependent.
+#[derive(Debug, Clone)]
+pub struct MentionCandidateCache {
+    pub workspace: PathBuf,
+    pub cwd: Option<PathBuf>,
+    pub walk_depth: usize,
+    pub follow_links: bool,
+    pub collected_at: std::time::Instant,
+    pub candidates: Vec<String>,
 }
 
 /// Composer input state — grouped fields for the text input area.
@@ -879,8 +1323,17 @@ pub struct ComposerState {
     /// Single-entry kill buffer for emacs-style `Ctrl+K` cut / `Ctrl+Y` yank.
     pub kill_buffer: String,
     pub paste_burst: PasteBurst,
+    /// When a large paste is consolidated at submit time, the file @mention
+    /// is stored here so it can be appended to the submitted text without
+    /// replacing the visible composer content (#3263).
+    pub(crate) pending_paste_reference: Option<String>,
+    /// When composer content is oversized, the full text is stored here
+    /// while `self.input` shows a truncated preview. At submit time the
+    /// full text is restored for model submission (#3263).
+    pub(crate) oversized_paste_full_text: Option<String>,
     pub input_history: Vec<String>,
     pub draft_history: VecDeque<String>,
+    pub clear_undo_buffer: Option<String>,
     pub history_index: Option<usize>,
     pub(crate) history_navigation_draft: Option<InputHistoryDraft>,
     pub composer_history_search: Option<ComposerHistorySearch>,
@@ -892,6 +1345,9 @@ pub struct ComposerState {
     /// Cached @-mention completions to avoid re-walking the filesystem when
     /// the cursor moves inside the same mention token.
     pub mention_completion_cache: Option<MentionCompletionCache>,
+    /// Cached full candidate list so successive keystrokes inside one mention
+    /// token filter in memory instead of re-walking the workspace (#3757).
+    pub mention_candidate_cache: Option<MentionCandidateCache>,
     /// Whether vim modal editing is enabled for this composer.
     /// Sourced from `Settings::composer_vim_mode` at startup.
     pub vim_enabled: bool,
@@ -901,6 +1357,10 @@ pub struct ComposerState {
     /// user presses `d` in Normal mode; cleared on the next key (either `d`
     /// to complete `dd`, or any other key to cancel).
     pub vim_pending_d: bool,
+    /// When set, the cursor is the active end of a text selection and
+    /// `selection_anchor` is the fixed end.  Both are char-indexed.
+    /// `None` means no selection is active.
+    pub selection_anchor: Option<usize>,
 }
 
 impl Default for ComposerState {
@@ -910,8 +1370,11 @@ impl Default for ComposerState {
             cursor_position: 0,
             kill_buffer: String::new(),
             paste_burst: PasteBurst::default(),
+            pending_paste_reference: None,
+            oversized_paste_full_text: None,
             input_history: Vec::new(),
             draft_history: VecDeque::new(),
+            clear_undo_buffer: None,
             history_index: None,
             history_navigation_draft: None,
             composer_history_search: None,
@@ -921,9 +1384,11 @@ impl Default for ComposerState {
             mention_menu_selected: 0,
             mention_menu_hidden: false,
             mention_completion_cache: None,
+            mention_candidate_cache: None,
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
+            selection_anchor: None,
         }
     }
 }
@@ -938,11 +1403,28 @@ pub struct ViewportState {
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub transcript_scrollbar_dragging: bool,
     pub last_transcript_area: Option<Rect>,
+    pub last_composer_area: Option<Rect>,
+    /// Outer rect of the right-hand sidebar (when visible), stored at render
+    /// time so mouse hit-testing can keep scroll events over the sidebar from
+    /// leaking into the transcript viewport.
+    pub last_sidebar_area: Option<Rect>,
+    /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
+    pub last_workflow_panel_area: Option<Rect>,
+    pub last_workflow_cancel_area: Option<Rect>,
     pub last_transcript_top: usize,
     pub last_transcript_visible: usize,
     pub last_transcript_total: usize,
     pub last_transcript_padding_top: usize,
     pub jump_to_latest_button_area: Option<Rect>,
+    /// Inner content rect of the composer (excluding border/padding),
+    /// stored at render time for mouse coordinate mapping.
+    pub last_composer_content: Option<Rect>,
+    /// Number of rendered text lines scrolled off the top of the composer,
+    /// stored at render time for mouse coordinate mapping.
+    pub last_composer_scroll_offset: usize,
+    /// Vertical padding above the first text line in the composer,
+    /// stored at render time for mouse coordinate mapping.
+    pub last_composer_top_padding: usize,
 }
 
 impl Default for ViewportState {
@@ -956,21 +1438,69 @@ impl Default for ViewportState {
             selection_autoscroll: None,
             transcript_scrollbar_dragging: false,
             last_transcript_area: None,
+            last_composer_area: None,
+            last_sidebar_area: None,
+            last_workflow_panel_area: None,
+            last_workflow_cancel_area: None,
             last_transcript_top: 0,
             last_transcript_visible: 0,
             last_transcript_total: 0,
             last_transcript_padding_top: 0,
             jump_to_latest_button_area: None,
+            last_composer_content: None,
+            last_composer_scroll_offset: 0,
+            last_composer_top_padding: 0,
         }
     }
 }
 
-/// Goal mode state (#397).
+/// Verdict for a hunt (#2092).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HuntVerdict {
+    #[default]
+    Hunting,
+    Hunted,
+    Wounded,
+    Escaped,
+}
+
+impl HuntVerdict {
+    #[must_use]
+    pub fn goal_status(self) -> crate::tools::goal::GoalStatus {
+        match self {
+            Self::Hunting => crate::tools::goal::GoalStatus::Active,
+            Self::Hunted => crate::tools::goal::GoalStatus::Complete,
+            Self::Wounded => crate::tools::goal::GoalStatus::Paused,
+            Self::Escaped => crate::tools::goal::GoalStatus::Blocked,
+        }
+    }
+
+    #[must_use]
+    pub fn from_goal_status(status: crate::tools::goal::GoalStatus) -> Self {
+        match status {
+            crate::tools::goal::GoalStatus::Active => Self::Hunting,
+            crate::tools::goal::GoalStatus::Paused => Self::Wounded,
+            crate::tools::goal::GoalStatus::Complete => Self::Hunted,
+            crate::tools::goal::GoalStatus::Blocked => Self::Escaped,
+        }
+    }
+}
+
+/// Hunt tracking state (#2092 — was GoalState).
 #[derive(Debug, Clone, Default)]
-pub struct GoalState {
-    pub goal_objective: Option<String>,
-    pub goal_token_budget: Option<u32>,
-    pub goal_started_at: Option<Instant>,
+pub struct HuntState {
+    pub quarry: Option<String>,
+    pub token_budget: Option<u32>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub continuation_count: u32,
+    pub started_at: Option<Instant>,
+    /// When the goal reached a terminal verdict (Hunted/Wounded/Escaped).
+    /// While `None`, elapsed time keeps growing; once set, the sidebar freezes
+    /// the timer at `finished_at - started_at` so completed goals stop ticking.
+    pub finished_at: Option<Instant>,
+    pub verdict: HuntVerdict,
 }
 
 /// Session cost and token telemetry state.
@@ -985,13 +1515,126 @@ pub struct SessionState {
     pub displayed_cost_high_water_cny: f64,
     pub last_prompt_tokens: Option<u32>,
     pub last_completion_tokens: Option<u32>,
+    pub last_output_throughput: Option<TokenThroughput>,
     pub last_prompt_cache_hit_tokens: Option<u32>,
     pub last_prompt_cache_miss_tokens: Option<u32>,
     pub last_reasoning_replay_tokens: Option<u32>,
     pub total_tokens: u32,
     pub total_conversation_tokens: u32,
+    /// Accumulated token breakdown for the session.
+    pub total_input_tokens: u32,
+    pub total_cache_hit_tokens: u32,
+    pub total_cache_miss_tokens: u32,
+    pub total_output_tokens: u32,
     pub turn_cache_history: VecDeque<TurnCacheRecord>,
     pub last_cache_inspection: Option<PromptInspection>,
+    pub last_warmup_key: Option<CacheWarmupKey>,
+    /// Tool catalog from the most recent model request.
+    ///
+    /// `/cache inspect` uses this to inspect the same tool schema bytes
+    /// that were eligible for the provider's prefix cache.
+    pub last_tool_catalog: Option<Vec<Tool>>,
+    /// API base URL used by the most recent model request or cache warmup.
+    pub last_base_url: Option<String>,
+}
+
+/// Sidebar hover state for mouse tooltip support.
+#[derive(Debug, Clone, Default)]
+pub struct SidebarHoverState {
+    /// Rendered sections with their areas and full-text lines.
+    pub sections: Vec<SidebarHoverSection>,
+}
+
+/// Per-row metadata for sidebar detail popovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRowAction {
+    Command(String),
+    /// Put a destructive command in the composer instead of executing it.
+    /// The user confirms with Enter or cancels by editing/clearing the draft.
+    #[allow(dead_code)] // destructive confirm path; mouse_ui already matches it (TUI-DOG-008)
+    PrefillCommand(String),
+    HotbarSlot(u8),
+    ToggleAgentDetails {
+        agent_id: String,
+    },
+    /// Drill into the child's transcript card (action tree, status, summary)
+    /// in the detail pager — registered on the expanded dossier rows (#2889
+    /// slice, dogfood A3).
+    OpenAgentDetail {
+        agent_id: String,
+    },
+    CancelAgent {
+        agent_id: String,
+    },
+    /// Safe read-only inspection for work rows without a mutable backend
+    /// action (for example an agent-owned To-do item).
+    InspectText {
+        label: String,
+        detail: String,
+    },
+}
+
+impl SidebarRowAction {
+    #[must_use]
+    pub fn as_command(&self) -> Option<&str> {
+        match self {
+            Self::Command(command) => Some(command.as_str()),
+            Self::PrefillCommand(_)
+            | Self::HotbarSlot(_)
+            | Self::ToggleAgentDetails { .. }
+            | Self::OpenAgentDetail { .. }
+            | Self::CancelAgent { .. }
+            | Self::InspectText { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancel_action(&self) -> bool {
+        match self {
+            Self::Command(command) => command.contains(" cancel "),
+            Self::PrefillCommand(command) => command.contains(" cancel "),
+            Self::CancelAgent { .. } => true,
+            Self::ToggleAgentDetails { .. }
+            | Self::OpenAgentDetail { .. }
+            | Self::InspectText { .. }
+            | Self::HotbarSlot(_) => false,
+        }
+    }
+}
+
+/// Per-row metadata for sidebar detail popovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarHoverRow {
+    /// Absolute row position in the terminal.
+    pub row_y: u16,
+    /// Text shown in the compact sidebar row.
+    pub display_text: String,
+    /// Full untruncated text for the popover.
+    pub full_text: String,
+    /// Optional additional detail line.
+    pub detail: Option<String>,
+    /// Whether the compact row lost information.
+    pub is_truncated: bool,
+    /// Slash command to execute when this row is clicked (#3028).
+    /// `shell_*` job ids route through `/jobs` (e.g. `/jobs cancel
+    /// shell_abc123`); task-manager ids route through `/task` (e.g.
+    /// `/task show task_abc123`).
+    pub click_action: Option<SidebarRowAction>,
+    /// Optional narrower stop target for rows that show an inline `[x]`.
+    pub stop_action: Option<SidebarRowAction>,
+    pub stop_zone_start_col: Option<u16>,
+    pub stop_zone_end_col: Option<u16>,
+}
+
+/// Per-section metadata for sidebar hover detection.
+#[derive(Debug, Clone)]
+pub struct SidebarHoverSection {
+    /// Content area within the section (inside border + padding).
+    pub content_area: Rect,
+    /// Full original text for each content line rendered.
+    pub lines: Vec<String>,
+    /// Per-row metadata for rich hover popovers.
+    pub rows: Vec<SidebarHoverRow>,
 }
 
 impl Default for SessionState {
@@ -1006,29 +1649,83 @@ impl Default for SessionState {
             displayed_cost_high_water_cny: 0.0,
             last_prompt_tokens: None,
             last_completion_tokens: None,
+            last_output_throughput: None,
             last_prompt_cache_hit_tokens: None,
             last_prompt_cache_miss_tokens: None,
             last_reasoning_replay_tokens: None,
             total_tokens: 0,
             total_conversation_tokens: 0,
+            total_input_tokens: 0,
+            total_cache_hit_tokens: 0,
+            total_cache_miss_tokens: 0,
+            total_output_tokens: 0,
             turn_cache_history: VecDeque::new(),
             last_cache_inspection: None,
+            last_warmup_key: None,
+            last_tool_catalog: None,
+            last_base_url: None,
         }
     }
+}
+
+impl SessionState {
+    /// Reset the accumulated token breakdown fields to zero.
+    pub fn reset_token_breakdown(&mut self) {
+        self.total_input_tokens = 0;
+        self.total_cache_hit_tokens = 0;
+        self.total_cache_miss_tokens = 0;
+        self.total_output_tokens = 0;
+        self.last_output_throughput = None;
+    }
+}
+
+/// Evidence collected during a turn for the post-turn receipt.
+#[derive(Debug, Clone)]
+pub struct ToolEvidence {
+    pub tool_name: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingProviderSwitch {
+    pub previous_provider: ApiProvider,
+    pub previous_model: String,
+    pub previous_model_ids_passthrough: bool,
+    pub previous_route_limits: Option<RouteLimits>,
+    pub previous_context_window_override: Option<u32>,
+    pub previous_config: Config,
+    pub previous_onboarding: OnboardingState,
+    pub previous_onboarding_needs_api_key: bool,
+    pub previous_api_key_env_only: bool,
 }
 
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub mode: AppMode,
+    /// Registered hotbar actions available for future slot config/render layers.
+    #[allow(dead_code)]
+    pub hotbar_actions: HotbarActionRegistry,
     /// Composer sub-state (input, cursor, history, menus).
     pub composer: ComposerState,
     /// Viewport sub-state (scroll, cache, selection).
     pub viewport: ViewportState,
+    /// Ocean work-surface state. Kept separate from transcript/sidebar state
+    /// so the replacement shell can be removed or promoted as one unit.
+    pub work_surface: crate::tui::work_surface::WorkSurfaceState,
     /// Goal sub-state.
-    pub goal: GoalState,
+    pub hunt: HuntState,
     /// Session sub-state (cost, tokens, telemetry).
     pub session: SessionState,
+    /// Active tool restriction from custom slash command frontmatter.
+    /// `None` means the current turn may use the normal tool set.
+    pub active_allowed_tools: Option<Vec<String>>,
+    /// True when the active custom slash command opted into pause/resume.
+    pub pausable: bool,
+    /// True after Esc paused a pausable command and before it is resumed or cancelled.
+    pub paused: bool,
+    /// Saved custom-command objective while the command is paused.
+    pub paused_quarry: Option<String>,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
     /// Per-cell revision counter, kept in lockstep with `history`.
@@ -1037,6 +1734,19 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Timestamp of the most recent Enter while the engine was busy.
+    /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
+    pub last_enter_instant: Option<Instant>,
+    /// Whether the once-per-turn provider-wait incident (#3095) has already
+    /// been logged for the current turn.
+    pub provider_wait_incident_logged: bool,
+    /// Ghost-text follow-up suggestion shown in the composer when empty.
+    /// Generated asynchronously after each completed turn; cleared on new input.
+    pub prompt_suggestion: Option<String>,
+    /// Monotonic turn counter for stale-suggestion protection. Incremented on
+    /// each TurnStarted; background suggestion tasks capture the token and
+    /// discard their result if the token no longer matches.
+    pub prompt_suggestion_gen: std::sync::atomic::AtomicU64,
     /// Degraded connectivity mode; new user inputs are queued for later retry.
     pub offline_mode: bool,
     /// Whether an `EngineEvent::Error` has already been posted for the
@@ -1053,6 +1763,9 @@ pub struct App {
     /// Last status text already promoted from `status_message` into toast state.
     pub last_status_message_seen: Option<String>,
     pub model: String,
+    /// Persisted model selections by provider name. Loaded from settings so
+    /// `/model` and the picker can surface saved provider-specific choices.
+    pub provider_models: HashMap<String, String>,
     /// When true, the model is auto-selected based on request complexity
     /// rather than using a fixed model. The `/model auto` command sets this.
     /// `dispatch_user_message` calls `auto_model_heuristic` to resolve the
@@ -1060,10 +1773,46 @@ pub struct App {
     pub auto_model: bool,
     /// Last concrete model chosen while `auto_model` is active.
     pub last_effective_model: Option<String>,
+    /// Provider that actually served the latest auto-routed turn.
+    pub last_effective_provider: Option<ApiProvider>,
+    /// Route selected for the next turn, retained for in-flight UI details
+    /// until the engine confirms the authoritative `TurnStarted` route.
+    pub pending_turn_route: Option<(ApiProvider, String, bool)>,
+    /// Authoritative lifecycle metadata attached to the most recent
+    /// `TurnStarted`. Kept separate from `pending_turn_route` so a preceding
+    /// compaction completion cannot consume the next model turn's route.
+    pub active_turn: Option<ActiveTurnMetadata>,
     /// Current API provider (mirrors `Config::api_provider`).
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
     pub api_provider: ApiProvider,
+    /// Primary provider plus configured fallback providers for this session.
+    pub provider_chain: Option<ProviderChain>,
+    /// Per-provider auth/local readiness snapshot for the fallback chain (#2574).
+    ///
+    /// Captured at startup alongside `provider_chain` (where the live `Config` is
+    /// in scope). `advance_fallback` consults it to skip chain entries that
+    /// cannot serve a turn — hosted providers missing a key — while local
+    /// providers (Ollama/vLLM/SGLang) are always ready. Stored as `(provider,
+    /// ready)` pairs; lookups fall back to "ready" for providers not present so
+    /// an unknown entry is tried rather than silently skipped.
+    provider_readiness: Vec<(ApiProvider, bool)>,
+    /// Session-local evidence from real provider requests and verification
+    /// probes. Unlike `provider_readiness` above, this never treats a saved key
+    /// as proof that the endpoint is healthy.
+    pub(crate) provider_health: crate::provider_readiness::ProviderReadinessSnapshot,
+    /// Human-readable description of the last provider fallback event.
+    pub last_fallback_reason: Option<String>,
+    /// True when the active provider/base URL accepts arbitrary model IDs
+    /// verbatim rather than DeepSeek-only aliases.
+    pub model_ids_passthrough: bool,
+    /// Resolved provider/model route limits for the active runtime route.
+    pub active_route_limits: Option<RouteLimits>,
+    /// User-configured provider context-window override for the active route.
+    pub active_context_window_override: Option<u32>,
+    /// Pending provider transition for transactional rollback when the next
+    /// auth failure indicates the new provider cannot be used.
+    pub pending_provider_switch: Option<PendingProviderSwitch>,
     /// Current reasoning-effort tier for DeepSeek thinking mode.
     /// Cycled via Shift+Tab; initialized from config at startup.
     pub reasoning_effort: ReasoningEffort,
@@ -1074,14 +1823,19 @@ pub struct App {
     pub config_profile: Option<String>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
+    pub skills_scan_codewhale_only: bool,
     /// Path to the user-memory file (#489). Always populated; only
     /// consulted when `use_memory` is `true`.
     pub memory_path: PathBuf,
     /// Whether the user-memory feature is enabled (#489). Mirrors
     /// `Config::memory_enabled()` at app boot. Used by the `# foo`
-    /// composer interception, the `/memory` slash command, and tool
-    /// registration for `remember`.
+    /// composer interception (also gated by `moraine_fallback`),
+    /// the `/memory` slash command, and tool registration for
+    /// `remember`.
     pub use_memory: bool,
+    /// True when legacy memory push/inject behavior should stay disabled
+    /// because Moraine pull/recall is the configured memory backend.
+    pub moraine_fallback: bool,
     pub use_alt_screen: bool,
     pub use_mouse_capture: bool,
     /// When true, plain Up/Down on an empty composer scroll the transcript
@@ -1090,6 +1844,19 @@ pub struct App {
     /// sequences (e.g. Windows CMD without `WT_SESSION`) get page-scrolling
     /// without any explicit config (#1443).
     pub composer_arrows_scroll: bool,
+    /// Data-side cap for the `@`-mention popup. The renderer still limits the
+    /// visible rows to available terminal height.
+    pub mention_menu_limit: usize,
+    /// Maximum workspace depth for `@`-mention completion walks. `0` means
+    /// unlimited depth.
+    pub mention_walk_depth: usize,
+    /// `@`-mention completion behavior: fuzzy workspace search or deterministic
+    /// directory browser.
+    pub mention_menu_behavior: String,
+    /// Follow symbolic links during workspace file discovery walks.
+    /// When `true`, symlinked directories are traversed, enabling
+    /// multi-project workspaces.
+    pub workspace_follow_symlinks: bool,
     pub use_bracketed_paste: bool,
     pub use_paste_burst_detection: bool,
     /// Set to `true` the first time a real `Event::Paste` arrives during a
@@ -1103,12 +1870,35 @@ pub struct App {
     #[allow(dead_code)]
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
+    pub auto_compact_user_configured: bool,
+    pub auto_compact_threshold_percent: f64,
     pub calm_mode: bool,
     pub low_motion: bool,
-    /// Pending #61 (animated working strip). Set from config but not read
-    /// until the footer widget consumes it.
-    #[allow(dead_code)]
+    pub constrained_frame_rate: bool,
+    pub ocean_started_at: Instant,
+    /// Start of the underwater shell's one-shot successful-turn exhale.
+    /// Kept separate from the ambient ocean clock so completion can settle
+    /// once without restarting or repainting the transcript field.
+    pub ocean_completion_started_at: Option<Instant>,
+    /// History length at the current turn boundary. Successful completion
+    /// uses this stable index to settle only the receipts produced by that
+    /// turn, never old transcript rows.
+    pub ocean_turn_history_start: usize,
+    /// First committed history cell participating in the current one-shot
+    /// receipt-settle cascade.
+    pub ocean_receipt_settle_start: Option<usize>,
+    /// Enables the authored underwater phase and ambient motion system.
     pub fancy_animations: bool,
+    /// Typed appearance treatment; appearance is independent from motion
+    /// settings, and every underwater treatment keeps ambient life.
+    pub ocean_treatment: crate::tui::ocean::OceanTreatment,
+    /// Distinct pre-session menu. Once dismissed, the normal idle ocean owns
+    /// the empty session and this state stays hidden.
+    pub launch: LaunchState,
+    /// Mouse-selected launch action, consumed by the async UI loop.
+    pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
+    /// Mouse-selected hotbar slot, consumed by the async UI loop.
+    pub pending_hotbar_slot: Option<u8>,
     /// Whether the renderer should wrap each frame in DEC mode 2026
     /// synchronized output. Resolved from `Settings::synchronized_output`
     /// at construction; `auto`/`on` → `true`, `off` → `false`. The Ptyxis
@@ -1117,34 +1907,97 @@ pub struct App {
     /// the draw loop the decision is already made. See the
     /// `Settings::synchronized_output` doc for the user-facing knob.
     pub synchronized_output_enabled: bool,
-    /// Header status-indicator chip mode. One of `"whale"` (default, cycles
-    /// 🐳→🐋 frames keyed off `turn_started_at`), `"dots"` (geometric ◌
-    /// frames), or `"off"` (chip hidden entirely). Loaded from settings;
-    /// changed via `/config status_indicator <whale|dots|off>`.
+    /// Header status-indicator chip mode. `"cw"` is the static default;
+    /// `"whale"` and `"dots"` preserve the animated legacy choices, while
+    /// `"off"` hides the chip. Loaded from settings and changed via
+    /// `/config status_indicator <cw|whale|dots|off>`.
     pub status_indicator: String,
     pub show_thinking: bool,
     pub verbose_transcript: bool,
     pub show_tool_details: bool,
     pub ui_locale: Locale,
     pub cost_currency: CostCurrency,
+    /// Route payment truth. Model pricing alone cannot distinguish metered
+    /// API calls from OAuth or token-plan quota.
+    pub billing_presentation: crate::route_billing::BillingPresentation,
     pub composer_density: ComposerDensity,
     pub composer_border: bool,
+    /// Voice input state — toggled by `/voice` and the voice hotbar action.
+    pub voice_enabled: bool,
+    /// Auto-send after transcription when the transcript ends with an
+    /// explicit send instruction ("send it" / "发送"). Toggled by `/voice-send`.
+    pub voice_send_enabled: bool,
+    /// AI-assisted dictation that sees the current composer text.
+    /// Toggled by `/voice-control`.
+    pub voice_control_enabled: bool,
     pub transcript_spacing: TranscriptSpacing,
     pub sidebar_width_percent: u16,
     pub sidebar_focus: SidebarFocus,
+    /// Sidebar hover state for mouse tooltip support.
+    pub sidebar_hover: SidebarHoverState,
+    /// Current hover tooltip text, if any.
+    pub sidebar_hover_tooltip: Option<String>,
+    /// Last successfully rendered Work panel summary. Transient mutex misses
+    /// should not wipe completed checklist/strategy state from the sidebar.
+    pub(crate) cached_work_summary: Option<SidebarWorkSummary>,
+    /// Browsing context from the last dismissed `/model` picker, so reopening
+    /// restores the view mode and highlighted row instead of resetting to the
+    /// top (#4109 picker memory). Session-scoped, never persisted.
+    pub model_picker_memory: Option<ModelPickerMemory>,
+    /// Browsing context from the last dismissed `/provider` picker.
+    pub provider_picker_memory: Option<ProviderPickerMemory>,
+    /// Last known mouse position for tooltip placement.
+    pub last_mouse_pos: Option<(u16, u16)>,
+    /// Whether the user is currently dragging the sidebar resize handle.
+    pub sidebar_resizing: bool,
+    /// Mouse column at the start of a sidebar-resize drag.
+    pub sidebar_resize_anchor_x: u16,
+    /// Sidebar width in columns at the start of a sidebar-resize drag.
+    pub sidebar_resize_anchor_width: u16,
+    /// Last sidebar area rendered (for mouse hit-testing the resize handle).
+    pub last_sidebar_area: Option<Rect>,
+    /// Last total chat/sidebar width considered for sidebar rendering.
+    pub last_sidebar_host_width: Option<u16>,
+    /// Handle rect painted on the left edge of the sidebar (1 col).
+    pub last_sidebar_handle_area: Option<Rect>,
+    /// Total horizontal space (chat + sidebar) used to compute the percentage
+    /// during sidebar resize drag.
+    pub sidebar_resize_total_width: u16,
+    /// Sidebar width changed during this drag and needs persistence.
+    pub sidebar_width_dirty: bool,
+    /// Sidebar focus/hidden state changed and needs persistence.
+    pub sidebar_focus_dirty: bool,
     /// Whether the session-context panel is enabled (#504).
     pub context_panel: bool,
+    /// Minimum number of consecutive safe tool cells needed for auto-collapse.
+    pub tool_collapse_threshold: usize,
+    /// Tool runs the user explicitly expanded. Stores original history indices.
+    pub expanded_tool_runs: HashSet<usize>,
+    /// Current dense tool-run collapse behavior.
+    pub tool_collapse_mode: ToolCollapseMode,
     /// File-tree pane state. `None` when hidden; `Some` when visible.
     pub file_tree: Option<crate::tui::file_tree::FileTreeState>,
+    /// Whether the file-tree pane was actually rendered in the last frame.
+    /// Set false when the terminal is too narrow to show the tree.
+    pub file_tree_visible: bool,
     #[allow(dead_code)]
     pub compact_threshold: usize,
     pub max_input_history: usize,
     pub allow_shell: bool,
+    pub verbosity: Option<String>,
     pub max_subagents: usize,
+    /// Per-SSE-chunk idle timeout for streamed turns, in seconds.
+    pub stream_chunk_timeout_secs: u64,
     /// Cached sub-agent snapshots for UI views.
     pub subagent_cache: Vec<SubAgentResult>,
+    /// First time this TUI observed each terminal sub-agent card.
+    pub subagent_terminal_seen_at: HashMap<String, Instant>,
     /// Last known per-agent progress text for running sub-agents.
     pub agent_progress: HashMap<String, String>,
+    /// Agent rows expanded by direct sidebar interaction.
+    pub expanded_sidebar_agents: HashSet<String>,
+    /// Parent/depth metadata for live progress-only sub-agent rows.
+    pub agent_progress_meta: HashMap<String, AgentProgressMeta>,
     /// In-transcript sub-agent card index by `agent_id` (issue #128).
     /// Maps each live sub-agent to the `HistoryCell::SubAgent` it renders
     /// into, so successive mailbox envelopes mutate the same cell rather
@@ -1155,11 +2008,25 @@ pub struct App {
     /// when a fresh fanout-family tool call starts.
     pub last_fanout_card_index: Option<usize>,
     /// Most recently observed sub-agent dispatch tool name (set on
-    /// `ToolCallStarted` for `agent_spawn` / `rlm` / etc., cleared
+    /// `ToolCallStarted` for `agent` / `rlm` / etc., cleared
     /// after the first `Started` mailbox envelope routes through it).
     pub pending_subagent_dispatch: Option<String>,
     /// Animation anchor for status-strip active sub-agent spinner.
     pub agent_activity_started_at: Option<Instant>,
+    /// Monotonic counter for stable agent labels (#3030).
+    /// Incremented each time a sub-agent is spawned; used to generate
+    /// "Agent 1", "Agent 2", etc.
+    pub agent_counter: u64,
+    /// Maps raw agent_id to a stable user-facing label (#3030).
+    /// Populated when `AgentSpawned` fires; read by sidebar rendering.
+    pub agent_label_map: HashMap<String, String>,
+    /// Last time a sub-agent progress event triggered a redraw.
+    /// Used to throttle redraws under high sub-agent concurrency (#3033).
+    pub last_agent_progress_redraw: Option<Instant>,
+    /// Last time a workflow `budget_updated` event was allowed to request a
+    /// repaint. High-signal workflow events (task/run lifecycle) always paint;
+    /// budget-only chatter is paced under fan-out (#4095 residual).
+    pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
@@ -1169,6 +2036,7 @@ pub struct App {
     // Onboarding
     pub onboarding: OnboardingState,
     pub onboarding_needs_api_key: bool,
+    pub onboarding_provider: ApiProvider,
     pub onboarding_workspace_trust_gate: bool,
     pub api_key_env_only: bool,
     pub api_key_input: String,
@@ -1177,7 +2045,20 @@ pub struct App {
     pub hooks: HookExecutor,
     #[allow(dead_code)]
     pub yolo: bool,
-    yolo_restore: Option<YoloRestoreState>,
+    /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
+    yolo_compat_notified: bool,
+    /// One-shot Shift+Tab/Ctrl+T rebinding notice for this session (#0.8.68 M3).
+    keybinding_migration_notified: bool,
+    /// Durable Agent-era permission baseline that Plan/YOLO derive from and
+    /// restore to (#3386). Refreshed from the live fields whenever the user
+    /// leaves Agent mode; see [`base_policy_for_mode`] and `set_mode`.
+    mode_prefs: ModeSessionPrefs,
+    /// True when config/requirements supplied an approval policy. In that
+    /// case the TUI-only Shift+Tab preference must not loosen it.
+    approval_policy_locked: bool,
+    /// True only when an organization requirements file owns approval policy.
+    /// Unlike a user-owned config key, this source cannot be edited in-app.
+    approval_policy_requirements_managed: bool,
     // Clipboard handler
     pub clipboard: ClipboardHandler,
     // Tool approval session allowlist
@@ -1191,12 +2072,21 @@ pub struct App {
     pub approval_mode: ApprovalMode,
     // Modal view stack (approval/help/etc.)
     pub view_stack: ViewStack,
+    /// Last `request_user_input` prompt, retained so a failed modal submit can reopen (#1198).
+    pub pending_user_input_prompt: Option<(String, crate::tools::user_input::UserInputRequest)>,
     /// Esc-Esc backtrack state machine (#133). `Inactive` by default; first
     /// Esc primes, second Esc opens the live-transcript overlay scoped to
     /// previous user messages so the user can rewind a turn.
     pub backtrack: crate::tui::backtrack::BacktrackState,
     /// Current session ID for auto-save updates
     pub current_session_id: Option<String>,
+    /// Last non-contended Work snapshot captured in this App. The outer
+    /// option distinguishes "never captured" from a captured empty state.
+    pub(crate) last_known_work_state: Option<Option<SessionWorkState>>,
+    /// Metadata for the active session, cached in memory so automatic
+    /// checkpoints never synchronously reload and parse a growing JSON file on
+    /// the UI thread.
+    pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
     /// Trust mode - allow access outside workspace
@@ -1219,8 +2109,8 @@ pub struct App {
     pub plan_prompt_pending: bool,
     /// Whether update_plan was called during the current turn
     pub plan_tool_used_in_turn: bool,
-    /// Todo list for `TodoWriteTool`
-    #[allow(dead_code)] // For future engine integration
+    /// Todo list for `TodoWriteTool`. Read by the plan confirmation modal to
+    /// show the active checklist alongside the plan.
     pub todos: SharedTodoList,
     /// Durable runtime services exposed to model-visible task/automation tools.
     pub runtime_services: RuntimeToolServices,
@@ -1291,8 +2181,18 @@ pub struct App {
     /// thinking into the active cell so it groups visually with tool calls
     /// until the next assistant prose chunk flushes the group into history.
     pub streaming_thinking_active_entry: Option<usize>,
+    /// Instant of the last throttled active-cell revision bump for the
+    /// in-flight thinking stream (#1620). Reasoning chunks arrive faster than
+    /// the eye can read, and each bump invalidates the active cell's wrap
+    /// cache, forcing a full re-wrap. We debounce intermediate bumps to a
+    /// time window so high-frequency thinking deltas no longer trigger a
+    /// re-render per character. `None` means "no bump since the last
+    /// finalize" so the first chunk of a block always renders immediately.
+    pub thinking_revision_last_bump_at: Option<Instant>,
     /// Newline-gated streaming collector state.
     pub streaming_state: StreamingState,
+    /// Live approximate output tokens for the current assistant stream.
+    pub streaming_output_token_estimate: u64,
     /// Accumulated reasoning text
     pub reasoning_buffer: String,
     /// Live reasoning header extracted from bold text
@@ -1313,22 +2213,81 @@ pub struct App {
     /// cancelled cleanly). Surfaced in the pending-input preview so the user
     /// knows the steer was deferred to end-of-turn. Today no engine path
     /// produces these; the field is scaffolding for a future signalling
-    /// channel and the bucket renders identically when populated.
+    /// channel and the bucket renders with a rejected-steer label when
+    /// populated.
     pub rejected_steers: VecDeque<String>,
     /// Legacy resend flag for pending steer recovery.
     pub submit_pending_steers_after_interrupt: bool,
     /// Start time for current turn
     pub turn_started_at: Option<Instant>,
+    /// Most recent engine event observed for the current turn. This is
+    /// separate from `turn_started_at` because the latter drives elapsed-time
+    /// UI and must not be reset during long but healthy turns.
+    pub turn_last_activity_at: Option<Instant>,
     /// Sum of completed turn durations for this `App` instance (#448
     /// follow-up). Drives the footer's `worked Nh Mm` chip so the
     /// label reflects actual model work, not wall-clock since launch.
     /// Incremented on `TurnComplete` from the elapsed time of the
     /// just-finished turn. Resets per launch.
     pub cumulative_turn_duration: std::time::Duration,
+    /// DeepSeek account balance, refreshed once per turn completion.
+    /// Shared cell updated by background fetch tasks; read lock in the UI thread.
+    pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
+    /// Shared cell for async fleet-profile model-draft delivery. A background
+    /// task fills it (model label + drafted profile or a failure reason) so
+    /// the drafting network call never parks the event loop (#3757 review).
+    #[allow(clippy::type_complexity)]
+    /// Monotonic generation for model-draft requests. Bumped on each draft
+    /// request and each setup/fleet wizard open, so a draft that lands after
+    /// a superseding request or a wizard reopen is dropped rather than
+    /// installed into the wrong (or a stale) wizard instance.
+    pub draft_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[allow(clippy::type_complexity)]
+    pub fleet_draft_cell: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                u64,
+                String,
+                // The `(provider, model)` route the operator picked when they
+                // pressed `m` (#4093). Carried alongside the async draft so the
+                // ratified profile keeps the picked cross-provider route even if
+                // the model draft (which is always `provider: None`) omitted or
+                // changed it. `None` for an `inherit` pick.
+                Option<(String, String)>,
+                // The reasoning tier selected when the operator pressed `m`
+                // (#4137). `None` means inherit.
+                Option<String>,
+                Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
+            )>,
+        >,
+    >,
+    /// Shared cell for async constitution model-draft delivery (same pattern
+    /// as `fleet_draft_cell`, so the drafting network call never parks the
+    /// event loop).
+    #[allow(clippy::type_complexity)]
+    pub constitution_draft_cell: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                u64,
+                String,
+                crate::localization::Locale,
+                Result<Box<codewhale_config::UserConstitution>, String>,
+            )>,
+        >,
+    >,
+    /// Shared cell for async prompt suggestion delivery from background task.
+    pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
+    /// Tracks whether the initial balance fetch has been attempted for this session.
+    pub balance_initiated: bool,
+    /// Timestamp of the last balance fetch, used to debounce rapid requests.
+    pub last_balance_fetch: Option<std::time::Instant>,
     /// Current runtime turn id (if known).
     pub runtime_turn_id: Option<String>,
     /// Current runtime turn status (if known).
     pub runtime_turn_status: Option<String>,
+    /// Monotonic turn counter for stable user-facing labels (#3030).
+    /// Incremented each time a new turn starts; displayed as "Turn N".
+    pub turn_counter: u64,
     /// When the UI accepted a user message but has not observed `TurnStarted` yet.
     pub dispatch_started_at: Option<Instant>,
 
@@ -1340,27 +2299,41 @@ pub struct App {
     pub workspace_context_refreshed_at: Option<Instant>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
+    /// Active decision card (v0.8.43 truth-surface). When set, keyboard input
+    /// is routed through the card navigation instead of the composer.
+    pub decision_card: Option<crate::tui::widgets::decision_card::DecisionCard>,
+    /// Unified Workflow activity surface (#4121). Lives above the composer so
+    /// phase/row progress does not flood the chat transcript. Preserved after
+    /// completion until the next `RunStarted` replaces it.
+    pub workflow_panel: Option<crate::tui::widgets::workflow_panel::WorkflowPanel>,
     /// Wall-clock time when this TUI session started. Used by the Work
     /// sidebar projection to hide completed durable tasks that finished
     /// before the current session (bug #1913).
     pub session_started_at: chrono::DateTime<chrono::Utc>,
     /// Whether the UI needs to be redrawn.
     pub needs_redraw: bool,
+    /// When true, the next draw will be a full repaint (terminal clear +
+    /// all cells redrawn) instead of a ratatui incremental diff. Used by
+    /// theme switches where the diff engine may miss color-only changes
+    /// in sidebar cells that were previously rendered with palette constants.
+    pub force_next_full_repaint: bool,
     /// When the current thinking block started (for duration tracking).
     pub thinking_started_at: Option<Instant>,
     /// Whether context compaction is currently in progress.
     pub is_compacting: bool,
+    /// Whether context purge is currently in progress.
+    pub is_purging: bool,
     /// Set when the user scrolls up/down during a streaming turn so subsequent
     /// streamed chunks don't yank the view back to the live tail. Cleared
     /// when the user explicitly returns to bottom or the turn completes.
     pub user_scrolled_during_stream: bool,
-    /// Plain-language session coherence state for the footer.
-    pub coherence_state: CoherenceState,
     /// Timestamp of the last user message send (for brief visual feedback).
     pub last_send_at: Option<Instant>,
     /// Most recent user prompt accepted for an active engine turn. Ctrl+C can
     /// restore this into an empty composer after cancelling that turn.
     pub last_submitted_prompt: Option<String>,
+    /// Startup prompt should be submitted automatically after the engine is ready.
+    pub auto_submit_initial_input: bool,
     /// Two-tap quit confirmation. When set, a prior Ctrl+C in idle state has
     /// armed the quit shortcut; a second Ctrl+C before this `Instant` exits
     /// the app, while expiry silently re-arms the prompt for next time.
@@ -1368,14 +2341,6 @@ pub struct App {
     /// Ctrl+C keeps its current "interrupt this turn" semantics in those
     /// states. See [`App::arm_quit`] / [`App::quit_is_armed`].
     pub quit_armed_until: Option<Instant>,
-
-    /// Number of checkpoint-restart cycles crossed in this session
-    /// (issue #124). Mirrors `Session.cycle_count` on the engine side.
-    pub cycle_count: u32,
-
-    /// Briefings produced at past cycle boundaries, in chronological order.
-    /// Used by `/cycles` and `/cycle <n>` slash commands.
-    pub cycle_briefings: Vec<CycleBriefing>,
 
     // === Prefix-Cache Stability Tracking ===
     /// Number of times the prefix (system prompt + tool specs) has changed.
@@ -1386,15 +2351,19 @@ pub struct App {
     pub prefix_stability_pct: Option<u32>,
     /// Description of the last prefix change, if any.
     pub last_prefix_change_desc: Option<String>,
+    /// Current pinned prefix combined hash (SHA-256, 64 hex chars).
+    /// Updated per-turn via PrefixCacheChange events; surfaced by
+    /// `/cache stats` for cache-hit debugging.
+    pub last_pinned_prefix_hash: Option<String>,
 
-    /// Active cycle configuration (token threshold, briefing cap, per-model
-    /// overrides). Loaded from config and forwarded to the engine.
-    pub cycle: CycleConfig,
-
-    // === Goal Mode (#397) ===
+    // === Transcript filtering (#397) ===
     /// Transcript cells the user has collapsed (hidden from view).
     /// Stores **original** virtual cell indices (pre-filtering).
     pub collapsed_cells: HashSet<usize>,
+    /// Thinking cells the user has folded (showing summary instead of full
+    /// content). Stores **original** virtual cell indices. Toggled by Space
+    /// when the composer is empty and the cursor is on a thinking cell.
+    pub folded_thinking: HashSet<usize>,
     /// Mapping from filtered cell index → original virtual index.
     /// Populated during `ChatWidget::new` by filtering out collapsed cells.
     /// Used by `build_context_menu_entries` to convert line-meta indices
@@ -1408,9 +2377,18 @@ pub struct App {
     /// Whether LSP diagnostics are currently enabled. Mirrors the config file
     /// `[lsp].enabled` setting. Toggled at runtime via `/lsp on|off`.
     pub lsp_enabled: bool,
+    /// Current-turn LSP repair-loop summary for Ctrl-O Turn Inspector (#4107).
+    pub lsp_repair: LspRepairState,
     /// Derived title for the current session shown in the composer border.
     /// Updated when `EngineEvent::SessionUpdated` fires or a saved session is loaded.
     pub session_title: Option<String>,
+
+    /// Post-turn receipt rendered as transient composer chrome.
+    /// Set when a turn completes; cleared when a new turn starts or after expiry.
+    pub receipt_text: Option<String>,
+    pub receipt_started_at: Option<Instant>,
+    /// Tool evidence collected during the current turn for the receipt.
+    pub tool_evidence: Vec<ToolEvidence>,
 }
 
 /// Message queued while the engine is busy.
@@ -1449,12 +2427,22 @@ pub struct ToolDetailRecord {
 }
 
 /// Lightweight task view for sidebar rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPanelEntry {
     pub id: String,
     pub status: String,
     pub prompt_summary: String,
     pub duration_ms: Option<u64>,
+    pub kind: TaskPanelEntryKind,
+    pub stale: bool,
+    pub elapsed_since_output_ms: Option<u64>,
+    pub owner_agent_id: Option<String>,
+    pub owner_agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPanelEntryKind {
+    Background,
 }
 
 impl QueuedMessage {
@@ -1512,11 +2500,26 @@ fn default_composer_arrows_scroll(use_mouse_capture: bool) -> bool {
     default_composer_arrows_scroll_for_platform(use_mouse_capture, cfg!(windows))
 }
 
-fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, is_windows: bool) -> bool {
-    is_windows || !use_mouse_capture
+fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_windows: bool) -> bool {
+    !use_mouse_capture
 }
 
 impl App {
+    /// Advance and return the model-draft generation. Call when a draft is
+    /// requested or a setup/fleet wizard opens; a spawned draft that captured
+    /// an older generation is dropped on delivery.
+    pub fn next_draft_gen(&self) -> u64 {
+        self.draft_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// The current model-draft generation (delivery compares against this).
+    #[must_use]
+    pub fn current_draft_gen(&self) -> u64 {
+        self.draft_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Cap on the session turn-cache history. Holds enough turns to debug a long
     /// session without being so large the on-screen `/cache` table wraps.
     pub const TURN_CACHE_HISTORY_CAP: usize = 50;
@@ -1533,13 +2536,17 @@ impl App {
     pub(crate) fn clear_model_scoped_telemetry(&mut self) {
         self.session.last_prompt_tokens = None;
         self.session.last_completion_tokens = None;
+        self.session.last_output_throughput = None;
         self.session.last_prompt_cache_hit_tokens = None;
         self.session.last_prompt_cache_miss_tokens = None;
         self.session.last_reasoning_replay_tokens = None;
         self.session.turn_cache_history.clear();
+        self.pending_turn_route = None;
+        self.active_turn = None;
+        self.last_pinned_prefix_hash = None;
     }
 
-    pub fn tr(&self, id: MessageId) -> &'static str {
+    pub fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.ui_locale, id)
     }
 
@@ -1563,21 +2570,135 @@ impl App {
             start_in_agent_mode,
             skip_onboarding,
             yolo,
-            resume_session_id: _,
+            resume_session_id,
             initial_input,
         } = options;
 
-        let settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        // Start from disk-only preferences so one-time migrations can never
+        // persist terminal/environment overlays such as NO_ANIMATIONS. Apply
+        // those overlays only after any normalized settings write succeeds.
+        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
+        let legacy_yolo_default = settings.legacy_yolo_default_detected();
+        let legacy_yolo_full_access = if legacy_yolo_default {
+            let control = config.approval_policy_control(
+                config_path.as_deref(),
+                config_profile.as_deref(),
+                &workspace,
+            );
+            match control {
+                crate::config::ApprovalPolicyControl::Unset => {
+                    if let Err(error) = settings.save() {
+                        tracing::warn!(
+                            "failed to normalize legacy YOLO settings; retrying next launch: {error:#}"
+                        );
+                    }
+                    true
+                }
+                crate::config::ApprovalPolicyControl::RootConfig => {
+                    let active_config_path =
+                        crate::config::resolve_load_config_path(config_path.clone());
+                    match crate::config_persistence::persist_unset_root_key(
+                        active_config_path.as_deref(),
+                        "approval_policy",
+                    ) {
+                        Ok(_) => {
+                            if let Err(error) = settings.save() {
+                                tracing::warn!(
+                                    "removed legacy approval_policy but could not normalize settings; retrying next launch: {error:#}"
+                                );
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "could not migrate legacy YOLO approval policy; keeping the controlling policy: {error:#}"
+                            );
+                            false
+                        }
+                    }
+                }
+                source => {
+                    tracing::warn!(
+                        "legacy YOLO setting was not allowed to override {}",
+                        source.label()
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        settings.apply_env_overrides();
+        let launch_visible =
+            settings.launch_screen && resume_session_id.is_none() && initial_input.is_none();
+        let launch = LaunchState::new(launch_visible, &workspace);
+
+        // If settings.toml exists on disk but couldn't be parsed (we fell back
+        // to defaults), surface a warning in the TUI so the user knows their
+        // file is broken instead of silently losing all settings.
+        let settings_parse_warning = crate::settings::Settings::path().ok().and_then(|p| {
+            if p.exists() {
+                std::fs::read_to_string(&p).ok().and_then(|raw| {
+                    ::toml::from_str::<::toml::Value>(&raw)
+                        .err()
+                        .map(|e| format!("⚠ settings.toml is malformed — using defaults ({e})"))
+                })
+            } else {
+                None
+            }
+        });
+        let tui_prefs_warning = crate::settings::TuiPrefs::path().ok().and_then(|p| {
+            if p.exists() {
+                std::fs::read_to_string(&p).ok().and_then(|raw| {
+                    ::toml::from_str::<::toml::Value>(&raw)
+                        .err()
+                        .map(|e| format!("⚠ tui.toml is malformed — using defaults ({e})"))
+                })
+            } else {
+                None
+            }
+        });
+
         let mut provider = config.api_provider();
 
-        // Let settings override the config provider so runtime switches survive restarts.
-        if let Some(ref provider_str) = settings.default_provider
+        // Let settings preserve runtime switches only when config/CLI did not
+        // explicitly select a provider. A configured provider must not be
+        // pushed back to a stale saved setting on restart.
+        if config
+            .provider
+            .as_deref()
+            .and_then(ApiProvider::parse)
+            .is_none()
+            && let Some(ref provider_str) = settings.default_provider
             && let Some(parsed) = ApiProvider::parse(provider_str)
         {
             provider = parsed;
         }
         let mut effective_auth_config = config.clone();
         effective_auth_config.provider = Some(provider.as_str().to_string());
+        let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
+        let provider_chain = provider
+            .kind()
+            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
+            .filter(|chain| chain.providers().len() > 1);
+
+        // Snapshot per-provider readiness for the fallback chain (#2574). Uses
+        // the same `has_api_key_for` helper the provider picker uses, so hosted
+        // providers require a key and self-hosted ones (Ollama/vLLM/SGLang) are
+        // reported ready without one. Empty when there is no fallback chain.
+        let provider_readiness = provider_chain
+            .as_ref()
+            .map(|chain| {
+                chain
+                    .providers()
+                    .iter()
+                    .map(|kind| {
+                        let provider = ApiProvider::from_kind(*kind);
+                        (provider, has_api_key_for(config, provider))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Check if the effective provider has an API key. This must happen
         // after settings.default_provider is applied; otherwise a saved
@@ -1586,10 +2707,16 @@ impl App {
         let api_key_env_only =
             crate::config::active_provider_uses_env_only_api_key(&effective_auth_config);
         let was_onboarded = crate::tui::onboarding::is_onboarded();
-        let auto_compact = settings.auto_compact;
+        let settings_auto_compact = settings.auto_compact;
+        let auto_compact_user_configured = Settings::auto_compact_explicitly_configured();
+        let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
         let calm_mode = settings.calm_mode;
         let low_motion = settings.low_motion;
+        let constrained_frame_rate = settings.constrained_frame_rate;
         let fancy_animations = settings.fancy_animations;
+        let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
+        let work_surface_placement =
+            crate::tui::work_surface::WorkSurfacePlacement::parse(&settings.work_surface_placement);
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
@@ -1623,10 +2750,10 @@ impl App {
         {
             ui_theme = ui_theme.with_background_color(background);
         }
-        let model = settings
-            .provider_models
-            .as_ref()
-            .and_then(|m| m.get(provider.as_str()).cloned())
+        let provider_models = settings.provider_models.clone().unwrap_or_default();
+        let model = provider_models
+            .get(provider.as_str())
+            .cloned()
             .or_else(|| {
                 // default_model is a DeepSeek-centric setting; other providers
                 // get their model from config.toml / env (e.g. OPENAI_MODEL).
@@ -1638,6 +2765,26 @@ impl App {
             })
             .unwrap_or(model);
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
+        let active_context_window_override = config.context_window_for_provider_config(provider);
+        let active_route_limits = if auto_model {
+            active_context_window_override.map(|window| RouteLimits {
+                context_tokens: Some(u64::from(window)),
+                ..RouteLimits::default()
+            })
+        } else {
+            let saved_provider_model = config
+                .provider_config_for(provider)
+                .and_then(|provider| provider.model.as_deref());
+            crate::route_runtime::resolve_route_candidate(
+                provider,
+                Some(&model),
+                saved_provider_model,
+                Some(effective_auth_config.deepseek_base_url()),
+                active_context_window_override,
+            )
+            .ok()
+            .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
+        };
         let configured_reasoning_effort = settings
             .reasoning_effort
             .as_deref()
@@ -1647,27 +2794,38 @@ impl App {
         } else {
             model.as_str()
         };
-        let compact_threshold =
-            compaction_threshold_for_model_and_effort(threshold_model, configured_reasoning_effort);
+        let compact_threshold = crate::route_budget::compaction_threshold_for_route_at_percent(
+            provider,
+            threshold_model,
+            active_route_limits,
+            auto_compact_threshold_percent,
+        );
+        let auto_compact = if auto_compact_user_configured {
+            settings_auto_compact
+        } else {
+            crate::route_budget::auto_compact_default_for_route(
+                provider,
+                threshold_model,
+                active_route_limits,
+            )
+        };
         let reasoning_effort = if auto_model {
             ReasoningEffort::Auto
         } else {
             configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
-                ReasoningEffort::from_setting(s)
+                ReasoningEffort::from_setting_for_provider(s, provider)
             })
         };
 
-        // Start in YOLO mode if --yolo flag was passed
+        // Resolve the saved mode separately from the permission posture.
         let preferred_mode = AppMode::from_setting(&settings.default_mode);
-        let initial_mode = if yolo {
-            AppMode::Yolo
-        } else if start_in_agent_mode {
+        let yolo_compat = yolo || (preferred_mode == AppMode::Yolo && !start_in_agent_mode);
+        let initial_mode = if yolo_compat || start_in_agent_mode {
             AppMode::Agent
         } else {
             preferred_mode
         };
-        let needs_workspace_trust =
-            initial_mode != AppMode::Yolo && crate::tui::onboarding::needs_trust(&workspace);
+        let needs_workspace_trust = !yolo_compat && crate::tui::onboarding::needs_trust(&workspace);
         let onboarding = initial_onboarding_state(
             skip_onboarding,
             was_onboarded,
@@ -1681,53 +2839,110 @@ impl App {
             needs_workspace_trust,
         );
 
-        let yolo_restore = if initial_mode == AppMode::Yolo {
-            Some(YoloRestoreState {
-                allow_shell: config.allow_shell(),
-                trust_mode: false,
-                approval_mode: config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default(),
-            })
-        } else {
+        // Durable Agent-era permission baseline (#3386). Plan/YOLO derive from
+        // and restore to this. Legacy Auto inputs parse to Agent; if an older
+        // caller still constructs `AppMode::Auto` directly, it projects through
+        // the Agent baseline instead of enabling a fourth runtime posture. When
+        // the user starts in YOLO the live shell flag is force-enabled below, so
+        // the baseline shell value is taken from the interactive default (the
+        // pre-mode Agent surface) rather than the YOLO-forced live mirror;
+        // otherwise it mirrors the resolved `allow_shell` option, which already
+        // carries that same interactive default. Using `interactive_allow_shell()`
+        // here keeps the Agent baseline identical regardless of launch mode, so
+        // a YOLO -> Agent downshift exposes shell (approval-gated) exactly as
+        // documented, while an explicit `allow_shell = false` still hides it.
+        // Trust is never part of the Agent baseline (it is YOLO-only authority).
+        // Approval mirrors the configured policy.
+        let explicit_approval_mode = (!legacy_yolo_full_access)
+            .then_some(config.approval_policy.as_deref())
+            .flatten()
+            .and_then(ApprovalMode::from_config_value);
+        let approval_policy_locked =
+            !legacy_yolo_full_access && config.approval_policy_is_managed();
+        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
+        let saved_permission_posture = if approval_policy_locked {
             None
+        } else {
+            settings
+                .permission_posture
+                .as_deref()
+                .and_then(ApprovalMode::from_config_value)
         };
-        let allow_shell = allow_shell || initial_mode == AppMode::Yolo;
+        let configured_approval_mode = explicit_approval_mode
+            .or(saved_permission_posture)
+            .unwrap_or_default();
+        let mode_prefs = ModeSessionPrefs {
+            agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
+                config.interactive_allow_shell()
+            } else {
+                allow_shell
+            },
+            agent_trust_mode: false,
+            // The YOLO-compat launch elevates the *live* approval mirror to
+            // Bypass below; the durable Agent baseline keeps the configured
+            // policy so a YOLO -> Agent downshift restores it.
+            agent_approval_mode: configured_approval_mode,
+        };
+        let allow_shell = allow_shell || yolo_compat || matches!(initial_mode, AppMode::Yolo);
         let shell_manager = new_shared_shell_manager(workspace.clone());
 
-        // Initialize hooks executor from config
-        let hooks_config = config.hooks_config();
+        // Initialize hooks executor from config, merged with project-local
+        // `.codewhale/hooks.toml` (#3026).
+        let hooks_config =
+            crate::hooks::HooksConfig::load_with_project(config.hooks_config(), &workspace);
         let hooks = HookExecutor::new(hooks_config, workspace.clone());
 
         // Initialize plan state
         let plan_state = new_shared_plan_state();
 
+        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills = Self::discover_cached_skills(&workspace, &skills_dir);
+        let cached_skills =
+            Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
 
         let input_history = crate::composer_history::load_history();
-        let (initial_input_text, initial_input_cursor) = match initial_input {
-            // #451: pre-populate the composer when invoked via
-            // `deepseek pr <N>` (or any future caller that wants to
-            // drop the model into a session with context already
-            // typed). Cursor lands at the end so Enter sends as-is.
-            Some(text) if !text.is_empty() => {
-                let cursor = text.len();
-                (text, cursor)
-            }
-            _ => (String::new(), 0),
-        };
-        Self {
+        let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
+            match initial_input {
+                // #451: pre-populate the composer when invoked via
+                // `deepseek pr <N>` (or any future caller that wants to
+                // drop the model into a session with context already
+                // typed). Cursor lands at the end so Enter sends as-is.
+                Some(InitialInput::Prefill(text)) if !text.is_empty() => {
+                    let cursor = text.chars().count();
+                    (text, cursor, false)
+                }
+                Some(InitialInput::Submit(text)) if !text.is_empty() => {
+                    let cursor = text.chars().count();
+                    (text, cursor, true)
+                }
+                _ => (String::new(), 0, false),
+            };
+        let mcp_configured_count =
+            crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
+                .map(|cfg| cfg.servers.len())
+                .unwrap_or(0);
+        let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
+            config,
+            provider,
+            &model,
+            &provider_models,
+        );
+        // #2069: expose the already-discovered skills as bindable hotbar
+        // actions. Reuses the startup skill cache, so no extra filesystem I/O.
+        hotbar_actions.register_skills(&cached_skills);
+        let mut app = Self {
             mode: initial_mode,
+            hotbar_actions,
             composer: ComposerState {
                 input: initial_input_text,
                 cursor_position: initial_input_cursor,
                 kill_buffer: String::new(),
                 paste_burst: PasteBurst::default(),
+                pending_paste_reference: None,
+                oversized_paste_full_text: None,
                 input_history,
                 draft_history: VecDeque::new(),
+                clear_undo_buffer: None,
                 history_index: None,
                 history_navigation_draft: None,
                 composer_history_search: None,
@@ -1737,29 +2952,56 @@ impl App {
                 mention_menu_selected: 0,
                 mention_menu_hidden: false,
                 mention_completion_cache: None,
+                mention_candidate_cache: None,
                 vim_enabled: composer_vim_enabled,
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,
+                selection_anchor: None,
             },
             viewport: ViewportState::default(),
-            goal: GoalState::default(),
+            work_surface: crate::tui::work_surface::WorkSurfaceState::with_placement(
+                work_surface_placement,
+            ),
+            hunt: HuntState::default(),
             session: SessionState::default(),
+            active_allowed_tools: None,
+            pausable: false,
+            paused: false,
+            paused_quarry: None,
             history: Vec::new(),
             history_version: 0,
             history_revisions: Vec::new(),
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            last_enter_instant: None,
+            provider_wait_incident_logged: false,
+            prompt_suggestion: None,
+            prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
-            status_message: None,
+            // Surface parse warnings so the user knows their config file is
+            // broken instead of silently losing all settings.
+            status_message: settings_parse_warning.or(tui_prefs_warning),
             status_toasts: VecDeque::new(),
             sticky_status: None,
             last_status_message_seen: None,
             model,
+            provider_models,
             auto_model,
             last_effective_model: None,
+            last_effective_provider: None,
+            pending_turn_route: None,
+            active_turn: None,
             api_provider: provider,
+            provider_chain,
+            provider_readiness,
+            provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
+            last_fallback_reason: None,
+            model_ids_passthrough,
+            active_route_limits,
+            active_context_window_override,
+            pending_provider_switch: None,
             reasoning_effort,
             last_effective_reasoning_effort: None,
             workspace,
@@ -1767,8 +3009,10 @@ impl App {
             config_profile,
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
+            skills_scan_codewhale_only,
             memory_path,
             use_memory,
+            moraine_fallback: config.moraine_fallback(),
             use_alt_screen,
             use_mouse_capture,
             use_bracketed_paste,
@@ -1776,9 +3020,20 @@ impl App {
             bracketed_paste_seen: false,
             system_prompt: None,
             auto_compact,
+            auto_compact_user_configured,
+            auto_compact_threshold_percent,
             calm_mode,
             low_motion,
+            constrained_frame_rate,
+            ocean_started_at: Instant::now(),
+            ocean_completion_started_at: None,
+            ocean_turn_history_start: 0,
+            ocean_receipt_settle_start: None,
             fancy_animations,
+            ocean_treatment,
+            launch,
+            pending_launch_action: None,
+            pending_hotbar_slot: None,
             synchronized_output_enabled,
             status_indicator,
             show_thinking,
@@ -1786,51 +3041,87 @@ impl App {
             show_tool_details,
             ui_locale,
             cost_currency,
+            billing_presentation: crate::route_billing::for_route(config, provider),
             composer_density,
             composer_border,
+            voice_enabled: false,
+            voice_send_enabled: false,
+            voice_control_enabled: false,
             transcript_spacing,
             sidebar_width_percent,
             sidebar_focus,
+            sidebar_hover: SidebarHoverState::default(),
+            sidebar_hover_tooltip: None,
+            cached_work_summary: None,
+            model_picker_memory: None,
+            provider_picker_memory: None,
+            last_mouse_pos: None,
+            sidebar_resizing: false,
+            sidebar_resize_anchor_x: 0,
+            sidebar_resize_anchor_width: 0,
+            last_sidebar_area: None,
+            last_sidebar_host_width: None,
+            last_sidebar_handle_area: None,
+            sidebar_resize_total_width: 0,
+            sidebar_width_dirty: false,
+            sidebar_focus_dirty: false,
             context_panel: settings.context_panel,
+            tool_collapse_threshold: 3,
+            expanded_tool_runs: HashSet::new(),
+            tool_collapse_mode: ToolCollapseMode::from_setting(&settings.tool_collapse_mode),
             file_tree: None,
+            file_tree_visible: false,
             compact_threshold,
             max_input_history,
             allow_shell,
+            verbosity: config.verbosity.clone(),
             max_subagents,
+            stream_chunk_timeout_secs: config.stream_chunk_timeout_secs(),
             subagent_cache: Vec::new(),
+            subagent_terminal_seen_at: HashMap::new(),
             agent_progress: HashMap::new(),
+            expanded_sidebar_agents: HashSet::new(),
+            agent_progress_meta: HashMap::new(),
             subagent_card_index: HashMap::new(),
             last_fanout_card_index: None,
             pending_subagent_dispatch: None,
             agent_activity_started_at: None,
+            agent_counter: 0,
+            agent_label_map: HashMap::new(),
+            last_agent_progress_redraw: None,
+            last_workflow_budget_redraw: None,
             ui_theme,
             theme_id,
             onboarding,
             onboarding_needs_api_key: needs_api_key,
+            onboarding_provider: provider,
             onboarding_workspace_trust_gate,
             api_key_env_only,
             api_key_input: String::new(),
             api_key_cursor: 0,
             hooks,
-            yolo: initial_mode == AppMode::Yolo,
-            yolo_restore,
+            yolo: yolo_compat,
+            yolo_compat_notified: false,
+            keybinding_migration_notified: false,
+            mode_prefs,
+            approval_policy_locked,
+            approval_policy_requirements_managed,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
             approval_session_denied: HashSet::new(),
-            approval_mode: if matches!(initial_mode, AppMode::Yolo) {
-                ApprovalMode::Auto
+            approval_mode: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
+                ApprovalMode::Bypass
             } else {
-                config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default()
+                configured_approval_mode
             },
             view_stack: ViewStack::new(),
+            pending_user_input_prompt: None,
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
+            last_known_work_state: None,
+            current_session_metadata: None,
             session_artifacts: Vec::new(),
-            trust_mode: initial_mode == AppMode::Yolo,
+            trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
             translation_enabled: false,
             status_items: config
                 .tui
@@ -1850,11 +3141,9 @@ impl App {
             // Read the MCP config once at boot to know how many servers
             // the user has declared. The footer chip uses this even when
             // no live snapshot is available (#502). Cheap (just reads
-            // the JSON file); errors fall through to zero so a missing
+            // the JSON files); errors fall through to zero so a missing
             // or malformed config simply hides the chip.
-            mcp_configured_count: crate::mcp::load_config(&mcp_config_path)
-                .map(|cfg| cfg.servers.len())
-                .unwrap_or(0),
+            mcp_configured_count,
             mcp_restart_required: false,
             tool_log: Vec::new(),
             active_skill: None,
@@ -1874,7 +3163,9 @@ impl App {
             streaming_message_index: None,
             suppress_stream_events_until_turn_complete: false,
             streaming_thinking_active_entry: None,
+            thinking_revision_last_bump_at: None,
             streaming_state: StreamingState::new(),
+            streaming_output_token_estimate: 0,
             reasoning_buffer: String::new(),
             reasoning_header: None,
             last_reasoning: None,
@@ -1885,57 +3176,90 @@ impl App {
             rejected_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             turn_started_at: None,
+            turn_last_activity_at: None,
             cumulative_turn_duration: std::time::Duration::ZERO,
+            balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            balance_initiated: false,
+            last_balance_fetch: None,
             runtime_turn_id: None,
             runtime_turn_status: None,
+            turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             task_panel: Vec::new(),
+            decision_card: None,
+            workflow_panel: None,
             session_started_at: chrono::Utc::now(),
             needs_redraw: true,
+            force_next_full_repaint: false,
             thinking_started_at: None,
             is_compacting: false,
+            is_purging: false,
             user_scrolled_during_stream: false,
-            coherence_state: CoherenceState::default(),
             last_send_at: None,
             last_submitted_prompt: None,
+            auto_submit_initial_input,
             quit_armed_until: None,
-            cycle_count: 0,
-            cycle_briefings: Vec::new(),
             prefix_change_count: 0,
             prefix_checks_total: 0,
             prefix_stability_pct: None,
             last_prefix_change_desc: None,
-            cycle: CycleConfig::default(),
+            last_pinned_prefix_hash: None,
             collapsed_cells: HashSet::new(),
+            folded_thinking: HashSet::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),
+            lsp_repair: LspRepairState::default(),
             composer_arrows_scroll: config
                 .tui
                 .as_ref()
                 .and_then(|tui| tui.composer_arrows_scroll)
                 .unwrap_or_else(|| default_composer_arrows_scroll(use_mouse_capture)),
+            mention_menu_limit: settings.mention_menu_limit,
+            mention_walk_depth: settings.mention_walk_depth,
+            mention_menu_behavior: settings.mention_menu_behavior.clone(),
+            workspace_follow_symlinks: settings.workspace_follow_symlinks,
             session_title: None,
+            receipt_text: None,
+            receipt_started_at: None,
+            tool_evidence: Vec::new(),
+        };
+        if yolo_compat {
+            app.notify_yolo_compat_once();
         }
+        app
     }
 
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
+        scan_codewhale_only: bool,
     ) -> Vec<(String, String)> {
-        crate::skills::discover_for_workspace_and_dir(workspace, skills_dir)
-            .list()
-            .iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
-            .collect()
+        crate::skills::discover_for_workspace_and_dir_with_mode(
+            workspace,
+            skills_dir,
+            crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+        )
+        .list()
+        .iter()
+        .map(|s| (s.name.clone(), s.description.clone()))
+        .collect()
     }
 
     pub fn refresh_skill_cache(&mut self) {
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(&self.workspace, &skills_dir);
+        self.cached_skills = Self::discover_cached_skills(
+            &self.workspace,
+            &skills_dir,
+            self.skills_scan_codewhale_only,
+        );
     }
 
     pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
@@ -1944,19 +3268,24 @@ impl App {
             return Err(ApiKeyError::Empty);
         }
 
-        match save_api_key(&key) {
-            Ok(saved) => {
-                self.api_key_input.clear();
-                self.api_key_cursor = 0;
-                self.onboarding_needs_api_key = false;
-                self.api_key_env_only = false;
-                Ok(saved)
-            }
-            Err(source) => Err(ApiKeyError::SaveFailed { source }),
-        }
+        let saved = if matches!(
+            self.onboarding_provider,
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        ) {
+            save_api_key(&key).map_err(|source| ApiKeyError::SaveFailed { source })?
+        } else {
+            let path = save_api_key_for(self.onboarding_provider, &key)
+                .map_err(|source| ApiKeyError::SaveFailed { source })?;
+            SavedCredential::ConfigFile(path)
+        };
+        self.api_key_input.clear();
+        self.api_key_cursor = 0;
+        self.onboarding_needs_api_key = false;
+        self.api_key_env_only = false;
+        Ok(saved)
     }
 
-    pub fn finish_onboarding(&mut self) {
+    pub fn finish_onboarding_without_feature_intro(&mut self) {
         self.onboarding = OnboardingState::None;
         if let Err(err) = crate::tui::onboarding::mark_onboarded() {
             self.status_message = Some(format!("Failed to mark onboarding: {err}"));
@@ -1964,14 +3293,41 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Mark the first-run follow-up as seen without inserting a transcript
+    /// message. The empty underwater launch surface owns setup guidance; a
+    /// synthetic history cell would hide that surface before the user sends
+    /// anything.
+    pub fn maybe_show_feature_intro(&mut self) {
+        if self.onboarding != OnboardingState::None {
+            return;
+        }
+        // Never claim "setup is ready" when auth is still missing — e.g.
+        // `--skip-onboarding` with no API key (#3985). Leave the flag unset so
+        // the tip can appear after the user finishes provider setup.
+        if self.onboarding_needs_api_key {
+            return;
+        }
+        let mut settings = Settings::load_persisted().unwrap_or_default();
+        if settings.feature_intro_shown {
+            return;
+        }
+        settings.feature_intro_shown = true;
+        if let Err(err) = settings.save() {
+            self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
+            // Still show the nudge; the flag write may simply retry next launch.
+        }
+        self.status_message = Some(self.tr(MessageId::FleetReadyNotice).into_owned());
+        self.needs_redraw = true;
+    }
+
     /// Apply a locale tag selected from the onboarding language picker (#566).
-    /// Persists the value to `~/.deepseek/settings.toml` and immediately
+    /// Persists the value to settings.toml and immediately
     /// re-resolves `ui_locale` so the rest of onboarding renders in the new
     /// language. `App` doesn't keep `Settings` resident — it loads on entry
     /// and rewrites on exit, mirroring the pattern used by the `/config`
     /// surface.
     pub fn set_locale_from_onboarding(&mut self, tag: &str) -> anyhow::Result<()> {
-        let mut settings = Settings::load().unwrap_or_else(|_| Settings::default());
+        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
         settings.set("locale", tag)?;
         settings.save()?;
         self.ui_locale = crate::localization::resolve_locale(&settings.locale);
@@ -1979,7 +3335,7 @@ impl App {
         Ok(())
     }
 
-    /// Locale tag currently persisted in `~/.deepseek/settings.toml` (or
+    /// Locale tag currently persisted in settings.toml (or
     /// `"auto"` when no settings file exists). Used by the onboarding
     /// language picker to highlight the current selection without `App`
     /// having to keep `Settings` resident.
@@ -1990,32 +3346,52 @@ impl App {
     }
 
     pub fn set_mode(&mut self, mode: AppMode) -> bool {
+        let requested_mode = mode;
+        let mode = match mode {
+            AppMode::Yolo => AppMode::Agent,
+            other => other,
+        };
+        let yolo_compat = requested_mode == AppMode::Yolo;
         let previous_mode = self.mode;
-        if previous_mode == mode {
+        if previous_mode == mode && !yolo_compat && !self.yolo {
             return false;
         }
 
-        let entering_yolo = mode == AppMode::Yolo && previous_mode != AppMode::Yolo;
-        let leaving_yolo = previous_mode == AppMode::Yolo && mode != AppMode::Yolo;
         self.mode = mode;
-        self.status_message = Some(format!("Switched to {} mode", mode.label()));
+        // Mode chip lives in the header — skip redundant status/toast copy.
 
-        if entering_yolo {
-            self.yolo_restore = Some(YoloRestoreState {
-                allow_shell: self.allow_shell,
-                trust_mode: self.trust_mode,
-                approval_mode: self.approval_mode,
-            });
-            self.allow_shell = true;
-            self.trust_mode = true;
-            self.approval_mode = ApprovalMode::Auto;
-        } else if leaving_yolo && let Some(restore) = self.yolo_restore.take() {
-            self.allow_shell = restore.allow_shell;
-            self.trust_mode = restore.trust_mode;
-            self.approval_mode = restore.approval_mode;
+        // Mode cycling is untangled from permission policy (#3386). The user
+        // only edits the durable permission surface while in Agent mode, so
+        // refresh the baseline from the live mirrors whenever we leave Agent —
+        // before any transient Plan/YOLO policy overwrites them. This subsumes
+        // the old per-mode `YoloRestoreState`/`PlanRestoreState` snapshots:
+        // cross-mode hops (Plan -> YOLO, YOLO -> Plan) do not touch the baseline,
+        // so YOLO's elevated authority never bleeds into the restored Agent
+        // surface (#3279).
+        if previous_mode.uses_agent_baseline() && !self.yolo {
+            self.mode_prefs = ModeSessionPrefs {
+                agent_allow_shell: self.allow_shell,
+                agent_trust_mode: self.trust_mode,
+                agent_approval_mode: self.approval_mode,
+            };
         }
 
-        self.yolo = mode == AppMode::Yolo;
+        if yolo_compat {
+            // Transient full-access mirrors for legacy YOLO entry points; do not
+            // persist trust/shell elevation into the durable Agent baseline.
+            self.allow_shell = true;
+            self.trust_mode = true;
+            self.approval_mode = ApprovalMode::Bypass;
+            self.yolo = true;
+            self.notify_yolo_compat_once();
+        } else {
+            let policy = base_policy_for_mode(mode, &self.mode_prefs);
+            self.allow_shell = policy.allow_shell;
+            self.trust_mode = policy.trust_mode;
+            self.approval_mode = policy.approval_mode;
+            self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
+        }
+
         if mode != AppMode::Plan {
             self.plan_prompt_pending = false;
             self.plan_tool_used_in_turn = false;
@@ -2032,38 +3408,245 @@ impl App {
         true
     }
 
-    /// Cycle through modes: Plan → Agent → YOLO → Plan.
+    fn notify_yolo_compat_once(&mut self) {
+        if self.yolo_compat_notified {
+            return;
+        }
+        self.yolo_compat_notified = true;
+        // Per-install suppression: check the persisted flag so the toast
+        // appears exactly once across sessions, not every launch.
+        if let Ok(settings) = crate::settings::Settings::load()
+            && settings.yolo_deprecation_shown
+        {
+            return;
+        }
+        // Persist the flag best-effort; toast still fires even if the write
+        // fails (retries on the next attempt).
+        if let Ok(mut settings) = crate::settings::Settings::load_persisted() {
+            settings.yolo_deprecation_shown = true;
+            let _ = settings.save();
+        }
+        self.push_status_toast(
+            "Legacy full-access mode is deprecated — use Act + Full Access (Shift+Tab)".to_string(),
+            StatusToastLevel::Warning,
+            Some(8_000),
+        );
+    }
+
+    /// One-release migration notice for the Shift+Tab/Ctrl+T rebinding: users
+    /// pressing Shift+Tab expecting the old thinking cycle land here first.
+    fn notify_keybinding_migration_once(&mut self) {
+        if self.keybinding_migration_notified {
+            return;
+        }
+        self.keybinding_migration_notified = true;
+        self.push_status_toast(
+            "Shift+Tab now cycles permissions — reasoning effort moved to Ctrl+T".to_string(),
+            StatusToastLevel::Info,
+            Some(8_000),
+        );
+    }
+
+    /// Whether mode/thinking selection is locked because a turn is in flight.
+    ///
+    /// While `is_loading`, the model/permission surface the engine is acting on
+    /// must not shift underneath it, so user-initiated mode and thinking changes
+    /// are refused (#2982). Returns true (and posts a concise status message) if
+    /// the change should be rejected — the caller leaves the selection unchanged
+    /// so the chip "twitches" back instead of moving.
+    fn reject_setting_change_while_busy(&mut self, what: &str) -> bool {
+        if self.is_loading {
+            self.status_message = Some(format!(
+                "{what} is locked while a turn is running — press Esc to interrupt first"
+            ));
+            self.needs_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cycle through productive modes: Plan → Act → Plan.
     pub fn cycle_mode(&mut self) {
-        let next = match self.mode {
-            AppMode::Plan => AppMode::Agent,
-            AppMode::Agent => AppMode::Yolo,
-            AppMode::Yolo => AppMode::Plan,
-        };
+        if self.reject_setting_change_while_busy("Mode") {
+            return;
+        }
+        let next = self.mode.next();
         let _ = self.set_mode(next);
     }
 
     /// Cycle through modes in reverse.
     #[allow(dead_code)]
     pub fn cycle_mode_reverse(&mut self) {
-        let next = match self.mode {
-            AppMode::Agent => AppMode::Plan,
-            AppMode::Yolo => AppMode::Agent,
-            AppMode::Plan => AppMode::Yolo,
-        };
+        if self.reject_setting_change_while_busy("Mode") {
+            return;
+        }
+        let next = self.mode.previous();
         let _ = self.set_mode(next);
     }
 
-    /// Cycle reasoning-effort through the three behaviorally distinct tiers:
-    /// `Off` → `High` → `Max` → `Off`.
+    /// Cycle reasoning-effort through the active provider's distinct tiers.
     pub fn cycle_effort(&mut self) {
-        self.reasoning_effort = self.reasoning_effort.cycle_next();
+        if self.reject_setting_change_while_busy("Thinking") {
+            return;
+        }
+        self.reasoning_effort = self
+            .reasoning_effort
+            .cycle_next_for_provider(self.api_provider);
         self.last_effective_reasoning_effort = None;
         self.needs_redraw = true;
-        self.push_status_toast(
-            format!("Thinking: {}", self.reasoning_effort.short_label()),
-            StatusToastLevel::Info,
-            Some(1_500),
+        // Effort chip in the header is canonical — no duplicate toast.
+    }
+
+    /// Cycle the durable Agent permission posture: Ask → Auto-Review → Bypass.
+    pub fn cycle_approval_posture(&mut self) -> bool {
+        if self.reject_setting_change_while_busy("Permissions") {
+            return false;
+        }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        if self.approval_policy_locked() {
+            self.push_status_toast(
+                "Permissions are controlled by config or managed requirements".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
+        let persisted = match next {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        };
+        let persistence_result = (|| -> anyhow::Result<()> {
+            let mut settings = Settings::load_persisted()?;
+            settings.permission_posture = Some(persisted.to_string());
+            settings.save()
+        })();
+        if let Err(err) = persistence_result {
+            self.push_status_toast(
+                format!("Permissions were not changed: could not save TUI posture ({err})"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        self.set_agent_approval_posture(next);
+        self.needs_redraw = true;
+        // Footer permission chip is canonical — no status toast for the new
+        // value, only the one-shot rebinding notice.
+        self.notify_keybinding_migration_once();
+        true
+    }
+
+    /// Replace the complete durable Act baseline and project it onto the live
+    /// runtime when the current mode uses that baseline. Keeping these three
+    /// fields together prevents setup presets from updating a live mirror while
+    /// leaving the next Plan → Act transition stale.
+    pub fn set_agent_runtime_baseline(
+        &mut self,
+        allow_shell: bool,
+        trust_mode: bool,
+        approval_mode: ApprovalMode,
+    ) {
+        self.mode_prefs = ModeSessionPrefs {
+            agent_allow_shell: allow_shell,
+            agent_trust_mode: trust_mode,
+            agent_approval_mode: approval_mode,
+        };
+        if self.mode.uses_agent_baseline() {
+            let policy = base_policy_for_mode(self.mode, &self.mode_prefs);
+            self.allow_shell = policy.allow_shell;
+            self.trust_mode = policy.trust_mode;
+            self.approval_mode = policy.approval_mode;
+            self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn agent_trust_baseline(&self) -> bool {
+        self.mode_prefs.agent_trust_mode
+    }
+
+    /// Update the durable Act shell choice without disturbing trust or
+    /// approval. The live mirror changes only while Act owns the runtime.
+    pub fn set_agent_shell_access(&mut self, allow_shell: bool) {
+        self.set_agent_runtime_baseline(
+            allow_shell,
+            self.mode_prefs.agent_trust_mode,
+            self.mode_prefs.agent_approval_mode,
         );
+    }
+
+    /// Update the durable Act approval choice without changing its saved shell
+    /// or trust choices. Plan remains read-only.
+    pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
+        self.set_agent_runtime_baseline(
+            self.mode_prefs.agent_allow_shell,
+            self.mode_prefs.agent_trust_mode,
+            next,
+        );
+    }
+
+    #[must_use]
+    pub fn approval_policy_locked(&self) -> bool {
+        self.approval_policy_locked
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn approval_policy_requirements_managed(&self) -> bool {
+        self.approval_policy_requirements_managed
+    }
+
+    /// Session transitions must never detach live runtime producers. Late
+    /// engine, compaction, purge, or background-task events could otherwise
+    /// contaminate the replacement session after clear/load/new.
+    #[must_use]
+    pub fn session_transition_blocked(&self) -> bool {
+        self.is_loading
+            || self.runtime_turn_status.as_deref() == Some("in_progress")
+            || self.is_compacting
+            || self.is_purging
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "queued" | "running"))
+    }
+
+    /// Whether the interface is asking the user to make a decision. Ambient
+    /// motion yields across the whole frame while this is true; freezing one
+    /// task marker still leaves distracting movement in peripheral vision.
+    #[must_use]
+    pub fn attention_hold_active(&self) -> bool {
+        !self.view_stack.is_empty()
+            || self.pending_user_input_prompt.is_some()
+            || self.plan_prompt_pending
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"))
+    }
+
+    pub fn mark_approval_policy_locked(&mut self) {
+        self.approval_policy_locked = true;
+    }
+
+    pub fn clear_saved_approval_policy_lock(&mut self) {
+        if !self.approval_policy_requirements_managed {
+            self.approval_policy_locked = false;
+        }
     }
 
     /// Execute hooks for a specific event with the given context
@@ -2151,6 +3734,9 @@ impl App {
         metadata.cost.subagent_cost_cny = self.session.subagent_cost_cny;
         metadata.cost.displayed_cost_high_water_usd = self.session.displayed_cost_high_water;
         metadata.cost.displayed_cost_high_water_cny = self.session.displayed_cost_high_water_cny;
+        // Persist cumulative turn duration so the footer "worked" chip
+        // survives session save/restore (#2038).
+        metadata.cumulative_turn_secs = self.cumulative_turn_duration.as_secs();
     }
 
     /// Recompute the displayed cost high-water mark. Called any time a cost
@@ -2176,7 +3762,7 @@ impl App {
 
     /// Read the visible session+sub-agent cost in the chosen currency.
     pub fn displayed_session_cost_for_currency(&self, currency: CostCurrency) -> f64 {
-        match currency {
+        match self.cost_display_currency(currency) {
             CostCurrency::Usd => {
                 let current = self.session.session_cost + self.session.subagent_cost;
                 current.max(self.session.displayed_cost_high_water)
@@ -2189,25 +3775,62 @@ impl App {
     }
 
     pub fn session_cost_for_currency(&self, currency: CostCurrency) -> f64 {
-        match currency {
+        match self.cost_display_currency(currency) {
             CostCurrency::Usd => self.session.session_cost,
             CostCurrency::Cny => self.session.session_cost_cny,
         }
     }
 
     pub fn subagent_cost_for_currency(&self, currency: CostCurrency) -> f64 {
-        match currency {
+        match self.cost_display_currency(currency) {
             CostCurrency::Usd => self.session.subagent_cost,
             CostCurrency::Cny => self.session.subagent_cost_cny,
         }
     }
 
     pub fn format_cost_amount(&self, amount: f64) -> String {
-        crate::pricing::format_cost_amount(amount, self.cost_currency)
+        crate::pricing::format_cost_amount(amount, self.cost_display_currency(self.cost_currency))
     }
 
     pub fn format_cost_amount_precise(&self, amount: f64) -> String {
-        crate::pricing::format_cost_amount_precise(amount, self.cost_currency)
+        crate::pricing::format_cost_amount_precise(
+            amount,
+            self.cost_display_currency(self.cost_currency),
+        )
+    }
+
+    pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
+        if currency == CostCurrency::Cny
+            && self.session.session_cost_cny == 0.0
+            && self.session.subagent_cost_cny == 0.0
+            && self.session.displayed_cost_high_water_cny == 0.0
+            && (self.session.session_cost > 0.0
+                || self.session.subagent_cost > 0.0
+                || self.session.displayed_cost_high_water > 0.0)
+        {
+            CostCurrency::Usd
+        } else {
+            currency
+        }
+    }
+
+    /// Estimated cost saved by the last turn's cache-hit tokens in the
+    /// configured display currency.  Returns `None` when the model's pricing
+    /// is unknown or there were no cache hits.
+    pub fn last_turn_cache_savings(&self) -> Option<f64> {
+        let hit_tokens = self.session.last_prompt_cache_hit_tokens?;
+        let estimate = crate::pricing::calculate_cache_savings_for_provider(
+            self.api_provider,
+            &self.model,
+            hit_tokens,
+        )?;
+        Some(match self.cost_currency {
+            crate::pricing::CostCurrency::Usd => estimate.usd,
+            crate::pricing::CostCurrency::Cny if estimate.cny == 0.0 && estimate.usd > 0.0 => {
+                estimate.usd
+            }
+            crate::pricing::CostCurrency::Cny => estimate.cny,
+        })
     }
 
     /// Fold the oldest [`Self::HISTORY_FOLD_BATCH`] cells into a single
@@ -2322,7 +3945,33 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
+        self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
+            .into_iter()
+            .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
+            .collect();
         self.collapsed_cell_map.clear();
+    }
+
+    /// #3030: return the stable user-facing label for an agent id
+    /// ("Agent 3"), assigning the next sequential label on first sight.
+    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
+        if let Some(label) = self.agent_label_map.get(agent_id) {
+            return label.clone();
+        }
+        self.agent_counter = self.agent_counter.saturating_add(1);
+        let label = format!("Agent {}", self.agent_counter);
+        self.agent_label_map
+            .insert(agent_id.to_string(), label.clone());
+        label
+    }
+
+    /// #3030: read-only label lookup with raw-id fallback for agents the
+    /// label map has never seen.
+    pub(crate) fn agent_display_label(&self, agent_id: &str) -> String {
+        self.agent_label_map
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| agent_id.to_string())
     }
 
     pub fn mark_history_updated(&mut self) {
@@ -2416,6 +4065,7 @@ impl App {
         self.session_context_references.clear();
         self.session_artifacts.clear();
         self.collapsed_cells.clear();
+        self.expanded_tool_runs.clear();
         self.collapsed_cell_map.clear();
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -2428,6 +4078,8 @@ impl App {
             self.history_revisions.pop();
             self.context_references_by_cell.remove(&self.history.len());
             self.rebuild_session_context_references();
+            self.expanded_tool_runs
+                .retain(|idx| *idx < self.history.len());
             self.history_version = self.history_version.wrapping_add(1);
             self.needs_redraw = true;
         }
@@ -2465,9 +4117,51 @@ impl App {
         }
         // Drop collapsed cells that reference indices past the new tail.
         self.collapsed_cells.retain(|idx| *idx < new_len);
+        self.expanded_tool_runs.retain(|idx| *idx < new_len);
         self.collapsed_cell_map.clear();
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
+    }
+
+    #[must_use]
+    pub fn tool_collapse_active(&self) -> bool {
+        self.tool_collapse_threshold > 0 && self.tool_collapse_mode.is_active(self.calm_mode)
+    }
+
+    #[must_use]
+    pub fn tool_run_start_for_history_index(&self, index: usize) -> Option<usize> {
+        if !self.tool_collapse_active() {
+            return None;
+        }
+        let active_entries = self
+            .active_cell
+            .as_ref()
+            .map_or(&[][..], crate::tui::active_cell::ActiveCell::entries);
+        if index >= self.history.len().saturating_add(active_entries.len()) {
+            return None;
+        }
+        crate::tui::history::detect_tool_runs_from_slices(
+            &self.history,
+            active_entries,
+            self.tool_collapse_threshold,
+        )
+        .into_iter()
+        .find(|run| index >= run.start && index < run.start.saturating_add(run.count))
+        .map(|run| run.start)
+    }
+
+    pub fn toggle_tool_run_expansion_at(&mut self, index: usize) -> bool {
+        let Some(start) = self.tool_run_start_for_history_index(index) else {
+            return false;
+        };
+        if self.expanded_tool_runs.remove(&start) {
+            self.status_message = Some("Tool group collapsed".to_string());
+        } else {
+            self.expanded_tool_runs.insert(start);
+            self.status_message = Some("Tool group expanded".to_string());
+        }
+        self.mark_history_updated();
+        true
     }
 
     /// Bump the active-cell revision counter and request a redraw.
@@ -2502,6 +4196,14 @@ impl App {
         self.virtual_cell_count()
     }
 
+    #[must_use]
+    pub fn original_cell_index_for_rendered(&self, rendered_index: usize) -> usize {
+        self.collapsed_cell_map
+            .get(rendered_index)
+            .copied()
+            .unwrap_or(rendered_index)
+    }
+
     /// Resolve a virtual cell index to either a committed history cell or an
     /// active-cell entry. Used by the pager / details lookup code so it can
     /// transparently address still-in-flight cells.
@@ -2530,8 +4232,9 @@ impl App {
             .find(|detail| self.tool_cells.get(&detail.tool_id).copied() == Some(index))
     }
 
-    /// Whether a virtual transcript cell can open a meaningful Alt+V detail
-    /// view.
+    /// Whether a virtual transcript cell can open a meaningful `v` detail
+    /// view. Thinking cells render their own raw text inline so there is no
+    /// separate "raw" target — only tool / sub-agent cells get the hint.
     #[must_use]
     pub fn cell_has_detail_target(&self, index: usize) -> bool {
         self.tool_detail_record_for_cell(index).is_some()
@@ -2542,7 +4245,7 @@ impl App {
     }
 
     /// Pick the detail target for the current viewport. This is used by the
-    /// transcript highlight and footer hint so they agree with Alt+V.
+    /// transcript highlight and footer hint so they agree with `v`.
     #[must_use]
     pub fn detail_cell_index_for_viewport(
         &self,
@@ -2556,7 +4259,7 @@ impl App {
             .ordered_endpoints()
             .and_then(|(start, _)| line_meta.get(start.line_index))
             .and_then(TranscriptLineMeta::cell_line)
-            .map(|(cell_index, _)| cell_index)
+            .map(|(cell_index, _)| self.original_cell_index_for_rendered(cell_index))
             .filter(|&idx| self.cell_has_detail_target(idx));
         if selected_cell.is_some() {
             return selected_cell;
@@ -2568,6 +4271,7 @@ impl App {
             let Some((cell_index, _)) = meta.cell_line() else {
                 continue;
             };
+            let cell_index = self.original_cell_index_for_rendered(cell_index);
             if self.cell_has_detail_target(cell_index) {
                 return Some(cell_index);
             }
@@ -2725,6 +4429,74 @@ impl App {
             active.mark_in_progress_as_interrupted();
         }
         self.flush_active_cell();
+        // #4121: interrupt finalizes running workflow children as cancelled
+        // and preserves the completed panel until the next run starts.
+        if let Some(panel) = self.workflow_panel.as_mut() {
+            panel.finalize_interrupt();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Apply a workflow panel event, creating the panel on first `RunStarted`.
+    ///
+    /// Returns whether this event should request an immediate repaint.
+    /// Budget-only updates always mutate panel state but leave repaint to the
+    /// caller so high-frequency fan-out budget ticks can be paced (#4095).
+    pub fn apply_workflow_panel_event(
+        &mut self,
+        event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
+    ) -> bool {
+        use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
+        let budget_only = matches!(event, WorkflowPanelEvent::BudgetUpdated { .. });
+        match (&mut self.workflow_panel, &event) {
+            (
+                None,
+                WorkflowPanelEvent::RunStarted {
+                    run_id,
+                    workflow_goal,
+                    workflow_id,
+                    token_budget,
+                    at_ms,
+                    ..
+                },
+            ) => {
+                let label = workflow_goal
+                    .clone()
+                    .or_else(|| workflow_id.clone())
+                    .unwrap_or_else(|| "workflow".to_string());
+                let mut panel = WorkflowPanel::new(run_id.clone(), label, *at_ms);
+                panel.locale = self.ui_locale;
+                panel.budget_total = *token_budget;
+                panel.budget_remaining = *token_budget;
+                self.workflow_panel = Some(panel);
+            }
+            (None, _) => {
+                // No panel yet and event is not a start — seed a shell panel
+                // so late events still surface rather than being dropped.
+                let mut panel = WorkflowPanel::new("workflow", "workflow", 0);
+                panel.locale = self.ui_locale;
+                panel.apply_event(event);
+                self.workflow_panel = Some(panel);
+            }
+            (Some(panel), _) => {
+                panel.apply_event(event);
+            }
+        }
+        if !budget_only {
+            self.needs_redraw = true;
+        }
+        !budget_only
+    }
+
+    /// Toggle the workflow panel expand/collapse state. Returns true when a
+    /// panel was present and toggled.
+    pub fn toggle_workflow_panel(&mut self) -> bool {
+        let Some(panel) = self.workflow_panel.as_mut() else {
+            return false;
+        };
+        let _ = panel.toggle_expanded();
+        self.needs_redraw = true;
+        true
     }
 
     pub fn push_status_toast(
@@ -2783,6 +4555,39 @@ impl App {
         }
     }
 
+    pub const RECEIPT_VISIBLE_DURATION: Duration = Duration::from_secs(8);
+
+    pub fn set_receipt_text(&mut self, text: impl Into<String>) {
+        self.receipt_text = Some(text.into());
+        self.receipt_started_at = Some(Instant::now());
+        self.needs_redraw = true;
+    }
+
+    pub fn clear_receipt(&mut self) {
+        if self.receipt_text.is_some() || self.receipt_started_at.is_some() {
+            self.receipt_text = None;
+            self.receipt_started_at = None;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn active_receipt_text(&self) -> Option<&str> {
+        let receipt = self.receipt_text.as_deref()?;
+        let started = self.receipt_started_at?;
+        (started.elapsed() <= Self::RECEIPT_VISIBLE_DURATION).then_some(receipt)
+    }
+
+    /// Tick called from the redraw loop so transient receipts leave the UI
+    /// without waiting for the next keypress.
+    pub fn tick_receipt(&mut self) {
+        if self
+            .receipt_started_at
+            .is_some_and(|started| started.elapsed() > Self::RECEIPT_VISIBLE_DURATION)
+        {
+            self.clear_receipt();
+        }
+    }
+
     pub fn set_sticky_status(
         &mut self,
         text: impl Into<String>,
@@ -2798,7 +4603,10 @@ impl App {
     }
 
     pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
-        self.sidebar_focus = focus;
+        if self.sidebar_focus != focus {
+            self.sidebar_focus = focus;
+            self.sidebar_focus_dirty = true;
+        }
         self.needs_redraw = true;
     }
 
@@ -2823,16 +4631,29 @@ impl App {
         {
             return (StatusToastLevel::Error, Some(15_000), true);
         }
-        if has("saved")
-            || has("loaded")
-            || has("queued")
-            || has("found")
-            || has("enabled")
-            || has("completed")
+        // A success keyword under a negation ("not saved", "no longer
+        // found", "could not enable") is a failure the coarse keyword match
+        // would otherwise paint green. Guard it: negated success degrades to
+        // a neutral Info toast rather than a misleading Success.
+        let negated = has("not ")
+            || has("no longer")
+            || has("no ")
+            || has("could not")
+            || has("couldn't")
+            || has("cannot")
+            || has("can't")
+            || has("unable");
+        if !negated
+            && (has("saved")
+                || has("loaded")
+                || has("queued")
+                || has("found")
+                || has("enabled")
+                || has("completed"))
         {
             return (StatusToastLevel::Success, Some(5_000), false);
         }
-        if has("cancelled") || has("warning") {
+        if has("cancelled") || has("canceled") || has("warning") {
             return (StatusToastLevel::Warning, Some(5_000), false);
         }
         (StatusToastLevel::Info, Some(4_000), false)
@@ -2855,6 +4676,9 @@ impl App {
         if message.trim().is_empty() {
             return;
         }
+        if Self::is_mode_switch_status_message(&message) {
+            return;
+        }
 
         let (level, ttl_ms, sticky) = Self::classify_status_text(&message);
         if sticky {
@@ -2867,10 +4691,6 @@ impl App {
                     .is_some_and(|toast| matches!(toast.level, StatusToastLevel::Error))
             {
                 self.clear_sticky_status();
-            }
-            if Self::is_mode_switch_status_message(&message) {
-                self.status_toasts
-                    .retain(|toast| !Self::is_mode_switch_status_message(&toast.text));
             }
             self.push_status_toast(message, level, ttl_ms);
         }
@@ -2993,10 +4813,23 @@ impl App {
         byte_index_at_char(&self.input, self.cursor_position)
     }
 
+    /// When the user starts editing a truncated oversized paste, restore the
+    /// full text so they can see and edit the complete content (#3263).
+    fn auto_expand_oversized_paste(&mut self) {
+        if let Some(full) = self.oversized_paste_full_text.take() {
+            self.input = full;
+            // Clamp cursor to the new length instead of resetting to 0,
+            // so the user's position in the truncated preview is preserved.
+            self.cursor_position = self.cursor_position.min(char_count(&self.input));
+        }
+    }
+
     pub fn insert_str(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        self.auto_expand_oversized_paste();
+        self.delete_selection();
         self.selected_attachment_index = None;
         let cursor = self.cursor_position.min(char_count(&self.input));
         let byte_index = byte_index_at_char(&self.input, cursor);
@@ -3018,14 +4851,11 @@ impl App {
             self.insert_str(&normalized);
         }
         self.paste_burst.clear_after_explicit_paste();
-        // Visible-before-submit consolidation: when the post-paste input
-        // is over the cap, swap it for an @paste-…md mention immediately
-        // (instead of waiting until the user presses Enter and getting
-        // surprised by an auto-sent @mention). The same logic runs as a
-        // safety-net at submit time so any other code path that fills
-        // self.input above the cap still consolidates rather than
-        // silently truncating.
-        self.consolidate_large_input_if_oversized();
+        // Large pasted input stays editable and visible until submit. The
+        // submit-time safety net consolidates oversized composer content into
+        // an @paste-...md mention before dispatch, so no path silently
+        // truncates user input.
+        // self.consolidate_large_input_if_oversized(); // deferred to submit time
     }
 
     pub fn insert_media_attachment(&mut self, kind: &str, path: &Path, description: Option<&str>) {
@@ -3259,6 +5089,8 @@ impl App {
 
     pub fn insert_char(&mut self, c: char) {
         self.clear_input_history_navigation();
+        self.auto_expand_oversized_paste();
+        self.delete_selection();
         self.selected_attachment_index = None;
         let cursor = self.cursor_position.min(char_count(&self.input));
         let byte_index = byte_index_at_char(&self.input, cursor);
@@ -3272,9 +5104,6 @@ impl App {
     }
 
     fn strip_raw_mouse_reports_from_input(&mut self) {
-        if !self.use_mouse_capture {
-            return;
-        }
         if let Some((input, cursor_position)) =
             strip_raw_mouse_report_runs(&self.input, self.cursor_position)
         {
@@ -3285,6 +5114,10 @@ impl App {
 
     pub fn delete_char(&mut self) {
         self.clear_input_history_navigation();
+        self.auto_expand_oversized_paste();
+        if self.delete_selection() {
+            return;
+        }
         self.selected_attachment_index = None;
         if self.cursor_position == 0 {
             return;
@@ -3302,6 +5135,10 @@ impl App {
 
     pub fn delete_char_forward(&mut self) {
         self.clear_input_history_navigation();
+        self.auto_expand_oversized_paste();
+        if self.delete_selection() {
+            return;
+        }
         self.selected_attachment_index = None;
         if self.input.is_empty() {
             return;
@@ -3320,6 +5157,9 @@ impl App {
     /// Delete the word before the cursor.
     pub fn delete_word_backward(&mut self) {
         self.clear_input_history_navigation();
+        if self.delete_selection() {
+            return;
+        }
         self.selected_attachment_index = None;
         if self.cursor_position == 0 {
             return;
@@ -3361,6 +5201,9 @@ impl App {
     /// Delete from the cursor to the start of the line.
     pub fn delete_to_start_of_line(&mut self) {
         self.clear_input_history_navigation();
+        if self.delete_selection() {
+            return;
+        }
         self.selected_attachment_index = None;
         if self.cursor_position == 0 {
             return;
@@ -3386,6 +5229,9 @@ impl App {
     /// Delete the word after the cursor.
     pub fn delete_word_forward(&mut self) {
         self.clear_input_history_navigation();
+        if self.delete_selection() {
+            return;
+        }
         self.selected_attachment_index = None;
         let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
         if cursor_byte >= self.input.len() {
@@ -3430,6 +5276,13 @@ impl App {
     /// Returns `true` when bytes were moved into the kill buffer.
     pub fn kill_to_end_of_line(&mut self) -> bool {
         self.clear_input_history_navigation();
+        if let Some((start, end)) = self.selection_range() {
+            let sb = byte_index_at_char(&self.input, start);
+            let eb = byte_index_at_char(&self.input, end);
+            self.kill_buffer = self.input[sb..eb].to_string();
+            self.delete_selection();
+            return true;
+        }
         let total_chars = char_count(&self.input);
         let cursor = self.cursor_position.min(total_chars);
         let start_byte = byte_index_at_char(&self.input, cursor);
@@ -3475,6 +5328,7 @@ impl App {
         if self.kill_buffer.is_empty() {
             return false;
         }
+        self.delete_selection();
         self.clear_input_history_navigation();
         let text = self.kill_buffer.clone();
         let cursor = self.cursor_position.min(char_count(&self.input));
@@ -3600,6 +5454,59 @@ impl App {
         self.needs_redraw = true;
     }
 
+    // === Selection helpers ===
+
+    /// Return the (start, end) of the active selection, or `None`.
+    /// `start` is inclusive, `end` is exclusive; both are char indices.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let total = char_count(&self.input);
+        let anchor = self.selection_anchor?.min(total);
+        let cursor = self.cursor_position.min(total);
+        if anchor == cursor {
+            return None;
+        }
+        Some(if anchor < cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        })
+    }
+
+    /// Return the selected text, or empty string if no selection.
+    pub fn selected_text(&self) -> String {
+        self.selection_range()
+            .map(|(s, e)| {
+                let sb = byte_index_at_char(&self.input, s);
+                let eb = byte_index_at_char(&self.input, e);
+                self.input[sb..eb].to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Delete the selected text, place cursor at the start of the deleted range.
+    /// Returns true if a selection was deleted.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        let sb = byte_index_at_char(&self.input, start);
+        let eb = byte_index_at_char(&self.input, end);
+        self.input.replace_range(sb..eb, "");
+        self.cursor_position = start;
+        self.selection_anchor = None;
+        self.clear_input_history_navigation();
+        self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Clear the selection without moving the cursor.
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
     // === Vim composer mode helpers ===
 
     /// Move the cursor to the start of the current logical line (vim `0`).
@@ -3639,6 +5546,7 @@ impl App {
 
     /// Delete the character under the cursor (vim `x`).
     pub fn vim_delete_char_under_cursor(&mut self) {
+        self.auto_expand_oversized_paste();
         let total = char_count(&self.input);
         if self.cursor_position >= total {
             return;
@@ -3782,6 +5690,11 @@ impl App {
         self.clear_input_history_navigation();
         self.input.clear();
         self.cursor_position = 0;
+        // Prevent stale oversized-paste state from leaking when the user
+        // clears the composer or navigates to a different input (#3263).
+        self.pending_paste_reference = None;
+        self.oversized_paste_full_text = None;
+        self.selection_anchor = None;
         self.selected_attachment_index = None;
         self.slash_menu_selected = 0;
         self.slash_menu_hidden = false;
@@ -3795,7 +5708,15 @@ impl App {
     }
 
     pub fn stash_current_input_for_recovery(&mut self) {
+        // Before stashing, expand any truncated paste so the saved draft
+        // contains the full text, not the truncated preview (#3263).
+        self.auto_expand_oversized_paste();
         let draft = self.input.clone();
+        if draft.trim().is_empty() {
+            self.clear_undo_buffer = None;
+            return;
+        }
+        self.clear_undo_buffer = Some(draft.clone());
         self.remember_draft_for_recovery(draft);
     }
 
@@ -3814,6 +5735,9 @@ impl App {
         if self.composer_history_search.is_some() {
             return;
         }
+        // Expand any truncated paste first so the history search seed
+        // contains the full text, not the truncated preview (#3263).
+        self.auto_expand_oversized_paste();
         self.composer_history_search = Some(ComposerHistorySearch::new(
             self.input.clone(),
             self.cursor_position,
@@ -3992,7 +5916,19 @@ impl App {
         // the consolidation in `insert_paste_text` first, so the user
         // sees the @mention in the composer before submission.
         self.consolidate_large_input_if_oversized();
-        let input = self.input.clone();
+        // If consolidation created a paste file, restore the full text and
+        // append the @mention so the model can read the complete content
+        // while the composer stays editable (#3263).
+        let mut input = self
+            .oversized_paste_full_text
+            .take()
+            .unwrap_or_else(|| self.input.clone());
+        if let Some(reference) = self.pending_paste_reference.take() {
+            if !input.is_empty() && !input.ends_with('\n') {
+                input.push('\n');
+            }
+            input.push_str(&reference);
+        }
         if !looks_like_slash_command_input(&input) {
             self.input_history.push(input.clone());
             if self.max_input_history == 0 {
@@ -4030,6 +5966,28 @@ impl App {
         self.history_navigation_draft = None;
         self.selected_attachment_index = None;
         self.needs_redraw = true;
+        true
+    }
+
+    /// Restore the last cleared input if the composer is empty.
+    /// Returns `true` if the input was restored.
+    pub fn restore_last_cleared_input_if_empty(&mut self) -> bool {
+        if !self.input.is_empty() {
+            return false;
+        }
+        let Some(saved) = self.clear_undo_buffer.take().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+
+        self.input = saved;
+        self.cursor_position = char_count(&self.input);
+        self.history_index = None;
+        self.history_navigation_draft = None;
+        self.selected_attachment_index = None;
+        self.slash_menu_selected = 0;
+        self.slash_menu_hidden = false;
+        self.needs_redraw = true;
+        self.clear_undo_buffer = None;
         true
     }
 
@@ -4084,7 +6042,7 @@ impl App {
 
     /// When the composer input exceeds [`MAX_SUBMITTED_INPUT_CHARS`], write
     /// the full content to a timestamped paste file under
-    /// `.deepseek/pastes/` and replace `self.input` with an `@`-mention
+    /// `.codewhale/pastes/` and replace `self.input` with an `@`-mention
     /// pointing at it so the model can read the full content via the
     /// normal file-mention resolution path (#553).
     fn consolidate_large_input(&mut self) {
@@ -4094,9 +6052,9 @@ impl App {
         let now = chrono::Local::now();
         let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let filename = format!("paste-{}-{}.md", now.format("%Y-%m-%d-%H%M%S"), suffix);
-        let rel_path = format!(".deepseek/pastes/{filename}");
+        let rel_path = format!(".codewhale/pastes/{filename}");
 
-        let pastes_dir = self.workspace.join(".deepseek/pastes");
+        let pastes_dir = self.workspace.join(".codewhale/pastes");
         if let Err(e) = std::fs::create_dir_all(&pastes_dir) {
             // Fallback: keep a truncated version so we don't lose the
             // user's input entirely when the filesystem is unhappy.
@@ -4122,10 +6080,20 @@ impl App {
             return;
         }
 
-        self.input = format!("@{rel_path}");
-        self.cursor_position = char_count(&self.input);
+        // Keep a truncated preview in the composer so the user can still
+        // select, copy, and edit it, while the full text is stored for
+        // model submission. The @mention is appended at submit time (#3263).
+        self.pending_paste_reference = Some(format!("@{rel_path}"));
+        self.oversized_paste_full_text = Some(full_input.clone());
+        let display_chars = char_count(&full_input).min(MAX_COMPOSER_DISPLAY_CHARS);
+        let mut truncated: String = full_input.chars().take(display_chars).collect();
+        if char_count(&full_input) > MAX_COMPOSER_DISPLAY_CHARS {
+            truncated.push_str("\n\n---\n(content truncated for display — start typing to expand; full text sent to model)");
+        }
+        self.input = truncated;
+        self.cursor_position = 0;
         self.push_status_toast(
-            "Large paste consolidated — sent as @mention",
+            "Large paste backed up to file — the model will receive the full content.",
             StatusToastLevel::Info,
             Some(5_000),
         );
@@ -4170,6 +6138,18 @@ impl App {
         true
     }
 
+    /// Stop editing a queued follow-up and put the original queued message back
+    /// at the tail where [`Self::pop_last_queued_into_draft`] took it from.
+    pub fn cancel_queued_draft_edit(&mut self) -> bool {
+        let Some(draft) = self.queued_draft.take() else {
+            return false;
+        };
+        self.queued_messages.push_back(draft);
+        self.clear_input_recoverable();
+        self.needs_redraw = true;
+        true
+    }
+
     /// Park a legacy pending steer. New keyboard handling routes running-turn
     /// drafts through Enter (same-turn steer) or Tab (next-turn follow-up).
     #[allow(dead_code)]
@@ -4192,12 +6172,15 @@ impl App {
 
     /// Decide how to route a fresh composer submit.
     ///
-    /// #382: default to Queue when busy — the user shouldn't have to distinguish
-    /// "streaming" from "tool execution". Ctrl+Enter overrides to Steer.
+    /// v0.8.68: streaming output queues. Busy-but-waiting turns steer so
+    /// Enter can amend the active turn before output starts. A double-tap
+    /// Enter within 500 ms triggers Steer while streaming; Ctrl+Enter forces
+    /// Steer in all busy states.
     ///
     /// Truth table:
     ///   offline=F, busy=F → Immediate
-    ///   offline=F, busy=T → Queue  (was Steer for non-streaming; now unified)
+    ///   offline=F, busy=T, streaming=F → Steer
+    ///   offline=F, busy=T, streaming=T → Queue (double-tap → Steer)
     ///   offline=T, busy=* → Queue
     #[must_use]
     pub fn decide_submit_disposition(&self) -> SubmitDisposition {
@@ -4207,8 +6190,40 @@ impl App {
         if !self.is_loading {
             return SubmitDisposition::Immediate;
         }
-        // Busy: always queue. Ctrl+Enter routes through steer_user_message directly.
+        if self.streaming_message_index.is_none() {
+            return SubmitDisposition::Steer;
+        }
+        // Streaming: queue the message. Double-tap Enter within 500 ms
+        // triggers Steer via enter_with_double_tap(); see the ui.rs submit
+        // handler.
         SubmitDisposition::Queue
+    }
+
+    /// Process an Enter keypress with double-tap steering detection.
+    ///
+    /// When the engine is busy, the first Enter queues the message. A second
+    /// Enter within 500 ms triggers Steer (interrupt the current turn to
+    /// inject the new instruction immediately). When idle, Enter submits
+    /// immediately.
+    #[must_use]
+    pub fn enter_with_double_tap(&mut self) -> Option<SubmitDisposition> {
+        let disposition = self.decide_submit_disposition();
+        match disposition {
+            SubmitDisposition::Queue => {
+                if let Some(instant) = self.last_enter_instant
+                    && instant.elapsed() < Duration::from_millis(500)
+                {
+                    self.last_enter_instant = None;
+                    return Some(SubmitDisposition::Steer);
+                }
+                self.last_enter_instant = Some(Instant::now());
+                Some(SubmitDisposition::Queue)
+            }
+            other => {
+                self.last_enter_instant = None;
+                Some(other)
+            }
+        }
     }
 
     /// Mark the in-flight streaming Assistant cell as interrupted: prepend
@@ -4239,6 +6254,9 @@ impl App {
             return;
         }
         if self.history_index.is_none() {
+            // Expand truncated paste first so the saved draft contains the
+            // full text instead of the truncated preview (#3263).
+            self.auto_expand_oversized_paste();
             self.history_navigation_draft = Some(InputHistoryDraft {
                 input: self.input.clone(),
                 cursor: self.cursor_position,
@@ -4251,6 +6269,7 @@ impl App {
         self.history_index = Some(new_index);
         self.input = self.input_history[new_index].clone();
         self.cursor_position = char_count(&self.input);
+        self.selection_anchor = None;
         self.selected_attachment_index = None;
         self.slash_menu_hidden = false;
         self.paste_burst.clear_after_explicit_paste();
@@ -4267,6 +6286,7 @@ impl App {
                     self.history_index = Some(i + 1);
                     self.input = self.input_history[i + 1].clone();
                     self.cursor_position = char_count(&self.input);
+                    self.selection_anchor = None;
                     self.selected_attachment_index = None;
                     self.slash_menu_hidden = false;
                     self.paste_burst.clear_after_explicit_paste();
@@ -4275,6 +6295,7 @@ impl App {
                     if let Some(draft) = self.history_navigation_draft.take() {
                         self.input = draft.input;
                         self.cursor_position = draft.cursor.min(char_count(&self.input));
+                        self.selection_anchor = None;
                         self.selected_attachment_index = None;
                         self.slash_menu_hidden = false;
                         self.paste_burst.clear_after_explicit_paste();
@@ -4308,27 +6329,123 @@ impl App {
         None
     }
 
-    pub fn clear_todos(&mut self) -> bool {
-        // Clear the todo list (the sidebar checklist). Retry with try_lock
-        // so /clear always resets todos even when the engine briefly holds
-        // the mutex during tool execution.
-        let todos_cleared = if let Some(mut todos) = Self::retry_lock(&self.todos, 100) {
-            todos.clear();
-            true
-        } else {
-            false
+    /// Capture the durable Work state without ever converting lock contention
+    /// into an empty snapshot.
+    pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        let todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
+        let plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
         };
-        // Also clear the plan state — /clear means a full reset.
-        if let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) {
-            *plan = crate::tools::plan::PlanState::default();
-        }
-        todos_cleared
+        Ok((!state.is_empty()).then_some(state))
+    }
+
+    /// Non-blocking snapshot for the render/event loop. Automatic persistence
+    /// must skip a contended first save instead of pausing the UI or writing a
+    /// false empty state.
+    pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        let todos = self
+            .todos
+            .try_lock()
+            .map_err(|_| "To-do state is busy".to_string())?;
+        let plan = self
+            .plan_state
+            .try_lock()
+            .map_err(|_| "Plan state is busy".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
+        };
+        let state = (!state.is_empty()).then_some(state);
+        drop(plan);
+        drop(todos);
+        self.last_known_work_state = Some(state.clone());
+        Ok(state)
+    }
+
+    /// Atomically replace the live Work state from a saved session.
+    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+        let (restored_todos, restored_plan) = match state {
+            Some(state) => (
+                TodoList::from_snapshot(&state.todos)?,
+                PlanState::from_snapshot(&state.plan),
+            ),
+            None => (TodoList::new(), PlanState::default()),
+        };
+        let normalized_state = SessionWorkState {
+            todos: restored_todos.snapshot(),
+            plan: restored_plan.snapshot(),
+        };
+
+        let mut todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; session was not restored".to_string())?;
+        let mut plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; session was not restored".to_string())?;
+        *todos = restored_todos;
+        *plan = restored_plan;
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state =
+            Some((!normalized_state.is_empty()).then_some(normalized_state));
+        Ok(())
+    }
+
+    pub fn clear_todos(&mut self) -> bool {
+        // Acquire both stores before mutating either one. `/clear` must never
+        // report success after clearing only half of the Work surface.
+        let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
+            return false;
+        };
+        let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) else {
+            return false;
+        };
+        todos.clear();
+        *plan = PlanState::default();
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state = Some(None);
+        true
     }
 
     pub fn update_model_compaction_budget(&mut self) {
         let model = self.effective_model_for_budget().to_string();
-        self.compact_threshold =
-            compaction_threshold_for_model_and_effort(&model, self.reasoning_effort.api_value());
+        self.compact_threshold = crate::route_budget::compaction_threshold_for_route_at_percent(
+            self.api_provider,
+            &model,
+            self.active_route_limits,
+            self.auto_compact_threshold_percent,
+        );
+        if !self.auto_compact_user_configured {
+            self.auto_compact = crate::route_budget::auto_compact_default_for_route(
+                self.api_provider,
+                &model,
+                self.active_route_limits,
+            );
+        }
+    }
+
+    pub fn set_active_route_limits(&mut self, limits: RouteLimits) {
+        self.active_route_limits = crate::route_budget::known_route_limits(limits);
+    }
+
+    pub fn set_active_context_window_override(&mut self, context_window: Option<u32>) {
+        self.active_context_window_override = context_window;
+        if self.active_route_limits.is_none() {
+            self.active_route_limits = self.context_window_override_limits();
+        }
+    }
+
+    pub fn context_window_override_limits(&self) -> Option<RouteLimits> {
+        self.active_context_window_override
+            .map(|window| RouteLimits {
+                context_tokens: Some(u64::from(window)),
+                ..RouteLimits::default()
+            })
     }
 
     pub fn set_model_selection(&mut self, model: String) {
@@ -4340,6 +6457,15 @@ impl App {
         };
         self.auto_model = auto_model;
         self.last_effective_model = None;
+        self.last_effective_provider = None;
+        self.last_effective_reasoning_effort = None;
+        if auto_model {
+            self.reasoning_effort = ReasoningEffort::Auto;
+        } else {
+            self.reasoning_effort = self
+                .reasoning_effort
+                .normalize_for_provider(self.api_provider);
+        }
     }
 
     pub fn model_selection_for_persistence(&self) -> String {
@@ -4348,6 +6474,11 @@ impl App {
         } else {
             self.model.clone()
         }
+    }
+
+    pub fn accepts_custom_model_ids(&self) -> bool {
+        self.model_ids_passthrough
+            || crate::config::provider_passes_model_through(self.api_provider)
     }
 
     pub fn effective_model_for_budget(&self) -> &str {
@@ -4373,29 +6504,171 @@ impl App {
         self.model.clone()
     }
 
+    /// Provider/model identity used by the in-flight or most recent request.
+    /// This is the display contract for auto routing and must match billing.
+    #[must_use]
+    pub fn effective_route_display(&self) -> (ApiProvider, String) {
+        if let Some((provider, model, _)) = self.pending_turn_route.as_ref() {
+            return (*provider, model.clone());
+        }
+        if self.auto_model
+            && let (Some(provider), Some(model)) = (
+                self.last_effective_provider,
+                self.last_effective_model.as_ref(),
+            )
+        {
+            return (provider, model.clone());
+        }
+        (self.api_provider, self.model_display_label())
+    }
+
     pub fn reasoning_effort_display_label(&self) -> String {
         if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
             if let Some(effective) = self.last_effective_reasoning_effort {
-                return format!("auto: {}", effective.short_label());
+                return format!(
+                    "auto: {}",
+                    effective.display_label_for_provider(self.api_provider)
+                );
             }
             return "auto".to_string();
         }
-        self.reasoning_effort.short_label().to_string()
+        self.reasoning_effort
+            .display_label_for_provider(self.api_provider)
+            .to_string()
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {
         CompactionConfig {
             enabled: self.auto_compact,
             token_threshold: self.compact_threshold,
-            model: self.model.clone(),
+            model: self.effective_model_for_budget().to_string(),
+            effective_context_window: Some(crate::route_budget::route_context_window_tokens(
+                self.api_provider,
+                self.effective_model_for_budget(),
+                self.active_route_limits,
+            )),
             ..Default::default()
         }
     }
 
-    /// Forward the active cycle configuration to the engine. Cloned so the
-    /// engine has its own copy to mutate per-session.
-    pub fn cycle_config(&self) -> CycleConfig {
-        self.cycle.clone()
+    pub fn fallback_chain_entries(&self) -> Vec<(usize, ApiProvider, bool)> {
+        let Some(chain) = &self.provider_chain else {
+            return Vec::new();
+        };
+        let position = chain.position();
+        chain
+            .providers()
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (index, ApiProvider::from_kind(*provider), index == position))
+            .collect()
+    }
+
+    pub fn fallback_chain_position(&self) -> Option<usize> {
+        self.provider_chain.as_ref().map(ProviderChain::position)
+    }
+
+    pub fn fallback_chain_len(&self) -> usize {
+        self.provider_chain
+            .as_ref()
+            .map_or(0, |chain| chain.providers().len())
+    }
+
+    /// Whether a fallback chain entry can serve a turn right now (#2574).
+    ///
+    /// Mirrors the provider picker's eligibility: hosted providers need a key
+    /// (`has_api_key_for`, captured into `provider_readiness` at startup) while
+    /// self-hosted providers (Ollama/vLLM/SGLang) are always ready. Providers
+    /// absent from the snapshot default to ready so an unknown entry is tried
+    /// rather than silently skipped.
+    fn fallback_provider_is_ready(&self, provider: ApiProvider) -> bool {
+        self.provider_readiness
+            .iter()
+            .find_map(|(candidate, ready)| (*candidate == provider).then_some(*ready))
+            .unwrap_or(true)
+    }
+
+    /// Advance to the next *eligible* provider in the fallback chain (#2574).
+    ///
+    /// Walks the chain from the current position, skipping entries that are not
+    /// ready (hosted providers missing auth) and recording a clear note for each
+    /// skip. Local providers are always eligible. Returns the first ready
+    /// provider, or `None` (with an exhaustion reason) when every remaining entry
+    /// is unready or the end of the chain is reached. `ProviderChain::advance`
+    /// stays pure — the readiness filtering lives here at the App level.
+    ///
+    /// Note: auth-rejection (401) failures never reach this path; the caller
+    /// excludes them from fallback so a bad key does not silently rotate
+    /// providers (see `apply_engine_error_to_app`).
+    ///
+    /// Local/private policy (#2574): when the chain's primary provider is a
+    /// self-hosted / local runtime, cloud candidates are skipped with a clear
+    /// note so a local/private route never silently falls back out to a hosted
+    /// provider. Self-hosted siblings remain eligible. The policy is anchored
+    /// to the original primary; a cloud primary may still hop through a local
+    /// runtime and then back to another cloud fallback.
+    pub fn advance_fallback(&mut self, reason: impl Into<String>) -> Option<ApiProvider> {
+        let reason = reason.into();
+        self.provider_chain.as_ref()?;
+
+        let origin_is_local = self
+            .provider_chain
+            .as_ref()
+            .and_then(|chain| chain.providers().first().copied())
+            .map(ApiProvider::from_kind)
+            .is_some_and(ApiProvider::is_self_hosted);
+
+        let mut skip_notes: Vec<String> = Vec::new();
+        let mut chosen: Option<ApiProvider> = None;
+        while let Some(next_kind) = self
+            .provider_chain
+            .as_mut()
+            .and_then(ProviderChain::advance)
+        {
+            let candidate = ApiProvider::from_kind(next_kind);
+            if origin_is_local && !candidate.is_self_hosted() {
+                skip_notes.push(format!(
+                    "skipped {}: local/private policy (no local->cloud fallback)",
+                    candidate.as_str()
+                ));
+                continue;
+            }
+            if self.fallback_provider_is_ready(candidate) {
+                chosen = Some(candidate);
+                break;
+            }
+            skip_notes.push(format!("skipped {}: needs auth", candidate.as_str()));
+        }
+
+        let skipped = if skip_notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", skip_notes.join("; "))
+        };
+
+        let Some(next_provider) = chosen else {
+            let total = self
+                .provider_chain
+                .as_ref()
+                .map_or(0, |chain| chain.providers().len());
+            self.last_fallback_reason = Some(format!(
+                "Fallback chain exhausted after {total} provider(s): {reason}{skipped}"
+            ));
+            return None;
+        };
+
+        self.api_provider = next_provider;
+        self.last_fallback_reason = Some(format!(
+            "Fell back to {} after recoverable provider error: {reason}{skipped}",
+            next_provider.as_str()
+        ));
+        Some(next_provider)
+    }
+
+    pub fn is_fallback_active(&self) -> bool {
+        self.provider_chain
+            .as_ref()
+            .is_some_and(ProviderChain::is_fallback_active)
     }
 }
 
@@ -4428,6 +6701,7 @@ pub enum AppAction {
         system_prompt: Option<SystemPrompt>,
         model: String,
         workspace: PathBuf,
+        mode: AppMode,
     },
     OpenConfigEditor(ConfigUiMode),
     OpenConfigView,
@@ -4436,14 +6710,47 @@ pub enum AppAction {
     /// Open the `/provider` picker modal — DeepSeek / NVIDIA NIM / OpenRouter
     /// / Novita with inline API-key prompt for un-configured providers (#52).
     OpenProviderPicker,
-    /// Open the `/mode` picker modal for Agent / Plan / YOLO.
+    /// Open the `/provider` picker in setup/catalog mode, optionally focused on
+    /// a built-in provider that needs credentials before first use.
+    OpenProviderSetup {
+        provider: Option<ApiProvider>,
+    },
+    /// Run the xAI/Grok device-code flow with the TUI temporarily suspended.
+    StartXaiDeviceLogin,
+    /// Open the `/mode` picker modal for Act / Plan / Operate.
     OpenModePicker,
+    /// Refresh the engine prompt after the UI operating mode changes.
+    ModeChanged(AppMode),
+    /// Synchronize a saved top-level approval policy into the live Config,
+    /// then refresh the engine prompt from the App's updated permission mode.
+    ApprovalPolicyPersisted {
+        policy: Option<String>,
+    },
     /// Open the `/statusline` multi-select picker for footer items.
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
     OpenFeedbackPicker,
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
+    /// Open the `/fleet` roster — the saved-party view of the agent team.
+    OpenFleetRoster,
+    /// Open the `/fleet` profile authoring wizard.
+    OpenFleetSetup,
+    /// Open the `/hotbar` setup wizard.
+    OpenHotbarSetup,
+    /// Open the constitution-first `/setup` wizard shell.
+    OpenSetupWizard,
+    /// Open the constitution-first `/setup` wizard at a specific step.
+    OpenSetupWizardAt {
+        step: codewhale_config::SetupStep,
+    },
+    /// Record that the bundled/default constitution should be used.
+    UseBundledConstitution,
+    /// Disable the Hotbar: persist `hotbar = []` and clear the live slots.
+    DisableHotbar,
+    /// Restore the default recommended Hotbar slots: remove the `hotbar` key so
+    /// the resolver falls back to the built-in defaults.
+    RestoreHotbarDefaults,
     /// Open an external URL in the system browser.
     OpenExternalUrl {
         url: String,
@@ -4451,8 +6758,21 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Cancel a running sub-agent through the engine manager.
+    CancelSubAgent {
+        agent_id: String,
+    },
+    /// Update the runtime goal status (`/goal pause|resume|clear|…`) without
+    /// dispatching a model turn. The UI layer translates this into
+    /// `Op::SetGoalStatus`.
+    SetGoalStatus {
+        status: crate::tools::goal::GoalStatus,
+        clear: bool,
+    },
     ListSubAgents,
     FetchModels,
+    /// Force a Models.dev live-catalog refresh into ProviderLake (#4187).
+    RefreshModelsDevCatalog,
     CacheWarmup,
     /// Switch the active LLM backend (DeepSeek vs NVIDIA NIM) without
     /// restarting the process. The runtime rebuilds its API client from
@@ -4462,9 +6782,25 @@ pub enum AppAction {
         provider: ApiProvider,
         model: Option<String>,
     },
+    /// Switch provider+model through the same apply path as a `/model` route
+    /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
+    SwitchModelRoute {
+        provider: ApiProvider,
+        model: String,
+    },
     UpdateCompaction(CompactionConfig),
+    UpdateStreamChunkTimeout(u64),
+    UpdateSubagentRuntimeConfig {
+        enabled: bool,
+        max_subagents: usize,
+        launch_concurrency: usize,
+        max_spawn_depth: u32,
+        api_timeout_secs: u64,
+        heartbeat_timeout_secs: u64,
+    },
     OpenContextInspector,
     CompactContext,
+    PurgeContext,
     TaskAdd {
         prompt: String,
     },
@@ -4486,6 +6822,11 @@ pub enum AppAction {
     SwitchWorkspace {
         workspace: PathBuf,
     },
+    /// Record from the microphone and route the transcription into the
+    /// composer (or auto-send it). Emitted by `/voice` and the voice hotbar
+    /// action; handled in the UI event loop where the live `Config` supplies
+    /// provider credentials.
+    VoiceCapture,
     /// Export and share the current session as a web URL.
     ShareSession {
         history_len: usize,
@@ -4529,6 +6870,7 @@ pub enum McpUiAction {
     AddHttp {
         name: String,
         url: String,
+        transport: Option<String>,
     },
     Enable {
         name: String,
@@ -4539,1887 +6881,16 @@ pub enum McpUiAction {
     Remove {
         name: String,
     },
+    Login {
+        name: String,
+        scopes: Vec<String>,
+    },
+    Logout {
+        name: String,
+    },
     Validate,
     Reload,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ApiProvider, Config, ProviderConfig, ProvidersConfig};
-    use crate::test_support::lock_test_env;
-    use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
-    use crate::tools::todo::TodoStatus;
-    use crate::tui::clipboard::PastedImage;
-    use std::ffi::OsString;
-
-    fn test_options(yolo: bool) -> TuiOptions {
-        TuiOptions {
-            model: "test-model".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: yolo,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            // Keep unit tests independent from the developer's saved
-            // `default_mode` setting.
-            start_in_agent_mode: true,
-            skip_onboarding: false,
-            yolo,
-            resume_session_id: None,
-            initial_input: None,
-        }
-    }
-
-    #[test]
-    fn composer_arrows_scroll_default_is_true_without_mouse_capture() {
-        assert!(default_composer_arrows_scroll_for_platform(false, false));
-    }
-
-    #[test]
-    fn composer_arrows_scroll_default_is_false_with_mouse_capture_on_non_windows() {
-        assert!(!default_composer_arrows_scroll_for_platform(true, false));
-    }
-
-    #[test]
-    fn composer_arrows_scroll_default_is_true_on_windows_even_with_mouse_capture() {
-        assert!(default_composer_arrows_scroll_for_platform(true, true));
-    }
-
-    #[test]
-    fn move_cursor_line_start_multiline() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc\ndef\nghi".to_string();
-        app.cursor_position = "abc\ndef\nghi".chars().count(); // absolute end
-        app.move_cursor_line_start();
-        assert_eq!(app.cursor_position, "abc\ndef\n".len()); // start of "ghi"
-    }
-
-    #[test]
-    fn move_cursor_line_start_singleline() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "hello".to_string();
-        app.cursor_position = 3;
-        app.move_cursor_line_start();
-        assert_eq!(app.cursor_position, 0);
-    }
-
-    #[test]
-    fn move_cursor_line_end_multiline() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc\ndef\nghi".to_string();
-        app.cursor_position = 0; // start of first line
-        app.move_cursor_line_end();
-        assert_eq!(app.cursor_position, "abc".len()); // before first '\n'
-    }
-
-    #[test]
-    fn move_cursor_line_end_at_newline_stays_at_line_end() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc\ndef\nghi".to_string();
-        app.cursor_position = "abc".len(); // on the '\n'
-        app.move_cursor_line_end();
-        assert_eq!(app.cursor_position, "abc".len()); // stays at line end
-    }
-
-    #[test]
-    fn move_cursor_line_end_last_line() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc\ndef".to_string();
-        app.cursor_position = "abc\n".len(); // start of last line
-        app.move_cursor_line_end();
-        assert_eq!(app.cursor_position, "abc\ndef".chars().count()); // absolute end
-    }
-
-    #[test]
-    fn move_cursor_line_start_already_at_start() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc\ndef".to_string();
-        app.cursor_position = "abc\n".len(); // start of second line
-        app.move_cursor_line_start();
-        assert_eq!(app.cursor_position, "abc\n".len()); // unchanged
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    #[test]
-    fn test_trust_mode_follows_yolo_on_startup() {
-        let app = App::new(test_options(true), &Config::default());
-        assert!(app.trust_mode);
-    }
-
-    #[test]
-    fn settings_default_provider_auth_check_uses_provider_scoped_key() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            tmp.path().join("settings.toml"),
-            "default_provider = \"openai\"\n",
-        )
-        .expect("settings");
-        let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-        let _deepseek_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
-        let _openai_key = EnvVarGuard::remove("OPENAI_API_KEY");
-
-        let config = Config {
-            providers: Some(ProvidersConfig {
-                openai: ProviderConfig {
-                    api_key: Some("openai-config-key".to_string()),
-                    ..ProviderConfig::default()
-                },
-                ..ProvidersConfig::default()
-            }),
-            ..Config::default()
-        };
-
-        let app = App::new(test_options(false), &config);
-
-        assert_eq!(app.api_provider, ApiProvider::Openai);
-        assert!(
-            !app.onboarding_needs_api_key,
-            "OpenAI provider config key should satisfy startup auth without a DeepSeek key"
-        );
-        assert_ne!(app.onboarding, OnboardingState::ApiKey);
-        assert!(!app.api_key_env_only);
-    }
-
-    #[test]
-    fn sidebar_focus_accepts_work_and_maps_legacy_trackers_to_work() {
-        assert_eq!(SidebarFocus::from_setting("auto"), SidebarFocus::Auto);
-        assert_eq!(SidebarFocus::from_setting("work"), SidebarFocus::Work);
-        assert_eq!(SidebarFocus::from_setting("plan"), SidebarFocus::Work);
-        assert_eq!(SidebarFocus::from_setting("todos"), SidebarFocus::Work);
-        assert_eq!(SidebarFocus::from_setting("tasks"), SidebarFocus::Tasks);
-        assert_eq!(SidebarFocus::from_setting("agents"), SidebarFocus::Agents);
-        assert_eq!(SidebarFocus::from_setting("context"), SidebarFocus::Context);
-        assert_eq!(SidebarFocus::from_setting("hidden"), SidebarFocus::Hidden);
-        assert_eq!(SidebarFocus::from_setting("off"), SidebarFocus::Hidden);
-        assert_eq!(SidebarFocus::Work.as_setting(), "work");
-        assert_eq!(SidebarFocus::Hidden.as_setting(), "hidden");
-    }
-
-    #[test]
-    fn slash_command_classifier_treats_absolute_path_as_message() {
-        assert!(looks_like_slash_command_input("/"));
-        assert!(looks_like_slash_command_input("/help"));
-        assert!(looks_like_slash_command_input("/model deepseek-v4-pro"));
-        assert!(!looks_like_slash_command_input(
-            "/usr/lib/x86_64-linux-gnu/ 是标准路径吗？"
-        ));
-    }
-
-    #[test]
-    fn submit_input_records_absolute_slash_path_as_message_history() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let input = "/usr/lib/x86_64-linux-gnu/ 是标准路径吗？";
-        app.input = input.to_string();
-        app.cursor_position = input.chars().count();
-
-        let submitted = app.submit_input().expect("expected submitted input");
-
-        assert_eq!(submitted, input);
-        assert_eq!(app.input_history.last().map(String::as_str), Some(input));
-    }
-
-    #[test]
-    fn restore_last_submitted_prompt_rehydrates_empty_composer() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.last_submitted_prompt = Some("fix the typo\nand retry".to_string());
-
-        assert!(app.restore_last_submitted_prompt_if_empty());
-
-        assert_eq!(app.input, "fix the typo\nand retry");
-        assert_eq!(app.cursor_position, app.input.chars().count());
-        assert!(app.needs_redraw);
-    }
-
-    #[test]
-    fn restore_last_submitted_prompt_preserves_existing_draft() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.last_submitted_prompt = Some("previous prompt".to_string());
-        app.input = "new draft".to_string();
-        app.cursor_position = app.input.chars().count();
-
-        assert!(!app.restore_last_submitted_prompt_if_empty());
-
-        assert_eq!(app.input, "new draft");
-        assert_eq!(app.cursor_position, "new draft".chars().count());
-    }
-
-    #[test]
-    fn composer_strips_raw_sgr_mouse_report_when_mouse_capture_is_enabled() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        app.insert_str("[<35;44;18M");
-
-        assert_eq!(app.input, "");
-        assert_eq!(app.cursor_position, 0);
-    }
-
-    #[test]
-    fn composer_strips_corrupted_mouse_report_burst() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("draft ");
-        let leaked = "43;19M[<35;44;18M[<35;45;18M5;46;18M;48;18M";
-
-        app.insert_str(leaked);
-
-        assert_eq!(app.input, "draft ");
-        assert_eq!(app.cursor_position, "draft ".chars().count());
-    }
-
-    #[test]
-    fn composer_preserves_draft_suffix_when_stripping_mouse_report() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("commit -m");
-
-        app.insert_str("[<65;44;18M");
-
-        assert_eq!(app.input, "commit -m");
-        assert_eq!(app.cursor_position, "commit -m".chars().count());
-    }
-
-    #[test]
-    fn composer_preserves_numeric_draft_when_stripping_mouse_report() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("123");
-
-        app.insert_str("[<65;44;18M");
-
-        assert_eq!(app.input, "123");
-        assert_eq!(app.cursor_position, 3);
-    }
-
-    #[test]
-    fn composer_keeps_mouse_like_text_when_mouse_capture_is_disabled() {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        app.insert_str("[<35;44;18M");
-
-        assert_eq!(app.input, "[<35;44;18M");
-    }
-
-    #[test]
-    fn composer_keeps_normal_bracket_text_with_mouse_capture_enabled() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        app.insert_str("Use [<tag>] normally");
-
-        assert_eq!(app.input, "Use [<tag>] normally");
-    }
-
-    #[test]
-    fn composer_keeps_coordinate_like_text_with_mouse_capture_enabled() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        app.insert_str("Size 12;34M");
-
-        assert_eq!(app.input, "Size 12;34M");
-    }
-
-    // === Bug #1915: broader terminal control-sequence fragments leaking
-    // into the composer during dense streaming output. The narrow SGR
-    // mouse-report filter installed in e63a4ba4a covers `[<…M` style
-    // bursts, but not OSC 8 hyperlink fragments (`]8;;http…`) or Kitty
-    // keyboard protocol responses (`[?u`, `[>1u`). These can arrive when
-    // crossterm's event reader is mid-sequence and the unparsed tail is
-    // delivered as individual Char(c) keystrokes that land in the input.
-
-    #[test]
-    fn composer_strips_osc8_hyperlink_fragment() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("draft ");
-
-        // OSC 8 prefix with URL body but no terminator delivered yet —
-        // exactly what crossterm hands us if its event reader is
-        // interrupted mid-sequence and the leading ESC is consumed by the
-        // parser before the rest gets reclassified as Char(c).
-        app.insert_str("]8;;https://example.com");
-
-        assert_eq!(app.input, "draft ");
-        assert_eq!(app.cursor_position, "draft ".chars().count());
-    }
-
-    #[test]
-    fn composer_strips_closing_osc8_fragment() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("hello ");
-
-        // The closing wrapper `]8;;` (with a stray ST `\\` from a
-        // chopped escape) can arrive on its own when the parser ate
-        // the start of the sequence in a previous read but caught the
-        // tail as keystrokes.
-        app.insert_str("]8;;\\");
-
-        assert_eq!(app.input, "hello ");
-        assert_eq!(app.cursor_position, "hello ".chars().count());
-    }
-
-    #[test]
-    fn composer_strips_kitty_keyboard_protocol_fragment() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("ready ");
-
-        // Kitty keyboard protocol responses look like `\x1b[?1u`,
-        // `\x1b[>1u`, or `\x1b[?u`. With the ESC consumed, the tail
-        // shape is `[?…u` or `[>…u`.
-        app.insert_str("[?1u[>1u[?u");
-
-        assert_eq!(app.input, "ready ");
-        assert_eq!(app.cursor_position, "ready ".chars().count());
-    }
-
-    #[test]
-    fn composer_strips_mixed_control_sequence_burst() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-        app.insert_str("hi");
-
-        // Mixed dense burst combining all three fragment families
-        // described in #1915.
-        app.insert_str("[<35;44;18M]8;;https://example.com[?1u");
-
-        assert_eq!(app.input, "hi");
-        assert_eq!(app.cursor_position, 2);
-    }
-
-    #[test]
-    fn composer_keeps_legitimate_url_text_with_mouse_capture_enabled() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        // URLs typed by the user must survive the filter — only
-        // recognized control-sequence shapes are stripped.
-        app.insert_str("see https://example.com/path?a=1&b=2 for info");
-
-        assert_eq!(app.input, "see https://example.com/path?a=1&b=2 for info");
-    }
-
-    #[test]
-    fn composer_keeps_legitimate_bracket_question_text() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        // Text that uses brackets, question marks, and lowercase `u` —
-        // shapes that overlap Kitty fragments — must not be eaten.
-        app.insert_str("[is this ok?] sure");
-
-        assert_eq!(app.input, "[is this ok?] sure");
-    }
-
-    #[test]
-    fn composer_keeps_legitimate_closing_bracket_digit_text() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_mouse_capture = true;
-
-        // Plain `]8` followed by spaces and words must survive — only
-        // the OSC 8 shape `]8;` (with the mandatory `;` separator)
-        // should be treated as a fragment.
-        app.insert_str("array[]8 elements");
-
-        assert_eq!(app.input, "array[]8 elements");
-    }
-
-    // initial_onboarding_state tests
-    // These pin the logic that decides whether the TUI shows the
-    // onboarding flow (Welcome → Language → ApiKey → …) or goes
-    // straight to the chat view.  Getting this wrong either locks
-    // first-run users out of the API-key prompt or nags returning
-    // users whose key is already configured.
-
-    #[test]
-    fn skip_onboarding_suppresses_all_onboarding_states() {
-        assert_eq!(
-            initial_onboarding_state(true, false, true, true),
-            OnboardingState::None
-        );
-        assert_eq!(
-            initial_onboarding_state(true, true, true, true),
-            OnboardingState::None
-        );
-    }
-
-    #[test]
-    fn fully_configured_returning_user_skips_onboarding() {
-        assert_eq!(
-            initial_onboarding_state(false, true, false, false),
-            OnboardingState::None
-        );
-    }
-
-    #[test]
-    fn returning_user_missing_api_key_goes_to_api_key_screen() {
-        assert_eq!(
-            initial_onboarding_state(false, true, true, false),
-            OnboardingState::ApiKey
-        );
-        // workspace trust doesn't affect the api-key gate
-        assert_eq!(
-            initial_onboarding_state(false, true, true, true),
-            OnboardingState::ApiKey
-        );
-    }
-
-    #[test]
-    fn first_run_user_always_starts_at_welcome() {
-        assert_eq!(
-            initial_onboarding_state(false, false, false, false),
-            OnboardingState::Welcome
-        );
-        assert_eq!(
-            initial_onboarding_state(false, false, true, false),
-            OnboardingState::Welcome
-        );
-        assert_eq!(
-            initial_onboarding_state(false, false, false, true),
-            OnboardingState::Welcome
-        );
-    }
-
-    #[test]
-    fn onboarding_workspace_trust_gate_only_fires_for_onboarded_user() {
-        assert!(onboarding_is_workspace_trust_gate(false, true, false, true));
-        assert!(!onboarding_is_workspace_trust_gate(true, true, false, true));
-        assert!(!onboarding_is_workspace_trust_gate(false, true, true, true));
-        assert!(!onboarding_is_workspace_trust_gate(
-            false, false, false, true
-        ));
-    }
-
-    #[test]
-    fn onboarded_user_still_gets_workspace_trust_prompt_when_needed() {
-        assert_eq!(
-            initial_onboarding_state(false, true, false, true),
-            OnboardingState::TrustDirectory
-        );
-    }
-
-    // App::new tests: missing key is detected
-
-    #[test]
-    fn app_new_detects_missing_api_key_with_default_config() {
-        // Config::default() carries no api_key and the test runner
-        // should not have DEEPSEEK_API_KEY in its environment.
-        let app = App::new(test_options(false), &Config::default());
-        assert!(
-            app.onboarding_needs_api_key,
-            "default config (no key) must set onboarding_needs_api_key"
-        );
-    }
-
-    #[test]
-    fn app_new_with_explicit_api_key_does_not_trigger_onboarding() {
-        let config = Config {
-            api_key: Some("sk-test-onboarding-key".to_string()),
-            ..Config::default()
-        };
-        let app = App::new(test_options(false), &config);
-        assert!(
-            !app.onboarding_needs_api_key,
-            "explicit config.api_key must satisfy the onboarding check"
-        );
-    }
-
-    #[test]
-    fn new_caches_workspace_skills_for_slash_menu() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let workspace = tmp.path().join("workspace");
-        let skill_dir = workspace.join(".agents").join("skills").join("local-skill");
-        std::fs::create_dir_all(&skill_dir).expect("skill dir");
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: local-skill\ndescription: Local workspace skill\n---\nUse the local skill.\n",
-        )
-        .expect("skill file");
-
-        let mut options = test_options(false);
-        options.workspace = workspace.clone();
-        options.skills_dir = tmp.path().join("global-skills");
-        let app = App::new(options, &Config::default());
-
-        assert_eq!(app.skills_dir, workspace.join(".agents").join("skills"));
-        assert!(app.cached_skills.iter().any(|(name, description)| {
-            name == "local-skill" && description == "Local workspace skill"
-        }));
-    }
-
-    #[test]
-    fn cached_skills_merges_across_candidate_directories() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let workspace = tmp.path().join("workspace");
-
-        // Higher-precedence directory contains a stale empty dir for `foo`
-        // (no SKILL.md). This used to shadow the real definition further
-        // down the candidate list when the cache only scanned a single dir.
-        std::fs::create_dir_all(workspace.join(".agents").join("skills").join("foo"))
-            .expect("stale empty dir");
-
-        // Lower-precedence directory has the real skill.
-        let real_dir = workspace.join(".claude").join("skills").join("foo");
-        std::fs::create_dir_all(&real_dir).expect("real skill dir");
-        std::fs::write(
-            real_dir.join("SKILL.md"),
-            "---\nname: foo\ndescription: Real foo skill\n---\nbody\n",
-        )
-        .expect("skill file");
-
-        let mut options = test_options(false);
-        options.workspace = workspace.clone();
-        options.skills_dir = tmp.path().join("global-skills");
-        let app = App::new(options, &Config::default());
-
-        assert!(
-            app.cached_skills
-                .iter()
-                .any(|(name, description)| name == "foo" && description == "Real foo skill"),
-            "cached_skills should fall through to lower-precedence dir when higher-precedence one has an empty stub: {:?}",
-            app.cached_skills,
-        );
-    }
-
-    #[test]
-    fn cached_skills_include_configured_directory() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let workspace = tmp.path().join("workspace");
-
-        let configured_dir = tmp.path().join("configured-skills");
-        let configured_skill_dir = configured_dir.join("configured-skill");
-        std::fs::create_dir_all(&configured_skill_dir).expect("configured skill dir");
-        std::fs::write(
-            configured_skill_dir.join("SKILL.md"),
-            "---\nname: configured-skill\ndescription: Configured skill\n---\nbody\n",
-        )
-        .expect("write configured skill");
-
-        let mut options = test_options(false);
-        options.workspace = workspace.clone();
-        options.skills_dir = configured_dir.clone();
-        let config = Config {
-            skills_dir: Some(configured_dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let app = App::new(options, &config);
-
-        assert!(
-            app.cached_skills
-                .iter()
-                .any(|(name, description)| name == "configured-skill"
-                    && description == "Configured skill"),
-            "configured skill dir should be merged: {:?}",
-            app.cached_skills
-        );
-    }
-
-    #[test]
-    fn paste_consolidates_oversized_text_into_paste_file_visibly() {
-        // Visible-before-submit consolidation (paste UX): when a single
-        // bracketed paste exceeds the safety cap, the @mention must
-        // replace the input *immediately*, so the user sees what's
-        // about to be sent before pressing Enter — not as a side effect
-        // of submit.
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let mut opts = test_options(false);
-        opts.workspace = tmp.path().to_path_buf();
-        let mut app = App::new(opts, &Config::default());
-        let full_content = "y".repeat(MAX_SUBMITTED_INPUT_CHARS + 256);
-
-        app.insert_paste_text(&full_content);
-
-        // Composer should now contain the @mention, not the full text.
-        assert!(
-            app.input.starts_with("@.deepseek/pastes/paste-") && app.input.ends_with(".md"),
-            "expected @mention in composer after large paste, got: {}",
-            app.input
-        );
-        // The cursor moves to the end of the @mention.
-        assert_eq!(app.cursor_position, app.input.chars().count());
-        // The paste file must exist with the full content.
-        let rel_path = &app.input[1..];
-        let abs = tmp.path().join(rel_path);
-        assert!(abs.is_file(), "paste file must exist at {abs:?}");
-        let written = std::fs::read_to_string(&abs).expect("read");
-        assert_eq!(written, full_content);
-        // A toast confirms what happened so the user isn't surprised.
-        assert!(
-            app.status_toasts
-                .iter()
-                .any(|t| t.text.contains("consolidated")),
-            "expected consolidation toast"
-        );
-    }
-
-    #[test]
-    fn paste_under_threshold_does_not_consolidate() {
-        // Negative path: a small paste must NOT spawn a paste file. The
-        // input stays inline so the user can edit it freely.
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let mut opts = test_options(false);
-        opts.workspace = tmp.path().to_path_buf();
-        let mut app = App::new(opts, &Config::default());
-        let small = "hello world\nthis is fine".to_string();
-
-        app.insert_paste_text(&small);
-
-        assert_eq!(app.input, small);
-        assert!(!app.input.starts_with("@.deepseek/pastes/"));
-        // No paste file gets written for under-cap pastes.
-        let pastes_dir = tmp.path().join(".deepseek/pastes");
-        assert!(
-            !pastes_dir.exists() || std::fs::read_dir(&pastes_dir).unwrap().next().is_none(),
-            "no paste file should be written for under-cap content"
-        );
-    }
-
-    #[test]
-    fn submit_input_consolidates_oversized_input_into_paste_file() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let mut opts = test_options(false);
-        opts.workspace = tmp.path().to_path_buf();
-        let mut app = App::new(opts, &Config::default());
-        let full_content = "x".repeat(MAX_SUBMITTED_INPUT_CHARS + 128);
-        app.input = full_content.clone();
-        app.cursor_position = app.input.chars().count();
-
-        let submitted = app.submit_input().expect("expected submitted input");
-
-        // The submitted text should be the @mention, not the truncated
-        // original (#553).
-        assert!(
-            submitted.starts_with("@.deepseek/pastes/paste-"),
-            "expected @mention, got: {submitted}"
-        );
-        assert!(
-            submitted.ends_with(".md"),
-            "expected .md extension, got: {submitted}"
-        );
-
-        // The paste file must exist on disk with the full original content.
-        let rel_path = &submitted[1..]; // strip leading '@'
-        let abs_path = tmp.path().join(rel_path);
-        assert!(abs_path.is_file(), "paste file must exist at {abs_path:?}");
-        let written = std::fs::read_to_string(&abs_path).expect("read paste file");
-        assert_eq!(written, full_content);
-
-        // A status toast should have been pushed.
-        assert!(
-            app.status_toasts
-                .iter()
-                .any(|toast| toast.text.contains("consolidated")),
-            "expected consolidation toast, got: {:?}",
-            app.status_toasts
-                .iter()
-                .map(|t| &t.text)
-                .collect::<Vec<_>>()
-        );
-
-        // The composer must be clear after submit.
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn app_starts_without_seeded_transcript_messages() {
-        let app = App::new(test_options(false), &Config::default());
-        assert!(app.history.is_empty());
-        assert_eq!(app.history_version, 0);
-    }
-
-    #[test]
-    fn clear_todos_resets_todos_list() {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        // Seed some todos.
-        {
-            let mut todos = app.todos.try_lock().expect("todos lock");
-            todos.add("buy milk".to_string(), TodoStatus::Pending);
-            todos.add("write code".to_string(), TodoStatus::InProgress);
-            assert_eq!(todos.snapshot().items.len(), 2);
-        }
-
-        assert!(app.clear_todos());
-
-        let todos = app.todos.try_lock().expect("todos lock");
-        assert!(todos.snapshot().items.is_empty());
-    }
-
-    #[test]
-    fn clear_todos_resets_plan_state() {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        {
-            let mut plan = app
-                .plan_state
-                .try_lock()
-                .expect("plan lock should be available");
-            plan.update(UpdatePlanArgs {
-                explanation: Some("test plan".to_string()),
-                plan: vec![PlanItemArg {
-                    step: "step 1".to_string(),
-                    status: StepStatus::InProgress,
-                }],
-            });
-            assert!(!plan.is_empty());
-        }
-
-        assert!(app.clear_todos());
-
-        let plan = app
-            .plan_state
-            .try_lock()
-            .expect("plan lock should be available");
-        assert!(plan.is_empty());
-    }
-
-    #[test]
-    fn test_cycle_mode_transitions() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let initial_mode = app.mode;
-        app.cycle_mode();
-        // Mode should have changed
-        assert_ne!(app.mode, initial_mode);
-    }
-
-    #[test]
-    fn test_cycle_mode_reverse_transitions() {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        app.mode = AppMode::Plan;
-        app.cycle_mode_reverse();
-        assert_eq!(app.mode, AppMode::Yolo);
-
-        app.mode = AppMode::Agent;
-        app.cycle_mode_reverse();
-        assert_eq!(app.mode, AppMode::Plan);
-    }
-
-    #[test]
-    fn test_mode_switch_toasts_replace_previous_mode_switch_toast() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let first_mode = match app.mode {
-            AppMode::Plan => AppMode::Agent,
-            AppMode::Agent => AppMode::Yolo,
-            AppMode::Yolo => AppMode::Plan,
-        };
-        let second_mode = match first_mode {
-            AppMode::Plan => AppMode::Yolo,
-            AppMode::Agent => AppMode::Plan,
-            AppMode::Yolo => AppMode::Agent,
-        };
-        let third_mode = match second_mode {
-            AppMode::Plan => AppMode::Yolo,
-            AppMode::Agent => AppMode::Yolo,
-            AppMode::Yolo => AppMode::Plan,
-        };
-
-        app.set_mode(first_mode);
-        app.sync_status_message_to_toasts();
-        assert_eq!(app.status_toasts.len(), 1);
-        assert_eq!(
-            app.status_toasts.back().expect("mode toast").text,
-            format!("Switched to {} mode", first_mode.label())
-        );
-
-        app.set_mode(second_mode);
-        app.sync_status_message_to_toasts();
-        assert_eq!(app.status_toasts.len(), 1);
-        assert_eq!(
-            app.status_toasts.back().expect("mode toast").text,
-            format!("Switched to {} mode", second_mode.label())
-        );
-
-        app.set_mode(third_mode);
-        app.sync_status_message_to_toasts();
-        assert_eq!(app.status_toasts.len(), 1);
-        assert_eq!(
-            app.status_toasts.back().expect("mode toast").text,
-            format!("Switched to {} mode", third_mode.label())
-        );
-    }
-
-    #[test]
-    fn test_mode_switch_toasts_do_not_disrupt_non_mode_toasts() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.status_message = Some("Task queued".to_string());
-        app.sync_status_message_to_toasts();
-
-        app.set_mode(AppMode::Agent);
-        app.sync_status_message_to_toasts();
-        app.set_mode(AppMode::Yolo);
-        app.sync_status_message_to_toasts();
-
-        assert_eq!(app.status_toasts.len(), 2);
-        assert!(
-            app.status_toasts
-                .iter()
-                .any(|toast| toast.text == "Task queued")
-        );
-        assert!(
-            app.status_toasts
-                .iter()
-                .any(|toast| toast.text == "Switched to YOLO mode")
-        );
-    }
-
-    #[test]
-    fn test_clear_input() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "test input".to_string();
-        app.cursor_position = app.input.len();
-        app.clear_input();
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor_position, 0);
-    }
-
-    #[test]
-    fn test_queue_message() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new("test message".to_string(), None));
-        assert_eq!(app.queued_message_count(), 1);
-        assert!(app.queued_messages.front().is_some());
-    }
-
-    #[test]
-    fn test_remove_queued_message() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new("first".to_string(), None));
-        app.queue_message(QueuedMessage::new("second".to_string(), None));
-
-        // Remove first (index 0)
-        let removed = app.remove_queued_message(0);
-        assert!(removed.is_some());
-        assert_eq!(app.queued_message_count(), 1);
-
-        // Remove second (now at index 0)
-        let removed = app.remove_queued_message(0);
-        assert!(removed.is_some());
-        assert_eq!(app.queued_message_count(), 0);
-    }
-
-    #[test]
-    fn test_remove_queued_message_invalid_index() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new("test".to_string(), None));
-
-        // Try to remove non-existent index
-        let removed = app.remove_queued_message(100);
-        assert!(removed.is_none());
-    }
-
-    #[test]
-    fn test_set_mode_updates_state() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let initial_mode = app.mode;
-        app.set_mode(AppMode::Yolo);
-        assert_eq!(app.mode, AppMode::Yolo);
-        assert_ne!(app.mode, initial_mode);
-        // Yolo mode should enable trust and shell
-        assert!(app.trust_mode);
-        assert!(app.allow_shell);
-    }
-
-    #[test]
-    fn app_new_respects_allow_shell_option_when_not_yolo() {
-        let mut options = test_options(false);
-        options.allow_shell = false;
-        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
-        let app = App::new(options, &Config::default());
-        assert!(!app.allow_shell);
-    }
-
-    #[test]
-    fn set_mode_yolo_restores_previous_policies_on_exit() {
-        let mut options = test_options(false);
-        options.allow_shell = false;
-        options.start_in_agent_mode = true; // avoid coupling to settings.default_mode
-        let mut app = App::new(options, &Config::default());
-        app.allow_shell = false;
-        app.trust_mode = false;
-        app.approval_mode = ApprovalMode::Never;
-
-        app.set_mode(AppMode::Yolo);
-        assert!(app.allow_shell);
-        assert!(app.trust_mode);
-        assert_eq!(app.approval_mode, ApprovalMode::Auto);
-
-        app.set_mode(AppMode::Agent);
-        assert!(!app.allow_shell);
-        assert!(!app.trust_mode);
-        assert_eq!(app.approval_mode, ApprovalMode::Never);
-    }
-
-    #[test]
-    fn leaving_yolo_after_startup_restores_baseline_policies() {
-        let config = Config {
-            allow_shell: Some(false),
-            ..Default::default()
-        };
-
-        let mut app = App::new(test_options(true), &config);
-        assert_eq!(app.mode, AppMode::Yolo);
-        assert!(app.allow_shell);
-        assert!(app.trust_mode);
-        assert_eq!(app.approval_mode, ApprovalMode::Auto);
-
-        app.set_mode(AppMode::Agent);
-        assert!(!app.allow_shell);
-        assert!(!app.trust_mode);
-        assert_eq!(app.approval_mode, ApprovalMode::Suggest);
-    }
-
-    #[test]
-    fn configured_approval_policy_initializes_live_approval_mode() {
-        let config = Config {
-            approval_policy: Some("never".to_string()),
-            ..Default::default()
-        };
-        let mut options = test_options(false);
-        options.start_in_agent_mode = true;
-
-        let app = App::new(options, &config);
-
-        assert_eq!(app.mode, AppMode::Agent);
-        assert_eq!(app.approval_mode, ApprovalMode::Never);
-    }
-
-    #[test]
-    fn test_mark_history_updated() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let initial_version = app.history_version;
-        app.mark_history_updated();
-        assert!(app.history_version > initial_version);
-    }
-
-    #[test]
-    fn test_scroll_operations() {
-        let mut app = App::new(test_options(false), &Config::default());
-        // Just verify scroll methods can be called without panic
-        app.scroll_up(5);
-        app.scroll_down(3);
-    }
-
-    #[test]
-    fn resize_preserves_scrolled_transcript_position() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.viewport.transcript_scroll = TranscriptScroll::at_line(42);
-        app.viewport.last_transcript_top = 42;
-        app.viewport.pending_scroll_delta = 5;
-
-        app.handle_resize(120, 40);
-
-        let meta = vec![TranscriptLineMeta::Spacer; 240];
-        let (_, top) = app.viewport.transcript_scroll.resolve_top(&meta, 200);
-        assert_eq!(top, 42);
-        assert_eq!(app.viewport.pending_scroll_delta, 0);
-    }
-
-    #[test]
-    fn resize_keeps_tail_state_when_user_was_at_tail() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
-        app.viewport.last_transcript_top = 42;
-
-        app.handle_resize(120, 40);
-
-        assert!(app.viewport.transcript_scroll.is_at_tail());
-    }
-
-    #[test]
-    fn resize_seeds_visible_height_for_paging_before_next_render() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.viewport.last_transcript_visible = 12;
-
-        app.handle_resize(120, 40);
-        assert_eq!(app.viewport.last_transcript_visible, 38);
-
-        app.handle_resize(120, 1);
-        assert_eq!(app.viewport.last_transcript_visible, 1);
-    }
-
-    #[test]
-    fn test_add_message() {
-        let mut app = App::new(test_options(false), &Config::default());
-        let initial_len = app.history.len();
-        app.add_message(HistoryCell::User {
-            content: "test".to_string(),
-        });
-        assert_eq!(app.history.len(), initial_len + 1);
-    }
-
-    #[test]
-    fn test_compaction_config() {
-        let app = App::new(test_options(false), &Config::default());
-        let config = app.compaction_config();
-        // Config should be valid (just checking it returns something)
-        let _ = config.enabled;
-    }
-
-    #[test]
-    fn test_update_model_compaction_budget() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.model = "unknown-test-model".to_string();
-        app.update_model_compaction_budget();
-        let initial_threshold = app.compact_threshold;
-        app.model = "deepseek-v3.2-128k".to_string();
-        app.update_model_compaction_budget();
-        // Threshold may have changed based on model
-        // Explicit 128k DeepSeek model IDs have a higher threshold than unknown models.
-        assert!(app.compact_threshold >= initial_threshold);
-    }
-
-    #[test]
-    fn test_input_history_navigation() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.push("first".to_string());
-        app.input_history.push("second".to_string());
-
-        // Navigate up
-        app.history_up();
-        assert!(app.history_index.is_some());
-
-        // Navigate down
-        app.history_down();
-    }
-
-    #[test]
-    fn input_history_down_restores_live_draft_after_accidental_up() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.push("previous prompt".to_string());
-        app.input = "careful current draft".to_string();
-        app.cursor_position = "careful".chars().count();
-
-        app.history_up();
-        assert_eq!(app.input, "previous prompt");
-
-        app.history_down();
-        assert_eq!(app.input, "careful current draft");
-        assert_eq!(app.cursor_position, "careful".chars().count());
-        assert!(app.history_index.is_none());
-    }
-
-    #[test]
-    fn input_history_restores_empty_draft_at_end_of_navigation() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.push("previous prompt".to_string());
-
-        app.history_up();
-        assert_eq!(app.input, "previous prompt");
-
-        app.history_down();
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor_position, 0);
-        assert!(app.history_index.is_none());
-    }
-
-    #[test]
-    fn word_cursor_helpers_move_by_whitespace_delimited_words() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "alpha beta  gamma".to_string();
-        app.cursor_position = 0;
-
-        app.move_cursor_word_forward();
-        assert_eq!(app.cursor_position, "alpha ".chars().count());
-
-        app.move_cursor_word_forward();
-        assert_eq!(app.cursor_position, "alpha beta  ".chars().count());
-
-        app.move_cursor_word_backward();
-        assert_eq!(app.cursor_position, "alpha ".chars().count());
-    }
-
-    #[test]
-    fn editing_history_entry_leaves_navigation_mode() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.push("previous prompt".to_string());
-        app.input = "current draft".to_string();
-        app.cursor_position = app.input.chars().count();
-
-        app.history_up();
-        app.insert_char('!');
-        app.history_down();
-
-        assert_eq!(app.input, "previous prompt!");
-        assert!(app.history_index.is_none());
-    }
-
-    #[test]
-    fn history_search_filters_matches_and_skips_duplicates() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.clear();
-        app.input_history.push("alpha one".to_string());
-        app.input_history.push("beta two".to_string());
-        app.input_history.push("alpha one".to_string());
-        app.draft_history.push_back("draft alpha".to_string());
-
-        app.start_history_search();
-        app.history_search_insert_str("alpha");
-
-        assert_eq!(
-            app.history_search_matches(),
-            vec!["draft alpha".to_string(), "alpha one".to_string()]
-        );
-    }
-
-    #[test]
-    fn history_search_matches_unicode_case_insensitively() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.clear();
-        app.input_history.push("CAFÉ prompt".to_string());
-
-        app.start_history_search();
-        app.history_search_insert_str("café");
-
-        assert_eq!(
-            app.history_search_matches(),
-            vec!["CAFÉ prompt".to_string()]
-        );
-    }
-
-    #[test]
-    fn history_search_accepts_match_without_submitting() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.clear();
-        app.input_history.push("older prompt".to_string());
-
-        app.start_history_search();
-        app.history_search_insert_str("older");
-
-        assert!(app.accept_history_search());
-        assert_eq!(app.input, "older prompt");
-        assert_eq!(app.cursor_position, "older prompt".chars().count());
-        assert!(app.composer_history_search.is_none());
-    }
-
-    #[test]
-    fn history_search_cancel_restores_pre_search_draft() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.clear();
-        app.input = "current draft".to_string();
-        app.cursor_position = 7;
-        app.input_history.push("older prompt".to_string());
-
-        app.start_history_search();
-        app.history_search_insert_str("older");
-        app.cancel_history_search();
-
-        assert_eq!(app.input, "current draft");
-        assert_eq!(app.cursor_position, 7);
-        assert!(app.composer_history_search.is_none());
-    }
-
-    #[test]
-    fn recoverable_clear_stashes_nonempty_draft() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input_history.clear();
-        app.input = "recover this".to_string();
-        app.cursor_position = app.input.chars().count();
-
-        app.clear_input_recoverable();
-        app.start_history_search();
-        app.history_search_insert_str("recover");
-
-        assert_eq!(
-            app.history_search_matches(),
-            vec!["recover this".to_string()]
-        );
-    }
-
-    #[test]
-    fn composer_paste_flushes_pending_burst_and_normalizes_crlf() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_paste_burst_detection = true;
-        let now = Instant::now();
-        let key = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-
-        assert!(crate::tui::paste::handle_paste_burst_key(
-            &mut app, &key, now
-        ));
-        assert!(
-            app.input.is_empty(),
-            "first burst char should stay buffered"
-        );
-
-        app.insert_paste_text("a\r\nb\rc");
-
-        assert_eq!(app.input, "xa\nb\nc");
-        assert_eq!(app.cursor_position, "xa\nb\nc".chars().count());
-        assert!(!app.paste_burst.is_active());
-    }
-
-    #[test]
-    fn bracketed_paste_preserves_bare_carriage_return_line_breaks() {
-        let mut app = App::new(test_options(false), &Config::default());
-
-        app.insert_paste_text("alpha\r  indented\r# literal heading\r- literal list");
-
-        assert_eq!(
-            app.input,
-            "alpha\n  indented\n# literal heading\n- literal list"
-        );
-        assert_eq!(app.cursor_position, app.input.chars().count());
-    }
-
-    #[test]
-    fn enter_during_active_paste_burst_appends_newline_to_buffer_not_submit() {
-        // #1073: when chars are still being assembled into a paste burst and
-        // an Enter arrives (the trailing newline of the paste), the Enter
-        // must be absorbed into the burst buffer — not fired as a submit.
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_paste_burst_detection = true;
-        let now = Instant::now();
-        app.paste_burst.append_char_to_buffer('h', now);
-        app.paste_burst.append_char_to_buffer('i', now);
-        assert!(app.paste_burst.is_active());
-        assert!(app.input.is_empty());
-
-        let result = app.handle_composer_enter();
-
-        assert!(
-            result.is_none(),
-            "Enter during active paste burst must not submit"
-        );
-        let flushed = app.paste_burst.flush_before_modified_input();
-        assert_eq!(
-            flushed.as_deref(),
-            Some("hi\n"),
-            "newline must land in the burst buffer so the next flush carries it"
-        );
-    }
-
-    #[test]
-    fn enter_inside_paste_burst_window_after_flush_inserts_newline_not_submit() {
-        // #1073: after a burst has flushed (text now in `input`), the
-        // suppression window stays open for ~120ms. An Enter arriving in
-        // that window is the trailing newline of the paste, not a user
-        // submit — insert it as a literal newline into the composer.
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_paste_burst_detection = true;
-        app.input = "hello".to_string();
-        app.cursor_position = "hello".chars().count();
-        let now = Instant::now();
-        app.paste_burst.extend_window(now);
-        assert!(!app.paste_burst.is_active());
-        assert!(
-            app.paste_burst.newline_should_insert_instead_of_submit(now),
-            "suppression window should be open"
-        );
-
-        let result = app.handle_composer_enter();
-
-        assert!(
-            result.is_none(),
-            "Enter inside post-flush suppression window must not submit"
-        );
-        assert_eq!(
-            app.input, "hello\n",
-            "newline must be inserted into the composer instead of firing a submit"
-        );
-    }
-
-    #[test]
-    fn enter_outside_any_paste_burst_window_submits_normally() {
-        // Regression guard: the suppression must not trip when the user
-        // actually wants to submit.
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_paste_burst_detection = true;
-        app.input = "hello world".to_string();
-        app.cursor_position = "hello world".chars().count();
-
-        let result = app.handle_composer_enter();
-
-        assert_eq!(
-            result.as_deref(),
-            Some("hello world"),
-            "Enter outside any paste burst window must submit normally"
-        );
-        assert!(
-            app.input.is_empty(),
-            "submit_input should clear the composer"
-        );
-    }
-
-    #[test]
-    fn enter_with_paste_burst_detection_disabled_submits_normally() {
-        // When the user has explicitly turned off paste-burst detection
-        // (`bracketed_paste = false` is independent, this is the
-        // `paste_burst_detection` setting), the suppression must be
-        // skipped — otherwise turning it off would not actually turn it
-        // off.
-        let mut app = App::new(test_options(false), &Config::default());
-        app.use_paste_burst_detection = false;
-        app.input = "ship it".to_string();
-        app.cursor_position = "ship it".chars().count();
-        let now = Instant::now();
-        app.paste_burst.extend_window(now);
-
-        let result = app.handle_composer_enter();
-
-        assert_eq!(result.as_deref(), Some("ship it"));
-    }
-
-    #[test]
-    fn clipboard_text_paste_matches_bracketed_paste_state() {
-        let text = "alpha\r\nbeta";
-        let mut bracketed = App::new(test_options(false), &Config::default());
-        let mut clipboard = App::new(test_options(false), &Config::default());
-
-        bracketed.insert_paste_text(text);
-        clipboard.apply_clipboard_content(ClipboardContent::Text(text.to_string()));
-
-        assert_eq!(clipboard.input, bracketed.input);
-        assert_eq!(clipboard.cursor_position, bracketed.cursor_position);
-        assert_eq!(clipboard.slash_menu_hidden, bracketed.slash_menu_hidden);
-        assert_eq!(clipboard.mention_menu_hidden, bracketed.mention_menu_hidden);
-    }
-
-    #[test]
-    fn clipboard_image_paste_keeps_adjacent_text_and_concise_status() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "before after".to_string();
-        app.cursor_position = "before".chars().count();
-
-        app.apply_clipboard_content(ClipboardContent::Image(PastedImage {
-            path: PathBuf::from("/tmp/pasted.png"),
-            width: 8,
-            height: 4,
-            byte_len: 2048,
-        }));
-
-        assert!(
-            app.input
-                .contains("before\n[Attached image: 8x4 PNG (2KB) at /tmp/pasted.png]")
-        );
-        assert!(app.input.contains("] after"));
-        let status = app.status_message.as_deref().expect("status message");
-        assert_eq!(status, "Attached image: 8x4 PNG (2KB)");
-    }
-
-    #[test]
-    fn pasted_text_and_image_placeholders_survive_history_and_queue_paths() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.insert_paste_text("line 1\r\nline 2");
-        app.insert_media_attachment("image", Path::new("/tmp/pasted.png"), Some("8x4 PNG (2KB)"));
-
-        let submitted = app.submit_input().expect("submitted input");
-        assert!(submitted.contains("line 1\nline 2"));
-        assert!(submitted.contains("[Attached image: 8x4 PNG (2KB) at /tmp/pasted.png]"));
-
-        app.history_up();
-        assert_eq!(app.input, submitted);
-        assert_eq!(app.composer_attachment_count(), 1);
-
-        app.clear_input();
-        app.queue_message(QueuedMessage::new(
-            submitted.clone(),
-            Some("Use this skill".to_string()),
-        ));
-        assert!(app.pop_last_queued_into_draft());
-        assert_eq!(app.input, submitted);
-        assert_eq!(app.composer_attachment_count(), 1);
-        assert_eq!(
-            app.queued_draft
-                .as_ref()
-                .and_then(|draft| draft.skill_instruction.as_deref()),
-            Some("Use this skill")
-        );
-
-        app.push_pending_steer(QueuedMessage::new(submitted.clone(), None));
-        let steers = app.drain_pending_steers();
-        assert_eq!(steers[0].display, submitted);
-    }
-
-    #[test]
-    fn selected_attachment_row_removes_placeholder_without_manual_editing() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "before".to_string();
-        app.cursor_position = "before".chars().count();
-        app.insert_media_attachment("image", Path::new("/tmp/pasted.png"), Some("8x4 PNG"));
-        app.insert_str("after");
-
-        app.move_cursor_start();
-        assert!(app.select_previous_composer_attachment());
-        assert_eq!(app.selected_composer_attachment_index(), Some(0));
-        assert!(app.remove_selected_composer_attachment());
-
-        assert!(!app.input.contains("[Attached image:"));
-        assert!(app.input.contains("before"));
-        assert!(app.input.contains("after"));
-        assert_eq!(app.composer_attachment_count(), 0);
-        assert!(app.selected_composer_attachment_index().is_none());
-    }
-
-    #[test]
-    fn kill_to_end_of_line_cuts_from_middle_of_word() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "hello world".to_string();
-        app.cursor_position = 6; // before 'w'
-        assert!(app.kill_to_end_of_line());
-        assert_eq!(app.input, "hello ");
-        assert_eq!(app.cursor_position, 6);
-        assert_eq!(app.kill_buffer, "world");
-    }
-
-    #[test]
-    fn kill_at_eol_consumes_following_newline() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "line one\nline two".to_string();
-        app.cursor_position = 8; // sitting on the '\n'
-        assert!(app.kill_to_end_of_line());
-        assert_eq!(app.input, "line oneline two");
-        assert_eq!(app.cursor_position, 8);
-        assert_eq!(app.kill_buffer, "\n");
-
-        // Empty input: kill is a no-op and the buffer is untouched.
-        let mut empty = App::new(test_options(false), &Config::default());
-        assert!(!empty.kill_to_end_of_line());
-        assert!(empty.input.is_empty());
-        assert!(empty.kill_buffer.is_empty());
-    }
-
-    #[test]
-    fn yank_inserts_kill_buffer_and_preserves_it() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "abc def".to_string();
-        app.cursor_position = 4; // before 'd'
-        assert!(app.kill_to_end_of_line());
-        assert_eq!(app.input, "abc ");
-        assert_eq!(app.kill_buffer, "def");
-
-        // Move cursor to the start and yank twice — kill_buffer must persist.
-        app.cursor_position = 0;
-        assert!(app.yank());
-        assert!(app.yank());
-        assert_eq!(app.input, "defdefabc ");
-        assert_eq!(app.cursor_position, 6);
-        assert_eq!(app.kill_buffer, "def");
-
-        // Yank with empty buffer is a no-op.
-        let mut empty = App::new(test_options(false), &Config::default());
-        assert!(!empty.yank());
-        assert!(empty.input.is_empty());
-    }
-
-    // ---- Issue #90: quit confirmation timeout ----
-
-    #[test]
-    fn quit_is_not_armed_by_default() {
-        let app = App::new(test_options(false), &Config::default());
-        assert!(!app.quit_is_armed());
-        assert!(app.quit_armed_until.is_none());
-    }
-
-    #[test]
-    fn arm_quit_sets_two_second_window() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.arm_quit();
-        assert!(app.quit_is_armed());
-        let deadline = app.quit_armed_until.expect("deadline set");
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        // Allow a generous margin for slow CI machines: 1.5s..=2.0s.
-        assert!(
-            remaining >= Duration::from_millis(1500) && remaining <= Duration::from_secs(2),
-            "expected ~2s window, got {remaining:?}",
-        );
-        assert!(app.needs_redraw, "armed prompt should request a redraw");
-    }
-
-    #[test]
-    fn disarm_quit_clears_the_timer() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.arm_quit();
-        app.needs_redraw = false;
-        app.disarm_quit();
-        assert!(!app.quit_is_armed());
-        assert!(app.quit_armed_until.is_none());
-        assert!(app.needs_redraw, "disarming should request a redraw");
-    }
-
-    #[test]
-    fn disarm_quit_when_not_armed_is_a_noop() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.needs_redraw = false;
-        app.disarm_quit();
-        assert!(!app.needs_redraw, "no redraw when nothing changed");
-    }
-
-    #[test]
-    fn quit_armed_expires_after_window() {
-        let mut app = App::new(test_options(false), &Config::default());
-        // Pin the deadline in the past to simulate a stale timer.
-        app.quit_armed_until = Some(Instant::now() - Duration::from_millis(10));
-        assert!(
-            !app.quit_is_armed(),
-            "expired timer must not count as armed"
-        );
-
-        app.needs_redraw = false;
-        app.tick_quit_armed();
-        assert!(app.quit_armed_until.is_none(), "tick clears expired timer");
-        assert!(
-            app.needs_redraw,
-            "expiry triggers a redraw to repaint footer"
-        );
-    }
-
-    #[test]
-    fn quit_armed_tick_is_noop_within_window() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.arm_quit();
-        app.needs_redraw = false;
-        app.tick_quit_armed();
-        assert!(
-            app.quit_is_armed(),
-            "tick within window keeps the timer armed"
-        );
-        assert!(!app.needs_redraw, "no redraw when nothing changed");
-    }
-
-    #[test]
-    fn re_arming_after_expiry_starts_a_fresh_window() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.quit_armed_until = Some(Instant::now() - Duration::from_secs(5));
-        app.tick_quit_armed();
-        assert!(app.quit_armed_until.is_none());
-        app.arm_quit();
-        let deadline = app.quit_armed_until.expect("re-armed");
-        assert!(deadline > Instant::now(), "fresh deadline in the future");
-    }
-
-    // ---- Issue #208: in-flight input routing ----
-
-    #[test]
-    fn submit_disposition_immediate_when_idle_and_online() {
-        let app = App::new(test_options(false), &Config::default());
-        assert!(!app.is_loading);
-        assert!(!app.offline_mode);
-        assert_eq!(
-            app.decide_submit_disposition(),
-            SubmitDisposition::Immediate
-        );
-    }
-
-    #[test]
-    fn submit_disposition_queue_when_busy_and_online_not_streaming() {
-        // #382: Busy + not streaming → Queue (was Steer; now unified)
-        let mut app = App::new(test_options(false), &Config::default());
-        app.is_loading = true;
-        app.offline_mode = false;
-        // streaming_message_index is None (default) → tool execution phase
-        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
-    }
-
-    #[test]
-    fn submit_disposition_queue_when_busy_and_streaming() {
-        // #382: Busy + streaming → Queue (was QueueFollowUp; now unified)
-        let mut app = App::new(test_options(false), &Config::default());
-        app.is_loading = true;
-        app.offline_mode = false;
-        app.streaming_message_index = Some(0);
-        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
-    }
-
-    #[test]
-    fn submit_disposition_queue_when_offline_and_idle() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.is_loading = false;
-        app.offline_mode = true;
-        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
-    }
-
-    #[test]
-    fn submit_disposition_offline_busy_queues() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.is_loading = true;
-        app.offline_mode = true;
-        // Offline mode always queues, even when streaming
-        app.streaming_message_index = Some(0);
-        assert_eq!(app.decide_submit_disposition(), SubmitDisposition::Queue);
-    }
-
-    #[test]
-    fn push_pending_steer_arms_resend_flag() {
-        let mut app = App::new(test_options(false), &Config::default());
-        assert!(!app.submit_pending_steers_after_interrupt);
-        app.push_pending_steer(QueuedMessage::new("steer me".to_string(), None));
-        assert_eq!(app.pending_steers.len(), 1);
-        assert!(app.submit_pending_steers_after_interrupt);
-    }
-
-    #[test]
-    fn drain_pending_steers_clears_flag_and_returns_in_order() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.push_pending_steer(QueuedMessage::new("first".to_string(), None));
-        app.push_pending_steer(QueuedMessage::new("second".to_string(), None));
-        app.push_pending_steer(QueuedMessage::new("third".to_string(), None));
-
-        let drained = app.drain_pending_steers();
-        assert_eq!(drained.len(), 3);
-        assert_eq!(drained[0].display, "first");
-        assert_eq!(drained[2].display, "third");
-        assert!(app.pending_steers.is_empty());
-        assert!(!app.submit_pending_steers_after_interrupt);
-    }
-
-    #[test]
-    fn drain_pending_steers_when_empty_is_safe() {
-        let mut app = App::new(test_options(false), &Config::default());
-        // Flag-only set (someone armed it manually): drain still clears it.
-        app.submit_pending_steers_after_interrupt = true;
-        let drained = app.drain_pending_steers();
-        assert!(drained.is_empty());
-        assert!(!app.submit_pending_steers_after_interrupt);
-    }
-
-    #[test]
-    fn double_push_pending_steer_is_idempotent_on_flag() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.push_pending_steer(QueuedMessage::new("a".to_string(), None));
-        app.push_pending_steer(QueuedMessage::new("b".to_string(), None));
-        assert!(app.submit_pending_steers_after_interrupt);
-        assert_eq!(app.pending_steers.len(), 2);
-    }
-
-    #[test]
-    fn pop_last_queued_into_draft_pops_back_and_arms_draft() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new(
-            "first".to_string(),
-            Some("skill-A".to_string()),
-        ));
-        app.queue_message(QueuedMessage::new(
-            "last".to_string(),
-            Some("skill-B".to_string()),
-        ));
-
-        assert!(app.pop_last_queued_into_draft());
-        assert_eq!(app.input, "last");
-        assert_eq!(app.cursor_position, "last".chars().count());
-        assert_eq!(app.queued_messages.len(), 1);
-        let draft = app.queued_draft.clone().expect("draft is set");
-        assert_eq!(draft.display, "last");
-        assert_eq!(draft.skill_instruction.as_deref(), Some("skill-B"));
-    }
-
-    #[test]
-    fn pop_last_queued_into_draft_noop_when_composer_dirty() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new("queued".to_string(), None));
-        app.input = "typing".to_string();
-        app.cursor_position = char_count(&app.input);
-
-        assert!(!app.pop_last_queued_into_draft());
-        assert_eq!(app.input, "typing");
-        assert_eq!(app.queued_messages.len(), 1);
-        assert!(app.queued_draft.is_none());
-    }
-
-    #[test]
-    fn pop_last_queued_into_draft_noop_when_draft_already_armed() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.queue_message(QueuedMessage::new("queued".to_string(), None));
-        app.queued_draft = Some(QueuedMessage::new("editing".to_string(), None));
-
-        assert!(!app.pop_last_queued_into_draft());
-        assert_eq!(app.queued_messages.len(), 1);
-        assert_eq!(
-            app.queued_draft.as_ref().map(|d| d.display.as_str()),
-            Some("editing")
-        );
-    }
-
-    #[test]
-    fn pop_last_queued_into_draft_noop_when_queue_empty() {
-        let mut app = App::new(test_options(false), &Config::default());
-        assert!(!app.pop_last_queued_into_draft());
-        assert!(app.input.is_empty());
-        assert!(app.queued_draft.is_none());
-    }
-
-    #[test]
-    fn finalize_streaming_assistant_marks_existing_cell_interrupted() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.add_message(HistoryCell::Assistant {
-            content: "partial reply so far".to_string(),
-            streaming: true,
-        });
-        let idx = app.history.len() - 1;
-        app.streaming_message_index = Some(idx);
-
-        app.finalize_streaming_assistant_as_interrupted();
-
-        assert!(app.streaming_message_index.is_none());
-        match &app.history[idx] {
-            HistoryCell::Assistant { content, streaming } => {
-                assert!(content.starts_with("[interrupted]"), "got: {content}");
-                assert!(content.contains("partial reply so far"));
-                assert!(!*streaming);
-            }
-            other => panic!("expected Assistant cell, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn finalize_streaming_assistant_handles_empty_content() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.add_message(HistoryCell::Assistant {
-            content: String::new(),
-            streaming: true,
-        });
-        let idx = app.history.len() - 1;
-        app.streaming_message_index = Some(idx);
-
-        app.finalize_streaming_assistant_as_interrupted();
-
-        match &app.history[idx] {
-            HistoryCell::Assistant { content, streaming } => {
-                assert_eq!(content, "[interrupted]");
-                assert!(!*streaming);
-            }
-            other => panic!("expected Assistant cell, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn finalize_streaming_assistant_no_op_without_index() {
-        let mut app = App::new(test_options(false), &Config::default());
-        // No streaming index set; should not panic and should leave history unchanged.
-        let prev_len = app.history.len();
-        app.finalize_streaming_assistant_as_interrupted();
-        assert_eq!(app.history.len(), prev_len);
-        assert!(app.streaming_message_index.is_none());
-    }
-
-    #[test]
-    fn finalize_streaming_assistant_is_idempotent_on_double_call() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.add_message(HistoryCell::Assistant {
-            content: "something".to_string(),
-            streaming: true,
-        });
-        let idx = app.history.len() - 1;
-        app.streaming_message_index = Some(idx);
-
-        app.finalize_streaming_assistant_as_interrupted();
-        // Second call without resetting state must be safe.
-        app.finalize_streaming_assistant_as_interrupted();
-
-        match &app.history[idx] {
-            HistoryCell::Assistant { content, .. } => {
-                // Second call still finds index None — content unchanged from first.
-                assert!(content.starts_with("[interrupted] "));
-                assert_eq!(content.matches("[interrupted]").count(), 1);
-            }
-            other => panic!("expected Assistant cell, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn delete_word_backward_removes_previous_word_only() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "hello world".to_string();
-        app.cursor_position = char_count(&app.input);
-
-        app.delete_word_backward();
-
-        assert_eq!(app.input, "hello ");
-        assert_eq!(app.cursor_position, char_count("hello "));
-    }
-
-    #[test]
-    fn delete_word_backward_handles_trailing_space_and_utf8() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "cafe 你好   ".to_string();
-        app.cursor_position = char_count(&app.input);
-
-        app.delete_word_backward();
-
-        assert_eq!(app.input, "cafe ");
-        assert_eq!(app.cursor_position, char_count("cafe "));
-    }
-
-    #[test]
-    fn delete_word_forward_handles_leading_space_and_utf8() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "hello 你好 world".to_string();
-        app.cursor_position = char_count("hello");
-
-        app.delete_word_forward();
-
-        assert_eq!(app.input, "hello world");
-        assert_eq!(app.cursor_position, char_count("hello"));
-    }
-
-    #[test]
-    fn delete_to_start_of_line_respects_multiline_cursor() {
-        let mut app = App::new(test_options(false), &Config::default());
-        app.input = "first\nsecond line".to_string();
-        app.cursor_position = char_count("first\nsecond");
-
-        app.delete_to_start_of_line();
-
-        assert_eq!(app.input, "first\n line");
-        assert_eq!(app.cursor_position, char_count("first\n"));
-    }
-
-    #[test]
-    fn kill_and_yank_handle_multibyte_utf8() {
-        let mut app = App::new(test_options(false), &Config::default());
-        // "café 你好" — char_count = 7 (c,a,f,é, ,你,好); UTF-8 bytes differ.
-        app.input = "café 你好".to_string();
-        app.cursor_position = 5; // before '你'
-        assert!(app.kill_to_end_of_line());
-        assert_eq!(app.input, "café ");
-        assert_eq!(app.cursor_position, 5);
-        assert_eq!(app.kill_buffer, "你好");
-
-        // Yank back at the same spot — must not panic on char boundaries.
-        assert!(app.yank());
-        assert_eq!(app.input, "café 你好");
-        assert_eq!(app.cursor_position, 7);
-    }
-}
+mod tests;

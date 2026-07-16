@@ -11,80 +11,154 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::mcp::McpPool;
+use crate::model_profile::ToolSurfaceBudget;
 use crate::models::Tool;
-use crate::tools::spec::{ToolError, ToolResult, required_str};
+use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
 use crate::tui::app::AppMode;
+
+use crate::dependencies::ExternalTool;
+use crate::regex_cache::compile_user_regex;
 
 pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(super) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
 pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
-const TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const TOOL_SEARCH_REGEX_TYPE: &str = "tool_search_tool_regex_20251119";
-pub(super) const TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
-const TOOL_SEARCH_BM25_TYPE: &str = "tool_search_tool_bm25_20251119";
+pub(super) const TOOL_SEARCH_NAME: &str = "tool_search";
+const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
+const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
+const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
+const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
+const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 100;
 
 pub(super) fn is_tool_search_tool(name: &str) -> bool {
-    matches!(name, TOOL_SEARCH_REGEX_NAME | TOOL_SEARCH_BM25_NAME)
-}
-
-pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
-    if mode == AppMode::Yolo {
-        return false;
-    }
-
-    // Shell exec tools are kept active in Agent so the model can run
-    // verification commands (build/test/git/cargo) without first having to
-    // discover them through ToolSearch. Plan mode does not register shell
-    // execution tools.
-    let always_loaded_in_action_modes = matches!(mode, AppMode::Agent)
-        && matches!(
-            name,
-            "exec_shell"
-                | "exec_shell_wait"
-                | "exec_shell_interact"
-                | "exec_wait"
-                | "exec_interact"
-        );
-    if always_loaded_in_action_modes {
-        return false;
-    }
-
-    !matches!(
+    matches!(
         name,
-        "read_file"
-            | "write_file"
-            | "list_dir"
-            | "grep_files"
-            | "file_search"
-            | "diagnostics"
-            | "rlm_open"
-            | "rlm_eval"
-            | "rlm_configure"
-            | "rlm_close"
-            | "handle_read"
-            | "recall_archive"
-            | "notify"
-            | MULTI_TOOL_PARALLEL_NAME
-            | "update_plan"
-            | "checklist_write"
-            | "todo_write"
-            | "task_create"
-            | "task_list"
-            | "task_read"
-            | "task_gate_run"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "github_issue_context"
-            | "github_pr_context"
-            | REQUEST_USER_INPUT_NAME
+        TOOL_SEARCH_NAME | LEGACY_TOOL_SEARCH_REGEX_NAME | LEGACY_TOOL_SEARCH_BM25_NAME
     )
 }
 
-pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
+pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
+    "agent",
+    "apply_patch",
+    "edit_file",
+    "exec_interact",
+    "exec_shell",
+    "exec_shell_interact",
+    "exec_shell_wait",
+    "exec_wait",
+    "fetch_url",
+    "file_search",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_status",
+    "grep_files",
+    "list_dir",
+    "read_file",
+    "run_tests",
+    "run_verifiers",
+    "task_create",
+    "task_list",
+    "task_read",
+    "update_plan",
+    "wait_for_dev_server",
+    "web_search",
+    "work_update",
+    "write_file",
+];
+
+const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
+    CoreActionToolFallback {
+        name: "exec_shell",
+        description: "Run shell commands in the workspace.",
+        unavailable_reason: "Not present in the current model-visible catalog. Interactive Agent sessions expose shell by default unless allow_shell = false; noninteractive and durable profiles require allow_shell = true. Plan mode hides shell, and command tool allow/deny gates can also block it.",
+    },
+    CoreActionToolFallback {
+        name: "write_file",
+        description: "Create or overwrite files in the workspace.",
+        unavailable_reason: "Not present in the current model-visible catalog. File writes require Act mode and no command tool allow/deny gate blocking write_file.",
+    },
+    CoreActionToolFallback {
+        name: "edit_file",
+        description: "Edit existing files by replacing text.",
+        unavailable_reason: "Not present in the current model-visible catalog. File edits require Act mode and no command tool allow/deny gate blocking edit_file.",
+    },
+    CoreActionToolFallback {
+        name: "apply_patch",
+        description: "Apply a patch to one or more workspace files.",
+        unavailable_reason: "Not present in the current model-visible catalog. Patches require Act mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct CoreActionToolFallback {
+    name: &'static str,
+    description: &'static str,
+    unavailable_reason: &'static str,
+}
+
+/// Pre-computed lowercased haystack + name for each fallback; built once.
+struct CachedFallback {
+    fallback: CoreActionToolFallback,
+    haystack: String,
+    name_lower: String,
+}
+
+static CACHED_FALLBACKS: std::sync::OnceLock<Vec<CachedFallback>> = std::sync::OnceLock::new();
+
+fn cached_fallbacks() -> &'static [CachedFallback] {
+    CACHED_FALLBACKS.get_or_init(|| {
+        CORE_ACTION_TOOL_FALLBACKS
+            .iter()
+            .map(|f| CachedFallback {
+                fallback: *f,
+                haystack: format!(
+                    "{}\n{}\n{}",
+                    f.name.to_lowercase(),
+                    f.description.to_lowercase(),
+                    f.unavailable_reason.to_lowercase(),
+                ),
+                name_lower: f.name.to_lowercase(),
+            })
+            .collect()
+    })
+}
+
+/// Membership index over [`DEFAULT_ACTIVE_NATIVE_TOOLS`], built once for the
+/// process lifetime. The array stays the source of truth for *ordered*
+/// iteration (see [`tool_catalog_consistency_issues`] and
+/// `engine::default_active_native_tool_names`); this set only accelerates the
+/// hot membership check in [`should_default_defer_tool`], which runs once per
+/// catalog tool on every catalog rebuild (i.e. per turn) — an O(n·m) linear
+/// scan over the array collapses to O(1) hashed lookups.
+static DEFAULT_ACTIVE_NATIVE_TOOLS_SET: std::sync::OnceLock<HashSet<&'static str>> =
+    std::sync::OnceLock::new();
+
+fn default_active_native_tools_set() -> &'static HashSet<&'static str> {
+    DEFAULT_ACTIVE_NATIVE_TOOLS_SET
+        .get_or_init(|| DEFAULT_ACTIVE_NATIVE_TOOLS.iter().copied().collect())
+}
+
+pub(super) fn should_default_defer_tool(name: &str, always_load: &HashSet<String>) -> bool {
+    if always_load.contains(name) {
+        return false;
+    }
+
+    if is_tool_search_tool(name) {
+        return false;
+    }
+
+    // Membership-only test (no ordering dependency): the side set built from
+    // DEFAULT_ACTIVE_NATIVE_TOOLS returns identical hit/miss results as the
+    // former `.iter().any(...)` linear scan.
+    !default_active_native_tools_set().contains(name)
+}
+
+pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], always_load: &HashSet<String>) {
     for tool in catalog {
-        tool.defer_loading = Some(should_default_defer_tool(&tool.name, mode));
+        tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
     }
 }
 
@@ -99,20 +173,57 @@ fn should_keep_mcp_tool_loaded(name: &str) -> bool {
     )
 }
 
-pub(super) fn apply_mcp_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
+pub(super) fn apply_mcp_tool_deferral(
+    catalog: &mut [Tool],
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) {
     for tool in catalog {
+        if always_load.contains(&tool.name) {
+            tool.defer_loading = Some(false);
+            continue;
+        }
         tool.defer_loading =
             Some(mode != AppMode::Yolo && !should_keep_mcp_tool_loaded(&tool.name));
     }
 }
 
+/// Build the model tool catalog from native and MCP tool lists.
+///
+/// **Catalog-head stability invariant.** The head of the catalog (all
+/// non-deferred tools) must remain byte-identical across mode toggles
+/// (Plan ↔ Agent ↔ YOLO) for tools that are common to both modes.
+/// Deferred tool activations append to the tail and never reorder the
+/// head. This invariant is critical for DeepSeek's KV prefix cache:
+/// the tools array is part of the immutable prefix, and any byte-level
+/// change in the head forces a full re-prefill on the next turn.
+#[cfg(test)]
 pub(super) fn build_model_tool_catalog(
+    native_tools: Vec<Tool>,
+    mcp_tools: Vec<Tool>,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) -> Vec<Tool> {
+    build_model_tool_catalog_with_surface(
+        native_tools,
+        mcp_tools,
+        mode,
+        always_load,
+        ToolSurfaceBudget::Standard,
+    )
+}
+
+pub(super) fn build_model_tool_catalog_with_surface(
     mut native_tools: Vec<Tool>,
     mut mcp_tools: Vec<Tool>,
     mode: AppMode,
+    always_load: &HashSet<String>,
+    surface_budget: ToolSurfaceBudget,
 ) -> Vec<Tool> {
-    apply_native_tool_deferral(&mut native_tools, mode);
-    apply_mcp_tool_deferral(&mut mcp_tools, mode);
+    apply_native_tool_deferral(&mut native_tools, always_load);
+    apply_mcp_tool_deferral(&mut mcp_tools, mode, always_load);
+    apply_tool_surface_budget(&mut native_tools, surface_budget, always_load);
+    apply_tool_surface_budget(&mut mcp_tools, surface_budget, always_load);
     // Sort each partition by name for prefix-cache stability (#263). The
     // upstream `to_api_tools()` already sorts the registry's HashMap output;
     // this catalog is built from caller-supplied Vecs which the test harness
@@ -125,7 +236,32 @@ pub(super) fn build_model_tool_catalog(
     native_tools
 }
 
-pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
+fn apply_tool_surface_budget(
+    catalog: &mut [Tool],
+    surface_budget: ToolSurfaceBudget,
+    always_load: &HashSet<String>,
+) {
+    if !matches!(surface_budget, ToolSurfaceBudget::Compact) {
+        return;
+    }
+    for tool in catalog {
+        if always_load.contains(&tool.name) {
+            continue;
+        }
+        if matches!(
+            tool.name.as_str(),
+            "agent" | "run_tests" | "run_verifiers" | "task_create" | "web_search"
+        ) {
+            tool.defer_loading = Some(true);
+        }
+    }
+}
+
+pub(super) fn ensure_advanced_tooling(
+    catalog: &mut Vec<Tool>,
+    mode: AppMode,
+    always_load: &HashSet<String>,
+) {
     // code_execution depends on a locally-installed Python interpreter
     // (python3 / python / py -3). Before v0.8.31, the tool was always
     // advertised and would fail at execution time on Windows where
@@ -149,7 +285,10 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
                 "required": ["code"]
             }),
             allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
+            defer_loading: Some(should_default_defer_tool(
+                CODE_EXECUTION_TOOL_NAME,
+                always_load,
+            )),
             input_examples: None,
             strict: None,
             cache_control: None,
@@ -165,38 +304,33 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
         && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
         && crate::dependencies::resolve_node().is_some()
     {
-        catalog.push(crate::tools::js_execution::js_execution_tool_definition());
+        let mut tool = crate::tools::js_execution::js_execution_tool_definition();
+        tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));
+        catalog.push(tool);
     }
 
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME) {
+    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_NAME) {
         catalog.push(Tool {
-            tool_type: Some(TOOL_SEARCH_REGEX_TYPE.to_string()),
-            name: TOOL_SEARCH_REGEX_NAME.to_string(),
-            description: "Search deferred tool definitions using a regex query and return matching tool references.".to_string(),
+            tool_type: Some(TOOL_SEARCH_TYPE.to_string()),
+            name: TOOL_SEARCH_NAME.to_string(),
+            description: "Search deferred tool definitions and return matching tool references.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Regex pattern to search tool names/descriptions/schema." }
-                },
-                "required": ["query"]
-            }),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        });
-    }
-
-    if !catalog.iter().any(|t| t.name == TOOL_SEARCH_BM25_NAME) {
-        catalog.push(Tool {
-            tool_type: Some(TOOL_SEARCH_BM25_TYPE.to_string()),
-            name: TOOL_SEARCH_BM25_NAME.to_string(),
-            description: "Search deferred tool definitions using natural-language matching and return matching tool references.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Natural language query for tool discovery." }
+                    "query": { "type": "string", "description": "Search query for tool discovery." },
+                    "match": {
+                        "type": "string",
+                        "enum": ["bm25", "regex"],
+                        "default": "bm25",
+                        "description": "Matching algorithm: bm25 for natural-language matching, regex for a regular expression over tool names/descriptions/schema."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": TOOL_SEARCH_MAX_RESULTS_LIMIT,
+                        "default": TOOL_SEARCH_DEFAULT_MAX_RESULTS,
+                        "description": "Maximum number of matching tool references to return."
+                    }
                 },
                 "required": ["query"]
             }),
@@ -231,8 +365,9 @@ fn active_tool_list_from_catalog(catalog: &[Tool], active: &HashSet<String>) -> 
     // and were activated mid-conversation by ToolSearch get appended at the
     // tail. Otherwise activating a deferred tool shifts every later tool's
     // byte offset and busts the cached prefix from that point onwards.
-    let mut head: Vec<Tool> = Vec::new();
-    let mut tail: Vec<Tool> = Vec::new();
+    let catalog_len = catalog.len();
+    let mut head: Vec<Tool> = Vec::with_capacity(catalog_len);
+    let mut tail: Vec<Tool> = Vec::with_capacity(catalog_len);
     for tool in catalog {
         if !active.contains(&tool.name) {
             continue;
@@ -278,8 +413,80 @@ fn tool_search_haystack(tool: &Tool) -> String {
     )
 }
 
-fn discover_tools_with_regex(catalog: &[Tool], query: &str) -> Result<Vec<String>, ToolError> {
-    let regex = regex::Regex::new(query)
+fn catalog_contains_tool(catalog: &[Tool], name: &str) -> bool {
+    catalog.iter().any(|tool| tool.name == name)
+}
+
+fn unavailable_core_action_tools_with_regex(
+    catalog: &[Tool],
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<CoreActionToolFallback>, ToolError> {
+    if max_results == 0 {
+        return Ok(Vec::new());
+    }
+    let regex = compile_user_regex(query)
+        .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
+    Ok(cached_fallbacks()
+        .iter()
+        .filter(|cf| !catalog_contains_tool(catalog, cf.fallback.name))
+        .filter(|cf| regex.is_match(&cf.haystack))
+        .take(max_results)
+        .map(|cf| cf.fallback)
+        .collect())
+}
+
+fn unavailable_core_action_tools_with_bm25_like(
+    catalog: &[Tool],
+    query: &str,
+    max_results: usize,
+) -> Vec<CoreActionToolFallback> {
+    if max_results == 0 {
+        return Vec::new();
+    }
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(i64, CoreActionToolFallback)> = Vec::new();
+    for cf in cached_fallbacks() {
+        if catalog_contains_tool(catalog, cf.fallback.name) {
+            continue;
+        }
+        let hay = &cf.haystack;
+        let name = &cf.name_lower;
+        let mut score = 0i64;
+        for term in &terms {
+            if hay.contains(term) {
+                score += 1;
+            }
+            if name.contains(term) {
+                score += 2;
+            }
+        }
+        if score > 0 {
+            scored.push((score, cf.fallback));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(b.1.name)));
+    scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, fallback)| fallback)
+        .collect()
+}
+
+fn discover_tools_with_regex(
+    catalog: &[Tool],
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<String>, ToolError> {
+    let regex = compile_user_regex(query)
         .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
 
     let mut matches = Vec::new();
@@ -291,14 +498,14 @@ fn discover_tools_with_regex(catalog: &[Tool], query: &str) -> Result<Vec<String
         if regex.is_match(&hay) {
             matches.push(tool.name.clone());
         }
-        if matches.len() >= 5 {
+        if matches.len() >= max_results {
             break;
         }
     }
     Ok(matches)
 }
 
-fn discover_tools_with_bm25_like(catalog: &[Tool], query: &str) -> Vec<String> {
+fn discover_tools_with_bm25_like(catalog: &[Tool], query: &str, max_results: usize) -> Vec<String> {
     let terms: Vec<String> = query
         .split_whitespace()
         .map(|term| term.trim().to_lowercase())
@@ -328,7 +535,11 @@ fn discover_tools_with_bm25_like(catalog: &[Tool], query: &str) -> Vec<String> {
         }
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().take(5).map(|(_, name)| name).collect()
+    scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, name)| name)
+        .collect()
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -402,19 +613,117 @@ fn suggest_tool_names(catalog: &[Tool], requested: &str, limit: usize) -> Vec<St
         .collect()
 }
 
+fn is_synthetic_catalog_tool(name: &str) -> bool {
+    is_tool_search_tool(name)
+        || matches!(name, CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME)
+        || McpPool::is_mcp_tool(name)
+}
+
+pub(super) fn tool_catalog_consistency_issues(
+    catalog: &[Tool],
+    registry: &crate::tools::ToolRegistry,
+) -> Vec<String> {
+    let catalog_names = catalog
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let registry_api_tools = registry.to_api_tools();
+    let registry_model_visible_names = registry_api_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut issues = Vec::new();
+
+    for tool in catalog {
+        if is_synthetic_catalog_tool(&tool.name) {
+            continue;
+        }
+        if !registry.contains(&tool.name) {
+            issues.push(format!(
+                "catalog advertises '{}' but no registered handler exists",
+                tool.name
+            ));
+        }
+    }
+
+    for name in DEFAULT_ACTIVE_NATIVE_TOOLS {
+        if registry_model_visible_names.contains(name) && !catalog_names.contains(name) {
+            issues.push(format!(
+                "registered core tool '{name}' is missing from the model/search catalog"
+            ));
+        }
+    }
+
+    issues.sort();
+    issues
+}
+
 pub(super) fn missing_tool_error_message(tool_name: &str, catalog: &[Tool]) -> String {
-    let suggestions = suggest_tool_names(catalog, tool_name, 3);
-    if suggestions.is_empty() {
+    // Dogfood A5 (#4092): models mid-checklist sometimes emit each list entry
+    // as its own tool call named `item`/`todo`/... . Fuzzy suggestions are
+    // actively misleading there ("Did you mean: note, tts?"); name the actual
+    // fix instead.
+    if matches!(
+        tool_name,
+        "item" | "items" | "todo" | "todos" | "checklist" | "checklist_item" | "plan_item"
+    ) {
         return format!(
             "Tool '{tool_name}' is not available in the current tool catalog. \
-             Verify mode/feature flags, or use {TOOL_SEARCH_BM25_NAME} with a short query."
+             Checklist entries are not separate tool calls — write the whole list \
+             in one `work_update` call with a `todos` array of \
+             {{content, status}} objects."
+        );
+    }
+    let suggestions = suggest_tool_names(catalog, tool_name, 3);
+    let shell_hint = if is_shell_tool_name(tool_name) {
+        Some(shell_tool_allow_shell_hint())
+    } else {
+        None
+    };
+    if suggestions.is_empty() {
+        if let Some(shell_hint) = shell_hint {
+            return format!(
+                "Tool '{tool_name}' is not available in the current tool catalog. \
+                 {shell_hint}, or use {TOOL_SEARCH_NAME} with a short query."
+            );
+        }
+        return format!(
+            "Tool '{tool_name}' is not available in the current tool catalog. \
+             Verify mode/feature flags, or use {TOOL_SEARCH_NAME} with a short query."
+        );
+    }
+
+    let suggestion_text = format!("Did you mean: {}?", suggestions.join(", "));
+    if let Some(shell_hint) = shell_hint {
+        return format!(
+            "Tool '{tool_name}' is not available in the current tool catalog. \
+             {suggestion_text} {shell_hint}. \
+             You can also use {TOOL_SEARCH_NAME} to discover tools."
         );
     }
 
     format!(
         "Tool '{tool_name}' is not available in the current tool catalog. \
-         Did you mean: {}? You can also use {TOOL_SEARCH_BM25_NAME} to discover tools.",
-        suggestions.join(", ")
+         {suggestion_text} You can also use {TOOL_SEARCH_NAME} to discover tools."
+    )
+}
+
+fn shell_tool_allow_shell_hint() -> &'static str {
+    "Shell tools are absent because this session or profile disabled shell access, \
+     commonly via top-level `allow_shell = false` or Plan mode. \
+     Interactive Act mode exposes shell by default with approval gating unless disabled. \
+     Run `/config allow_shell true` for this session or add `--save` for future sessions; \
+     the next turn will expose shell again"
+}
+
+fn is_shell_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "task_shell_start"
+            | "task_shell_wait"
     )
 }
 
@@ -627,11 +936,34 @@ fn likely_field_corrections(
     } else if has_received("replacement") && has_expected("replace") {
         corrections.push("replacement -> replace".to_string());
     }
-    if tool_name == "checklist_update" && has_received("todos") {
+    if matches!(tool_name, "checklist_update" | "todo_update") && has_received("todos") {
         corrections.push(
-            "Use checklist_write to replace the full list, or retry checklist_update with id and status."
+            "Use work_update to replace the full list, or retry checklist_update/todo_update with id and status."
                 .to_string(),
         );
+    }
+    // RLM source fields are easy to misname (#2659). rlm_open takes exactly one
+    // of file_path / content / url / session_object; nudge common wrong names
+    // toward those.
+    if tool_name == "rlm_open" {
+        for wrong in [
+            "prompt",
+            "resident_file",
+            "text",
+            "body",
+            "path",
+            "file",
+            "source",
+        ] {
+            if has_received(wrong)
+                && !has_received("file_path")
+                && !has_received("content")
+                && !has_received("url")
+                && !has_received("session_object")
+            {
+                corrections.push(format!("{wrong} -> file_path (local file), content (inline text), url, or session_object"));
+            }
+        }
     }
     corrections
 }
@@ -643,10 +975,33 @@ pub(super) fn execute_tool_search(
     active_tools: &mut HashSet<String>,
 ) -> Result<ToolResult, ToolError> {
     let query = required_str(input, "query")?;
-    let discovered = if tool_name == TOOL_SEARCH_REGEX_NAME {
-        discover_tools_with_regex(catalog, query)?
+    let match_kind = match tool_name {
+        LEGACY_TOOL_SEARCH_REGEX_NAME => "regex",
+        LEGACY_TOOL_SEARCH_BM25_NAME => "bm25",
+        _ => optional_str(input, "match").unwrap_or("bm25"),
+    };
+    if !matches!(match_kind, "bm25" | "regex") {
+        return Err(ToolError::invalid_input(format!(
+            "Unsupported match algorithm '{match_kind}'. Expected one of: bm25, regex"
+        )));
+    }
+    let max_results = usize::try_from(optional_u64(
+        input,
+        "max_results",
+        TOOL_SEARCH_DEFAULT_MAX_RESULTS as u64,
+    ))
+    .unwrap_or(TOOL_SEARCH_DEFAULT_MAX_RESULTS)
+    .clamp(1, TOOL_SEARCH_MAX_RESULTS_LIMIT);
+    let discovered = if match_kind == "regex" {
+        discover_tools_with_regex(catalog, query, max_results)?
     } else {
-        discover_tools_with_bm25_like(catalog, query)
+        discover_tools_with_bm25_like(catalog, query, max_results)
+    };
+    let remaining_results = max_results.saturating_sub(discovered.len());
+    let unavailable = if match_kind == "regex" {
+        unavailable_core_action_tools_with_regex(catalog, query, remaining_results)?
+    } else {
+        unavailable_core_action_tools_with_bm25_like(catalog, query, remaining_results)
     };
 
     for name in &discovered {
@@ -657,10 +1012,21 @@ pub(super) fn execute_tool_search(
         .iter()
         .map(|name| json!({"type": "tool_reference", "tool_name": name}))
         .collect::<Vec<_>>();
+    let unavailable_references = unavailable
+        .iter()
+        .map(|fallback| {
+            json!({
+                "type": "unavailable_tool_reference",
+                "tool_name": fallback.name,
+                "reason": fallback.unavailable_reason,
+            })
+        })
+        .collect::<Vec<_>>();
 
     let payload = json!({
         "type": "tool_search_tool_search_result",
         "tool_references": references,
+        "unavailable_tool_references": unavailable_references.clone(),
     });
 
     Ok(ToolResult {
@@ -668,6 +1034,7 @@ pub(super) fn execute_tool_search(
         success: true,
         metadata: Some(json!({
             "tool_references": discovered,
+            "unavailable_tool_references": unavailable_references,
         })),
     })
 }
@@ -681,20 +1048,9 @@ pub(super) async fn execute_code_execution_tool(
     // Resolve the locally-installed Python interpreter we cached at
     // catalog-build time. If it's absent now (somehow registered but
     // disappeared between startup and this call — concurrent uninstall,
-    // PATH change, etc.) we fail fast with a clear message rather than
-    // dropping into `tokio::process::Command::new("python3")` and
-    // surfacing the cryptic "program not found" the contributor
-    // originally hit on Windows.
-    let interpreter = crate::dependencies::resolve_python_interpreter().ok_or_else(|| {
-        ToolError::execution_failed(format!(
-            "code_execution: no Python interpreter found on PATH (tried {:?}). \
-             Install Python 3 and ensure one of these is on PATH, then restart \
-             codewhale.",
-            crate::dependencies::PYTHON_CANDIDATES,
-        ))
-    })?;
-    let (program, args) = crate::dependencies::split_interpreter_spec(&interpreter);
-
+    // PATH change, etc.) the ExternalTool::tokio_command() will return
+    // None and we fail fast with a clear message.
+    //
     // Write the code to a temp file and execute it as a script rather
     // than passing it via `-c "<code>"`. Reasons:
     //   * `-c` has length limits (argv) on Windows.
@@ -711,12 +1067,12 @@ pub(super) async fn execute_code_execution_tool(
         .await
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
-    let mut cmd = tokio::process::Command::new(&program);
-    for arg in &args {
-        cmd.arg(arg);
-    }
-    cmd.arg(&script_path);
-    cmd.current_dir(workspace);
+    let mut cmd = crate::dependencies::Python::tokio_command().ok_or_else(|| {
+        ToolError::execution_failed(
+            "code_execution: Python interpreter became unavailable".to_string(),
+        )
+    })?;
+    cmd.arg(&script_path).current_dir(workspace);
 
     let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
         .await

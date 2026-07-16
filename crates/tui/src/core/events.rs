@@ -5,11 +5,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::core::coherence::CoherenceState;
+use crate::config::ApiProvider;
 use crate::error_taxonomy::ErrorEnvelope;
-use crate::models::{Message, SystemPrompt, Usage};
+use crate::models::{Message, SystemPrompt, Tool, Usage};
+use crate::tools::goal::GoalSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tools::subagent::SubAgentResult;
 use crate::tools::user_input::UserInputRequest;
@@ -20,6 +22,18 @@ pub enum TurnOutcomeStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+/// Provider/model route resolved for a model-backed turn.
+///
+/// Carried with `TurnStarted` so hosts can retain provenance until the matching
+/// `TurnComplete` without relying on mutable global selection state. Non-model
+/// turns such as composer `!` shell commands use no route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRoute {
+    pub provider: ApiProvider,
+    pub model: String,
+    pub auto_model: bool,
 }
 
 /// Events emitted by the engine to update the UI.
@@ -72,10 +86,6 @@ pub enum Event {
         input: Value,
     },
 
-    /// Tool execution progress (for long-running tools)
-    #[allow(dead_code)]
-    ToolCallProgress { id: String, output: String },
-
     /// Tool call completed
     ToolCallComplete {
         id: String,
@@ -85,14 +95,26 @@ pub enum Event {
 
     // === Turn Lifecycle ===
     /// A new turn has started (user sent a message)
-    TurnStarted { turn_id: String },
+    TurnStarted {
+        turn_id: String,
+        created_at: DateTime<Utc>,
+        route: Option<TurnRoute>,
+    },
 
     /// The turn is complete (no more tool calls)
     TurnComplete {
         usage: Usage,
         status: TurnOutcomeStatus,
         error: Option<String>,
+        /// Tool catalog sent with this turn's model request.
+        tool_catalog: Option<Vec<Tool>>,
+        /// API base URL used by this turn's client.
+        base_url: Option<String>,
     },
+
+    /// Runtime goal state changed inside the engine, usually from model-visible
+    /// `create_goal` or `update_goal` tool calls.
+    GoalUpdated { snapshot: GoalSnapshot },
 
     /// Context compaction started.
     CompactionStarted {
@@ -112,7 +134,36 @@ pub enum Event {
         /// Number of messages after compaction.
         #[allow(dead_code)]
         messages_after: Option<usize>,
+        /// Rendered text of the accumulated compaction summary prompt, if any.
+        /// Host layers (e.g. the /v1 runtime) persist this into the thread
+        /// record so the summary survives engine reloads — without it the
+        /// summary lives only in engine memory and is lost on LRU eviction
+        /// or restart (SyncSession re-extracts it from the record prompt).
+        summary_prompt: Option<String>,
     },
+
+    /// Context purge started.
+    PurgeStarted {
+        /// Status message for display.
+        message: String,
+    },
+
+    /// Context purge completed.
+    PurgeCompleted {
+        /// Number of messages before purge.
+        messages_before: usize,
+        /// Number of messages after purge.
+        messages_after: usize,
+        /// How many messages were removed.
+        removed_count: usize,
+        /// How many replace operations were applied.
+        replaced_count: usize,
+        /// Summary message for display.
+        message: String,
+    },
+
+    /// Context purge failed.
+    PurgeFailed { message: String },
 
     /// Context compaction failed.
     CompactionFailed {
@@ -121,70 +172,22 @@ pub enum Event {
         message: String,
     },
 
-    /// Checkpoint-restart cycle boundary advanced (issue #124). The previous
-    /// cycle has already been archived to disk; the engine has swapped its
-    /// in-memory message buffer for the seed messages of cycle `to`.
-    /// Carries the full briefing record so the UI can populate
-    /// `app.cycle_briefings` for `/cycle <n>`.
-    CycleAdvanced {
-        from: u32,
-        to: u32,
-        briefing: crate::cycle_manager::CycleBriefing,
-    },
-
-    /// Capacity decision telemetry.
-    #[allow(dead_code)]
-    CapacityDecision {
-        session_id: String,
-        turn_id: String,
-        h_hat: f64,
-        c_hat: f64,
-        slack: f64,
-        min_slack: f64,
-        violation_ratio: f64,
-        p_fail: f64,
-        risk_band: String,
-        action: String,
-        cooldown_blocked: bool,
-        reason: String,
-    },
-
-    /// Capacity intervention telemetry.
-    #[allow(dead_code)]
-    CapacityIntervention {
-        session_id: String,
-        turn_id: String,
-        action: String,
-        before_prompt_tokens: usize,
-        after_prompt_tokens: usize,
-        compaction_size_reduction: usize,
-        replay_outcome: Option<String>,
-        replan_performed: bool,
-    },
-
-    /// Capacity memory persistence failure telemetry.
-    #[allow(dead_code)]
-    CapacityMemoryPersistFailed {
-        session_id: String,
-        turn_id: String,
-        action: String,
-        error: String,
-    },
-
-    /// Plain-language session coherence state.
-    CoherenceState {
-        state: CoherenceState,
-        label: String,
-        description: String,
-        reason: String,
-    },
-
     // === Sub-Agent Events ===
     /// A sub-agent has been spawned
-    AgentSpawned { id: String, prompt: String },
+    AgentSpawned {
+        id: String,
+        prompt: String,
+        parent_run_id: Option<String>,
+        spawn_depth: u32,
+    },
 
     /// Sub-agent progress update
-    AgentProgress { id: String, status: String },
+    AgentProgress {
+        id: String,
+        status: String,
+        parent_run_id: Option<String>,
+        spawn_depth: u32,
+    },
 
     /// Sub-agent completed
     AgentComplete { id: String, result: String },
@@ -198,6 +201,16 @@ pub enum Event {
     SubAgentMailbox {
         seq: u64,
         message: crate::tools::subagent::MailboxMessage,
+    },
+
+    /// Live workflow UI event (#4122). Mirrors a typed `WorkflowUiEvent` JSON
+    /// object so the TUI can advance the WorkflowPanel and the compact history
+    /// card while a run is still in flight (not only on tool complete).
+    WorkflowUi {
+        run_id: String,
+        /// Flattened event JSON: `{"type":"task_started", "at_ms":…, …}`.
+        /// Callers inject `run_id` on the object when available.
+        event: Value,
     },
 
     // === System Events ===
@@ -226,11 +239,21 @@ pub enum Event {
         id: String,
         tool_name: String,
         description: String,
+        /// Tool parameters for approval display. Carried on the event so the
+        /// TUI does not need to reconstruct them from `pending_tool_uses`.
+        input: Value,
         /// Exact-argument fingerprint, used to scope *denials* (#1617).
         approval_key: String,
         /// Lossy / arity-aware fingerprint, used to scope *approvals* so an
         /// "approve for session" covers later flag variants (v0.8.37).
         approval_grouping_key: String,
+        /// The model's explanation of intent before invoking write tools (#2381).
+        /// Displayed in the approval view so users understand *why* the change
+        /// is being made before reviewing *what* will change.
+        intent_summary: Option<String>,
+        /// When true, the UI must show the prompt instead of consuming
+        /// session/auto approval shortcuts.
+        approval_force_prompt: bool,
     },
 
     /// Request user input for a tool call
@@ -265,6 +288,14 @@ pub enum Event {
         blocked_write: bool,
     },
 
+    /// Observable LSP repair-loop update for the Turn Inspector (#4107).
+    /// Carries only summary counts/state — never raw prompt internals.
+    LspRepairUpdate {
+        diagnostics_found: usize,
+        files: usize,
+        injected: bool,
+    },
+
     // === Prefix-Cache Stability Events ===
     /// The prefix (system prompt + tool specs) changed between turns,
     /// which invalidates DeepSeek's KV prefix cache. Carries diagnostics
@@ -281,6 +312,10 @@ pub enum Event {
         /// True when the prefix actually changed (cache invalidated).
         /// False for routine stable-check heartbeats.
         changed: bool,
+        /// Current pinned prefix combined hash (SHA-256, 64 hex chars).
+        /// Carried so `/cache stats` can surface it without reaching
+        /// into the engine's PrefixStabilityManager.
+        pinned_combined_hash: String,
     },
 }
 

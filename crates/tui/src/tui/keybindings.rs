@@ -18,8 +18,10 @@
 //! Entries are grouped by `KeybindingSection`. The `chord` field is a
 //! human-readable string formatted exactly the way it should appear in help —
 //! we avoid storing `KeyBinding` values directly because many shortcuts are
-//! pairs (`↑/↓`) or families (`Alt+1/2/3`) that don't map cleanly to a single
+//! pairs (`↑/↓`) or families (`1-8`) that don't map cleanly to a single
 //! chord.
+
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeybindingSection {
@@ -33,7 +35,7 @@ pub enum KeybindingSection {
 }
 
 impl KeybindingSection {
-    pub fn label(self, locale: crate::localization::Locale) -> &'static str {
+    pub fn label(self, locale: crate::localization::Locale) -> Cow<'static, str> {
         use crate::localization::{MessageId, tr};
         let id = match self {
             Self::Navigation => MessageId::HelpSectionNavigation,
@@ -84,11 +86,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "Ctrl+↑ / Ctrl+↓",
-        description_id: crate::localization::MessageId::KbNavigateHistory,
-        section: KeybindingSection::Navigation,
-    },
-    KeybindingEntry {
         chord: "Alt+↑ / Alt+↓",
         description_id: crate::localization::MessageId::KbScrollTranscriptAlt,
         section: KeybindingSection::Navigation,
@@ -109,12 +106,12 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "g / G",
+        chord: "Alt+G / Alt+Shift+G",
         description_id: crate::localization::MessageId::KbJumpTopBottomEmpty,
         section: KeybindingSection::Navigation,
     },
     KeybindingEntry {
-        chord: "[ / ]",
+        chord: "Alt+[ / Alt+]",
         description_id: crate::localization::MessageId::KbJumpToolBlocks,
         section: KeybindingSection::Navigation,
     },
@@ -191,28 +188,31 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
+        chord: "Ctrl+X (Activity sidebar)",
+        description_id: crate::localization::MessageId::KbCancelBackgroundShellJobs,
+        section: KeybindingSection::Submission,
+    },
+    KeybindingEntry {
         chord: "Ctrl+P",
         description_id: crate::localization::MessageId::KbFuzzyFilePicker,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Alt+C",
+        // `/context` is the guaranteed path; Alt+C is an unadvertised
+        // handler until proven in real terminals (TUI-DOG-003).
+        chord: "/context",
         description_id: crate::localization::MessageId::KbCompactInspector,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "l",
+        chord: "Alt+L",
         description_id: crate::localization::MessageId::KbLastMessagePager,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "v",
-        description_id: crate::localization::MessageId::KbSelectedDetails,
-        section: KeybindingSection::Submission,
-    },
-    KeybindingEntry {
+        // Bare `v` always types `v`; details is Alt+V only (⌥V on macOS).
         chord: "Alt+V",
-        description_id: crate::localization::MessageId::KbToolDetailsPager,
+        description_id: crate::localization::MessageId::KbSelectedDetails,
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
@@ -221,9 +221,14 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Ctrl+T",
+        chord: "Ctrl+Shift+T",
         description_id: crate::localization::MessageId::KbLiveTranscript,
         section: KeybindingSection::Submission,
+    },
+    KeybindingEntry {
+        chord: "Ctrl+T",
+        description_id: crate::localization::MessageId::KbCycleThinking,
+        section: KeybindingSection::Modes,
     },
     KeybindingEntry {
         chord: "Esc Esc",
@@ -232,12 +237,17 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Modes ---
     KeybindingEntry {
-        chord: "Tab / Shift+Tab",
+        chord: "Tab",
         description_id: crate::localization::MessageId::KbCompleteCycleModes,
         section: KeybindingSection::Modes,
     },
     KeybindingEntry {
-        chord: "Alt+1 / Alt+2 / Alt+3",
+        chord: "Shift+Tab",
+        description_id: crate::localization::MessageId::KbCyclePermissions,
+        section: KeybindingSection::Modes,
+    },
+    KeybindingEntry {
+        chord: "Alt+1-8",
         description_id: crate::localization::MessageId::KbJumpPlanAgentYolo,
         section: KeybindingSection::Modes,
     },
@@ -249,11 +259,6 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     KeybindingEntry {
         chord: "Alt+! / Alt+@ / Alt+# / Alt+$ / Alt+0 / Ctrl+Alt+0",
         description_id: crate::localization::MessageId::KbFocusSidebar,
-        section: KeybindingSection::Modes,
-    },
-    KeybindingEntry {
-        chord: "Ctrl+X",
-        description_id: crate::localization::MessageId::KbTogglePlanAgent,
         section: KeybindingSection::Modes,
     },
     // --- Sessions ---
@@ -285,18 +290,10 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Help ---
     KeybindingEntry {
-        chord: "?",
+        // F1 is primary (with /help); Ctrl+/ is the secondary fallback.
+        // Alt+? stays an unadvertised handler (TUI-DOG-003).
+        chord: "F1 / Ctrl+/",
         description_id: crate::localization::MessageId::KbHelpOverlay,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "F1",
-        description_id: crate::localization::MessageId::KbToggleHelp,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "Ctrl+/",
-        description_id: crate::localization::MessageId::KbToggleHelp,
         section: KeybindingSection::Help,
     },
 ];
@@ -328,31 +325,124 @@ mod tests {
     }
 
     #[test]
-    fn help_section_documents_question_mark() {
-        // The whole point of #93 is that `?` opens this overlay; if the entry
-        // ever disappears the user-facing discoverability promise breaks.
+    fn help_advertises_f1_and_ctrl_slash_never_alt_question() {
+        // TUI-DOG-003: Alt+? is not advertised anywhere; F1 (with /help) is
+        // primary and Ctrl+/ is the secondary fallback.
+        assert!(
+            KEYBINDINGS.iter().any(|entry| {
+                entry.section == KeybindingSection::Help
+                    && entry.chord.contains("F1")
+                    && entry.chord.contains("Ctrl+/")
+            }),
+            "help must document F1 with the Ctrl+/ fallback"
+        );
         assert!(
             KEYBINDINGS
                 .iter()
-                .any(|entry| entry.chord.contains('?') && entry.section == KeybindingSection::Help),
-            "`?` must remain documented as the help-toggle chord"
+                .all(|entry| !entry.chord.contains("Alt+?")),
+            "Alt+? must not be advertised in the help catalog"
         );
     }
 
     #[test]
-    fn ctrl_o_help_copy_matches_activity_detail_behavior() {
+    fn transcript_navigation_catalog_does_not_advertise_bare_typing_keys() {
+        for stale in [
+            "g / G",
+            "[ / ]",
+            "l",
+            "?",
+            "Ctrl+↑ / Ctrl+↓",
+            "v",
+            "v / Alt+V",
+        ] {
+            assert!(
+                KEYBINDINGS.iter().all(|entry| entry.chord != stale),
+                "stale handler-free chord remains documented: {stale}"
+            );
+        }
+        for wired in ["Alt+G / Alt+Shift+G", "Alt+[ / Alt+]", "Alt+L", "Alt+V"] {
+            assert!(
+                KEYBINDINGS.iter().any(|entry| entry.chord == wired),
+                "wired transcript shortcut missing from help: {wired}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_binding_source_matches_help_catalog_chords() {
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        assert_eq!(binding(ShellBindingId::ToolDetails).catalog_chord, "Alt+V");
+        assert_eq!(
+            binding(ShellBindingId::ContextInspector).catalog_chord,
+            "/context"
+        );
+        assert_eq!(binding(ShellBindingId::Help).catalog_chord, "F1 / Ctrl+/");
+        for id in [
+            ShellBindingId::ToolDetails,
+            ShellBindingId::ContextInspector,
+            ShellBindingId::Help,
+        ] {
+            let chord = binding(id).catalog_chord;
+            assert!(
+                KEYBINDINGS
+                    .iter()
+                    .any(|entry| entry.chord == chord || entry.chord.contains(chord)),
+                "shell binding {id:?} chord missing from help catalog: {chord}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_o_help_copy_matches_turn_inspector_behavior() {
         let ctrl_o = KEYBINDINGS
             .iter()
             .find(|entry| entry.chord == "Ctrl+O")
             .expect("Ctrl+O keybinding should be documented");
 
+        // Ctrl+O now opens the whole-turn Turn Inspector (#4104), not the
+        // single-cell Activity Detail. The message id is intentionally kept
+        // (`KbThinkingPager`) to avoid an existing-symbol rename; only the
+        // copy changes.
         assert_eq!(
             ctrl_o.description_id,
             crate::localization::MessageId::KbThinkingPager
         );
         assert_eq!(
             crate::localization::tr(crate::localization::Locale::En, ctrl_o.description_id,),
-            "Open Activity Detail"
+            "Open Turn Inspector"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_activity_sidebar_cancel_all_is_documented() {
+        let ctrl_x_activity = KEYBINDINGS
+            .iter()
+            .find(|entry| entry.chord == "Ctrl+X (Activity sidebar)")
+            .expect("Ctrl+X Activity sidebar keybinding should be documented");
+
+        assert_eq!(
+            ctrl_x_activity.description_id,
+            crate::localization::MessageId::KbCancelBackgroundShellJobs
+        );
+    }
+
+    #[test]
+    fn tool_details_documents_alt_v_only_never_bare_v() {
+        let selected_details = KEYBINDINGS
+            .iter()
+            .filter(|entry| {
+                entry.description_id == crate::localization::MessageId::KbSelectedDetails
+            })
+            .map(|entry| entry.chord)
+            .collect::<Vec<_>>();
+
+        // TUI-DOG-002: bare `v` always types `v`; details is Alt+V only.
+        assert_eq!(selected_details, vec!["Alt+V"]);
+        assert!(
+            KEYBINDINGS
+                .iter()
+                .all(|entry| entry.chord != "v" && !entry.chord.starts_with("v /")),
+            "bare `v` must not be advertised — composer typing owns it"
         );
     }
 

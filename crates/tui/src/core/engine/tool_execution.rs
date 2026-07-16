@@ -4,7 +4,13 @@
 //! parallel-tool fanout out of `engine.rs`; the turn loop still owns planning,
 //! approval, and how tool results are written back into session state.
 
-use std::{fs::OpenOptions, io::Write, sync::Arc, time::Duration};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use super::*;
 
@@ -123,16 +129,35 @@ pub(super) fn emit_tool_audit(event: serde_json::Value) {
     let Some(path) = std::env::var_os("DEEPSEEK_TOOL_AUDIT_LOG") else {
         return;
     };
+    emit_tool_audit_to_path(&PathBuf::from(path), event);
+}
+
+fn emit_tool_audit_to_path(path: &Path, event: serde_json::Value) {
     let line = match serde_json::to_string(&event) {
         Ok(line) => line,
-        Err(_) => return,
+        Err(e) => {
+            tracing::error!("Failed to serialize tool audit event: {e}");
+            return;
+        }
     };
-    let path = PathBuf::from(path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::error!(
+            "Failed to create audit log directory {}: {e}",
+            parent.display()
+        );
+        return;
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{line}") {
+                tracing::error!("Failed to write to audit log {}: {e}", path.display());
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to open audit log {}: {e}", path.display());
+        }
     }
 }
 
@@ -147,7 +172,7 @@ impl Engine {
             .call_tool(name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
         Ok(ToolResult::success(content))
     }
 
@@ -169,8 +194,10 @@ impl Engine {
             ));
         };
 
+        let result_count = calls.len();
         let mut tasks = FuturesUnordered::new();
-        for (tool_name, tool_input) in calls {
+        let shell_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
+        for (index, (tool_name, tool_input)) in calls.into_iter().enumerate() {
             if tool_name == MULTI_TOOL_PARALLEL_NAME {
                 return Err(ToolError::invalid_input(
                     "multi_tool_use.parallel cannot call itself",
@@ -190,17 +217,17 @@ impl Engine {
                         "tool '{tool_name}' is not registered"
                     )));
                 };
-                if !spec.is_read_only() {
+                if !spec.is_read_only_for(&tool_input) {
                     return Err(ToolError::invalid_input(format!(
                         "Tool '{tool_name}' is not read-only and cannot run in parallel"
                     )));
                 }
-                if spec.approval_requirement() != ApprovalRequirement::Auto {
+                if spec.approval_requirement_for(&tool_input) != ApprovalRequirement::Auto {
                     return Err(ToolError::invalid_input(format!(
                         "Tool '{tool_name}' requires approval and cannot run in parallel"
                     )));
                 }
-                if !spec.supports_parallel() {
+                if !spec.supports_parallel_for(&tool_input) {
                     return Err(ToolError::invalid_input(format!(
                         "Tool '{tool_name}' does not support parallel execution"
                     )));
@@ -211,7 +238,14 @@ impl Engine {
             let lock = tool_exec_lock.clone();
             let tx_event = self.tx_event.clone();
             let mcp_pool = mcp_pool.clone();
+            let shell_permits = shell_permits.clone();
+            let workspace = self.session.workspace.clone();
             tasks.push(async move {
+                let _shell_permit = if tool_name == "exec_shell" {
+                    shell_permits.acquire_owned().await.ok()
+                } else {
+                    None
+                };
                 let result = Engine::execute_tool_with_lock(
                     lock,
                     true,
@@ -219,41 +253,45 @@ impl Engine {
                     tx_event,
                     tool_name.clone(),
                     tool_input.clone(),
+                    workspace,
                     Some(registry_ref),
                     mcp_pool,
                     None,
                 )
                 .await;
-                (tool_name, result)
+                (index, tool_name, result)
             });
         }
 
-        let mut results = Vec::new();
-        while let Some((tool_name, result)) = tasks.next().await {
-            match result {
+        let mut results: Vec<Option<ParallelToolResultEntry>> = Vec::with_capacity(result_count);
+        results.resize_with(result_count, || None);
+        while let Some((index, tool_name, result)) = tasks.next().await {
+            let entry = match result {
                 Ok(output) => {
                     let mut error = None;
                     if !output.success {
                         error = Some(output.content.clone());
                     }
-                    results.push(ParallelToolResultEntry {
+                    ParallelToolResultEntry {
                         tool_name,
                         success: output.success,
                         content: output.content,
                         error,
-                    });
+                    }
                 }
                 Err(err) => {
                     let message = format!("{err}");
-                    results.push(ParallelToolResultEntry {
+                    ParallelToolResultEntry {
                         tool_name,
                         success: false,
                         content: format!("Error: {message}"),
                         error: Some(message),
-                    });
+                    }
                 }
-            }
+            };
+            results[index] = Some(entry);
         }
+        let results = results.into_iter().flatten().collect();
 
         ToolResult::json(&ParallelToolResult { results })
             .map_err(|e| ToolError::execution_failed(e.to_string()))
@@ -267,6 +305,7 @@ impl Engine {
         tx_event: mpsc::Sender<Event>,
         tool_name: String,
         tool_input: serde_json::Value,
+        workspace: PathBuf,
         registry: Option<&crate::tools::ToolRegistry>,
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
@@ -274,6 +313,11 @@ impl Engine {
         let started_at = std::time::Instant::now();
         let dispatch = if McpPool::is_mcp_tool(&tool_name) {
             "mcp"
+        } else if matches!(
+            tool_name.as_str(),
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+        ) {
+            "interpreter"
         } else if registry.is_some() {
             "registry"
         } else {
@@ -313,6 +357,10 @@ impl Engine {
                     "tool '{tool_name}' is not registered"
                 )))
             }
+        } else if tool_name == CODE_EXECUTION_TOOL_NAME {
+            execute_code_execution_tool(&tool_input, &workspace).await
+        } else if tool_name == JS_EXECUTION_TOOL_NAME {
+            execute_js_execution_tool(&tool_input, &workspace).await
         } else if let Some(registry) = registry {
             registry
                 .execute_full_with_context(&tool_name, tool_input, context_override.as_ref())
@@ -365,16 +413,7 @@ impl Engine {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::{sync::Mutex, time::Duration};
-
-    /// Tests in this module mutate `DEEPSEEK_TOOL_AUDIT_LOG` which is
-    /// process-global; serialise through this guard so the parallel
-    /// runner doesn't observe interleaved env mutations.
-    static AUDIT_TEST_GUARD: Mutex<()> = Mutex::new(());
-
-    fn audit_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        AUDIT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use std::time::Duration;
 
     #[tokio::test]
     async fn terminal_guard_queues_resume_when_event_channel_is_full() {
@@ -423,33 +462,43 @@ mod tests {
     }
 
     #[test]
-    fn emit_tool_audit_writes_jsonl_line_when_env_var_set() {
-        let _g = audit_test_guard();
+    fn emit_tool_audit_to_path_writes_jsonl_lines() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");
-        // SAFETY: serialised by the guard above.
-        unsafe {
-            std::env::set_var("DEEPSEEK_TOOL_AUDIT_LOG", &path);
-        }
+        let marker = path.display().to_string();
 
-        emit_tool_audit(json!({
-            "event": "tool.spillover",
-            "tool_id": "call-abc",
-            "tool_name": "exec_shell",
-            "path": "/tmp/foo.txt",
-        }));
-        emit_tool_audit(json!({
-            "event": "tool.result",
-            "tool_id": "call-xyz",
-            "success": true,
-        }));
+        emit_tool_audit_to_path(
+            &path,
+            json!({
+                "event": "tool.spillover",
+                "test_marker": marker,
+                "tool_id": "call-abc",
+                "tool_name": "exec_shell",
+                "path": "/tmp/foo.txt",
+            }),
+        );
+        emit_tool_audit_to_path(
+            &path,
+            json!({
+                "event": "tool.result",
+                "test_marker": marker,
+                "tool_id": "call-xyz",
+                "success": true,
+            }),
+        );
 
         let body = std::fs::read_to_string(&path).expect("audit log written");
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 2, "two emits → two lines");
+        let entries: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit line is JSON"))
+            .filter(|entry: &serde_json::Value| {
+                entry.get("test_marker").and_then(|v| v.as_str()) == Some(marker.as_str())
+            })
+            .collect();
+        assert_eq!(entries.len(), 2, "two marked emits -> two lines");
 
         // Each line round-trips as JSON, has the expected event key.
-        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first line is JSON");
+        let first = &entries[0];
         assert_eq!(
             first.get("event").and_then(|v| v.as_str()),
             Some("tool.spillover")
@@ -459,51 +508,20 @@ mod tests {
             Some("call-abc")
         );
 
-        let second: serde_json::Value =
-            serde_json::from_str(lines[1]).expect("second line is JSON");
+        let second = &entries[1];
         assert_eq!(
             second.get("event").and_then(|v| v.as_str()),
             Some("tool.result")
         );
-
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_TOOL_AUDIT_LOG");
-        }
-    }
-
-    #[test]
-    fn emit_tool_audit_is_noop_when_env_var_unset() {
-        let _g = audit_test_guard();
-        // SAFETY: serialised by the guard above.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_TOOL_AUDIT_LOG");
-        }
-        // Should not panic and should not create any file. We can't
-        // assert "no file written" without knowing where one might be
-        // written, but the contract is "do nothing", which we verify
-        // by ensuring the call returns without error.
-        emit_tool_audit(json!({"event": "noop", "x": 1}));
-        // Successful return is the assertion.
     }
 
     #[test]
     fn emit_tool_audit_creates_parent_directory() {
-        let _g = audit_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         // Path with a parent that doesn't exist yet — the writer
         // should create it.
         let nested = tmp.path().join("nested").join("dir").join("audit.log");
-        // SAFETY: serialised by the guard above.
-        unsafe {
-            std::env::set_var("DEEPSEEK_TOOL_AUDIT_LOG", &nested);
-        }
-        emit_tool_audit(json!({"event": "test"}));
+        emit_tool_audit_to_path(&nested, json!({"event": "test"}));
         assert!(nested.exists(), "writer should mkdir -p the parent chain");
-
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_TOOL_AUDIT_LOG");
-        }
     }
 }

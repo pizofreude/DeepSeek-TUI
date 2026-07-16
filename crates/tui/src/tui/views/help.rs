@@ -2,7 +2,7 @@
 //!
 //! Renders two stacked sections — *Slash commands* and *Keybindings* — with
 //! a live substring filter applied as the user types in the search box. The
-//! command list is sourced from [`crate::commands::COMMANDS`] and the
+//! command list is sourced from [`crate::commands::command_infos()`] and the
 //! keybinding list from [`crate::tui::keybindings::KEYBINDINGS`] so neither
 //! can drift from the wired-up handlers.
 //!
@@ -12,13 +12,16 @@
 //! ten rows, `Home`/`End` jump to ends, and `Esc` closes. Pressing `?` again
 //! at the call-site (`tui::ui`) also toggles the overlay closed.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::borrow::Cow;
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -26,7 +29,10 @@ use crate::commands;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::keybindings::KEYBINDINGS;
-use crate::tui::views::{ModalKind, ModalView, ViewAction};
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, render_modal_footer, render_panel_scroll_rail,
+    render_underwater_surface,
+};
 
 /// Two top-level sections rendered in the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +42,7 @@ enum HelpSection {
 }
 
 impl HelpSection {
-    fn label(self, locale: Locale) -> &'static str {
+    fn label(self, locale: Locale) -> Cow<'static, str> {
         match self {
             Self::Command => tr(locale, MessageId::HelpSlashCommands),
             Self::Keybinding => tr(locale, MessageId::HelpKeybindings),
@@ -81,6 +87,7 @@ pub struct HelpView {
     filtered: Vec<usize>,
     query: String,
     selected: usize,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
 }
 
 impl Default for HelpView {
@@ -102,12 +109,13 @@ impl HelpView {
             filtered: Vec::new(),
             query: String::new(),
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
         };
         view.refilter();
         view
     }
 
-    fn tr(&self, id: MessageId) -> &'static str {
+    fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.locale, id)
     }
 
@@ -202,7 +210,7 @@ impl HelpView {
 fn build_entries(locale: Locale) -> Vec<HelpEntry> {
     let mut entries = Vec::new();
 
-    for command in commands::COMMANDS {
+    for command in commands::command_infos() {
         let label = format!("/{}", command.name);
         let localized = command.description_for(locale);
         let description = if command.aliases.is_empty() {
@@ -237,7 +245,9 @@ fn build_entries(locale: Locale) -> Vec<HelpEntry> {
     }
 
     for binding in KEYBINDINGS {
-        let label = binding.chord.to_string();
+        // macOS renders Alt chords with the Option glyph (`⌥V`), never
+        // `Alt`/`Cmd` (TUI-DOG-002 acceptance).
+        let label = crate::tui::shell_key_routing::display_chord(binding.chord).into_owned();
         let description = format!(
             "[{}] {}",
             binding.section.label(locale),
@@ -258,14 +268,6 @@ fn build_entries(locale: Locale) -> Vec<HelpEntry> {
     }
 
     entries
-}
-
-fn modal_block() -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
-        .padding(Padding::uniform(1))
 }
 
 fn truncate_to_width(text: &str, max_width: usize) -> String {
@@ -295,6 +297,25 @@ impl ModalView for HelpView {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        // Scroll clamps at the ends (keyboard Up/Down wrap); wheel-wrapping
+        // reads as disorienting.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.move_selection(-1),
+            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(slot) = self.row_hitboxes.borrow().iter().find_map(|(rect, slot)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*slot)
+                }) {
+                    self.selected = slot;
+                }
+            }
+            _ => {}
+        }
+        ViewAction::None
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
@@ -364,16 +385,31 @@ impl ModalView for HelpView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_width = 90.min(area.width.saturating_sub(4));
-        let popup_height = 28.min(area.height.saturating_sub(4));
-        let popup_area = Rect {
-            x: area.width.saturating_sub(popup_width) / 2,
-            y: area.height.saturating_sub(popup_height) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        self.row_hitboxes.borrow_mut().clear();
+        let inner = render_underwater_surface(
+            area,
+            buf,
+            format!(
+                "{} — {}",
+                self.tr(MessageId::HelpTitle),
+                self.tr(MessageId::HelpSubtitle)
+            ),
+        );
 
-        Clear.render(popup_area, buf);
+        // The action footer wraps inside the modal body (#3732) rather than the
+        // single-line border title that silently clipped hints at narrow
+        // widths; the list renders into the content area above it. Empty hint
+        // keys keep the existing localized footer phrases as plain labels.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("", self.tr(MessageId::HelpFooterTypeFilter)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterMove)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterJump)),
+                ActionHint::new("", self.tr(MessageId::HelpFooterClose)),
+            ],
+        );
 
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -385,7 +421,7 @@ impl ModalView for HelpView {
         lines.push(Line::from(Span::styled(
             query_label,
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         )));
 
@@ -402,6 +438,20 @@ impl ModalView for HelpView {
         )));
         lines.push(Line::from(""));
 
+        let rows = self.render_rows();
+        let visible_rows = content.height.saturating_sub(lines.len() as u16) as usize;
+        let row_start = Self::visible_row_start(&rows, self.selected, visible_rows.max(1));
+        // Reserve the rail before calculating column widths. Otherwise the
+        // description column writes beneath the rail on compact terminals.
+        let content = render_panel_scroll_rail(
+            content,
+            buf,
+            rows.len(),
+            row_start,
+            visible_rows.max(1),
+            true,
+        );
+
         if self.filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 self.tr(MessageId::HelpNoMatches),
@@ -413,22 +463,17 @@ impl ModalView for HelpView {
             // The chord/label column takes up to 28 cols on wide screens;
             // descriptions fill the remainder. Borders and padding eat 4
             // cells from each side (border 1 + padding 1) × 2.
-            let inner_width = popup_width.saturating_sub(4) as usize;
+            let inner_width = content.width as usize;
             let label_width = 28.min(inner_width.saturating_sub(8));
             let desc_capacity = inner_width.saturating_sub(label_width + 4);
 
-            // The block uses a one-cell border plus one-cell padding, so the
-            // real paragraph body is four rows shorter than the outer popup.
-            // Budget against that body height so selected rows are not clipped
-            // by the bottom border/padding.
+            // `content` is the body area above the wrapping footer (the block's
+            // border, padding, and footer rows already removed), so budgeting
+            // against its height keeps selected rows clear of the footer.
             let header_lines = lines.len();
-            let visible_budget = (popup_height as usize)
-                .saturating_sub(4)
+            let visible_budget = (content.height as usize)
                 .saturating_sub(header_lines)
                 .max(1);
-
-            let rows = self.render_rows();
-            let row_start = Self::visible_row_start(&rows, self.selected, visible_budget);
 
             for row in rows.iter().skip(row_start).take(visible_budget) {
                 match *row {
@@ -441,17 +486,21 @@ impl ModalView for HelpView {
                         lines.push(Line::from(Span::styled(
                             format!("  {} ({})", section.label(self.locale), count),
                             Style::default()
-                                .fg(palette::DEEPSEEK_BLUE)
+                                .fg(palette::WHALE_ACCENT_PRIMARY)
                                 .add_modifier(Modifier::BOLD),
                         )));
                     }
                     HelpRenderRow::Entry { slot, entry_idx } => {
+                        let row_y = content.y.saturating_add(lines.len() as u16);
+                        self.row_hitboxes
+                            .borrow_mut()
+                            .push((Rect::new(content.x, row_y, content.width, 1), slot));
                         let entry = &self.entries[entry_idx];
                         let is_selected = slot == self.selected;
                         let style = if is_selected {
                             Style::default()
                                 .fg(palette::SELECTION_TEXT)
-                                .bg(palette::DEEPSEEK_BLUE)
+                                .bg(palette::SELECTION_BG)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
@@ -466,33 +515,7 @@ impl ModalView for HelpView {
             }
         }
 
-        let block = modal_block()
-            .title(Line::from(vec![Span::styled(
-                format!(" {} ", self.tr(MessageId::HelpTitle)),
-                Style::default()
-                    .fg(palette::DEEPSEEK_BLUE)
-                    .add_modifier(Modifier::BOLD),
-            )]))
-            .title_bottom(Line::from(vec![
-                Span::styled(
-                    self.tr(MessageId::HelpFooterTypeFilter),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterMove),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterJump),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    self.tr(MessageId::HelpFooterClose),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-            ]));
-
-        Paragraph::new(lines).block(block).render(popup_area, buf);
+        Paragraph::new(lines).render(content, buf);
     }
 }
 
@@ -515,7 +538,7 @@ mod tests {
     fn empty_filter_lists_all_entries() {
         let view = HelpView::new();
         // Total = registered slash commands + catalogued keybindings.
-        let expected = commands::COMMANDS.len() + KEYBINDINGS.len();
+        let expected = commands::command_infos().len() + KEYBINDINGS.len();
         assert_eq!(view.filtered.len(), expected);
         assert_eq!(view.entries.len(), expected);
     }
@@ -523,24 +546,24 @@ mod tests {
     #[test]
     fn substring_filter_narrows_to_command() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "mode yolo");
+        type_filter(&mut view, "mode [act");
         assert!(!view.filtered.is_empty());
         // Every filtered entry should genuinely contain the query in its
         // searchable haystack — no false positives slipped past.
         for idx in &view.filtered {
             assert!(
-                view.entries[*idx].haystack.contains("yolo"),
-                "entry {:?} leaked through `mode yolo` filter",
+                view.entries[*idx].haystack.contains("mode [act"),
+                "entry {:?} leaked through `mode [act` filter",
                 view.entries[*idx]
             );
         }
         // The unified `/mode` command must surface when filtering for a
-        // concrete mode value.
+        // concrete mode value from the visible vocabulary.
         assert!(
             view.filtered
                 .iter()
                 .any(|idx| view.entries[*idx].label == "/mode"),
-            "/mode should match the `mode yolo` filter"
+            "/mode should match the `mode [act` filter"
         );
     }
 
@@ -586,7 +609,9 @@ mod tests {
     #[test]
     fn backspace_widens_match_set() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "yolox");
+        // Near-miss against the still-visible mode vocabulary so the last
+        // character removes a unique miss and broadens the match set.
+        type_filter(&mut view, "modez");
         let narrow = view.filtered.len();
         view.handle_key(key(KeyCode::Backspace));
         let wider = view.filtered.len();
@@ -599,7 +624,7 @@ mod tests {
     #[test]
     fn ctrl_h_widens_match_set() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "yolox");
+        type_filter(&mut view, "modez");
         let narrow = view.filtered.len();
         view.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
         let wider = view.filtered.len();
@@ -653,6 +678,24 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_selects_visible_help_row() {
+        let mut view = HelpView::new();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let (rect, slot) = view.row_hitboxes.borrow()[1];
+
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(view.selected, slot);
+    }
+
+    #[test]
     fn visible_window_keeps_selected_entry_visible_after_scroll() {
         let mut view = HelpView::new();
         let selected = view
@@ -699,7 +742,7 @@ mod tests {
                 let cell = &buf[(x, y)];
                 row.push_str(cell.symbol());
                 row_has_highlight |=
-                    cell.bg == palette::DEEPSEEK_BLUE && cell.fg == palette::SELECTION_TEXT;
+                    cell.bg == palette::SELECTION_BG && cell.fg == palette::SELECTION_TEXT;
             }
             if row_has_highlight && row.contains(&selected_label) {
                 highlighted_label = true;
@@ -714,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_help_row_uses_stronger_highlight() {
+    fn selected_help_row_uses_selection_highlight() {
         let view = HelpView::new();
         let area = Rect::new(0, 0, 96, 32);
         let mut buf = Buffer::empty(area);
@@ -724,7 +767,7 @@ mod tests {
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 let cell = &buf[(x, y)];
-                if cell.bg == palette::DEEPSEEK_BLUE && cell.fg == palette::SELECTION_TEXT {
+                if cell.bg == palette::SELECTION_BG && cell.fg == palette::SELECTION_TEXT {
                     found_highlight = true;
                     break;
                 }
@@ -733,7 +776,7 @@ mod tests {
 
         assert!(
             found_highlight,
-            "selected row should use a strong blue highlight"
+            "selected row should use the semantic selection highlight"
         );
     }
 
@@ -765,14 +808,14 @@ mod tests {
     #[test]
     fn render_with_filter_shows_only_matching_section_and_status() {
         let mut view = HelpView::new();
-        type_filter(&mut view, "mode yolo");
+        type_filter(&mut view, "mode [act");
         let area = Rect::new(0, 0, 96, 24);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
 
         let dump = buffer_text(&buf, area);
         assert!(
-            dump.contains("Filter: mode yolo"),
+            dump.contains("Filter: mode [act"),
             "filter echo missing:\n{dump}"
         );
         assert!(
@@ -785,7 +828,7 @@ mod tests {
         );
         assert!(
             !dump.contains("/model"),
-            "non-matching commands should not render under a `mode yolo` filter:\n{dump}"
+            "non-matching commands should not render under a `mode [act` filter:\n{dump}"
         );
     }
 
@@ -825,6 +868,60 @@ mod tests {
                 "keybinding description not localized: {}",
                 entry.description
             );
+        }
+    }
+
+    /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires
+    /// every overlay to remain readable and fully operable at.
+    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn help_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(HelpView::new_for_locale(Locale::En));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            let text = rows.join("\n");
+
+            for label in [
+                "type to filter",
+                "Up/Down move",
+                "PgUp/PgDn jump",
+                "Esc close",
+            ] {
+                assert!(text.contains(label), "{w}x{h}: missing footer '{label}'");
+            }
+            assert!(
+                !text.contains('X'),
+                "{w}x{h}: background bleed-through into modal surface"
+            );
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::WHALE_BG,
+                "{w}x{h}: modal interior must be opaque"
+            );
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
         }
     }
 

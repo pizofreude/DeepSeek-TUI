@@ -2,10 +2,11 @@
 //!
 //! Automations are local-first recurring jobs that enqueue standard background
 //! tasks. This module stores automation definitions and run history under
-//! `~/.deepseek/automations` (or `DEEPSEEK_AUTOMATIONS_DIR` override).
+//! `~/.codewhale/automations` (or `DEEPSEEK_AUTOMATIONS_DIR` override).
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +23,10 @@ use crate::utils::spawn_supervised;
 
 const CURRENT_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 const CURRENT_RUN_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_AUTOMATION_MODE: &str = "agent";
+const DEFAULT_AUTOMATION_ALLOW_SHELL: bool = false;
+const DEFAULT_AUTOMATION_TRUST_MODE: bool = false;
+const DEFAULT_AUTOMATION_AUTO_APPROVE: bool = true;
 
 const fn default_automation_schema_version() -> u32 {
     CURRENT_AUTOMATION_SCHEMA_VERSION
@@ -58,6 +63,14 @@ pub struct AutomationRecord {
     pub rrule: String,
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_shell: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
     pub status: AutomationStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -65,6 +78,29 @@ pub struct AutomationRecord {
     pub next_run_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<DateTime<Utc>>,
+}
+
+impl AutomationRecord {
+    fn task_mode(&self) -> String {
+        self.mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or(DEFAULT_AUTOMATION_MODE)
+            .to_string()
+    }
+
+    fn task_allow_shell(&self) -> bool {
+        self.allow_shell.unwrap_or(DEFAULT_AUTOMATION_ALLOW_SHELL)
+    }
+
+    fn task_trust_mode(&self) -> bool {
+        self.trust_mode.unwrap_or(DEFAULT_AUTOMATION_TRUST_MODE)
+    }
+
+    fn task_auto_approve(&self) -> bool {
+        self.auto_approve.unwrap_or(DEFAULT_AUTOMATION_AUTO_APPROVE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +134,14 @@ pub struct CreateAutomationRequest {
     #[serde(default)]
     pub cwds: Vec<PathBuf>,
     #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allow_shell: Option<bool>,
+    #[serde(default)]
+    pub trust_mode: Option<bool>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
+    #[serde(default)]
     pub status: Option<AutomationStatus>,
 }
 
@@ -107,6 +151,10 @@ pub struct UpdateAutomationRequest {
     pub prompt: Option<String>,
     pub rrule: Option<String>,
     pub cwds: Option<Vec<PathBuf>>,
+    pub mode: Option<String>,
+    pub allow_shell: Option<bool>,
+    pub trust_mode: Option<bool>,
+    pub auto_approve: Option<bool>,
     pub status: Option<AutomationStatus>,
 }
 
@@ -319,17 +367,35 @@ impl AutomationManager {
         Self::open(default_automations_dir())
     }
 
-    fn automation_path(&self, id: &str) -> PathBuf {
-        self.automations_dir.join(format!("{id}.json"))
+    fn automation_path(&self, id: &str) -> Result<PathBuf> {
+        ensure_safe_storage_id("automation id", id)?;
+        Ok(self.automations_dir.join(format!("{id}.json")))
     }
 
-    fn runs_dir_for(&self, automation_id: &str) -> PathBuf {
-        self.runs_dir.join(automation_id)
+    fn runs_dir_for(&self, automation_id: &str) -> Result<PathBuf> {
+        ensure_safe_storage_id("automation id", automation_id)?;
+        Ok(self.runs_dir.join(automation_id))
     }
 
-    fn run_path(&self, automation_id: &str, run_id: &str) -> PathBuf {
-        self.runs_dir_for(automation_id)
-            .join(format!("{run_id}.json"))
+    /// Current run file name: `{sortable-created-at}-{run_id}.json`. The
+    /// fixed-width timestamp prefix makes directory listings sort
+    /// chronologically without reading file contents (see [`Self::list_runs`]).
+    fn run_path(&self, run: &AutomationRunRecord) -> Result<PathBuf> {
+        ensure_safe_storage_id("run id", &run.id)?;
+        Ok(self.runs_dir_for(&run.automation_id)?.join(format!(
+            "{}-{}.json",
+            run_file_stamp(run.created_at),
+            run.id
+        )))
+    }
+
+    /// Pre-sortable-name run file: `{run_id}.json` (run ids are UUIDs, so
+    /// these carry no ordering hint and must be read to learn `created_at`).
+    fn legacy_run_path(&self, automation_id: &str, run_id: &str) -> Result<PathBuf> {
+        ensure_safe_storage_id("run id", run_id)?;
+        Ok(self
+            .runs_dir_for(automation_id)?
+            .join(format!("{run_id}.json")))
     }
 
     pub fn create_automation(&self, req: CreateAutomationRequest) -> Result<AutomationRecord> {
@@ -350,6 +416,10 @@ impl AutomationManager {
             prompt: req.prompt.trim().to_string(),
             rrule: req.rrule.trim().to_ascii_uppercase(),
             cwds: req.cwds,
+            mode: normalize_optional_string(req.mode),
+            allow_shell: req.allow_shell,
+            trust_mode: req.trust_mode,
+            auto_approve: req.auto_approve,
             status,
             created_at: now,
             updated_at: now,
@@ -362,7 +432,7 @@ impl AutomationManager {
     }
 
     pub fn get_automation(&self, id: &str) -> Result<AutomationRecord> {
-        let path = self.automation_path(id);
+        let path = self.automation_path(id)?;
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read automation {}", path.display()))?;
         let record: AutomationRecord = serde_json::from_str(&raw)
@@ -378,7 +448,7 @@ impl AutomationManager {
     }
 
     pub fn save_automation(&self, record: &AutomationRecord) -> Result<()> {
-        write_json_atomic(&self.automation_path(&record.id), record)
+        write_json_atomic(&self.automation_path(&record.id)?, record)
     }
 
     pub fn list_automations(&self) -> Result<Vec<AutomationRecord>> {
@@ -439,6 +509,18 @@ impl AutomationManager {
         if let Some(cwds) = req.cwds {
             existing.cwds = cwds;
         }
+        if let Some(mode) = req.mode {
+            existing.mode = normalize_optional_string(Some(mode));
+        }
+        if let Some(allow_shell) = req.allow_shell {
+            existing.allow_shell = Some(allow_shell);
+        }
+        if let Some(trust_mode) = req.trust_mode {
+            existing.trust_mode = Some(trust_mode);
+        }
+        if let Some(auto_approve) = req.auto_approve {
+            existing.auto_approve = Some(auto_approve);
+        }
         if let Some(status) = req.status {
             existing.status = status;
             if matches!(status, AutomationStatus::Paused) {
@@ -476,11 +558,11 @@ impl AutomationManager {
 
     pub fn delete_automation(&self, id: &str) -> Result<AutomationRecord> {
         let existing = self.get_automation(id)?;
-        let path = self.automation_path(id);
+        let path = self.automation_path(id)?;
         fs::remove_file(&path)
             .with_context(|| format!("Failed to delete automation {}", path.display()))?;
 
-        let runs_dir = self.runs_dir_for(id);
+        let runs_dir = self.runs_dir_for(id)?;
         if runs_dir.exists() {
             fs::remove_dir_all(&runs_dir).with_context(|| {
                 format!("Failed to delete automation runs {}", runs_dir.display())
@@ -495,12 +577,16 @@ impl AutomationManager {
         automation_id: &str,
         limit: Option<usize>,
     ) -> Result<Vec<AutomationRunRecord>> {
-        let dir = self.runs_dir_for(automation_id);
+        let dir = self.runs_dir_for(automation_id)?;
         if !dir.exists() {
             return Ok(Vec::new());
         }
 
-        let mut out = Vec::new();
+        // Split the listing into sortable-name files (newest-first by file
+        // name alone, so reads stop after the newest `limit`) and legacy
+        // `{uuid}.json` files, which must all be read to learn `created_at`.
+        let mut sortable = Vec::new();
+        let mut legacy = Vec::new();
         for entry in
             fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?
         {
@@ -509,21 +595,34 @@ impl AutomationManager {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            let run: AutomationRunRecord = serde_json::from_str(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
-            if run.schema_version > CURRENT_RUN_SCHEMA_VERSION {
-                bail!(
-                    "Automation run schema v{} is newer than supported v{}",
-                    run.schema_version,
-                    CURRENT_RUN_SCHEMA_VERSION
-                );
+            if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(has_sortable_run_stem)
+            {
+                sortable.push(path);
+            } else {
+                legacy.push(path);
             }
-            out.push(run);
+        }
+
+        sortable.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        if let Some(limit) = limit {
+            // Any sortable file dropped here is older than the `limit` newest
+            // sortable files, so it can never make the merged top `limit`.
+            sortable.truncate(limit);
+        }
+
+        let mut out = Vec::new();
+        for path in sortable.into_iter().chain(legacy) {
+            out.push(read_run_file(&path)?);
         }
 
         out.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        // A crash between the sortable-name write and the legacy-file removal
+        // in `save_run` can leave one run under both names; keep the sortable
+        // copy (chained first above, so it survives the stable sort).
+        out.dedup_by(|a, b| a.id == b.id);
         if let Some(limit) = limit {
             out.truncate(limit);
         }
@@ -531,106 +630,42 @@ impl AutomationManager {
     }
 
     fn save_run(&self, run: &AutomationRunRecord) -> Result<()> {
-        let dir = self.runs_dir_for(&run.automation_id);
+        let dir = self.runs_dir_for(&run.automation_id)?;
         fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-        write_json_atomic(&self.run_path(&run.automation_id, &run.id), run)
-    }
-
-    async fn enqueue_run_task(
-        &self,
-        automation: &AutomationRecord,
-        run: &mut AutomationRunRecord,
-        task_manager: &SharedTaskManager,
-    ) -> Result<()> {
-        let workspace = automation.cwds.first().cloned();
-
-        let new_task = NewTaskRequest {
-            prompt: automation.prompt.clone(),
-            model: None,
-            workspace,
-            mode: Some("agent".to_string()),
-            allow_shell: Some(false),
-            trust_mode: Some(false),
-            auto_approve: Some(true),
-        };
-
-        match task_manager.add_task(new_task).await {
-            Ok(task) => {
-                run.status = AutomationRunStatus::Running;
-                run.started_at = Some(Utc::now());
-                run.task_id = Some(task.id.clone());
-                run.thread_id = task.thread_id.clone();
-                run.turn_id = task.turn_id.clone();
-                run.error = None;
-                Ok(())
-            }
-            Err(err) => {
-                run.status = AutomationRunStatus::Failed;
-                run.ended_at = Some(Utc::now());
-                run.error = Some(format!("Failed to enqueue task: {err}"));
-                Ok(())
-            }
+        let path = self.run_path(run)?;
+        write_json_atomic(&path, run)?;
+        // Rewrites of a legacy-named run migrate it to the sortable name; drop
+        // the old file so the run never exists twice.
+        let legacy = self.legacy_run_path(&run.automation_id, &run.id)?;
+        if legacy != path && legacy.exists() {
+            fs::remove_file(&legacy)
+                .with_context(|| format!("Failed to remove legacy run {}", legacy.display()))?;
         }
+        Ok(())
     }
 
-    pub async fn run_now(
+    /// Sweep all automations under one lock hold: initialize/advance schedule
+    /// bookkeeping and return the (automation, run) pairs that must be
+    /// enqueued. `next_run_at` for returned pairs is only advanced after the
+    /// run is persisted (see [`scheduler_tick_shared`]) so a crash mid-enqueue
+    /// retries the slot; the run-per-slot check keeps that idempotent.
+    fn collect_due_runs(
         &self,
-        automation_id: &str,
-        task_manager: &SharedTaskManager,
-    ) -> Result<AutomationRunRecord> {
-        let mut automation = self.get_automation(automation_id)?;
-        let now = Utc::now();
-        let mut run = AutomationRunRecord {
-            schema_version: CURRENT_RUN_SCHEMA_VERSION,
-            id: Uuid::new_v4().to_string(),
-            automation_id: automation.id.clone(),
-            scheduled_for: now,
-            status: AutomationRunStatus::Queued,
-            created_at: now,
-            started_at: None,
-            ended_at: None,
-            task_id: None,
-            thread_id: None,
-            turn_id: None,
-            error: None,
-        };
-
-        self.enqueue_run_task(&automation, &mut run, task_manager)
-            .await?;
-        self.save_run(&run)?;
-
-        automation.updated_at = Utc::now();
-        if matches!(
-            run.status,
-            AutomationRunStatus::Completed
-                | AutomationRunStatus::Failed
-                | AutomationRunStatus::Canceled
-        ) {
-            automation.last_run_at = run.ended_at.or(Some(Utc::now()));
-        }
-        self.save_automation(&automation)?;
-
-        Ok(run)
-    }
-
-    pub async fn scheduler_tick(&self, task_manager: &SharedTaskManager) -> Result<()> {
-        let now = Utc::now();
-        let mut automations = self.list_automations()?;
-
-        for automation in &mut automations {
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(AutomationRecord, AutomationRunRecord)>> {
+        let mut due = Vec::new();
+        for mut automation in self.list_automations()? {
             if !matches!(automation.status, AutomationStatus::Active) {
                 continue;
             }
 
             let schedule = AutomationSchedule::parse_rrule(&automation.rrule)?;
-            if automation.next_run_at.is_none() {
+            let Some(due_at) = automation.next_run_at else {
                 automation.next_run_at = Some(schedule.next_after(now)?);
                 automation.updated_at = now;
-                self.save_automation(automation)?;
+                self.save_automation(&automation)?;
                 continue;
-            }
-
-            let due_at = automation.next_run_at.expect("checked above");
+            };
             if due_at > now {
                 continue;
             }
@@ -645,118 +680,339 @@ impl AutomationManager {
             if existing_for_slot {
                 automation.next_run_at = Some(schedule.next_after(due_at)?);
                 automation.updated_at = now;
-                self.save_automation(automation)?;
+                self.save_automation(&automation)?;
                 continue;
             }
 
-            let mut run = AutomationRunRecord {
-                schema_version: CURRENT_RUN_SCHEMA_VERSION,
-                id: Uuid::new_v4().to_string(),
-                automation_id: automation.id.clone(),
-                scheduled_for: due_at,
-                status: AutomationRunStatus::Queued,
-                created_at: now,
-                started_at: None,
-                ended_at: None,
-                task_id: None,
-                thread_id: None,
-                turn_id: None,
-                error: None,
-            };
-
-            self.enqueue_run_task(automation, &mut run, task_manager)
-                .await?;
-            self.save_run(&run)?;
-
-            automation.updated_at = now;
-            automation.next_run_at = Some(schedule.next_after(due_at)?);
-            self.save_automation(automation)?;
+            let run = new_run_record(&automation.id, due_at, now);
+            due.push((automation, run));
         }
-
-        Ok(())
+        Ok(due)
     }
 
-    pub async fn reconcile_run_statuses(&self, task_manager: &SharedTaskManager) -> Result<()> {
-        let automations = self.list_automations()?;
-        for automation in automations {
-            let runs = self.list_runs(&automation.id, Some(100))?;
-            for mut run in runs {
-                if !matches!(
+    /// Persist a completed enqueue attempt and advance the schedule slot.
+    /// The run record is saved unconditionally: `enqueue_run_task` already
+    /// created a real task before this is called, so even when the automation
+    /// was deleted while the enqueue await ran outside the lock, the run must
+    /// be persisted (not orphaned) — only the schedule advance is skipped.
+    fn finish_scheduled_run(&self, run: &AutomationRunRecord, now: DateTime<Utc>) -> Result<()> {
+        self.save_run(run)?;
+        let Ok(mut automation) = self.get_automation(&run.automation_id) else {
+            return Ok(());
+        };
+        let schedule = AutomationSchedule::parse_rrule(&automation.rrule)?;
+        automation.updated_at = now;
+        automation.next_run_at = Some(schedule.next_after(run.scheduled_for)?);
+        self.save_automation(&automation)
+    }
+
+    /// Snapshot runs still waiting on task-manager state, for reconciliation
+    /// outside the lock.
+    fn collect_pending_runs(&self) -> Result<Vec<AutomationRunRecord>> {
+        let mut pending = Vec::new();
+        for automation in self.list_automations()? {
+            for run in self.list_runs(&automation.id, Some(100))? {
+                if matches!(
                     run.status,
                     AutomationRunStatus::Queued | AutomationRunStatus::Running
-                ) {
-                    continue;
-                }
-                let Some(task_id) = run.task_id.clone() else {
-                    continue;
-                };
-                let task = match task_manager.get_task(&task_id).await {
-                    Ok(task) => task,
-                    Err(_) => continue,
-                };
-
-                run.thread_id = task.thread_id.clone();
-                run.turn_id = task.turn_id.clone();
-
-                let mut changed = false;
-                match task.status {
-                    TaskStatus::Queued => {
-                        if !matches!(run.status, AutomationRunStatus::Queued) {
-                            run.status = AutomationRunStatus::Queued;
-                            changed = true;
-                        }
-                    }
-                    TaskStatus::Running => {
-                        if !matches!(run.status, AutomationRunStatus::Running) {
-                            run.status = AutomationRunStatus::Running;
-                            changed = true;
-                        }
-                        if run.started_at.is_none() {
-                            run.started_at = Some(task.started_at.unwrap_or_else(Utc::now));
-                            changed = true;
-                        }
-                    }
-                    TaskStatus::Completed => {
-                        run.status = AutomationRunStatus::Completed;
-                        run.started_at = run.started_at.or(task.started_at);
-                        run.ended_at = task.ended_at.or(Some(Utc::now()));
-                        run.error = None;
-                        changed = true;
-                    }
-                    TaskStatus::Failed => {
-                        run.status = AutomationRunStatus::Failed;
-                        run.started_at = run.started_at.or(task.started_at);
-                        run.ended_at = task.ended_at.or(Some(Utc::now()));
-                        run.error = task.error.clone();
-                        changed = true;
-                    }
-                    TaskStatus::Canceled => {
-                        run.status = AutomationRunStatus::Canceled;
-                        run.started_at = run.started_at.or(task.started_at);
-                        run.ended_at = task.ended_at.or(Some(Utc::now()));
-                        changed = true;
-                    }
-                }
-
-                if changed {
-                    self.save_run(&run)?;
-                    if matches!(
-                        run.status,
-                        AutomationRunStatus::Completed
-                            | AutomationRunStatus::Failed
-                            | AutomationRunStatus::Canceled
-                    ) {
-                        let mut updated_automation = self.get_automation(&automation.id)?;
-                        updated_automation.last_run_at = run.ended_at.or(Some(Utc::now()));
-                        updated_automation.updated_at = Utc::now();
-                        self.save_automation(&updated_automation)?;
-                    }
+                ) && run.task_id.is_some()
+                {
+                    pending.push(run);
                 }
             }
         }
-
-        Ok(())
+        Ok(pending)
     }
+}
+
+fn new_run_record(
+    automation_id: &str,
+    scheduled_for: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+) -> AutomationRunRecord {
+    AutomationRunRecord {
+        schema_version: CURRENT_RUN_SCHEMA_VERSION,
+        id: Uuid::new_v4().to_string(),
+        automation_id: automation_id.to_string(),
+        scheduled_for,
+        status: AutomationRunStatus::Queued,
+        created_at,
+        started_at: None,
+        ended_at: None,
+        task_id: None,
+        thread_id: None,
+        turn_id: None,
+        error: None,
+    }
+}
+
+/// Enqueue the automation's durable task, folding the outcome into `run`.
+/// Free function (no `AutomationManager` receiver) so callers can await
+/// task-manager latency without holding the shared manager mutex.
+async fn enqueue_run_task(
+    automation: &AutomationRecord,
+    run: &mut AutomationRunRecord,
+    task_manager: &SharedTaskManager,
+) {
+    let workspace = automation.cwds.first().cloned();
+
+    let new_task = NewTaskRequest {
+        prompt: automation.prompt.clone(),
+        model: None,
+        workspace,
+        mode: Some(automation.task_mode()),
+        allow_shell: Some(automation.task_allow_shell()),
+        trust_mode: Some(automation.task_trust_mode()),
+        auto_approve: Some(automation.task_auto_approve()),
+    };
+
+    match task_manager.add_task(new_task).await {
+        Ok(task) => {
+            run.status = AutomationRunStatus::Running;
+            run.started_at = Some(Utc::now());
+            run.task_id = Some(task.id.clone());
+            run.thread_id = task.thread_id.clone();
+            run.turn_id = task.turn_id.clone();
+            run.error = None;
+        }
+        Err(err) => {
+            run.status = AutomationRunStatus::Failed;
+            run.ended_at = Some(Utc::now());
+            run.error = Some(format!("Failed to enqueue task: {err}"));
+        }
+    }
+}
+
+/// Run an automation immediately. The shared manager mutex is held only for
+/// the read and persist phases, never across the task-manager await, so
+/// listing/pausing/resuming stay responsive behind a slow enqueue.
+pub async fn run_now_shared(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    task_manager: &SharedTaskManager,
+) -> Result<AutomationRunRecord> {
+    let task_manager = Arc::clone(task_manager);
+    run_now_with(
+        automations,
+        automation_id,
+        move |automation, mut run| async move {
+            enqueue_run_task(&automation, &mut run, &task_manager).await;
+            run
+        },
+    )
+    .await
+}
+
+/// Lock-phased core of [`run_now_shared`], generic over the enqueue await so
+/// tests can stub task-manager latency.
+async fn run_now_with<F, Fut>(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    enqueue: F,
+) -> Result<AutomationRunRecord>
+where
+    F: FnOnce(AutomationRecord, AutomationRunRecord) -> Fut,
+    Fut: Future<Output = AutomationRunRecord>,
+{
+    // Phase 1: read state under the lock.
+    let automation = {
+        let manager = automations.lock().await;
+        manager.get_automation(automation_id)?
+    };
+    let now = Utc::now();
+    let run = new_run_record(&automation.id, now, now);
+
+    // Phase 2: await the task manager without the lock.
+    let run = enqueue(automation, run).await;
+
+    // Phase 3: reacquire to persist the final run state.
+    let manager = automations.lock().await;
+    manager.save_run(&run)?;
+    // Re-read: the record may have changed (or been deleted) while unlocked.
+    if let Ok(mut automation) = manager.get_automation(automation_id) {
+        automation.updated_at = Utc::now();
+        if matches!(
+            run.status,
+            AutomationRunStatus::Completed
+                | AutomationRunStatus::Failed
+                | AutomationRunStatus::Canceled
+        ) {
+            automation.last_run_at = run.ended_at.or(Some(Utc::now()));
+        }
+        manager.save_automation(&automation)?;
+    }
+
+    Ok(run)
+}
+
+async fn scheduler_tick_shared(
+    automations: &SharedAutomationManager,
+    task_manager: &SharedTaskManager,
+) -> Result<()> {
+    let now = Utc::now();
+    // Phase 1: compute due runs and schedule bookkeeping under the lock.
+    let due_runs = {
+        let manager = automations.lock().await;
+        manager.collect_due_runs(now)?
+    };
+
+    for (automation, mut run) in due_runs {
+        // Phase 2: enqueue without the lock.
+        enqueue_run_task(&automation, &mut run, task_manager).await;
+
+        // Phase 3: reacquire to persist the run and advance the slot.
+        let manager = automations.lock().await;
+        manager.finish_scheduled_run(&run, now)?;
+    }
+
+    Ok(())
+}
+
+/// Fold a durable task's state back into its automation run. Returns whether
+/// the run changed and needs persisting.
+fn apply_task_status(
+    run: &mut AutomationRunRecord,
+    task: &crate::task_manager::TaskRecord,
+) -> bool {
+    run.thread_id = task.thread_id.clone();
+    run.turn_id = task.turn_id.clone();
+
+    let mut changed = false;
+    match task.status {
+        TaskStatus::Queued => {
+            if !matches!(run.status, AutomationRunStatus::Queued) {
+                run.status = AutomationRunStatus::Queued;
+                changed = true;
+            }
+        }
+        TaskStatus::Running => {
+            if !matches!(run.status, AutomationRunStatus::Running) {
+                run.status = AutomationRunStatus::Running;
+                changed = true;
+            }
+            if run.started_at.is_none() {
+                run.started_at = Some(task.started_at.unwrap_or_else(Utc::now));
+                changed = true;
+            }
+        }
+        TaskStatus::Completed => {
+            run.status = AutomationRunStatus::Completed;
+            run.started_at = run.started_at.or(task.started_at);
+            run.ended_at = task.ended_at.or(Some(Utc::now()));
+            run.error = None;
+            changed = true;
+        }
+        TaskStatus::Failed => {
+            run.status = AutomationRunStatus::Failed;
+            run.started_at = run.started_at.or(task.started_at);
+            run.ended_at = task.ended_at.or(Some(Utc::now()));
+            run.error = task.error.clone();
+            changed = true;
+        }
+        TaskStatus::Canceled => {
+            run.status = AutomationRunStatus::Canceled;
+            run.started_at = run.started_at.or(task.started_at);
+            run.ended_at = task.ended_at.or(Some(Utc::now()));
+            changed = true;
+        }
+    }
+    changed
+}
+
+async fn reconcile_run_statuses_shared(
+    automations: &SharedAutomationManager,
+    task_manager: &SharedTaskManager,
+) -> Result<()> {
+    // Phase 1: snapshot pending runs under the lock.
+    let pending = {
+        let manager = automations.lock().await;
+        manager.collect_pending_runs()?
+    };
+
+    for mut run in pending {
+        let Some(task_id) = run.task_id.clone() else {
+            continue;
+        };
+        // Phase 2: task lookups happen without the lock.
+        let task = match task_manager.get_task(&task_id).await {
+            Ok(task) => task,
+            Err(_) => continue,
+        };
+
+        if !apply_task_status(&mut run, &task) {
+            continue;
+        }
+
+        // Phase 3: reacquire to persist the reconciled state.
+        let manager = automations.lock().await;
+        manager.save_run(&run)?;
+        if matches!(
+            run.status,
+            AutomationRunStatus::Completed
+                | AutomationRunStatus::Failed
+                | AutomationRunStatus::Canceled
+        ) && let Ok(mut updated_automation) = manager.get_automation(&run.automation_id)
+        {
+            updated_automation.last_run_at = run.ended_at.or(Some(Utc::now()));
+            updated_automation.updated_at = Utc::now();
+            manager.save_automation(&updated_automation)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Fixed-width, lexically-sortable UTC stamp for run file names, e.g.
+/// `20260705T142530123Z` (millisecond precision; the run id suffix breaks
+/// same-millisecond ties deterministically).
+const RUN_STAMP_FORMAT: &str = "%Y%m%dT%H%M%S%3fZ";
+const RUN_STAMP_LEN: usize = "20260705T142530123Z".len();
+
+fn run_file_stamp(created_at: DateTime<Utc>) -> String {
+    created_at.format(RUN_STAMP_FORMAT).to_string()
+}
+
+/// Shape check for `{stamp}-{run_id}` file stems. Ordering trusts the file
+/// name only for pruning; the parsed record's `created_at` stays
+/// authoritative for the final sort.
+fn has_sortable_run_stem(stem: &str) -> bool {
+    let Some((stamp, rest)) = stem.split_at_checked(RUN_STAMP_LEN) else {
+        return false;
+    };
+    if !rest.starts_with('-') || rest.len() < 2 {
+        return false;
+    }
+    stamp.char_indices().all(|(idx, ch)| match idx {
+        8 => ch == 'T',
+        18 => ch == 'Z',
+        _ => ch.is_ascii_digit(),
+    })
+}
+
+fn read_run_file(path: &Path) -> Result<AutomationRunRecord> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let run: AutomationRunRecord = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    if run.schema_version > CURRENT_RUN_SCHEMA_VERSION {
+        bail!(
+            "Automation run schema v{} is newer than supported v{}",
+            run.schema_version,
+            CURRENT_RUN_SCHEMA_VERSION
+        );
+    }
+    Ok(run)
+}
+
+fn ensure_safe_storage_id(kind: &str, value: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    let Some(component) = components.next() else {
+        bail!("{kind} must not be empty");
+    };
+    if components.next().is_some() || !matches!(component, std::path::Component::Normal(_)) {
+        bail!("{kind} must be a single path component");
+    }
+    Ok(())
 }
 
 fn validate_name_and_prompt(name: &str, prompt: &str) -> Result<()> {
@@ -767,6 +1023,12 @@ fn validate_name_and_prompt(name: &str, prompt: &str) -> Result<()> {
         bail!("Automation prompt is required");
     }
     Ok(())
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -788,15 +1050,31 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn default_automations_dir() -> PathBuf {
+    // Most-specific override: an explicit automations dir.
     if let Ok(path) = std::env::var("DEEPSEEK_AUTOMATIONS_DIR") {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
         }
     }
+    // $CODEWHALE_HOME is a hard override of the base data directory
+    // (docs/CONFIGURATION.md): when SET, automations live under it and we do
+    // NOT fall back to the legacy ~/.deepseek path — silent fallback would
+    // defeat the isolation the override promises. Check the env var directly
+    // (not codewhale_home()'s Ok/Err, which succeeds for the default home too).
+    if let Some(home) = std::env::var_os("CODEWHALE_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join("automations");
+    }
     dirs::home_dir()
-        .map(|home| home.join(".deepseek").join("automations"))
-        .unwrap_or_else(|| PathBuf::from(".deepseek").join("automations"))
+        .map(|home| {
+            let primary = home.join(".codewhale").join("automations");
+            let legacy = home.join(".deepseek").join("automations");
+            if primary.exists() || !legacy.exists() {
+                return primary;
+            }
+            legacy
+        })
+        .unwrap_or_else(|| PathBuf::from(".codewhale").join("automations"))
 }
 
 pub type SharedAutomationManager = Arc<Mutex<AutomationManager>>;
@@ -830,14 +1108,14 @@ pub fn spawn_scheduler(
                     break;
                 }
 
-                {
-                    let manager = automations.lock().await;
-                    if let Err(err) = manager.scheduler_tick(&task_manager).await {
-                        tracing::warn!("automation scheduler tick failed: {err}");
-                    }
-                    if let Err(err) = manager.reconcile_run_statuses(&task_manager).await {
-                        tracing::warn!("automation reconcile failed: {err}");
-                    }
+                // Lock scope lives inside the shared helpers: the manager
+                // mutex is dropped across every task-manager await so API and
+                // tool callers are never queued behind enqueue/status latency.
+                if let Err(err) = scheduler_tick_shared(&automations, &task_manager).await {
+                    tracing::warn!("automation scheduler tick failed: {err}");
+                }
+                if let Err(err) = reconcile_run_statuses_shared(&automations, &task_manager).await {
+                    tracing::warn!("automation reconcile failed: {err}");
                 }
 
                 tokio::select! {
@@ -852,6 +1130,87 @@ pub fn spawn_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    use crate::task_manager::{
+        ExecutionTask, TaskExecutionEvent, TaskExecutionResult, TaskExecutor, TaskManager,
+        TaskManagerConfig,
+    };
+
+    struct AutomationNoopExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for AutomationNoopExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            _events: mpsc::UnboundedSender<TaskExecutionEvent>,
+            _cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: Some("done".to_string()),
+                error: None,
+            }
+        }
+    }
+
+    fn automation_task_config(root: PathBuf) -> TaskManagerConfig {
+        TaskManagerConfig {
+            data_dir: root,
+            worker_count: 1,
+            default_workspace: PathBuf::from("."),
+            default_model: "deepseek-v4-flash".to_string(),
+            default_mode: "plan".to_string(),
+            allow_shell: true,
+            trust_mode: true,
+        }
+    }
+
+    fn automation_record_with_settings(
+        mode: Option<&str>,
+        allow_shell: Option<bool>,
+        trust_mode: Option<bool>,
+        auto_approve: Option<bool>,
+    ) -> AutomationRecord {
+        let now = Utc::now();
+        AutomationRecord {
+            schema_version: CURRENT_AUTOMATION_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            name: "Test automation".to_string(),
+            prompt: "Run the automation".to_string(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+            cwds: Vec::new(),
+            mode: mode.map(ToString::to_string),
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            status: AutomationStatus::Active,
+            created_at: now,
+            updated_at: now,
+            next_run_at: None,
+            last_run_at: None,
+        }
+    }
+
+    fn queued_run_for(automation: &AutomationRecord) -> AutomationRunRecord {
+        let now = Utc::now();
+        AutomationRunRecord {
+            schema_version: CURRENT_RUN_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            automation_id: automation.id.clone(),
+            scheduled_for: now,
+            status: AutomationRunStatus::Queued,
+            created_at: now,
+            started_at: None,
+            ended_at: None,
+            task_id: None,
+            thread_id: None,
+            turn_id: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn parses_hourly_rrule() {
@@ -906,6 +1265,10 @@ mod tests {
                 prompt: "prompt".to_string(),
                 rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
                 cwds: Vec::new(),
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
                 status: Some(AutomationStatus::Active),
             })
             .expect("create");
@@ -925,13 +1288,367 @@ mod tests {
             error: None,
         };
         manager.save_run(&run).expect("save run");
-        assert!(manager.runs_dir_for(&created.id).exists());
+        assert!(
+            manager
+                .runs_dir_for(&created.id)
+                .expect("runs dir")
+                .exists()
+        );
 
         manager
             .delete_automation(&created.id)
             .expect("delete automation");
 
         assert!(manager.get_automation(&created.id).is_err());
-        assert!(!manager.runs_dir_for(&created.id).exists());
+        assert!(
+            !manager
+                .runs_dir_for(&created.id)
+                .expect("runs dir")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn automation_storage_rejects_traversal_ids() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().join("root")).expect("manager");
+        let escaped_file = tempdir.path().join("escape.json");
+        let escaped_runs = tempdir.path().join("escape-runs");
+
+        let err = manager
+            .get_automation("../escape")
+            .expect_err("traversal automation ids must be rejected");
+        assert!(err.to_string().contains("single path component"));
+        assert!(!escaped_file.exists());
+
+        let err = manager
+            .list_runs("../escape-runs", None)
+            .expect_err("traversal run dirs must be rejected");
+        assert!(err.to_string().contains("single path component"));
+        assert!(!escaped_runs.exists());
+
+        let run = AutomationRunRecord {
+            schema_version: CURRENT_RUN_SCHEMA_VERSION,
+            id: "../escape-run".to_string(),
+            automation_id: Uuid::new_v4().to_string(),
+            scheduled_for: Utc::now(),
+            status: AutomationRunStatus::Queued,
+            created_at: Utc::now(),
+            started_at: None,
+            ended_at: None,
+            task_id: None,
+            thread_id: None,
+            turn_id: None,
+            error: None,
+        };
+        let err = manager
+            .save_run(&run)
+            .expect_err("traversal run ids must be rejected");
+        assert!(err.to_string().contains("single path component"));
+        assert!(!tempdir.path().join("escape-run.json").exists());
+    }
+
+    #[test]
+    fn automation_task_settings_default_for_legacy_records() {
+        let now = Utc::now().to_rfc3339();
+        let record: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Legacy automation",
+            "prompt": "Run legacy automation",
+            "rrule": "FREQ=HOURLY;INTERVAL=1",
+            "cwds": [],
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("legacy automation record should deserialize");
+
+        assert_eq!(record.mode, None);
+        assert_eq!(record.task_mode(), "agent");
+        assert!(!record.task_allow_shell());
+        assert!(!record.task_trust_mode());
+        assert!(record.task_auto_approve());
+    }
+
+    #[tokio::test]
+    async fn automation_enqueue_uses_default_and_explicit_task_settings() -> Result<()> {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let task_manager = TaskManager::start_with_executor(
+            automation_task_config(tempdir.path().join("tasks")),
+            std::sync::Arc::new(AutomationNoopExecutor),
+        )
+        .await?;
+
+        let default_automation = automation_record_with_settings(None, None, None, None);
+        let mut default_run = queued_run_for(&default_automation);
+        enqueue_run_task(&default_automation, &mut default_run, &task_manager).await;
+        let default_task = task_manager
+            .get_task(default_run.task_id.as_deref().expect("task id"))
+            .await?;
+        assert_eq!(default_task.mode, "agent");
+        assert!(!default_task.allow_shell);
+        assert!(!default_task.trust_mode);
+        assert!(default_task.auto_approve);
+
+        let explicit_automation =
+            automation_record_with_settings(Some("plan"), Some(true), Some(true), Some(false));
+        let mut explicit_run = queued_run_for(&explicit_automation);
+        enqueue_run_task(&explicit_automation, &mut explicit_run, &task_manager).await;
+        let explicit_task = task_manager
+            .get_task(explicit_run.task_id.as_deref().expect("task id"))
+            .await?;
+        assert_eq!(explicit_task.mode, "plan");
+        assert!(explicit_task.allow_shell);
+        assert!(explicit_task.trust_mode);
+        assert!(!explicit_task.auto_approve);
+
+        task_manager.shutdown();
+        Ok(())
+    }
+
+    fn write_legacy_run_file(manager: &AutomationManager, run: &AutomationRunRecord) {
+        let dir = manager.runs_dir_for(&run.automation_id).expect("runs dir");
+        fs::create_dir_all(&dir).expect("create runs dir");
+        fs::write(
+            dir.join(format!("{}.json", run.id)),
+            serde_json::to_string_pretty(run).expect("serialize run"),
+        )
+        .expect("write legacy run");
+    }
+
+    fn run_created_at(
+        automation: &AutomationRecord,
+        created_at: DateTime<Utc>,
+    ) -> AutomationRunRecord {
+        let mut run = queued_run_for(automation);
+        run.created_at = created_at;
+        run.scheduled_for = created_at;
+        run
+    }
+
+    #[test]
+    fn save_run_uses_sortable_names_and_migrates_legacy_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        let run = queued_run_for(&automation);
+
+        write_legacy_run_file(&manager, &run);
+        manager.save_run(&run).expect("save run");
+
+        let dir = manager.runs_dir_for(&automation.id).expect("runs dir");
+        let names: Vec<String> = fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let expected = format!("{}-{}.json", run_file_stamp(run.created_at), run.id);
+        assert_eq!(names, vec![expected.clone()]);
+        assert!(has_sortable_run_stem(expected.trim_end_matches(".json")));
+        // Legacy uuid stems are not mistaken for sortable names.
+        assert!(!has_sortable_run_stem(&run.id));
+    }
+
+    #[test]
+    fn finish_scheduled_run_persists_run_when_automation_deleted_mid_enqueue() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        manager.save_automation(&automation).expect("save");
+        let run = queued_run_for(&automation);
+
+        // Simulate the automation being deleted while the enqueue await ran
+        // outside the lock. The task already exists in the task manager at
+        // this point, so the run record must still be persisted — an early
+        // return here orphans a real running task.
+        manager.delete_automation(&automation.id).expect("delete");
+        manager
+            .finish_scheduled_run(&run, Utc::now())
+            .expect("finish");
+
+        let runs = manager.list_runs(&automation.id, None).expect("list runs");
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![run.id.as_str()],
+            "run must be persisted even though its automation was deleted"
+        );
+        assert!(
+            manager.get_automation(&automation.id).is_err(),
+            "the deleted automation must not be resurrected"
+        );
+    }
+
+    #[test]
+    fn list_runs_merges_legacy_and_sortable_files_newest_first() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        let base = Utc::now();
+
+        // Legacy files sit at both ends of the timeline to prove the merge is
+        // by created_at, not by file-name era.
+        let legacy_oldest = run_created_at(&automation, base - Duration::minutes(30));
+        let legacy_newest = run_created_at(&automation, base + Duration::minutes(30));
+        write_legacy_run_file(&manager, &legacy_oldest);
+        write_legacy_run_file(&manager, &legacy_newest);
+
+        let sortable_old = run_created_at(&automation, base - Duration::minutes(20));
+        let sortable_new = run_created_at(&automation, base + Duration::minutes(20));
+        manager.save_run(&sortable_old).expect("save old");
+        manager.save_run(&sortable_new).expect("save new");
+
+        let all = manager.list_runs(&automation.id, None).expect("list all");
+        let ids: Vec<&str> = all.iter().map(|run| run.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                legacy_newest.id.as_str(),
+                sortable_new.id.as_str(),
+                sortable_old.id.as_str(),
+                legacy_oldest.id.as_str(),
+            ]
+        );
+
+        let top_two = manager.list_runs(&automation.id, Some(2)).expect("list 2");
+        let top_ids: Vec<&str> = top_two.iter().map(|run| run.id.as_str()).collect();
+        assert_eq!(
+            top_ids,
+            vec![legacy_newest.id.as_str(), sortable_new.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn list_runs_with_limit_skips_older_sortable_files_entirely() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+        let automation = automation_record_with_settings(None, None, None, None);
+        let base = Utc::now();
+
+        let newest = run_created_at(&automation, base);
+        manager.save_run(&newest).expect("save newest");
+
+        // A corrupt sortable-named file older than the newest run: bounded
+        // listing must never open it, while an unbounded listing fails.
+        let dir = manager.runs_dir_for(&automation.id).expect("runs dir");
+        let stale_stamp = run_file_stamp(base - Duration::minutes(5));
+        fs::write(
+            dir.join(format!("{stale_stamp}-{}.json", Uuid::new_v4())),
+            "{ not json",
+        )
+        .expect("write corrupt run");
+
+        let bounded = manager
+            .list_runs(&automation.id, Some(1))
+            .expect("bounded list must not read files beyond the limit");
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].id, newest.id);
+
+        assert!(manager.list_runs(&automation.id, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_automations_completes_during_slow_enqueue() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = AutomationManager::open(tempdir.path().to_path_buf()).expect("manager");
+        let created = manager
+            .create_automation(CreateAutomationRequest {
+                name: "Slow enqueue".to_string(),
+                prompt: "prompt".to_string(),
+                rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+                cwds: Vec::new(),
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                status: Some(AutomationStatus::Active),
+            })
+            .expect("create");
+        let shared: SharedAutomationManager = Arc::new(Mutex::new(manager));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let run_task = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            let automation_id = created.id.clone();
+            async move {
+                run_now_with(&shared, &automation_id, move |_, mut run| async move {
+                    // Delayed task-manager stub: stall the enqueue await until
+                    // the test has proven the manager mutex is free.
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    run.status = AutomationRunStatus::Failed;
+                    run.ended_at = Some(Utc::now());
+                    run.error = Some("stubbed enqueue".to_string());
+                    run
+                })
+                .await
+            }
+        });
+
+        entered_rx.await.expect("enqueue phase entered");
+
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            shared.lock().await.list_automations()
+        })
+        .await
+        .expect("list_automations must not block behind a slow enqueue")
+        .expect("list automations");
+        assert_eq!(listed.len(), 1);
+
+        release_tx.send(()).expect("release stub");
+        let run = run_task.await.expect("join").expect("run now");
+        assert!(matches!(run.status, AutomationRunStatus::Failed));
+
+        // The final run state was persisted after the lock was reacquired.
+        let manager = shared.lock().await;
+        let runs = manager.list_runs(&created.id, None).expect("list runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+        assert!(matches!(runs[0].status, AutomationRunStatus::Failed));
+        let automation = manager.get_automation(&created.id).expect("automation");
+        assert!(automation.last_run_at.is_some());
+    }
+
+    #[test]
+    fn default_automations_dir_honors_codewhale_home_as_hard_override() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by lock_test_env.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_AUTOMATIONS_DIR");
+            std::env::set_var("CODEWHALE_HOME", tmp.path());
+        }
+        // $CODEWHALE_HOME IS the home dir (no ".codewhale" appended); the
+        // legacy ~/.deepseek fallback is bypassed entirely.
+        assert_eq!(default_automations_dir(), tmp.path().join("automations"));
+        // SAFETY: cleanup under the same lock.
+        unsafe {
+            std::env::remove_var("CODEWHALE_HOME");
+        }
+    }
+
+    #[test]
+    fn default_automations_dir_prefers_deepseek_automations_dir_over_codewhale_home() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by lock_test_env.
+        unsafe {
+            std::env::set_var("DEEPSEEK_AUTOMATIONS_DIR", tmp.path());
+            std::env::set_var("CODEWHALE_HOME", "/should/not/be/used");
+        }
+        // The most-specific override wins over the base-data-dir override.
+        assert_eq!(default_automations_dir(), tmp.path());
+        // SAFETY: cleanup under the same lock.
+        unsafe {
+            std::env::remove_var("DEEPSEEK_AUTOMATIONS_DIR");
+            std::env::remove_var("CODEWHALE_HOME");
+        }
     }
 }

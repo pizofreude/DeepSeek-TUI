@@ -51,6 +51,130 @@ Thank you for your interest in contributing to codewhale! This document provides
   directory (for example `crates/tui/tests/` or `crates/state/tests/`). The
   repository root `tests/` directory is not used
 
+### Pre-push verification
+
+Run these before every push. They match what CI enforces on pull
+requests, so passing locally means the PR lanes should pass too:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-features --locked -- \
+  -D warnings \
+  -A clippy::uninlined_format_args \
+  -A clippy::too_many_arguments \
+  -A clippy::unnecessary_map_or \
+  -A clippy::collapsible_if \
+  -A clippy::assertions_on_constants
+cargo test --workspace --all-features --locked
+```
+
+The release lane runs a stricter clippy that also lints test, bench, and
+example targets. The PR template checklist asks for this form, and it is
+the right command before requesting review or doing release-bound work,
+because `--all-features` alone skips lints that will fail the release
+lane later:
+
+```bash
+cargo clippy --workspace --all-targets --all-features --locked -- \
+  -D warnings \
+  -A clippy::uninlined_format_args \
+  -A clippy::too_many_arguments \
+  -A clippy::unnecessary_map_or \
+  -A clippy::collapsible_if \
+  -A clippy::assertions_on_constants
+```
+
+#### Fast local loop
+
+The full gate above is what CI enforces, but you do not need it for every
+edit. `crates/tui` is a ~750k-line crate, so the loop that stays fast is
+the one that avoids rebuilding it more than necessary (numbers and the
+reasoning are in [`docs/BUILD_PERFORMANCE.md`](docs/BUILD_PERFORMANCE.md)):
+
+```bash
+# 1. Type-check first (seconds after the first build; no codegen, no link).
+scripts/dev-cargo.sh check -p codewhale-tui
+
+# 2. Run only the tests near your change (one crate, one filter).
+scripts/dev-test.sh tui fleet_setup
+# or: scripts/dev-test.sh crates/tui/src/elapsed.rs
+
+# 3. Run a whole crate's unit suite. scripts/dev-test.sh uses nextest when
+#    it is installed (one process per test, all cores busy, slow tests
+#    named; ~100 s here vs ~270 s with libtest).
+cargo install cargo-nextest --locked      # once
+scripts/dev-test.sh tui
+scripts/dev-cargo.sh nextest run --workspace --all-features --locked
+
+# 4. Before pushing, run the authoritative gate exactly as CI does:
+cargo test --workspace --all-features --locked
+```
+
+`.config/nextest.toml` already serializes the PTY suite and bounds the
+integration tests that spawn the real binary, so `cargo nextest run` is
+safe to use on the whole workspace (nextest does not run doctests; the
+authoritative `cargo test` gate does). Tests must not depend on running in
+the same process as another test (nextest gives every test its own
+process); if a test needs the rustls crypto provider, install it in that
+test as production does at startup.
+
+On a machine with less than 16 GB of RAM (or when cross-compiling, e.g.
+for OHOS), build one rustc at a time: `CARGO_BUILD_JOBS=1` (or `-j1`), one
+crate at a time, `--lib` for tests, never `--workspace`/`--all-targets`.
+The tui library needs ~6 GB for its own rustc and its unit-test build ~8 GB;
+`cargo test --workspace` runs both at once. Numbers and the full recipe:
+[`docs/BUILD_PERFORMANCE.md`](docs/BUILD_PERFORMANCE.md#low-memory-build-recipe-machines-with--16-gb-cross-builds).
+
+If you work in several worktrees, do **not** share one `CARGO_TARGET_DIR`
+by default: two cargos on the same target flock and serialize. Use
+`scripts/dev-cargo.sh` / `scripts/dev-test.sh`, which give each workspace
+its own Cargo `build-dir` (`{workspace-path-hash}` under
+`${CODEWHALE_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/codewhale}`).
+`CODEWHALE_DEV_CACHE=local` keeps `./target` if you want that.
+`sccache` wraps rustc only when incremental compilation is already off
+(`CARGO_INCREMENTAL=0` or `CODEWHALE_SCCACHE=1`) and `sccache` is on
+`PATH`; a missing binary is a printed fallback, not an error. Override
+the cache root with `CODEWHALE_CACHE_ROOT` — there is no machine-specific
+default. A single shared `CARGO_TARGET_DIR` remains valid only for
+serialized trunk work. See
+[`docs/BUILD_PERFORMANCE.md`](docs/BUILD_PERFORMANCE.md).
+
+Some checks are platform-bound or intentionally excluded from an ordinary
+change. Choose them for the risk they answer rather than treating every
+available suite as ritual. Visible TUI behavior is accepted in the actual
+terminal at the sizes and interaction path affected by the change; the former
+full-screen PTY assertion suite was removed because it froze layout and copy
+while missing product quality.
+
+- **Long-running process acceptance** should use a sealed local home, local
+  fixtures, and the real binary. Record the terminal size, inputs, visible
+  result, and any filesystem side effect instead of adding a full-screen
+  golden.
+- **OCR** (`image_ocr`) uses the macOS Vision framework or a locally
+  installed `tesseract`; its platform-specific paths are
+  `cfg(target_os = "macos")`-gated and depend on host tooling.
+- **Seatbelt sandbox** tests are macOS-only (`cfg(target_os =
+  "macos")` at the module level) and do not run elsewhere.
+
+#### Local git hooks are optional
+
+This repository does not install git hooks, and no hook installer
+exists; CI is the enforced gate. If you want a local `pre-push` hook
+that runs the commands above, add it yourself (`.git/hooks/pre-push` or
+`git config core.hooksPath`). Constraints for any local hook:
+
+- A hook must never push, tag, publish, deploy, mutate credentials, or
+  rewrite the working tree (no auto-fix commits or silent file
+  modification). It may only verify and report.
+- To bypass your own hook for a knowingly documented reason (for
+  example, pushing work-in-progress to your own fork branch), use
+  `git push --no-verify` and say so in the PR description. Bypassing a
+  local hook does not make the gates pass — CI still runs them, and a
+  bypassed gate must never be reported as a passing one.
+- Release publication (tags, GitHub Releases, crates/npm artifacts) is a
+  separate, owner-approved gate. Neither local hooks nor a green local
+  run authorize any publication step.
+
 ### Commit Messages
 
 Use clear, descriptive commit messages following conventional commits:
@@ -210,7 +334,7 @@ What this means for you:
 
 ## Contribution Gate
 
-CodeWhale uses a maintainer-managed contribution gate for the community front
+Codewhale uses a maintainer-managed contribution gate for the community front
 door. Maintainers and collaborators bypass this gate automatically. The gate
 workflows default to dry-run / comment-only mode so maintainers can observe the
 signal before changing contributor flow.
@@ -221,7 +345,7 @@ keeping good-faith contributors seen, credited, and able to keep helping.
 
 Issues are never auto-closed by the contribution gate. Unapproved external
 issues receive a short welcome note that asks for reproduction details and then
-remain open for maintainer triage. CodeWhale depends on real edge cases from
+remain open for maintainer triage. Codewhale depends on real edge cases from
 real users, so issue intake should stay warm and open.
 
 Pull requests are different because they can touch code, CI, release plumbing,
@@ -254,9 +378,9 @@ reopened, ask the contributor to resubmit after the allowlist PR is merged.
 
 ## Agent-Assisted Improvements
 
-CodeWhale is allowed to help improve CodeWhale, but the contribution still has
-to be shaped for human review. The recommended workflow is the
-[recursive self-improvement prompt](docs/RECURSIVE_SELF_IMPROVEMENT.md): run it
+Codewhale is allowed to help improve Codewhale, but the contribution still has
+to be shaped for human review. The recommended workflow is the recursive self-improvement prompt
+in the private `codewhale-ops` repo: run it
 from a fresh fork or branch, let the agent find exactly one small friction point,
 and stop after one patch. DeepSeek V4 Pro is the reference path for this loop
 today, but any configured provider works — the review shape matters more than
@@ -307,12 +431,9 @@ these crates, including the bottom-up build order.
 
 2. Make your changes and commit them
 
-3. Ensure CI passes:
-   ```bash
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --all-features
-   cargo test --workspace --all-features
-   ```
+3. Run the pre-push verification commands (see
+   [Pre-push verification](#pre-push-verification) above for the exact
+   gate and the stricter release clippy form)
 
 4. Push your branch and create a Pull Request
 
@@ -347,12 +468,8 @@ Typically each PR touches 1–3 new files, modifies 2–5 existing files for wir
 are scoped to a single feature or fix — if you discover related work that needs
 doing, open a separate issue rather than expanding the PR scope.
 
-Before submitting, run:
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features 2>&1 | head -50
-cargo check
-```
+Before submitting, run the commands in
+[Pre-push verification](#pre-push-verification).
 
 ## Reporting Issues
 

@@ -45,7 +45,7 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Create a compact session relay (接力) for a future CodeWhale thread."
+        "Create a compact session relay (接力) for a future Codewhale thread."
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "Write or update `.deepseek/handoff.md`.");
@@ -54,6 +54,10 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
         "Keep the existing file path for compatibility, but title the artifact `# Session relay`."
     );
     let _ = writeln!(out);
+    let _ = writeln!(out, "Use this relay structure:");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", crate::prompts::COMPACT_TEMPLATE.trim());
+    let _ = writeln!(out);
     let _ = writeln!(out, "Current session snapshot:");
     let _ = writeln!(out, "- Workspace: {}", app.workspace.display());
     let _ = writeln!(out, "- Mode: {}", app.mode.label());
@@ -61,38 +65,36 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
     if let Some(focus) = focus {
         let _ = writeln!(out, "- Requested relay focus: {focus}");
     }
-    if let Some(quarry) = app.hunt.quarry.as_deref() {
-        let _ = writeln!(out, "- Goal objective: {quarry}");
+    if let Some(objective) = app.goal.objective.as_deref() {
+        let _ = writeln!(out, "- Goal objective: {objective}");
     }
-    if let Some(budget) = app.hunt.token_budget {
+    if let Some(budget) = app.goal.token_budget {
         let _ = writeln!(out, "- Goal token budget: {budget}");
     }
-    if let Ok(todos) = app.todos.try_lock() {
-        let snapshot = todos.snapshot();
-        if !snapshot.items.is_empty() {
-            let _ = writeln!(
-                out,
-                "\nTo-do (primary progress surface, {}% complete):",
-                snapshot.completion_pct
-            );
-            for item in snapshot.items {
-                let _ = writeln!(
-                    out,
-                    "- #{} [{}] {}",
-                    item.id,
-                    item.status.as_str(),
-                    item.content
-                );
+    // Read through the same authoritative graph-backed snapshot seam used by
+    // persistence. A model can call `work_update` immediately before `/relay`;
+    // the UI projection may not have published yet, but the handoff must still
+    // describe the staged To-do rather than a stale compatibility list.
+    match app.work_state_snapshot() {
+        Ok(Some(state)) => {
+            if let Some(body) = crate::todo_snapshot::todo_snapshot_body(&state.todos) {
+                let _ = writeln!(out, "\nCurrent To-do:");
+                let _ = writeln!(out, "{body}");
             }
         }
-    } else {
-        let _ = writeln!(out, "\nTo-do: unavailable because the list is busy.");
+        Ok(None) => {}
+        Err(_) => {
+            let _ = writeln!(out, "\nTo-do: unavailable because the list is busy.");
+        }
     }
 
     if let Ok(plan) = app.plan_state.try_lock() {
         let snapshot = plan.snapshot();
         if !snapshot.is_empty() {
-            let _ = writeln!(out, "\nOptional strategy metadata from update_plan:");
+            let _ = writeln!(
+                out,
+                "\nConversational strategy notes from update_plan (reasoning context, not a Work surface):"
+            );
             write_plan_field(&mut out, "Title", snapshot.title.as_deref());
             write_plan_field(&mut out, "Objective", snapshot.objective.as_deref());
             write_plan_field(&mut out, "Context", snapshot.context_summary.as_deref());
@@ -134,29 +136,6 @@ fn build_relay_instruction(app: &App, focus: Option<&str>) -> String {
     let _ = writeln!(
         out,
         "\nBefore writing, inspect the current transcript context and any live tool evidence you need. Do not invent test results, file changes, blockers, or decisions."
-    );
-    let _ = writeln!(
-        out,
-        "\nUse this compact structure:\n\
-         # Session relay\n\
-         \n\
-         ## Goal\n\
-         [the user's objective and any explicit constraints]\n\
-         \n\
-         ## Current work\n\
-         [the active To-do item, progress, and what is mid-flight]\n\
-         \n\
-         ## Files and state\n\
-         [changed files, important paths, sub-agents/RLM sessions, commands run]\n\
-         \n\
-         ## Decisions\n\
-         [why key choices were made]\n\
-         \n\
-         ## Verification\n\
-         [what passed, what failed, what was not run]\n\
-         \n\
-         ## Next action\n\
-         [one concrete action for the next thread]"
     );
     let _ = writeln!(
         out,

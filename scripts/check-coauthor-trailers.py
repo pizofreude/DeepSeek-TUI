@@ -4,7 +4,8 @@
 The check is intentionally scoped to new commits. Historical commits may carry
 raw or local emails, but new harvested commits should use GitHub's numeric
 `id+login@users.noreply.github.com` address so co-author credit lands in the
-contributor graph.
+contributor graph. Preserved integration commits may resolve a mapped identity
+without a history rewrite only through an exact-SHA exception below.
 """
 
 from __future__ import annotations
@@ -37,6 +38,67 @@ BOT_EMAILS = {
     "noreply@anthropic.com",
 }
 BOT_NAMES = ("claude", "codex", "cursor")
+
+# Recognized agent contributors may receive `Co-authored-by` credit for work
+# they materially authored (see AGENTS.md). Matching is exact on the normalized
+# name+email pair: lookalike or unknown agent identities still fail the gate.
+# These identities intentionally stay out of AUTHOR_MAP because they are not
+# GitHub contributor-graph humans.
+AGENT_CONTRIBUTOR_IDENTITIES = {
+    ("codewhale agent", "codewhale-agent@hmbown.local"),
+    ("claude fable 5", "noreply@anthropic.com"),
+}
+
+# This commit is already immutable history on origin/main. Its trailer names a
+# local Codewhale automation actor, not a human contributor. It escaped the
+# existing gate and is now immutable on origin/main. Rewriting main would
+# invalidate every descendant, while mapping the actor to a human would
+# manufacture contributor credit. Exempt only the exact full SHA + exact actor
+# identity; every other malformed trailer still fails.
+LEGACY_AUTOMATION_TRAILER_EXCEPTIONS = {
+    (
+        "9a74825cd182a62465943bcbbcbcf591d1ce99ee",
+        "codewhale agent",
+        "codewhale-agent@hmbown.local",
+    ),
+}
+
+# These public-surface commits were merged into the v0.9.1 integration graph
+# before the credit gate ran. Rewriting them would replace the original commits
+# and every descendant merge. Resolve only their exact Hunter identities through
+# AUTHOR_MAP; a changed SHA, role, name, or email remains a hard failure.
+PRESERVED_MAPPED_IDENTITY_EXCEPTIONS = {
+    (
+        "5087269606fc8847487b0a8b51ef6adffa8eb2ca",
+        "author",
+        "hunter b",
+        "hmbown@gmail.com",
+    ),
+    (
+        "5087269606fc8847487b0a8b51ef6adffa8eb2ca",
+        "coauthor",
+        "hunter bown",
+        "hmbown@gmail.com",
+    ),
+    (
+        "e37df06caeb3064b2bb9263c1c98a903738f3a0a",
+        "coauthor",
+        "hunter bown",
+        "hmbown@gmail.com",
+    ),
+    (
+        "6d0ebc881a8bd2469c45b25f2a606fa63681e112",
+        "coauthor",
+        "fleitz",
+        "fleitzo@gmail.com",
+    ),
+    (
+        "338138eb546bcf8917b27395325f59af0d2e4f52",
+        "author",
+        "hunter b",
+        "hmbown@gmail.com",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -127,6 +189,10 @@ def git_log(commit_range: str) -> list[Commit]:
     for record in raw.split("\x1e"):
         if not record.strip():
             continue
+        # `git log` emits a newline after each record separator. Remove only
+        # that framing byte so the next record's full SHA remains exact while
+        # preserving commit-body whitespace.
+        record = record.lstrip("\n")
         parts = record.split("\x00", 5)
         if len(parts) != 6:
             raise RuntimeError("failed to parse git log output")
@@ -148,6 +214,44 @@ def lookup_identity(aliases: dict[str, Identity], *values: str) -> Identity | No
         if identity is not None:
             return identity
     return None
+
+
+def merged_author_emails(commit: Commit) -> set[str]:
+    """Author emails of the commits a merge commit brings in.
+
+    A merge commit that lands a contributor's PR preserves the contributor as
+    author of the merged commits themselves. When such a merge also carries a
+    `Harvested from PR #N by @login` line (so the auto-close workflow credits
+    the PR), the contributor's authorship on the second-parent side is the
+    machine-readable credit; the merge commit does not need a duplicate
+    trailer.
+    """
+    parents = commit.parents.split()
+    if len(parents) < 2:
+        return set()
+    try:
+        raw = subprocess.check_output(
+            [
+                "git",
+                "log",
+                "--format=%ae",
+                f"{parents[0]}..{commit.sha}",
+            ],
+            cwd=ROOT,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return set()
+    return {norm_key(line) for line in raw.splitlines() if line.strip()}
+
+
+def is_preserved_mapped_identity(commit: Commit, role: str, identity: Identity) -> bool:
+    return (
+        commit.sha.strip().lower(),
+        role,
+        norm_key(identity.name),
+        norm_key(identity.email),
+    ) in PRESERVED_MAPPED_IDENTITY_EXCEPTIONS
 
 
 def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors: bool) -> list[str]:
@@ -173,6 +277,11 @@ def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors:
                 is_harvested_commit
                 and mapped_author
                 and norm_key(commit.author_email) != norm_key(mapped_author.email)
+                and not is_preserved_mapped_identity(
+                    commit,
+                    "author",
+                    Identity(commit.author_name, commit.author_email),
+                )
             ):
                 errors.append(
                     f"{prefix}: author {commit.author_name} <{commit.author_email}> "
@@ -180,6 +289,14 @@ def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors:
                 )
 
         for coauthor in coauthors:
+            if (
+                commit.sha.strip().lower(),
+                norm_key(coauthor.name),
+                norm_key(coauthor.email),
+            ) in LEGACY_AUTOMATION_TRAILER_EXCEPTIONS:
+                continue
+            if (norm_key(coauthor.name), norm_key(coauthor.email)) in AGENT_CONTRIBUTOR_IDENTITIES:
+                continue
             if is_bot_identity(coauthor.name, coauthor.email):
                 if not commit.is_merge_commit():
                     errors.append(
@@ -191,10 +308,11 @@ def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors:
                 continue
             expected = lookup_identity(aliases, coauthor.email, coauthor.name)
             if expected:
-                errors.append(
-                    f"{prefix}: co-author {coauthor.name} <{coauthor.email}> is not "
-                    f"GitHub-mappable. Use `{expected.trailer()}`."
-                )
+                if not is_preserved_mapped_identity(commit, "coauthor", coauthor):
+                    errors.append(
+                        f"{prefix}: co-author {coauthor.name} <{coauthor.email}> is not "
+                        f"GitHub-mappable. Use `{expected.trailer()}`."
+                    )
             else:
                 errors.append(
                     f"{prefix}: co-author {coauthor.name} <{coauthor.email}> is not "
@@ -202,7 +320,13 @@ def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors:
                     "or use `gh api users/<login> --jq '\"\\(.id)+\\(.login)@users.noreply.github.com\"'`."
                 )
 
-        coauthor_emails = {norm_key(coauthor.email) for coauthor in coauthors}
+        coauthor_emails: set[str] = set()
+        for coauthor in coauthors:
+            coauthor_emails.add(norm_key(coauthor.email))
+            expected = lookup_identity(aliases, coauthor.email, coauthor.name)
+            if expected and is_preserved_mapped_identity(commit, "coauthor", coauthor):
+                coauthor_emails.add(norm_key(expected.email))
+        merged_emails = merged_author_emails(commit) if harvested_logins else set()
         for login in harvested_logins:
             expected = lookup_identity(aliases, login)
             if expected is None:
@@ -213,6 +337,7 @@ def validate(commits: list[Commit], aliases: dict[str, Identity], check_authors:
             if (
                 norm_key(commit.author_email) != norm_key(expected.email)
                 and norm_key(expected.email) not in coauthor_emails
+                and norm_key(expected.email) not in merged_emails
             ):
                 errors.append(
                     f"{prefix}: `Harvested from PR ... by @{login}` needs machine-readable "

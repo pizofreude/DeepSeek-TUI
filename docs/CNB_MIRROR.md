@@ -21,7 +21,7 @@ against it:
 
 ```bash
 # Verify a downloaded CNB binary against the CNB manifest
-sha256sum -c codewhale-artifacts-sha256.txt
+sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 ```
 
 ## How it works
@@ -57,7 +57,9 @@ When CNB receives a `v*` tag, the root `.cnb.yml` tag pipeline builds Linux x64
 release assets from source and publishes a CNB release with:
 
 - `codewhale-linux-x64`
-- `codewhale-tui-linux-x64`
+- `codew-linux-x64`
+- `codewhale-tui-linux-x64` (compatibility-only release filename; not a third
+  installed command)
 - `codewhale-artifacts-sha256.txt`
 
 This gives users who can reach CNB but not GitHub a CNB-native release path.
@@ -120,12 +122,16 @@ If the workflow is healthy but happened to fail on the release run
 without pushing anything:
 
 ```bash
-gh workflow run sync-cnb.yml --repo Hmbown/CodeWhale
+# Prefer rerunning the existing failed tag run when one exists.
+gh run rerun <failed-tag-run-id> --repo Hmbown/CodeWhale
+
+# If no tag run exists, dispatch from the exact existing release tag.
+gh workflow run sync-cnb.yml --repo Hmbown/CodeWhale --ref vX.Y.Z
 ```
 
-`workflow_dispatch` runs against the workflow's default branch
-(`main`), so this will sync the current `main` to CNB. To re-sync
-a specific tag, the manual `git push cnb` path above is the way.
+Do not omit `--ref` when repairing a tag: a default-branch dispatch syncs
+`main`, not `refs/tags/vX.Y.Z`. Afterward, prove the tag and its Linux x64
+release assets exist before directing users to CNB.
 
 ## Rotating `CNB_GIT_TOKEN`
 
@@ -147,33 +153,86 @@ expired:
 ## Binary release assets and `codewhale update`
 
 CNB now builds Linux x64 assets for `v*` tags from the source-controlled
-`.cnb.yml` pipeline. GitHub remains the canonical macOS/Windows release matrix. Users
-behind GitHub-blocking networks should use one of these paths:
+`.cnb.yml` pipeline. GitHub remains the canonical macOS/Windows release matrix.
+
+### Automatic source selection (Linux x64)
+
+On Linux x64, `codewhale update` picks its asset source before it downloads
+anything large. Once the target tag is known, it requests
+`codewhale-artifacts-sha256.txt` for that exact tag from GitHub Releases and
+from the CNB release **at the same time**, and takes the first source that
+answers with a manifest listing `codewhale-linux-x64`. The straggler's answer is
+discarded.
+
+Three properties this relies on:
+
+- **The manifest is the probe.** It is a few hundred bytes, so a blocked or slow
+  source loses in about the time its connection takes to fail — the user never
+  waits out a stalled multi-megabyte asset download, and no timeout is doing the
+  choosing.
+- **Manifest and binary come from the same source.** CNB builds its own
+  artifacts from the tagged source (musl-static, not GitHub's glibc build), so
+  the two manifests describe different bytes and are not interchangeable. The
+  winning source supplies both, and a checksum mismatch fails the update rather
+  than falling back to the loser.
+- **Selection never changes which release is installed.** The tag still comes
+  from GitHub's stable-release or beta-release lookup, so `--beta` keeps its
+  meaning; only where the bytes for that tag are fetched from is decided by the
+  probe.
+
+`codewhale update` and `codewhale update --check` both print the result as a
+`Release source:` line, and the post-install summary repeats it, so the source a
+given binary came from is recoverable after the fact.
+
+Every other target keeps a single canonical source: CNB publishes Linux x64 and
+nothing else, so macOS, Windows, Android, and Linux arm64 do not race CNB;
+Linux riscv64 remains explicitly unsupported. All supported self-update paths
+are nevertheless checksum-required: the chosen source must publish a valid
+`codewhale-artifacts-sha256.txt` entry for the exact platform binary, or
+`codewhale update` stops before downloading that binary. There is no
+unverified-install fallback.
+
+Setting `CODEWHALE_RELEASE_BASE_URL` (or a legacy alias) or
+`CODEWHALE_USE_CNB_MIRROR` turns selection off entirely — an explicitly named
+source is used as named, including its own checksum manifest, with
+`CODEWHALE_RELEASE_BASE_URL` outranking `CODEWHALE_USE_CNB_MIRROR`.
+
+### Manual paths
+
+Users behind GitHub-blocking networks can also select a source explicitly:
 
 - **`cargo install`** from the CNB mirror:
   ```bash
-  cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewhale-cli
-  cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewhale-tui
+  cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewhale-cli --locked
   ```
-  (Both binaries are required — the dispatcher and the TUI ship
-  separately; see `AGENTS.md` for the two-binary install rationale.)
+  The current `codewhale` binary runs the TUI in-process. Cargo users who want
+  the optional short command can add a `codew` symlink beside it; a separate
+  `codewhale-tui` install is not required.
   Linux build-time dependencies (`build-essential`, `pkg-config`,
   `libdbus-1-dev` on Debian/Ubuntu) are required — see
   [INSTALL.md](INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
 
 - **CNB release assets** for Linux x64, when the matching CNB tag pipeline has
-  completed successfully. Download `codewhale-linux-x64`,
-  `codewhale-tui-linux-x64`, and `codewhale-artifacts-sha256.txt` from the CNB
-  release for `vX.Y.Z`, then verify the binaries against the manifest.
+  completed successfully. Download `codewhale-linux-x64`, `codew-linux-x64`,
+  and `codewhale-artifacts-sha256.txt` from the CNB release for `vX.Y.Z`, then
+  verify the binaries against the manifest. The published
+  `codewhale-tui-linux-x64` file is a legacy-client bridge and is not required
+  by current installs. On Linux x64 and OpenHarmony x64 the npm wrapper probes
+  that CNB checksum manifest concurrently with GitHub Releases for the exact
+  package version and locks onto the first source whose HTTP response and
+  manifest validate — it does not wait for a slow GitHub binary download. Set
+  `CODEWHALE_USE_CNB_MIRROR=1` to force CNB only, or
+  `CODEWHALE_RELEASE_BASE_URL` to skip the race. Other platforms must use
+  GitHub or a complete `CODEWHALE_RELEASE_BASE_URL` mirror.
 
-- **`DEEPSEEK_TUI_RELEASE_BASE_URL`** environment variable, if a
-  CDN mirror of release assets exists. The npm
-  wrapper installer and `codewhale update` read this variable to redirect
-  binary downloads. For `codewhale update`, also set
-  `DEEPSEEK_TUI_VERSION=X.Y.Z` so the updater can label the mirrored
+- **`CODEWHALE_RELEASE_BASE_URL`** environment variable, if a CDN mirror of
+  release assets exists. The npm wrapper installer and `codewhale update` read
+  this variable to redirect binary downloads. For `codewhale update`, also set
+  `CODEWHALE_VERSION=X.Y.Z` so the updater can label the mirrored
   release without contacting GitHub. The directory pointed to must contain
   `codewhale-artifacts-sha256.txt` and the platform binaries; format matches
-  a GitHub Release asset directory.
+  a GitHub Release asset directory. The earlier `DEEPSEEK_TUI_*` names remain
+  accepted as compatibility aliases.
 
 ## Clone from CNB
 

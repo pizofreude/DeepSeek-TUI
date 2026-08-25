@@ -7,14 +7,14 @@ release_base="${CODEWHALE_RELEASE_BASE_URL:-${DEEPSEEK_TUI_RELEASE_BASE_URL:-}}"
 
 usage() {
   cat <<'USAGE'
-CodeWhale installer for macOS and Linux.
+Codewhale installer for macOS and Linux.
 
 Usage:
   curl -fsSL https://codewhale.net/install.sh | sh
 
 Environment:
   CODEWHALE_INSTALL_DIR    Install directory. Default: $HOME/.local/bin
-  CODEWHALE_VERSION        Release tag to install, for example v0.8.64. Default: latest
+  CODEWHALE_VERSION        Release tag to install, for example v0.9.0. Default: latest
   CODEWHALE_RELEASE_BASE_URL
                            Custom release asset base URL ending in /download
   CODEWHALE_SKIP_GLIBC_CHECK=1
@@ -22,7 +22,7 @@ Environment:
 
 Examples:
   curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR=/usr/local/bin sh
-  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.8.64 sh
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=v0.9.0 sh
 USAGE
 }
 
@@ -139,6 +139,28 @@ check_glibc() {
     *) return ;;
   esac
 
+  # Linux arm64 assets became static musl builds in v0.9.6. `latest` and
+  # explicit v0.9.6+ installs therefore have no glibc floor. Keep the
+  # preflight only for explicitly requested older releases, whose arm64
+  # assets were linked against GNU libc on Ubuntu 24.04.
+  if [ "$version" = "latest" ]; then
+    return
+  fi
+  numeric_version="${version#v}"
+  if awk -v have="$numeric_version" '
+    BEGIN {
+      if (have !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) exit 1
+      split(have, h, ".")
+      if (h[1] > 0) exit 0
+      if (h[1] < 0) exit 1
+      if (h[2] > 9) exit 0
+      if (h[2] < 9) exit 1
+      exit !(h[3] >= 6)
+    }
+  '; then
+    return
+  fi
+
   [ "${CODEWHALE_SKIP_GLIBC_CHECK:-}" = "1" ] && return
   [ "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" = "1" ] && return
   [ "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" = "1" ] && return
@@ -147,11 +169,12 @@ check_glibc() {
   host="$(glibc_version || true)"
   if [ -z "$host" ] || ! version_at_least "$host" "$required"; then
     cat >&2 <<EOF
-codewhale install: prebuilt CodeWhale $target assets require glibc $required or newer.
+codewhale install: Codewhale $version $target assets require glibc $required or newer.
 This system reports glibc ${host:-unavailable}.
 
-Linux x64 uses a static musl build. Linux arm64 release assets are GNU libc
-builds from Ubuntu 24.04. Build from source with Cargo or set
+Linux arm64 assets before v0.9.6 were GNU libc builds from Ubuntu 24.04.
+Current v0.9.6+ assets are static musl builds. Build this older release from
+source with Cargo or set
 CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk.
 EOF
     exit 1
@@ -189,34 +212,33 @@ fi
 target="$(detect_platform)"
 check_glibc
 cli_asset="codewhale-$target"
-tui_asset="codewhale-tui-$target"
+shim_asset="codew-$target"
 manifest_asset="codewhale-artifacts-sha256.txt"
 
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t codewhale-install)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
-say "Installing CodeWhale for $target"
+say "Installing Codewhale for $target"
 say "Release assets: $release_base"
 say "Install dir: $install_dir"
 
 download "$release_base/$manifest_asset" "$tmpdir/$manifest_asset"
 download "$release_base/$cli_asset" "$tmpdir/codewhale"
-download "$release_base/$tui_asset" "$tmpdir/codewhale-tui"
+download "$release_base/$shim_asset" "$tmpdir/codew"
 
 verify_asset "$cli_asset" "$tmpdir/codewhale" "$tmpdir/$manifest_asset"
-verify_asset "$tui_asset" "$tmpdir/codewhale-tui" "$tmpdir/$manifest_asset"
+verify_asset "$shim_asset" "$tmpdir/codew" "$tmpdir/$manifest_asset"
 say "Checksums verified"
 
-chmod 755 "$tmpdir/codewhale" "$tmpdir/codewhale-tui"
+chmod 755 "$tmpdir/codewhale" "$tmpdir/codew"
 if command -v xattr >/dev/null 2>&1; then
-  xattr -d com.apple.quarantine "$tmpdir/codewhale" "$tmpdir/codewhale-tui" 2>/dev/null || true
+  xattr -d com.apple.quarantine "$tmpdir/codewhale" "$tmpdir/codew" 2>/dev/null || true
 fi
 
 sudo_cmd=""
 if [ -d "$install_dir" ]; then
   if [ ! -w "$install_dir" ] ||
     { [ -e "$install_dir/codewhale" ] && [ ! -w "$install_dir/codewhale" ]; } ||
-    { [ -e "$install_dir/codewhale-tui" ] && [ ! -w "$install_dir/codewhale-tui" ]; } ||
     { [ -e "$install_dir/codew" ] && [ ! -w "$install_dir/codew" ]; }; then
     need_cmd sudo
     sudo_cmd="sudo"
@@ -229,24 +251,42 @@ else
   fi
 fi
 
+legacy_tui="$install_dir/codewhale-tui"
+refresh_legacy_tui=0
+# v0.9.4's website installer placed a regular codewhale-tui binary beside
+# codewhale. A clean v0.9.5 install exposes only codewhale + codew, but an
+# upgrade must not leave that installer-owned path running stale v0.9.4 code.
+# Refresh the existing compatibility command from the already verified
+# consolidated bytes. Do not create it for new installs or replace a symlink.
+if [ -f "$legacy_tui" ] && [ ! -L "$legacy_tui" ]; then
+  refresh_legacy_tui=1
+fi
+
 stage_cli="$install_dir/.codewhale.$$"
-stage_tui="$install_dir/.codewhale-tui.$$"
-trap 'rm -rf "$tmpdir"; rm -f "$stage_cli" "$stage_tui" 2>/dev/null || true' EXIT INT TERM
+stage_shim="$install_dir/.codew.$$"
+stage_legacy_tui="$install_dir/.codewhale-tui.$$"
+trap 'rm -rf "$tmpdir"; rm -f "$stage_cli" "$stage_shim" "$stage_legacy_tui" 2>/dev/null || true' EXIT INT TERM
 
 $sudo_cmd cp "$tmpdir/codewhale" "$stage_cli"
-$sudo_cmd cp "$tmpdir/codewhale-tui" "$stage_tui"
-$sudo_cmd chmod 755 "$stage_cli" "$stage_tui"
+$sudo_cmd cp "$tmpdir/codew" "$stage_shim"
+$sudo_cmd chmod 755 "$stage_cli" "$stage_shim"
+if [ "$refresh_legacy_tui" -eq 1 ]; then
+  $sudo_cmd cp "$tmpdir/codewhale" "$stage_legacy_tui"
+  $sudo_cmd chmod 755 "$stage_legacy_tui"
+fi
 $sudo_cmd mv "$stage_cli" "$install_dir/codewhale"
-$sudo_cmd mv "$stage_tui" "$install_dir/codewhale-tui"
-
-$sudo_cmd rm -f "$install_dir/codew"
-if ! $sudo_cmd ln -s codewhale "$install_dir/codew"; then
-  say "Installed binaries, but could not create $install_dir/codew alias"
+$sudo_cmd mv "$stage_shim" "$install_dir/codew"
+if [ "$refresh_legacy_tui" -eq 1 ]; then
+  $sudo_cmd mv "$stage_legacy_tui" "$legacy_tui"
+  say "Refreshed legacy compatibility command: $legacy_tui"
 fi
 
 say "Installed:"
 "$install_dir/codewhale" --version || true
-"$install_dir/codewhale-tui" --version || true
+"$install_dir/codew" --version || true
+if [ "$refresh_legacy_tui" -eq 1 ]; then
+  "$legacy_tui" --version || true
+fi
 
 case ":$PATH:" in
   *":$install_dir:"*) ;;
@@ -257,4 +297,4 @@ case ":$PATH:" in
 esac
 
 say ""
-say "Run: codewhale"
+say "Run: codew (or codewhale)"

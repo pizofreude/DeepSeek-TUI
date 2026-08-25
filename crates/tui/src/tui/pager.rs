@@ -11,6 +11,8 @@
 //! - `Ctrl+B` / PageUp / Shift+Space — full page up
 //! - `/` — start search; `n` / `N` — next / previous match
 //! - `c` / `y` — copy the entire pager body to the system clipboard
+//! - `a` — copy the attached final assistant answer (answer-carrying pagers)
+//! - `e` — copy the attached turn handoff markdown (Turn Inspector only)
 //! - `q` / Esc — close pager
 
 use std::cell::Cell;
@@ -31,10 +33,74 @@ use crate::tui::views::{
     render_panel_scroll_rail, render_underwater_surface,
 };
 
-pub struct PagerView {
+#[derive(Debug, Clone)]
+struct PagerDestructiveAction {
+    key: char,
+    label: String,
+    confirm_label: String,
+    event: ViewEvent,
+    armed: bool,
+}
+
+/// One independently copyable document in a pager. Most pagers contain a
+/// single page; Turn Inspector uses several so each turn stays isolated while
+/// retaining the pager's existing scroll/search/copy behavior.
+#[derive(Debug, Clone)]
+pub(crate) struct PagerPage {
     title: String,
     lines: Vec<Line<'static>>,
     plain_lines: Vec<String>,
+    export_markdown: Option<String>,
+    copy_text: Option<String>,
+    answer_text: Option<String>,
+}
+
+impl PagerPage {
+    pub(crate) fn from_text(title: impl Into<String>, text: &str, width: u16) -> Self {
+        // Pager bodies frequently carry tool output or worker transcripts.
+        // Keep the same terminal-injection boundary as the single-page path.
+        let mut sanitized = String::with_capacity(text.len());
+        crate::tui::osc8::strip_ansi_into(text, &mut sanitized);
+        let mut lines = Vec::new();
+        for raw in sanitized.lines() {
+            for wrapped in wrap_text(raw, width.max(1) as usize) {
+                lines.push(Line::from(Span::raw(wrapped)));
+            }
+        }
+        let plain_lines = lines.iter().map(line_to_string).collect();
+        Self {
+            title: title.into(),
+            lines,
+            plain_lines,
+            export_markdown: None,
+            copy_text: None,
+            answer_text: None,
+        }
+    }
+
+    pub(crate) fn with_export_markdown(mut self, markdown: impl Into<String>) -> Self {
+        self.export_markdown = Some(markdown.into());
+        self
+    }
+
+    pub(crate) fn with_copy_text(mut self, text: impl Into<String>) -> Self {
+        self.copy_text = Some(text.into());
+        self
+    }
+
+    /// Attach the clean final assistant answer that the `a` key copies to
+    /// the clipboard. Only surfaces that can produce an answer-only payload
+    /// (Turn Inspector pages, assistant detail pagers) set this; the pager
+    /// body itself stays free to render scaffolding around the answer.
+    pub(crate) fn with_copy_answer(mut self, text: impl Into<String>) -> Self {
+        self.answer_text = Some(text.into());
+        self
+    }
+}
+
+pub struct PagerView {
+    pages: Vec<PagerPage>,
+    page_index: usize,
     scroll: usize,
     search_input: String,
     search_matches: Vec<usize>,
@@ -45,19 +111,24 @@ pub struct PagerView {
     /// keys (Ctrl+D/U, Ctrl+F/B, Space, etc.) to compute scroll deltas
     /// without access to the render area.
     last_visible_height: Cell<usize>,
-    /// Optional compact Markdown artifact surfaced by the `e` key. Set for the
-    /// Turn Inspector pager (#4108) so `e` copies a pasteable turn handoff;
-    /// `None` for every other pager, where `e` stays inert.
-    export_markdown: Option<String>,
+    /// Optional inspector-owned destructive action. It requires two presses
+    /// (or key then Enter); Esc disarms before it closes the pager.
+    destructive_action: Option<PagerDestructiveAction>,
 }
 
 impl PagerView {
     pub fn new(title: impl Into<String>, lines: Vec<Line<'static>>) -> Self {
         let plain_lines = lines.iter().map(line_to_string).collect();
         Self {
-            title: title.into(),
-            lines,
-            plain_lines,
+            pages: vec![PagerPage {
+                title: title.into(),
+                lines,
+                plain_lines,
+                export_markdown: None,
+                copy_text: None,
+                answer_text: None,
+            }],
+            page_index: 0,
             scroll: 0,
             search_input: String::new(),
             search_matches: Vec::new(),
@@ -65,29 +136,96 @@ impl PagerView {
             search_mode: false,
             pending_g: false,
             last_visible_height: Cell::new(0),
-            export_markdown: None,
+            destructive_action: None,
+        }
+    }
+
+    /// Build an opt-in multi-page pager and open the requested page. Page
+    /// switching is deliberately unavailable to ordinary one-page pagers.
+    pub(crate) fn from_pages(pages: Vec<PagerPage>, initial_page: usize) -> Self {
+        assert!(!pages.is_empty(), "a pager needs at least one page");
+        let page_index = initial_page.min(pages.len().saturating_sub(1));
+        Self {
+            pages,
+            page_index,
+            scroll: 0,
+            search_input: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
+            search_mode: false,
+            pending_g: false,
+            last_visible_height: Cell::new(0),
+            destructive_action: None,
         }
     }
 
     /// Attach a compact Markdown export (e.g. the #4108 turn handoff) that the
     /// `e` key copies to the clipboard. Only the Turn Inspector pager sets this;
     /// other pagers leave `e` inert.
+    #[cfg(test)]
     pub fn with_export_markdown(mut self, markdown: impl Into<String>) -> Self {
-        self.export_markdown = Some(markdown.into());
+        self.current_page_mut().export_markdown = Some(markdown.into());
+        self
+    }
+
+    /// Preserve a source-faithful payload for `c` / `y` while the rendered
+    /// pager remains free to wrap content to its viewport.
+    pub fn with_copy_text(mut self, text: impl Into<String>) -> Self {
+        self.current_page_mut().copy_text = Some(text.into());
+        self
+    }
+
+    /// Attach the clean final assistant answer that the `a` key copies
+    /// (see [`PagerPage::with_copy_answer`]).
+    pub fn with_copy_answer(mut self, text: impl Into<String>) -> Self {
+        self.current_page_mut().answer_text = Some(text.into());
+        self
+    }
+
+    /// Attach a two-step destructive action to this pager. Work Graph
+    /// inspectors use this to keep Stop inside the detail surface while
+    /// reusing the existing command/agent cancellation events.
+    pub fn with_destructive_action(
+        mut self,
+        key: char,
+        label: impl Into<String>,
+        confirm_label: impl Into<String>,
+        event: ViewEvent,
+    ) -> Self {
+        self.destructive_action = Some(PagerDestructiveAction {
+            key,
+            label: label.into(),
+            confirm_label: confirm_label.into(),
+            event,
+            armed: false,
+        });
         self
     }
 
     pub fn from_text(title: impl Into<String>, text: &str, width: u16) -> Self {
-        let mut lines = Vec::new();
-        for raw in text.lines() {
-            for wrapped in wrap_text(raw, width.max(1) as usize) {
-                lines.push(Line::from(Span::raw(wrapped)));
-            }
-            if raw.is_empty() {
-                lines.push(Line::from(""));
-            }
+        Self::from_pages(vec![PagerPage::from_text(title, text, width)], 0)
+    }
+
+    fn current_page(&self) -> &PagerPage {
+        &self.pages[self.page_index]
+    }
+
+    fn current_page_mut(&mut self) -> &mut PagerPage {
+        &mut self.pages[self.page_index]
+    }
+
+    fn switch_page(&mut self, page_index: usize) {
+        let page_index = page_index.min(self.pages.len().saturating_sub(1));
+        if page_index == self.page_index {
+            return;
         }
-        Self::new(title, lines)
+        self.page_index = page_index;
+        self.scroll = 0;
+        self.search_input.clear();
+        self.search_matches.clear();
+        self.search_index = 0;
+        self.search_mode = false;
+        self.pending_g = false;
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -106,21 +244,25 @@ impl PagerView {
         self.scroll = max_scroll;
     }
 
-    /// Plain-text body of the pager joined with `\n`, suitable for sending
-    /// to the system clipboard via `ViewEvent::CopyToClipboard`. Reflects the
-    /// content the user sees, including any width-based wrapping that
-    /// `from_text` introduced — copying the visible text is the expected
-    /// affordance when the user can't reach terminal-native selection inside
-    /// the modal (#1354).
+    /// Plain-text rendered body of the pager joined with `\n`. This reflects
+    /// width-based display wrapping. Clipboard events use this by default;
+    /// pagers with a source-faithful override use that payload instead.
     pub fn body_text(&self) -> String {
-        self.plain_lines.join("\n")
+        self.current_page().plain_lines.join("\n")
+    }
+
+    fn clipboard_text(&self) -> String {
+        self.current_page()
+            .copy_text
+            .clone()
+            .unwrap_or_else(|| self.body_text())
     }
 
     /// The pager's title bar text. Used by tests to assert the raw-detail
     /// pager is framed at leaf scope (#4105).
     #[cfg(test)]
     pub(crate) fn title(&self) -> &str {
-        &self.title
+        &self.current_page().title
     }
 
     /// Return the page height (in lines) used for paging keys.
@@ -143,7 +285,10 @@ impl PagerView {
     fn max_scroll(&self) -> usize {
         // Match the render-side clamp so G/End land at the visible bottom and
         // k/Up immediately scroll back up by one line.
-        self.lines.len().saturating_sub(self.page_height())
+        self.current_page()
+            .lines
+            .len()
+            .saturating_sub(self.page_height())
     }
 
     fn start_search(&mut self) {
@@ -162,6 +307,7 @@ impl PagerView {
         }
         let lower = query.to_ascii_lowercase();
         self.search_matches = self
+            .current_page()
             .plain_lines
             .iter()
             .enumerate()
@@ -254,6 +400,24 @@ impl ModalView for PagerView {
             }
         }
 
+        if let Some(action) = self.destructive_action.as_mut() {
+            if key.code == KeyCode::Esc && action.armed {
+                action.armed = false;
+                self.pending_g = false;
+                return ViewAction::None;
+            }
+            let matching_key =
+                matches!(key.code, KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&action.key));
+            if matching_key || (key.code == KeyCode::Enter && action.armed) {
+                self.pending_g = false;
+                if action.armed {
+                    return ViewAction::EmitAndClose(action.event.clone());
+                }
+                action.armed = true;
+                return ViewAction::None;
+            }
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let max_scroll = self.max_scroll();
@@ -288,6 +452,18 @@ impl ModalView for PagerView {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
+            KeyCode::Left if self.pages.len() > 1 => {
+                self.switch_page(self.page_index.saturating_sub(1));
+                ViewAction::None
+            }
+            KeyCode::Right if self.pages.len() > 1 => {
+                self.switch_page(
+                    self.page_index
+                        .saturating_add(1)
+                        .min(self.pages.len().saturating_sub(1)),
+                );
+                ViewAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_up(1);
                 self.pending_g = false;
@@ -369,19 +545,39 @@ impl ModalView for PagerView {
             KeyCode::Char('c') | KeyCode::Char('y') => {
                 self.pending_g = false;
                 ViewAction::Emit(ViewEvent::CopyToClipboard {
-                    text: self.body_text(),
+                    text: self.clipboard_text(),
                     label: "Pager content".to_string(),
                 })
             }
             // `e` exports the compact turn handoff (#4108) when this pager
             // carries one — the Turn Inspector. Elsewhere the guard fails and
             // `e` falls through to the inert arm below.
-            KeyCode::Char('e') | KeyCode::Char('E') if self.export_markdown.is_some() => {
+            KeyCode::Char('e') | KeyCode::Char('E')
+                if self.current_page().export_markdown.is_some() =>
+            {
                 self.pending_g = false;
-                let text = self.export_markdown.clone().unwrap_or_default();
+                let text = self
+                    .current_page()
+                    .export_markdown
+                    .clone()
+                    .unwrap_or_default();
                 ViewAction::Emit(ViewEvent::CopyToClipboard {
                     text,
                     label: "Turn handoff".to_string(),
+                })
+            }
+            // `a` copies ONLY the final assistant answer — the clean
+            // answer-only payload attached by the Turn Inspector and the
+            // assistant detail pagers. Unlike `c`/`y` (rendered body) or `e`
+            // (whole-turn handoff markdown), this payload carries no
+            // reasoning, tool calls/results, runtime status, or transcript
+            // scaffolding. Elsewhere the guard fails and `a` is inert.
+            KeyCode::Char('a') if self.current_page().answer_text.is_some() => {
+                self.pending_g = false;
+                let text = self.current_page().answer_text.clone().unwrap_or_default();
+                ViewAction::Emit(ViewEvent::CopyToClipboard {
+                    text,
+                    label: "Answer".to_string(),
                 })
             }
             _ => ViewAction::None,
@@ -405,7 +601,18 @@ impl ModalView for PagerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let inner = render_underwater_surface(area, buf, self.title.clone());
+        let page = self.current_page();
+        let title = if self.pages.len() > 1 {
+            format!(
+                "{} · {}/{} · ←/→",
+                page.title,
+                self.page_index + 1,
+                self.pages.len()
+            )
+        } else {
+            page.title.clone()
+        };
+        let inner = render_underwater_surface(area, buf, title);
 
         // The wrapping action footer is anchored to the bottom of the inner
         // area; the body fills the rows above it.
@@ -418,8 +625,20 @@ impl ModalView for PagerView {
             ActionHint::new("/", "search"),
             ActionHint::new("c", "copy"),
         ];
-        if self.export_markdown.is_some() {
+        if page.export_markdown.is_some() {
             hints.push(ActionHint::new("e", "copy handoff"));
+        }
+        if page.answer_text.is_some() {
+            hints.push(ActionHint::new("a", "copy answer"));
+        }
+        if let Some(action) = self.destructive_action.as_ref() {
+            let key = action.key.to_string();
+            let label = if action.armed {
+                action.confirm_label.clone()
+            } else {
+                action.label.clone()
+            };
+            hints.push(ActionHint::new(key, label));
         }
         let content = render_modal_footer(inner, buf, &hints);
 
@@ -437,13 +656,13 @@ impl ModalView for PagerView {
         // Cache for paging keys; the value is treated as advisory and
         // clamped at use-time.
         self.last_visible_height.set(visible_height);
-        let max_scroll = self.lines.len().saturating_sub(visible_height);
+        let max_scroll = page.lines.len().saturating_sub(visible_height);
         let scroll = self.scroll.min(max_scroll);
-        let end = (scroll + visible_height).min(self.lines.len());
-        let mut visible_lines = if self.lines.is_empty() {
+        let end = (scroll + visible_height).min(page.lines.len());
+        let mut visible_lines = if page.lines.is_empty() {
             vec![Line::from("")]
         } else {
-            self.lines[scroll..end].to_vec()
+            page.lines[scroll..end].to_vec()
         };
 
         // Highlight matched lines while the search prompt is closed and the
@@ -456,7 +675,7 @@ impl ModalView for PagerView {
             let current_match_line = self.search_matches.get(self.search_index).copied();
             for (visible_idx, line) in visible_lines.iter_mut().enumerate() {
                 let absolute_idx = scroll + visible_idx;
-                if absolute_idx >= self.lines.len() {
+                if absolute_idx >= page.lines.len() {
                     break;
                 }
                 if !self.search_matches.contains(&absolute_idx) {
@@ -501,7 +720,7 @@ impl ModalView for PagerView {
         }
 
         let content =
-            render_panel_scroll_rail(content, buf, self.lines.len(), scroll, visible_height, true);
+            render_panel_scroll_rail(content, buf, page.lines.len(), scroll, visible_height, true);
         let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
         paragraph.render(content, buf);
     }
@@ -600,6 +819,38 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn destructive_action_requires_two_steps_and_escape_only_disarms() {
+        let mut pager = make_pager(2).with_destructive_action(
+            's',
+            "stop",
+            "confirm stop · Esc cancels",
+            ViewEvent::SidebarAgentCancel {
+                agent_id: "agent_1".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Char('s'))),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Esc)),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Esc)),
+            ViewAction::Close
+        ));
+
+        let _ = pager.handle_key(key(KeyCode::Char('s')));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::SidebarAgentCancel { agent_id })
+                if agent_id == "agent_1"
+        ));
     }
 
     /// Drive a render once so `last_visible_height` is populated and paging
@@ -767,6 +1018,42 @@ mod tests {
     }
 
     #[test]
+    fn multi_page_switch_resets_view_state_and_keeps_copy_export_page_scoped() {
+        let first =
+            PagerPage::from_text("Turns", "first displayed", 80).with_copy_text("FIRST-SOURCE");
+        let latest = PagerPage::from_text("Turns", "latest displayed", 80)
+            .with_copy_text("LATEST-SOURCE")
+            .with_export_markdown("LATEST-HANDOFF");
+        let mut pager = PagerView::from_pages(vec![first, latest], 1);
+        pager.scroll = 4;
+        pager.search_input = "latest".to_string();
+        pager.search_matches = vec![0];
+
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Left)),
+            ViewAction::None
+        ));
+        assert_eq!(pager.body_text(), "first displayed");
+        assert_eq!(pager.scroll, 0);
+        assert!(pager.search_input.is_empty());
+        assert!(pager.search_matches.is_empty());
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Char('c'))),
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) if text == "FIRST-SOURCE"
+        ));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Char('e'))),
+            ViewAction::None
+        ));
+
+        let _ = pager.handle_key(key(KeyCode::Right));
+        assert!(matches!(
+            pager.handle_key(key(KeyCode::Char('e'))),
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) if text == "LATEST-HANDOFF"
+        ));
+    }
+
+    #[test]
     fn g_does_not_consume_search_input() {
         // While in search mode, 'g' must be treated as a search character,
         // not as the half of a `gg` jump-to-top sequence.
@@ -829,6 +1116,109 @@ mod tests {
             }
             other => panic!("expected CopyToClipboard emit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_emits_copy_event_with_attached_answer_only() {
+        // `a` copies the attached answer-only payload — never the rendered
+        // body, which may carry scaffolding around the answer.
+        let mut pager = PagerView::from_text("Turn Inspector", "[◆ · done] body", 40)
+            .with_copy_answer("CLEAN-ANSWER");
+        let action = pager.handle_key(key(KeyCode::Char('a')));
+        match action {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, label }) => {
+                assert_eq!(text, "CLEAN-ANSWER");
+                assert_eq!(label, "Answer");
+            }
+            other => panic!("expected CopyToClipboard emit, got {other:?}"),
+        }
+
+        // Without an attached answer `a` stays inert; it must never fall
+        // back to copying the rendered body.
+        let mut plain = PagerView::from_text("T", "body", 40);
+        assert!(matches!(
+            plain.handle_key(key(KeyCode::Char('a'))),
+            ViewAction::None
+        ));
+    }
+
+    #[test]
+    fn copy_override_preserves_indentation_tabs_and_blank_lines() {
+        let source = "Result:\n    indented\n\twith-tab\n\nnext";
+        let mut pager = PagerView::from_text("T", source, 12).with_copy_text(source);
+
+        let action = pager.handle_key(key(KeyCode::Char('c')));
+        match action {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) => {
+                assert_eq!(text, source);
+            }
+            other => panic!("expected CopyToClipboard emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_text_keeps_one_display_row_per_blank_source_line() {
+        let pager = PagerView::from_text("T", "first\n\nthird", 80);
+        assert_eq!(pager.body_text(), "first\n\nthird");
+    }
+
+    #[test]
+    fn from_text_strips_csi_mouse_and_osc_sequences() {
+        // A worker transcript can carry captured terminal bytes (a child TUI's
+        // mouse-tracking handshake, SGR color, OSC hyperlinks). Rendering them
+        // raw emits the escapes to the user's terminal, which re-enables mouse
+        // reporting after exit and leaves the shell executing fragments.
+        let hostile = "── assistant ──\n\
+                       enabling \u{1b}[?1003h\u{1b}[?1006h mouse tracking\n\
+                       click bytes \u{1b}[<65;72;17M\u{1b}[<35;131;42M arrived\n\
+                       \u{1b}[31mred text\u{1b}[0m and an \u{1b}]8;;https://example.com\u{7}OSC link\u{1b}]8;;\u{1b}\\\n\
+                       trailing stray \u{1b}\u{7}bytes\u{1b}c done";
+        let pager = PagerView::from_text("Agent transcript", hostile, 200);
+        let body = pager.body_text();
+        assert!(
+            !body.contains('\u{1b}'),
+            "no ESC byte may survive into the pager body: {body:?}"
+        );
+        assert!(
+            !body.contains('\u{7}'),
+            "no BEL byte may survive into the pager body: {body:?}"
+        );
+        for fragment in ["?1003h", "?1006h", "<65;72;17M", "<35;131;42M", "]8;;"] {
+            assert!(
+                !body.contains(fragment),
+                "escape fragment {fragment:?} must be stripped, not painted: {body:?}"
+            );
+        }
+        assert!(body.contains("red text"), "visible text survives: {body:?}");
+        assert!(body.contains("OSC link"), "link label survives: {body:?}");
+        assert!(body.contains("done"), "trailing text survives: {body:?}");
+    }
+
+    #[test]
+    fn from_text_sanitizes_jsonl_transcript_shaped_content() {
+        // Regression for the sub-agent transcript pager corrupting the parent
+        // terminal: content shaped like the raw artifact lines, with embedded
+        // mouse/CSI sequences inside a tool result, must render inert.
+        let transcript_like = concat!(
+            "── assistant ──\n",
+            "I'll run the build now.\n",
+            "← tool result (call-1)\n",
+            // JSON-escaped text is literal backslash-u bytes — inert, kept as-is.
+            "{\"line\":\"\\u{1b}[<0;9;4Mprogress done\"}\n",
+            // Raw event bytes are the dangerous form and must be stripped.
+            "raw \u{1b}[<0;10;5M event bytes\u{1b}[2K after\n",
+        );
+        let pager = PagerView::from_text("Agent transcript", transcript_like, 200);
+        let body = pager.body_text();
+        assert!(!body.contains('\u{1b}'), "inert body required: {body:?}");
+        assert!(
+            !body.contains("<0;10;5M"),
+            "mouse event fragment must not render: {body:?}"
+        );
+        assert!(
+            body.contains("progress") && body.contains("after"),
+            "readable content survives: {body:?}"
+        );
     }
 
     #[test]

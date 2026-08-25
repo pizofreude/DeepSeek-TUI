@@ -2,51 +2,56 @@
 
 use std::path::{Path, PathBuf};
 
+use codewhale_command_contract::facets::CommandMediaContext;
+use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
+use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+
 use crate::commands::CommandResult;
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::tui::app::App;
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "attach",
     aliases: &["image", "media", "fujian"],
     usage: "/attach <path>",
-    description_id: MessageId::CmdAttachDescription,
+    description_key: "cmd_attach_description",
 };
 
 pub(in crate::commands) struct AttachCmd;
 
-impl RegisterCommand for AttachCmd {
+impl RegisterCommand<CommandResult> for AttachCmd {
     fn info() -> &'static CommandInfo {
         &COMMAND_INFO
     }
 
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        attach(app, arg)
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual(attach_contextual)
     }
 }
 
-fn attach(app: &mut App, arg: Option<&str>) -> CommandResult {
+fn attach_contextual(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandResult {
+    let mut parts = contexts.into_parts();
+    let workspace = parts.workspace.as_deref().expect("workspace facet");
+    let media = parts.media.as_deref_mut().expect("media facet");
+    attach(workspace.workspace(), media, arg)
+}
+
+fn attach(
+    workspace: PathBuf,
+    media: &mut dyn CommandMediaContext,
+    arg: Option<&str>,
+) -> CommandResult {
     let Some(raw_path) = arg.map(str::trim).filter(|value| !value.is_empty()) else {
         return CommandResult::error("Usage: /attach <image-or-video-path>");
     };
 
-    let path = resolve_attachment_path(raw_path, &app.workspace);
-    let Ok(path) = path.canonicalize() else {
-        return CommandResult::error(format!("Attachment not found: {}", path.display()));
-    };
-    if !path.is_file() {
-        return CommandResult::error(format!("Attachment is not a file: {}", path.display()));
+    let path = resolve_attachment_path(raw_path, &workspace);
+    match media.attach_media(&path) {
+        Ok(receipt) => CommandResult::message(format!(
+            "Attached {}: {}",
+            receipt.kind,
+            receipt.path.display()
+        )),
+        Err(error) => CommandResult::error(error),
     }
-
-    let Some(kind) = media_kind(&path) else {
-        return CommandResult::error(
-            "Unsupported attachment type. /attach is for image/video paths; use @path for text files or directories.",
-        );
-    };
-
-    app.insert_media_attachment(kind, &path, None);
-    CommandResult::message(format!("Attached {kind}: {}", path.display()))
 }
 
 fn resolve_attachment_path(raw_path: &str, workspace: &Path) -> PathBuf {
@@ -72,78 +77,97 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn media_kind(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ppm" => Some("image"),
-        "mp4" | "mov" | "m4v" | "webm" | "avi" | "mkv" => Some("video"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::tui::app::TuiOptions;
-    use tempfile::TempDir;
 
-    fn app_with_workspace(tmpdir: &TempDir) -> App {
-        App::new(
-            TuiOptions {
-                model: "deepseek-v4-pro".to_string(),
-                workspace: tmpdir.path().to_path_buf(),
-                config_path: None,
-                config_profile: None,
-                allow_shell: false,
-                use_alt_screen: false,
-                use_mouse_capture: false,
-                use_bracketed_paste: true,
-                max_subagents: 1,
-                skills_dir: tmpdir.path().join("skills"),
-                memory_path: tmpdir.path().join("memory.md"),
-                notes_path: tmpdir.path().join("notes.txt"),
-                mcp_config_path: tmpdir.path().join("mcp.json"),
-                use_memory: false,
-                start_in_agent_mode: false,
-                skip_onboarding: true,
-                yolo: false,
-                resume_session_id: None,
-                initial_input: None,
-            },
-            &Config::default(),
-        )
+    struct FakeMedia;
+    impl CommandMediaContext for FakeMedia {
+        fn attach_media(
+            &mut self,
+            path: &Path,
+        ) -> Result<codewhale_command_contract::facets::MediaAttachmentReceipt, String> {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("png") {
+                Ok(codewhale_command_contract::facets::MediaAttachmentReceipt {
+                    kind: "image".to_string(),
+                    path: path.to_path_buf(),
+                })
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("mp4") {
+                Ok(codewhale_command_contract::facets::MediaAttachmentReceipt {
+                    kind: "video".to_string(),
+                    path: path.to_path_buf(),
+                })
+            } else {
+                Err("Unsupported attachment type".to_string())
+            }
+        }
+    }
+
+    fn workspace() -> PathBuf {
+        PathBuf::from("/workspace")
     }
 
     #[test]
-    fn attach_inserts_image_reference() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        let image_path = tmpdir.path().join("photo.png");
-        std::fs::write(&image_path, b"not actually decoded").expect("write image fixture");
-        let mut app = app_with_workspace(&tmpdir);
+    fn attach_resolves_relative_and_absolute_paths() {
+        let relative = resolve_attachment_path("photo.png", &workspace());
+        assert_eq!(relative, PathBuf::from("/workspace/photo.png"));
 
-        let result = attach(&mut app, Some("photo.png"));
+        let absolute = resolve_attachment_path("/tmp/photo.png", &workspace());
+        assert_eq!(absolute, PathBuf::from("/tmp/photo.png"));
 
+        let quoted = resolve_attachment_path("\"photo.png\"", &workspace());
+        assert_eq!(quoted, PathBuf::from("/workspace/photo.png"));
+
+        let home = resolve_attachment_path("~/photo.png", &workspace());
+        if let Some(home_dir) = std::env::var_os("HOME") {
+            assert_eq!(home, PathBuf::from(home_dir).join("photo.png"));
+        }
+    }
+
+    #[test]
+    fn attach_delegates_to_media_facet_and_composes_confirm() {
+        let result = attach(workspace(), &mut FakeMedia, Some("photo.png"));
         assert!(result.message.expect("message").contains("Attached image"));
-        assert!(app.input.contains("[Attached image:"));
-        let canonical_path = image_path.canonicalize().expect("canonical image path");
-        assert!(app.input.contains(&canonical_path.display().to_string()));
+        assert!(!result.is_error);
+
+        let video = attach(workspace(), &mut FakeMedia, Some("clip.mp4"));
+        assert!(video.message.expect("message").contains("Attached video"));
     }
 
     #[test]
-    fn attach_rejects_unsupported_extension() {
-        let tmpdir = TempDir::new().expect("tempdir");
-        std::fs::write(tmpdir.path().join("notes.txt"), b"text").expect("write fixture");
-        let mut app = app_with_workspace(&tmpdir);
+    fn attach_requires_a_path() {
+        let result = attach(workspace(), &mut FakeMedia, None);
+        assert!(result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Usage: /attach"),
+            "{:?}",
+            result.message
+        );
+    }
 
-        let result = attach(&mut app, Some("notes.txt"));
-
+    #[test]
+    fn attach_forwards_media_facet_error() {
+        let result = attach(workspace(), &mut FakeMedia, Some("notes.txt"));
+        assert!(result.is_error);
         assert!(
             result
                 .message
                 .expect("message")
                 .contains("Unsupported attachment type")
         );
-        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn handler_is_contextual() {
+        assert!(matches!(
+            AttachCmd::handler(),
+            CommandHandler::Contextual(_)
+        ));
+        assert_eq!(AttachCmd::info().description_key, "cmd_attach_description");
+        assert_eq!(AttachCmd::info().aliases, &["image", "media", "fujian"]);
     }
 }

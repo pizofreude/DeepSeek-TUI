@@ -10,13 +10,11 @@ use std::path::Path;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
-use codewhale_config::route::RouteLimits;
-
 use crate::compaction::{estimate_input_tokens_conservative, estimate_text_tokens_conservative};
-use crate::config::{ApiProvider, Config, provider_capability};
+use crate::config::Config;
 use crate::context_budget::PressureLevel;
-use crate::models::{ContentBlock, Message};
-use crate::prompts::{COMPACT_TEMPLATE, Personality};
+use crate::models::{CacheControl, ContentBlock, Message, SystemPrompt, Tool};
+use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
 use crate::route_budget::route_context_window_tokens;
 use crate::tui::app::App;
 
@@ -26,9 +24,37 @@ pub struct PromptSourceMap {
     pub total_estimated_tokens: usize,
     pub active_context_estimated_tokens: usize,
     pub context_window_tokens: Option<u32>,
+    /// Non-secret receipt for the effective context-window value.
+    pub context_window_source: Option<String>,
     pub budget_used_percent: Option<f64>,
     pub generated_at: String,
     pub note: String,
+}
+
+/// Inspectable request-prefix context for the current session.
+///
+/// `PromptSourceMap` explains provenance and estimated pressure. This sibling
+/// type exposes the current assembled system-prompt sections and most recently
+/// sent model tool catalog so users can audit the prompt plumbing as JSON.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptContext {
+    pub schema_version: u8,
+    pub provider: String,
+    pub model: String,
+    pub system_prompt_state: &'static str,
+    pub tool_catalog_state: &'static str,
+    pub sections: Vec<PromptContextSection>,
+    pub tools: Vec<Tool>,
+    pub source_map: PromptSourceMap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptContextSection {
+    pub index: usize,
+    pub block_type: String,
+    pub cache_control: Option<CacheControl>,
+    pub estimated_tokens: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +156,7 @@ impl SourceEntry {
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Constitution,
+    UserConstitution,
     RepoConstitution,
     ProjectContext,
     ProjectContextWarning,
@@ -138,6 +165,7 @@ pub enum SourceKind {
     ContextManagement,
     CompactionRelayTemplate,
     RuntimePolicy,
+    AuthorityRecap,
     EnvironmentBlock,
     UserMemory,
     SessionGoal,
@@ -182,11 +210,12 @@ impl ReportBuilder {
         self.entries.push(entry);
     }
 
+    /// The window arrives as one resolution rather than a number plus a
+    /// separately chosen label, so the report can never attribute one rung's
+    /// tokens to another rung.
     fn finish(
         self,
-        provider: ApiProvider,
-        model: &str,
-        route_limits: Option<RouteLimits>,
+        context_window: crate::route_runtime::ContextWindowResolution,
         active_context_estimated_tokens: usize,
         note: impl Into<String>,
     ) -> PromptSourceMap {
@@ -195,20 +224,16 @@ impl ReportBuilder {
             .iter()
             .map(|entry| entry.estimated_tokens)
             .sum();
-        // Overlay the resolved route's context window when known, falling back
-        // to the provider+model capability matrix (route_context_window_tokens
-        // always yields a concrete value, so this is never None at runtime).
-        let context_window_tokens =
-            Some(route_context_window_tokens(provider, model, route_limits));
-        let budget_used_percent = context_window_tokens.map(|window| {
-            ((active_context_estimated_tokens as f64 / f64::from(window)) * 100.0).clamp(0.0, 100.0)
-        });
+        let budget_used_percent =
+            ((active_context_estimated_tokens as f64 / f64::from(context_window.tokens)) * 100.0)
+                .clamp(0.0, 100.0);
         PromptSourceMap {
             entries: self.entries,
             total_estimated_tokens,
             active_context_estimated_tokens,
-            context_window_tokens,
-            budget_used_percent,
+            context_window_tokens: Some(context_window.tokens),
+            context_window_source: Some(context_window.source.label().to_string()),
+            budget_used_percent: Some(budget_used_percent),
             generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             note: note.into(),
         }
@@ -216,32 +241,108 @@ impl ReportBuilder {
 }
 
 pub fn build_context_report(app: &App) -> PromptSourceMap {
-    let mut builder = base_source_entries(&app.model, &app.workspace, Some(&app.skills_dir));
+    let mut builder = base_source_entries(
+        &app.model,
+        &app.workspace,
+        Some(&app.skills_dir),
+        app.project_context_pack_enabled,
+        app.skills_scan_codewhale_only,
+        app.ui_locale.tag(),
+        app.mode,
+        Some(app.plugin_registry.as_ref()),
+    );
     add_app_runtime_entries(&mut builder, app);
     let active_context_estimated_tokens =
         estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
+    // The host still stores the rung apart from the number; pair them against
+    // the same route limits the pressure meter reads.
+    let context_window = crate::route_runtime::ContextWindowResolution {
+        tokens: route_context_window_tokens(app.api_provider, &app.model, app.active_route_limits),
+        source: app.active_context_window_source,
+    };
     builder.finish(
-        app.api_provider,
-        &app.model,
-        app.active_route_limits,
+        context_window,
         active_context_estimated_tokens,
         "Diagnostic source map. Token counts are conservative estimates and may differ from provider billing.",
     )
 }
 
+#[must_use]
+pub fn build_prompt_context(app: &App) -> PromptContext {
+    let tool_catalog_state = if app.session.last_tool_catalog.is_some() {
+        "last_sent"
+    } else {
+        "not_yet_sent"
+    };
+    let sections = match app.system_prompt.as_ref() {
+        Some(SystemPrompt::Text(text)) => vec![PromptContextSection {
+            index: 0,
+            block_type: "text".to_string(),
+            cache_control: None,
+            estimated_tokens: estimate_text_tokens_conservative(text),
+            text: text.clone(),
+        }],
+        Some(SystemPrompt::Blocks(blocks)) => blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| PromptContextSection {
+                index,
+                block_type: block.block_type.clone(),
+                cache_control: block.cache_control.clone(),
+                estimated_tokens: estimate_text_tokens_conservative(&block.text),
+                text: block.text.clone(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    PromptContext {
+        schema_version: 1,
+        provider: app.api_provider.as_str().to_string(),
+        model: app.model.clone(),
+        system_prompt_state: "current_session",
+        tool_catalog_state,
+        sections,
+        tools: app.session.last_tool_catalog.clone().unwrap_or_default(),
+        source_map: build_context_report(app),
+    }
+}
+
 pub fn build_headless_context_report(config: &Config, workspace: &Path) -> PromptSourceMap {
     let model = config.default_model();
+    let provider = config.api_provider();
+    let provider_identity = config.provider_identity_for(provider);
+    let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
+    // A route we could not resolve does not erase an operator-configured
+    // window: doctor must report the same number the session would use.
+    let context_window = route.as_ref().map_or_else(
+        || {
+            crate::route_runtime::resolve_context_window(
+                provider,
+                &model,
+                None,
+                config.context_window_for_provider_config(provider),
+            )
+        },
+        |route| route.context_window,
+    );
     let global_skills_dir = config.skills_dir();
     let selected_skills_dir =
         crate::tui::app::resolve_skills_dir(workspace, &global_skills_dir, config);
-    let mut builder = base_source_entries(&model, workspace, Some(&selected_skills_dir));
+    let mut builder = base_source_entries(
+        &model,
+        workspace,
+        Some(&selected_skills_dir),
+        config.project_context_pack_enabled(),
+        config.skills_config().scan_codewhale_only(),
+        "en",
+        crate::tui::app::AppMode::Agent,
+        None,
+    );
     let memory_path = config.memory_path();
     let memory_enabled = config.memory_enabled();
-    let moraine_fallback = config.moraine_fallback();
 
-    // TODO(v0.8.71): remove legacy memory push/inject when Moraine recall stable; see #3490, #3495
     if let Some(memory_block) =
-        crate::memory::compose_block(memory_enabled && !moraine_fallback, &memory_path)
+        crate::native_memory::native_prompt_block(memory_enabled, &memory_path, workspace)
     {
         builder.push(SourceEntry::text(
             SourceKind::UserMemory,
@@ -258,26 +359,21 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
             "User memory",
             Some(memory_path.display().to_string()),
             Some(6),
-            if moraine_fallback && memory_enabled {
-                "disabled by moraine_fallback"
-            } else {
-                "disabled, missing, or empty"
-            },
+            "disabled, missing, or empty",
         ));
     }
 
     builder.push(SourceEntry::text(
         SourceKind::ModelProviderFact,
-        format!("Provider facts ({})", config.api_provider().as_str()),
+        format!("Provider facts ({provider_identity})"),
         None,
         ActivationReason::RuntimeState,
         &format!(
-            "provider: {}\nmodel: {}\ncontext_window: {}",
-            config.api_provider().as_str(),
+            "provider: {}\nmodel: {}\ncontext_window: {}\ncontext_window_source: {}",
+            provider_identity,
             model,
-            // Route limits aren't resolved in the headless doctor path, so report
-            // the provider+model capability window (route overlay is unavailable).
-            provider_capability(config.api_provider(), &model).context_window
+            context_window.tokens,
+            context_window.source.label()
         ),
         CountingConfidence::Approximate,
         None,
@@ -289,29 +385,49 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         .map(|entry| entry.estimated_tokens)
         .sum();
     builder.finish(
-        config.api_provider(),
-        &model,
-        // Route limits aren't resolved in the headless doctor path.
-        None,
+        context_window,
         active_context_estimated_tokens,
         "Headless diagnostic source map. Conversation, tool results, and live TUI state are unavailable in doctor mode.",
     )
 }
 
-fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>) -> ReportBuilder {
+#[allow(clippy::too_many_arguments)]
+fn base_source_entries(
+    model: &str,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+    project_pack_enabled: bool,
+    skills_scan_codewhale_only: bool,
+    locale_tag: &str,
+    mode: crate::tui::app::AppMode,
+    plugin_registry: Option<&crate::plugins::PluginRegistry>,
+) -> ReportBuilder {
     let mut builder = ReportBuilder::new();
 
-    let constitution =
-        crate::prompts::compose_prompt_with_approval_model_and_shell(Personality::Calm, model);
+    let constitution = crate::prompts::compose_default_static_layers(Personality::Calm, model);
     builder.push(SourceEntry::text(
         SourceKind::Constitution,
-        "Constitution and static prompt",
-        Some("crates/tui/src/prompts/constitution.md".to_string()),
+        "Bundled constitution, language policy, and output policy",
+        Some(crate::prompts::base_prompt_origin().label().to_string()),
         ActivationReason::AlwaysOn,
         &constitution,
         CountingConfidence::High,
         Some(1),
     ));
+
+    if let Some(block) = crate::prompts::load_user_constitution_block() {
+        builder.push(SourceEntry::text(
+            SourceKind::UserConstitution,
+            "User-global constitution",
+            codewhale_config::UserConstitution::path()
+                .ok()
+                .map(|path| path.display().to_string()),
+            ActivationReason::FilePresent,
+            &block,
+            CountingConfidence::High,
+            Some(2),
+        ));
+    }
 
     let project_context = crate::project_context::load_project_context_with_parents(workspace);
     if let Some(block) = project_context.constitution_block.as_deref() {
@@ -390,23 +506,44 @@ fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>)
         ));
     }
 
-    if let Some(pack) = crate::project_context::generate_project_context_pack(workspace) {
-        builder.push(SourceEntry::text(
+    if project_pack_enabled {
+        if let Some(pack) = crate::project_context::generate_project_context_pack(workspace) {
+            builder.push(SourceEntry::text(
+                SourceKind::ProjectContextPack,
+                "Project context pack",
+                Some(workspace.display().to_string()),
+                ActivationReason::ConfigEnabled,
+                &pack,
+                CountingConfidence::Approximate,
+                Some(5),
+            ));
+        }
+    } else {
+        builder.push(SourceEntry::omitted(
             SourceKind::ProjectContextPack,
             "Project context pack",
             Some(workspace.display().to_string()),
-            ActivationReason::RuntimeState,
-            &pack,
-            CountingConfidence::Approximate,
             Some(5),
+            "disabled; project_map provides this information on demand",
         ));
     }
 
+    let skill_discovery_mode =
+        crate::skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only);
     let skills_block = match skills_dir {
-        Some(dir) => {
-            crate::skills::render_available_skills_context_for_workspace_and_dir(workspace, dir)
-        }
-        None => crate::skills::render_available_skills_context_for_workspace(workspace),
+        Some(dir) => crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
+            workspace,
+            dir,
+            skill_discovery_mode,
+            locale_tag,
+            plugin_registry,
+        ),
+        None => crate::skills::render_available_skills_context_for_workspace_with_mode_and_plugins(
+            workspace,
+            skill_discovery_mode,
+            locale_tag,
+            plugin_registry,
+        ),
     };
     if let Some(block) = skills_block {
         builder.push(SourceEntry::text(
@@ -428,32 +565,46 @@ fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>)
         ));
     }
 
-    builder.push(SourceEntry::estimate(
+    builder.push(SourceEntry::omitted(
         SourceKind::ContextManagement,
-        "Context management guidance",
+        format!("{} runtime mode", mode.label()),
         None,
-        ActivationReason::AlwaysOn,
-        430,
-        CountingConfidence::Approximate,
         Some(3),
+        "mode enforced by runtime policy and the live tool catalog; no prompt doctrine",
+    ));
+    builder.push(SourceEntry::omitted(
+        SourceKind::CompactionRelayTemplate,
+        "Session relay template",
+        Some("bundled in this codewhale-tui build (COMPACT_TEMPLATE, compiled in)".to_string()),
+        Some(3),
+        "loaded only when /relay is requested; automatic compaction owns its successor brief",
     ));
     builder.push(SourceEntry::text(
-        SourceKind::CompactionRelayTemplate,
-        "Compaction relay template",
-        Some("crates/tui/src/prompts/compact.md".to_string()),
+        SourceKind::RuntimePolicy,
+        "Core execution discipline",
+        None,
         ActivationReason::AlwaysOn,
-        COMPACT_TEMPLATE,
+        CORE_EXECUTION_PROFILE_PROMPT,
         CountingConfidence::High,
         Some(3),
     ));
-    builder.push(SourceEntry::estimate(
-        SourceKind::RuntimePolicy,
-        "Runtime policy reference",
+    builder.push(SourceEntry::text(
+        SourceKind::AuthorityRecap,
+        "Authority recap",
         None,
         ActivationReason::AlwaysOn,
-        650,
-        CountingConfidence::Approximate,
-        Some(3),
+        crate::prompts::effective_authority_recap(),
+        CountingConfidence::High,
+        Some(1),
+    ));
+    builder.push(SourceEntry::text(
+        SourceKind::EnvironmentBlock,
+        "Runtime environment",
+        Some(workspace.display().to_string()),
+        ActivationReason::AlwaysOn,
+        &crate::prompts::render_environment_block(workspace, locale_tag),
+        CountingConfidence::High,
+        Some(4),
     ));
 
     add_handoff_entry(&mut builder, workspace);
@@ -461,26 +612,8 @@ fn base_source_entries(model: &str, workspace: &Path, skills_dir: Option<&Path>)
 }
 
 fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
-    builder.push(SourceEntry::text(
-        SourceKind::EnvironmentBlock,
-        "Runtime environment",
-        Some(app.workspace.display().to_string()),
-        ActivationReason::PerRequest,
-        &format!(
-            "workspace: {}\nmodel: {}\nprovider: {}\nmode: {}\napproval: {}",
-            app.workspace.display(),
-            app.model,
-            app.api_provider.as_str(),
-            app.mode.label(),
-            app.approval_mode.permission_chip_label()
-        ),
-        CountingConfidence::Approximate,
-        Some(4),
-    ));
-
-    // TODO(v0.8.71): remove legacy memory push/inject when Moraine recall stable; see #3490, #3495
     if let Some(memory_block) =
-        crate::memory::compose_block(app.use_memory && !app.moraine_fallback, &app.memory_path)
+        crate::native_memory::native_prompt_block(app.use_memory, &app.memory_path, &app.workspace)
     {
         builder.push(SourceEntry::text(
             SourceKind::UserMemory,
@@ -497,17 +630,13 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
             "User memory",
             Some(app.memory_path.display().to_string()),
             Some(6),
-            if app.moraine_fallback && app.use_memory {
-                "disabled by moraine_fallback"
-            } else {
-                "disabled, missing, or empty"
-            },
+            "disabled, missing, or empty",
         ));
     }
 
     if let Some(goal) = app
-        .hunt
-        .quarry
+        .goal
+        .objective
         .as_deref()
         .filter(|goal| !goal.trim().is_empty())
     {
@@ -695,16 +824,41 @@ pub fn format_context_report(report: &PromptSourceMap) -> String {
     );
     match (report.context_window_tokens, report.budget_used_percent) {
         (Some(window), Some(percent)) => {
+            let source = report
+                .context_window_source
+                .as_deref()
+                .unwrap_or_else(|| crate::route_runtime::ContextWindowSource::Fallback.label());
+            // An unverified rung is a guess about the window printed on this
+            // same line; it must not claim a fixed 128K default the capability
+            // matrix may not hold. A label from no known rung is no evidence
+            // either, so it reads the same way.
+            let source_label = if crate::route_runtime::ContextWindowSource::from_label(source)
+                .is_some_and(crate::route_runtime::ContextWindowSource::is_verified)
+            {
+                source.to_string()
+            } else {
+                format!(
+                    "{source} (unverified — nothing describes this model, so this window is a guess)"
+                )
+            };
             let _ = writeln!(
                 out,
-                "Window: {window} tokens ({percent:.1}% used, {})",
-                pressure_label(Some(percent))
+                "Window: {window} tokens ({percent:.1}% used, {}; source: {})",
+                pressure_label(Some(percent)),
+                source_label
             );
         }
         _ => {
             let _ = writeln!(out, "Window: unknown");
         }
     }
+    // #5134: the source label says where the window came from but not how to
+    // change it. Name the key here so the report answers the question it
+    // provokes.
+    let _ = writeln!(
+        out,
+        "Change the window: set `context_window` on the active `[providers.<name>]` table in config.toml (docs/CONFIGURATION.md, \"Context length\")."
+    );
     let _ = writeln!(
         out,
         "Source-entry total: {} tokens",
@@ -783,27 +937,36 @@ pub fn context_report_json(report: &PromptSourceMap) -> String {
     })
 }
 
+#[must_use]
+pub fn prompt_context_json(context: &PromptContext) -> String {
+    serde_json::to_string_pretty(context).unwrap_or_else(|error| {
+        format!(r#"{{"error":"failed to serialize prompt context: {error}"}}"#)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
+    use crate::models::Role;
     use crate::models::Tool;
+    use crate::route_runtime::{ContextWindowResolution, ContextWindowSource};
+    use codewhale_config::route::RouteLimits;
     use std::fs;
-    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
     fn context_report_json_contains_sources_and_tool_results() {
         let messages = vec![
             Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "read src/lib.rs".to_string(),
                     cache_control: None,
                 }],
             },
             Message {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "large tool output".repeat(40),
@@ -823,7 +986,14 @@ mod tests {
             Some(1),
         ));
         add_message_entries(&mut builder, &messages);
-        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 123, "test");
+        let report = builder.finish(
+            ContextWindowResolution {
+                tokens: 128_000,
+                source: ContextWindowSource::Fallback,
+            },
+            123,
+            "test",
+        );
         let json = context_report_json(&report);
 
         assert!(json.contains("\"source_kind\": \"tool_result\""));
@@ -881,6 +1051,108 @@ mod tests {
     }
 
     #[test]
+    fn headless_context_report_uses_kimi_code_k3_route_context() {
+        let tmp = tempdir().expect("workspace");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = build_headless_context_report(&config, tmp.path());
+
+        assert_eq!(report.context_window_tokens, Some(262_144));
+        assert_eq!(
+            report.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor")
+        );
+        assert!(context_report_json(&report).contains("\"context_window_tokens\": 262144"));
+    }
+
+    #[test]
+    fn headless_context_report_honors_kimi_code_k3_context_override() {
+        let tmp = tempdir().expect("workspace");
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("test-kimi-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    context_window: Some(1_048_576),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let report = build_headless_context_report(&config, tmp.path());
+
+        assert_eq!(report.context_window_tokens, Some(1_048_576));
+        assert_eq!(report.context_window_source.as_deref(), Some("configured"));
+    }
+
+    fn private_deployment_config(context_window: Option<u32>) -> Config {
+        Config {
+            provider: Some("custom".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "custom".to_string(),
+                    crate::config::ProviderConfig {
+                        api_key: Some("test-private-key".to_string()),
+                        base_url: Some("https://private.test/v1".to_string()),
+                        model: Some("private-1m-deployment-v9".to_string()),
+                        context_window,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// #5239: a privately deployed id nobody catalogs, with an operator
+    /// override, is a 1M route in the report — no route-resolution outcome may
+    /// silently substitute the legacy window.
+    #[test]
+    fn headless_context_report_honors_a_private_model_context_override() {
+        let tmp = tempdir().expect("workspace");
+
+        let report =
+            build_headless_context_report(&private_deployment_config(Some(1_048_576)), tmp.path());
+
+        assert_eq!(report.context_window_tokens, Some(1_048_576));
+        assert_eq!(report.context_window_source.as_deref(), Some("configured"));
+    }
+
+    /// The same id without an override is a guess, and the report must say so
+    /// against the window it actually used.
+    #[test]
+    fn headless_context_report_marks_an_unknown_private_model_unverified() {
+        let tmp = tempdir().expect("workspace");
+
+        let report = build_headless_context_report(&private_deployment_config(None), tmp.path());
+
+        assert_eq!(report.context_window_source.as_deref(), Some("fallback"));
+        let formatted = format_context_report(&report);
+        assert!(formatted.contains("this window is a guess"), "{formatted}");
+        assert!(
+            !formatted.contains("128K"),
+            "the fallback rung must not assert a window it did not read: {formatted}"
+        );
+    }
+
+    #[test]
     fn context_report_marks_whale_md_ignored_without_loading_body() {
         let tmp = tempdir().expect("tempdir");
         fs::write(tmp.path().join("WHALE.md"), "SECRET_LEGACY_WHALE_BODY").expect("write whale");
@@ -904,7 +1176,10 @@ mod tests {
     }
 
     #[test]
-    fn app_context_report_omits_legacy_memory_when_moraine_fallback_enabled() {
+    fn app_context_report_omits_legacy_plain_file_memory() {
+        // The legacy single-file memory path (`~/.deepseek/memory.md` and
+        // friends) was deleted for v0.9.4: only the native
+        // `memory/global/MEMORY.md` store injects.
         let tmp = tempdir().expect("tempdir");
         let memory_path = tmp.path().join("memory.md");
         fs::write(&memory_path, "private legacy memory").expect("write memory");
@@ -912,36 +1187,23 @@ mod tests {
             r#"
             [memory]
             enabled = true
-            moraine_fallback = true
             "#,
         )
         .expect("parse config");
         let app = App::new(
             crate::tui::app::TuiOptions {
-                model: "deepseek-v4-pro".to_string(),
-                workspace: tmp.path().to_path_buf(),
-                config_path: None,
-                config_profile: None,
-                allow_shell: false,
                 use_alt_screen: false,
-                use_mouse_capture: false,
                 use_bracketed_paste: false,
-                max_subagents: 1,
-                skills_dir: PathBuf::from("."),
                 memory_path: memory_path.clone(),
                 notes_path: tmp.path().join("notes.txt"),
                 mcp_config_path: tmp.path().join("mcp.json"),
                 use_memory: true,
                 start_in_agent_mode: true,
-                skip_onboarding: true,
-                yolo: false,
-                resume_session_id: None,
-                initial_input: None,
+                ..crate::test_support::test_tui_options(tmp.path())
             },
             &config,
         );
 
-        assert!(app.moraine_fallback);
         let report = build_context_report(&app);
         let memory_entry = report
             .entries
@@ -950,15 +1212,101 @@ mod tests {
             .expect("user memory source entry");
 
         assert_eq!(memory_entry.activation_reason, ActivationReason::Omitted);
-        assert_eq!(
-            memory_entry.truncation_reason.as_deref(),
-            Some("disabled by moraine_fallback")
-        );
         assert!(!context_report_json(&report).contains("private legacy memory"));
     }
 
     #[test]
-    fn headless_context_report_omits_legacy_memory_when_moraine_fallback_enabled() {
+    fn headless_report_counts_project_pack_only_when_configured() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn fixture() {}\n").expect("write fixture");
+
+        let default_report = build_headless_context_report(&Config::default(), tmp.path());
+        let default_pack = default_report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::ProjectContextPack)
+            .expect("project pack entry");
+        assert_eq!(default_pack.activation_reason, ActivationReason::Omitted);
+        assert_eq!(default_pack.estimated_tokens, 0);
+        assert_eq!(
+            default_pack.truncation_reason.as_deref(),
+            Some("disabled; project_map provides this information on demand")
+        );
+
+        let relay = default_report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::CompactionRelayTemplate)
+            .expect("relay template entry");
+        assert_eq!(relay.activation_reason, ActivationReason::Omitted);
+        assert_eq!(relay.estimated_tokens, 0);
+
+        let mut configured = Config::default();
+        configured.context.project_pack = Some(true);
+        let configured_report = build_headless_context_report(&configured, tmp.path());
+        let configured_pack = configured_report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::ProjectContextPack)
+            .expect("configured project pack entry");
+        assert_eq!(
+            configured_pack.activation_reason,
+            ActivationReason::ConfigEnabled
+        );
+        assert!(
+            configured_pack.estimated_tokens > 0,
+            "configured project pack must be counted"
+        );
+
+        let environment = configured_report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::EnvironmentBlock)
+            .expect("runtime environment entry");
+        assert_eq!(environment.activation_reason, ActivationReason::AlwaysOn);
+    }
+
+    #[test]
+    fn app_context_report_counts_configured_project_pack_before_first_turn() {
+        let tmp = tempdir().expect("tempdir");
+        fs::create_dir(tmp.path().join(".git")).expect("mkdir .git");
+        fs::create_dir(tmp.path().join("src")).expect("mkdir src");
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn fixture() {}\n").expect("write fixture");
+        let mut config = Config::default();
+        config.context.project_pack = Some(true);
+        let app = App::new(
+            crate::tui::app::TuiOptions {
+                use_alt_screen: false,
+                use_bracketed_paste: false,
+                notes_path: tmp.path().join("notes.txt"),
+                mcp_config_path: tmp.path().join("mcp.json"),
+                start_in_agent_mode: true,
+                ..crate::test_support::test_tui_options(tmp.path())
+            },
+            &config,
+        );
+
+        assert!(
+            app.system_prompt.is_none(),
+            "fixture must be pre-first-turn"
+        );
+        let report = build_context_report(&app);
+        let project_pack = report
+            .entries
+            .iter()
+            .find(|entry| entry.source_kind == SourceKind::ProjectContextPack)
+            .expect("project pack entry");
+        assert_eq!(
+            project_pack.activation_reason,
+            ActivationReason::ConfigEnabled
+        );
+        assert!(project_pack.estimated_tokens > 0);
+    }
+
+    #[test]
+    fn headless_context_report_omits_legacy_plain_file_memory() {
         let tmp = tempdir().expect("tempdir");
         let memory_path = tmp.path().join("memory.md");
         fs::write(&memory_path, "private legacy memory").expect("write memory");
@@ -966,7 +1314,6 @@ mod tests {
             r#"
             [memory]
             enabled = true
-            moraine_fallback = true
             "#,
         )
         .expect("parse config");
@@ -980,10 +1327,6 @@ mod tests {
             .expect("user memory source entry");
 
         assert_eq!(memory_entry.activation_reason, ActivationReason::Omitted);
-        assert_eq!(
-            memory_entry.truncation_reason.as_deref(),
-            Some("disabled by moraine_fallback")
-        );
         assert!(!context_report_json(&report).contains("private legacy memory"));
     }
 
@@ -1008,7 +1351,14 @@ mod tests {
             CountingConfidence::High,
             Some(7),
         ));
-        let report = builder.finish(ApiProvider::Deepseek, "deepseek-v4-pro", None, 525, "test");
+        let report = builder.finish(
+            ContextWindowResolution {
+                tokens: 128_000,
+                source: ContextWindowSource::Fallback,
+            },
+            525,
+            "test",
+        );
         let summary = format_context_summary(&report);
 
         assert!(summary.contains("Context Summary"));
@@ -1033,16 +1383,19 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
         };
-        let builder = ReportBuilder::new();
-        let report = builder.finish(
+        let resolved = crate::route_runtime::resolve_context_window(
             ApiProvider::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
-            10_000,
-            "test",
+            None,
         );
+        assert_eq!(resolved.source, ContextWindowSource::Catalog);
+
+        let builder = ReportBuilder::new();
+        let report = builder.finish(resolved, 10_000, "test");
 
         assert_eq!(report.context_window_tokens, Some(route_window as u32));
+        assert_eq!(report.context_window_source.as_deref(), Some("catalog"));
         // Budget percent is computed against the route window, not the default.
         let expected = (10_000.0 / route_window as f64) * 100.0;
         let actual = report.budget_used_percent.expect("window known");

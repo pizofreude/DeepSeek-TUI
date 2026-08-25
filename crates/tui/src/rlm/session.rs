@@ -357,6 +357,7 @@ fn compact_content_block(block: &ContentBlock) -> Value {
             name,
             input,
             caller,
+            ..
         } => json!({
             "type": "tool_use",
             "id": id,
@@ -381,7 +382,9 @@ fn compact_content_block(block: &ContentBlock) -> Value {
                 "content_chars": chars,
                 "content_sha256": sha256_hex(content.as_bytes()),
                 "content_redacted": large,
-                "content_blocks": content_blocks,
+                "content_blocks": crate::image_attach::safe_tool_result_content_blocks(
+                    content_blocks.as_deref(),
+                ),
             })
         }
         ContentBlock::ServerToolUse { id, name, input } => json!({
@@ -456,6 +459,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Role;
 
     #[test]
     fn derive_session_name_slugifies_path() {
@@ -484,7 +488,7 @@ mod tests {
             PathBuf::from("/tmp/work"),
             Some(SystemPrompt::Text("system body".to_string())),
             vec![Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "hello RLM".to_string(),
                     cache_control: None,
@@ -519,7 +523,7 @@ mod tests {
             PathBuf::from("/tmp/work"),
             None,
             vec![Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: large.clone(),

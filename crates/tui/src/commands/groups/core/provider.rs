@@ -14,7 +14,7 @@ use super::CommandResult;
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "provider",
     aliases: &[],
-    usage: "/provider [setup [name]|name [model]]",
+    usage: "/provider [setup [name]|templates|name [model]]",
     description_id: MessageId::CmdProviderDescription,
 };
 
@@ -49,20 +49,22 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
     if name.eq_ignore_ascii_case("fallback") {
         return provider_fallback(app, model_arg);
     }
+    if name.eq_ignore_ascii_case("templates") || name.eq_ignore_ascii_case("template") {
+        if model_arg.is_some() {
+            return CommandResult::error(
+                "Usage: /provider templates — open beginner setup templates.".to_string(),
+            );
+        }
+        return CommandResult::action(AppAction::OpenProviderTemplateList);
+    }
     if name.eq_ignore_ascii_case("setup") {
-        let provider = match model_arg {
-            None => None,
-            Some(raw) => match ApiProvider::parse(raw) {
-                Some(provider) => Some(provider),
-                None => {
-                    return CommandResult::error(format!(
-                        "Unknown provider '{raw}'. Expected: {}.",
-                        ApiProvider::names_hint()
-                    ));
-                }
+        return match model_arg {
+            None => CommandResult::action(AppAction::OpenProviderSetup { provider: None }),
+            Some(raw) => match provider_setup_action_for_name(raw) {
+                Ok(action) => CommandResult::action(action),
+                Err(message) => CommandResult::error(message),
             },
         };
-        return CommandResult::action(AppAction::OpenProviderSetup { provider });
     }
 
     let Some(target) = ApiProvider::parse(name) else {
@@ -82,9 +84,13 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
             // canonical map (DeepSeek, GLM via Z.ai/Zhipu, Kimi, MiniMax, …) and
             // an id matching none passes through unchanged — the upstream API is
             // the authority. Wire-id translation is deferred to the route
-            // resolver at request time, so `/provider` stores canonical names.
+            // resolver at request time. DeepSeek's two retiring aliases are
+            // also deferred because this command does not own the target base
+            // URL: a custom endpoint may still use either id natively.
             let expanded = expand_model_alias_for_provider(target, raw);
-            if provider_passes_model_through(target) {
+            if provider_passes_model_through(target)
+                || is_route_ambiguous_deepseek_alias(target, &expanded)
+            {
                 Some(expanded)
             } else {
                 match canonical_model_id_for_provider(target, &expanded) {
@@ -107,6 +113,44 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
         provider: target,
         model,
     })
+}
+
+pub(in crate::commands) fn provider_setup_action_for_name(raw: &str) -> Result<AppAction, String> {
+    if raw.eq_ignore_ascii_case("ds4") || raw.eq_ignore_ascii_case("dwarfstar") {
+        return Ok(AppAction::OpenDs4Setup);
+    }
+    if let Some(template) = codewhale_config::provider_setup_template(raw) {
+        match template.apply {
+            codewhale_config::ProviderSetupApply::FirstClass(kind) => {
+                return Ok(AppAction::OpenProviderSetup {
+                    provider: Some(ApiProvider::from_kind(kind)),
+                });
+            }
+            codewhale_config::ProviderSetupApply::Compatible
+            | codewhale_config::ProviderSetupApply::Unpublished => {
+                return Ok(AppAction::OpenTemplateSetup {
+                    template_id: template.id.to_string(),
+                });
+            }
+        }
+    }
+    match ApiProvider::parse(raw) {
+        Some(provider) => Ok(AppAction::OpenProviderSetup {
+            provider: Some(provider),
+        }),
+        None => Err(format!(
+            "Unknown provider '{raw}'. Expected: {}, or a template (agnes, sensenova, opencode-zen, opencode-go).",
+            ApiProvider::names_hint()
+        )),
+    }
+}
+
+fn is_route_ambiguous_deepseek_alias(provider: ApiProvider, model: &str) -> bool {
+    matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+    ) && (model.eq_ignore_ascii_case("deepseek-chat")
+        || model.eq_ignore_ascii_case("deepseek-reasoner"))
 }
 
 fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
@@ -140,7 +184,10 @@ fn provider_fallback(app: &mut App, subcommand: Option<&str>) -> CommandResult {
             }
 
             let mut lines = vec![
-                format!("Current provider: {}", app.api_provider.as_str()),
+                format!(
+                    "Current provider: {}",
+                    app.provider_identity_for_persistence()
+                ),
                 "Fallback chain:".to_string(),
             ];
             for (index, provider, is_current) in entries {
@@ -200,25 +247,7 @@ mod tests {
 
     fn create_test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = crate::localization::Locale::En;
@@ -255,6 +284,47 @@ mod tests {
                 provider: Some(ApiProvider::Anthropic),
             })
         );
+    }
+
+    #[test]
+    fn setup_subcommand_opens_ds4_preset() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("setup ds4"));
+        assert_eq!(result.action, Some(AppAction::OpenDs4Setup));
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn setup_subcommand_opens_agnes_unpublished_template() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("setup agnes"));
+        assert_eq!(
+            result.action,
+            Some(AppAction::OpenTemplateSetup {
+                template_id: "agnes".to_string(),
+            })
+        );
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn setup_subcommand_opens_first_class_zen_template() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("setup opencode-zen"));
+        assert_eq!(
+            result.action,
+            Some(AppAction::OpenProviderSetup {
+                provider: Some(ApiProvider::OpencodeZen),
+            })
+        );
+    }
+
+    #[test]
+    fn templates_subcommand_opens_template_list() {
+        let mut app = create_test_app();
+        let result = provider(&mut app, Some("templates"));
+        assert_eq!(result.action, Some(AppAction::OpenProviderTemplateList));
+        assert!(result.message.is_none());
     }
 
     #[test]
@@ -619,6 +689,118 @@ mod tests {
             }
             other => panic!("expected SwitchProvider action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn direct_deepseek_provider_commands_retire_aliases_at_official_wire_boundary() {
+        let mut app = create_test_app();
+        app.api_provider = ApiProvider::Openrouter;
+
+        for provider_name in ["deepseek", "deepseek-cn", "deepseek-anthropic"] {
+            for alias in ["deepseek-chat", "deepseek-reasoner"] {
+                let result = provider(&mut app, Some(&format!("{provider_name} {alias}")));
+                match result.action {
+                    Some(AppAction::SwitchProvider { provider, model }) => {
+                        assert!(matches!(
+                            provider,
+                            ApiProvider::Deepseek
+                                | ApiProvider::DeepseekCN
+                                | ApiProvider::DeepseekAnthropic
+                        ));
+                        assert_eq!(model.as_deref(), Some(alias));
+                        let official_base_url = match provider {
+                            ApiProvider::Deepseek => crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                            ApiProvider::DeepseekCN => crate::config::DEFAULT_DEEPSEEKCN_BASE_URL,
+                            ApiProvider::DeepseekAnthropic => {
+                                crate::config::DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+                            }
+                            _ => unreachable!("asserted direct DeepSeek provider"),
+                        };
+                        assert_eq!(
+                            crate::config::wire_model_for_provider_route(
+                                provider,
+                                official_base_url,
+                                model.as_deref().expect("command model"),
+                            ),
+                            crate::config::DEEPSEEK_ALIAS_REPLACEMENT
+                        );
+                        app.reasoning_effort = crate::tui::app::ReasoningEffort::Max;
+                        app.reasoning_effort_preference = None;
+                        app.apply_provider_switch_reasoning_effort(
+                            provider,
+                            official_base_url,
+                            model.as_deref(),
+                        );
+                        assert_eq!(
+                            app.reasoning_effort,
+                            if alias == "deepseek-chat" {
+                                crate::tui::app::ReasoningEffort::Off
+                            } else {
+                                crate::tui::app::ReasoningEffort::High
+                            },
+                            "{provider:?} {alias}"
+                        );
+                    }
+                    other => panic!("expected SwitchProvider action, got {other:?}"),
+                }
+            }
+        }
+
+        let wanjie = provider(&mut app, Some("wanjie-ark deepseek-reasoner"));
+        assert!(matches!(
+            wanjie.action,
+            Some(AppAction::SwitchProvider {
+                provider: ApiProvider::WanjieArk,
+                model: Some(ref model),
+            }) if model == "deepseek-reasoner"
+        ));
+    }
+
+    #[test]
+    fn provider_command_preserves_alias_owned_by_custom_deepseek_endpoint() {
+        let mut app = create_test_app();
+        app.model_ids_passthrough = true;
+
+        let result = provider(&mut app, Some("deepseek deepseek-reasoner"));
+        let Some(AppAction::SwitchProvider { provider, model }) = result.action else {
+            panic!("expected SwitchProvider action");
+        };
+        let model = model.expect("command model");
+
+        assert_eq!(provider, ApiProvider::Deepseek);
+        assert_eq!(model, "deepseek-reasoner");
+        assert_eq!(
+            crate::config::wire_model_for_provider_route(
+                provider,
+                "https://models.example/v1",
+                &model,
+            ),
+            "deepseek-reasoner"
+        );
+        app.reasoning_effort = crate::tui::app::ReasoningEffort::Max;
+        app.reasoning_effort_preference = None;
+        app.apply_provider_switch_reasoning_effort(
+            provider,
+            "https://models.example/v1",
+            Some(&model),
+        );
+        assert_eq!(
+            app.reasoning_effort,
+            crate::tui::app::ReasoningEffort::Max,
+            "custom endpoint owns alias semantics"
+        );
+
+        app.reasoning_effort_preference = Some(crate::tui::app::ReasoningEffort::Max);
+        app.apply_provider_switch_reasoning_effort(
+            provider,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            Some(&model),
+        );
+        assert_eq!(
+            app.reasoning_effort,
+            crate::tui::app::ReasoningEffort::Max,
+            "explicit effort must beat compatibility inference"
+        );
     }
 
     #[test]

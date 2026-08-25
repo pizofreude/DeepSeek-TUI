@@ -41,12 +41,45 @@ pub struct FleetRun {
     pub id: FleetRunId,
     pub name: String,
     pub status: FleetRunStatus,
+    /// Explicit execution target selected by the managed client.
+    ///
+    /// Older CLI-created runs predate target selection and therefore omit
+    /// this field. Runtime API creation always persists it and currently
+    /// accepts only [`FleetRuntimeTarget::ThisComputer`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<FleetRuntimeTarget>,
+    /// Named Workflow descriptor that owns this Fleet run.
+    ///
+    /// The durable task specs below remain the executable source of truth;
+    /// this descriptor keeps the product identity and scheduling policy
+    /// inspectable without smuggling them through labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<FleetWorkflowDescriptor>,
+    /// Canonical named roles declared for the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// Maximum number of workers the manager may drive concurrently.
+    ///
+    /// Older ledgers omit this field; callers fall back to the persisted
+    /// worker roster when resuming those runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers: Option<usize>,
+    /// Optional run-wide usage ceiling (R6, #5567). When the accumulated
+    /// worker usage crosses it, the ledger refuses new task admissions,
+    /// pauses the run, and records exactly one budget alert. Absent on older
+    /// ledgers and by default: unbounded, today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_ceiling: Option<FleetUsageCeiling>,
     #[serde(default)]
     pub task_specs: Vec<FleetTaskSpec>,
     #[serde(default)]
     pub worker_specs: Vec<FleetWorkerSpec>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Legacy replay-only execution policy from pre-0.9.11 ledgers.
+    ///
+    /// New Fleet runs reject this field: Fleet selects identity, while the
+    /// Runtime owns trust, secrets, approvals, sandboxing, and tool authority.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_policy: Option<FleetSecurityPolicy>,
     pub created_at: String,
@@ -54,6 +87,74 @@ pub struct FleetRun {
     pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+/// Product-level Runtime target for a managed Fleet run.
+///
+/// The enum intentionally names unsupported targets as contract values so a
+/// client receives a precise capability refusal instead of silently falling
+/// back to local execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetRuntimeTarget {
+    ThisComputer,
+    AnotherComputer,
+    Cloud,
+}
+
+/// Scheduling shape currently executable by the durable Fleet manager.
+///
+/// Fleet tasks are independent queue entries today, so only parallel
+/// workflows are advertised. Sequence/pipeline support must not be accepted
+/// until dependencies are durable in the Fleet ledger.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetWorkflowKind {
+    Parallel,
+}
+
+/// Durable identity for the Workflow that coordinates a Fleet run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetWorkflowDescriptor {
+    pub id: String,
+    pub kind: FleetWorkflowKind,
+}
+
+/// One privacy-bounded durable event exposed to managed Fleet clients.
+///
+/// `cursor` is an opaque stable digest of the underlying ledger transition.
+/// Clients persist it and send it back on reconnect; they must not parse it.
+/// Worker-local sequence numbers remain available separately because they are
+/// monotonic only within one `(worker, task)` lifecycle, not across a run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FleetRuntimeEvent {
+    pub cursor: String,
+    pub event: String,
+    pub run_id: FleetRunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_seq: Option<u64>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+/// Bounded durable replay page.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FleetEventReplay {
+    pub run_id: FleetRunId,
+    pub events: Vec<FleetRuntimeEvent>,
+    #[serde(default)]
+    pub has_more: bool,
+    /// True when a no-cursor request returned only the newest bounded tail.
+    #[serde(default)]
+    pub history_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Lifecycle status for an entire fleet run.
@@ -123,11 +224,12 @@ pub struct FleetTaskSpec {
 /// Worker role and tool expectations for a task.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FleetTaskWorkerProfile {
-    /// Named agent profile/persona posture to layer onto this worker.
+    /// Bounded human selector for one Fleet member.
     ///
-    /// `profile` is accepted as a shorter authoring alias. This is an intent
-    /// reference only; profile loading and permission narrowing happen in the
-    /// Fleet runtime layer.
+    /// Accepts member id/name, semantic role, model id/display name, or an
+    /// explicit `route:<provider>/<model>`. `profile` is accepted as a shorter
+    /// authoring alias. Resolution and permission narrowing happen in the Fleet
+    /// runtime layer.
     #[serde(default, alias = "profile", skip_serializing_if = "Option::is_none")]
     pub agent_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,9 +245,9 @@ pub struct FleetTaskWorkerProfile {
     pub model_class: Option<String>,
     /// Optional explicit model id for this worker.
     ///
-    /// Task-level model overrides are visible authoring data and take
-    /// precedence over the referenced agent profile's model hint. Provider and
-    /// wire-model validation still belong to route resolution.
+    /// Task-level model overrides are visible authoring data. They apply only
+    /// when the selected member does not pin an exact provider/model route;
+    /// conflicting overrides of an exact member route are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +291,9 @@ pub struct FleetEnvironmentRequirements {
 pub struct FleetTaskBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Maximum model turns. `None` and `Some(0)` both mean unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +403,8 @@ pub struct FleetWorkerSpec {
     pub id: String,
     pub name: String,
     pub host: FleetHostSpec,
+    /// Legacy replay-only host trust label. New runs reject author-supplied
+    /// values and derive execution authority from Runtime policy instead.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_level: Option<FleetTrustLevel>,
@@ -347,13 +454,13 @@ pub enum FleetHostSpec {
     },
 }
 
-// ── Security and trust types ────────────────────────────────────────────────
+// ── Legacy Runtime-policy wire compatibility ───────────────────────────────
 
-/// Trust classification assigned to a worker host.
+/// Legacy trust classification retained only to deserialize old Fleet ledgers.
 ///
-/// The trust level determines what a worker is allowed to do and what
-/// secrets it may access. The default for new workers is [`FleetTrustLevel::Sandbox`];
-/// operators must explicitly raise trust for SSH or container workers.
+/// It is not Fleet identity and new run creation rejects it. Current authority
+/// comes from live Runtime policy; these helper predicates describe the old
+/// wire vocabulary only.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FleetTrustLevel {
@@ -395,11 +502,11 @@ impl FleetTrustLevel {
     }
 }
 
-/// Security policy applied to a fleet run.
+/// Legacy Runtime execution-policy envelope retained for ledger replay.
 ///
-/// A policy defines the default trust level for workers, which secrets
-/// may be resolved, and what capabilities are granted. When a run has no
-/// explicit policy, workers inherit conservative defaults.
+/// This type is accepted while reading older protocol data but is rejected for
+/// new Fleet runs. Fleet membership/selection never grants trust, secrets, or
+/// capabilities; the Runtime derives those from its live policy boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetSecurityPolicy {
     /// Default trust level for workers that don't declare one explicitly.
@@ -688,6 +795,13 @@ pub enum FleetWorkerEventPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         memory_mb: Option<u64>,
     },
+    /// Provider-reported usage receipt for one model call inside this
+    /// worker (R6, #5567). Feeds the run-level accumulator that enforces
+    /// [`FleetUsageCeiling`].
+    UsageReport {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     Artifact(FleetArtifactRef),
     Completed {
         #[serde(default)]
@@ -722,6 +836,17 @@ pub enum FleetWorkerEventPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         alert_id: Option<String>,
     },
+}
+
+/// Run-wide usage ceiling (R6, #5567). Token-denominated: workers report
+/// provider token counts; a cost-denominated ceiling needs priced receipts
+/// in the worker stream and is deliberately not declared until it can be
+/// enforced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetUsageCeiling {
+    /// Maximum input+output tokens accumulated across every worker model
+    /// call in the run.
+    pub max_total_tokens: u64,
 }
 
 /// Retry policy for a task or worker.
@@ -887,6 +1012,15 @@ impl FleetAlertEndpoint {
 pub struct FleetResolvedRoute {
     /// Resolved provider canonical id (e.g. `"deepseek"`).
     pub provider_id: String,
+    /// Exact configured provider-table id when the worker used one.
+    ///
+    /// This is intentionally additive to `provider_id`: literal
+    /// `[providers.custom]` resolves to `Some("custom")`, while the legacy
+    /// idless root custom route resolves to `None`. Keeping the distinction
+    /// prevents a receipt from silently collapsing two different credential
+    /// and endpoint authorities into the same generic `custom` label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_exact_id: Option<String>,
     /// Resolved provider kind (e.g. `"deepseek"`).
     pub provider_kind: String,
     /// Canonical, provider-agnostic model identity, when known.
@@ -967,6 +1101,17 @@ pub struct FleetReceipt {
     pub run_id: FleetRunId,
     pub task_id: String,
     pub worker_id: String,
+    /// Durable lease generation that produced this receipt.
+    ///
+    /// Optional for backward compatibility with receipts written before Fleet
+    /// attempts were fenced explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Sequence of the terminal worker event finalized with this receipt.
+    ///
+    /// Optional so older ledger records remain replayable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_seq: Option<u64>,
     pub completed_at: String,
     pub result: FleetTaskResult,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1024,6 +1169,13 @@ mod tests {
             id: FleetRunId::from("run-001"),
             name: "dogfood smoke".to_string(),
             status: FleetRunStatus::Running,
+            target: Some(FleetRuntimeTarget::ThisComputer),
+            workflow: Some(FleetWorkflowDescriptor {
+                id: "release-checks".to_string(),
+                kind: FleetWorkflowKind::Parallel,
+            }),
+            roles: vec!["release-checker".to_string()],
+            max_workers: Some(1),
             task_specs: vec![FleetTaskSpec {
                 id: "task-1".to_string(),
                 name: "lint".to_string(),
@@ -1053,6 +1205,7 @@ mod tests {
                 context: vec!["release gate".to_string()],
                 budget: Some(FleetTaskBudget {
                     max_tokens: Some(8000),
+                    max_steps: Some(0),
                     max_tool_calls: Some(20),
                     max_seconds: Some(300),
                 }),
@@ -1070,12 +1223,23 @@ mod tests {
             created_at: "2026-06-12T17:00:00Z".to_string(),
             updated_at: None,
             completed_at: None,
+            usage_ceiling: None,
         };
         let json = serde_json::to_string(&run).unwrap();
         let back: FleetRun = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, run.id);
         assert_eq!(back.status, FleetRunStatus::Running);
+        assert_eq!(back.target, Some(FleetRuntimeTarget::ThisComputer));
+        assert_eq!(back.roles, vec!["release-checker"]);
+        assert_eq!(
+            back.workflow.as_ref().map(|workflow| workflow.id.as_str()),
+            Some("release-checks")
+        );
         assert_eq!(back.task_specs.len(), 1);
+        assert_eq!(
+            back.task_specs[0].budget.as_ref().unwrap().max_steps,
+            Some(0)
+        );
         assert_eq!(
             back.task_specs[0].worker.as_ref().unwrap().role.as_deref(),
             Some("release-checker")
@@ -1317,6 +1481,8 @@ mod tests {
             run_id: FleetRunId::from("run-003"),
             task_id: "task-1".to_string(),
             worker_id: "worker-b".to_string(),
+            attempt: Some(2),
+            terminal_seq: Some(7),
             completed_at: "2026-06-12T17:03:00Z".to_string(),
             result: FleetTaskResult::Pass,
             failure_kind: None,
@@ -1333,6 +1499,8 @@ mod tests {
         let back: FleetReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(back.result, FleetTaskResult::Pass);
         assert_eq!(back.score.as_ref().unwrap().value, 0.95);
+        assert_eq!(back.attempt, Some(2));
+        assert_eq!(back.terminal_seq, Some(7));
     }
 
     #[test]
@@ -1341,6 +1509,8 @@ mod tests {
             run_id: FleetRunId::from("run-004"),
             task_id: "task-2".to_string(),
             worker_id: "worker-c".to_string(),
+            attempt: None,
+            terminal_seq: None,
             completed_at: "2026-06-12T17:04:00Z".to_string(),
             result: FleetTaskResult::Partial,
             failure_kind: Some(FleetTaskFailureKind::Verifier),
@@ -1494,6 +1664,8 @@ mod tests {
             run_id: FleetRunId::from("run-route"),
             task_id: "task-route".to_string(),
             worker_id: "worker-route".to_string(),
+            attempt: Some(1),
+            terminal_seq: Some(4),
             completed_at: "2026-06-23T00:00:00Z".to_string(),
             result: FleetTaskResult::Pass,
             failure_kind: None,
@@ -1501,6 +1673,7 @@ mod tests {
             score: None,
             resolved_route: Some(FleetResolvedRoute {
                 provider_id: "deepseek".to_string(),
+                provider_exact_id: None,
                 provider_kind: "deepseek".to_string(),
                 canonical_model: Some("deepseek-v4-pro".to_string()),
                 wire_model_id: "deepseek-v4-pro".to_string(),
@@ -1590,6 +1763,8 @@ mod tests {
         let receipt: FleetReceipt = serde_json::from_str(legacy).unwrap();
         assert_eq!(receipt.task_id, "task-legacy");
         assert!(receipt.resolved_route.is_none());
+        assert!(receipt.attempt.is_none());
+        assert!(receipt.terminal_seq.is_none());
     }
 
     #[test]

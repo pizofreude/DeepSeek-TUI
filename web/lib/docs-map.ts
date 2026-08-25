@@ -24,9 +24,20 @@ export interface DocTopic {
   repoSource: string | string[];
   /** Whether this topic has a dedicated website page (vs. linking out). */
   hasPage: boolean;
+  /** Locale-relative website path when the page lives outside `/docs/<slug>`. */
+  sitePath?: string;
   /** Category for grouping in the sidebar. */
   category: "getting-started" | "core-concepts" | "reference" | "extending" | "operations";
 }
+
+/** Sidebar and breadcrumb labels for each docs-map category. */
+export const DOC_CATEGORY_LABELS: Record<DocTopic["category"], { en: string; zh: string }> = {
+  "getting-started": { en: "Getting started", zh: "入门" },
+  "core-concepts": { en: "Core concepts", zh: "核心概念" },
+  reference: { en: "Reference", zh: "参考" },
+  extending: { en: "Extending", zh: "扩展" },
+  operations: { en: "Operations", zh: "运维" },
+};
 
 export const DOC_TOPICS: DocTopic[] = [
   {
@@ -34,11 +45,12 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "install",
     label: { en: "Install", zh: "安装" },
     description: {
-      en: "npm, Cargo, Homebrew, Docker, Nix, Scoop, CNB mirror, and platform-specific notes.",
-      zh: "npm、Cargo、Homebrew、Docker、Nix、Scoop、CNB 镜像及平台说明。",
+      en: "npm, Cargo, Homebrew, Docker, prebuilt binaries, CNB mirror, and where config lives.",
+      zh: "npm、Cargo、Homebrew、Docker、预编译二进制、CNB 镜像，以及配置文件位置。",
     },
     repoSource: "docs/INSTALL.md",
-    hasPage: false,
+    hasPage: true,
+    sitePath: "install",
     category: "getting-started",
   },
   {
@@ -50,8 +62,20 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "首次运行、会话、命令、快捷键和日常使用流程。",
     },
     repoSource: ["docs/GUIDE.md", "docs/KEYBINDINGS.md"],
-    hasPage: false,
+    hasPage: true,
     category: "getting-started",
+  },
+  {
+    id: "vocabulary",
+    slug: "vocabulary",
+    label: { en: "Vocabulary", zh: "产品名词" },
+    description: {
+      en: "The exact product nouns — Fleet, Workflow, Lane, Runtime; Plan / Work / Operate; Consultant; and explicit route provenance — plus measurement principles.",
+      zh: "确切的产品名词——Fleet、Workflow、Lane、Runtime；Plan / Work / Operate；Consultant；明确的路由来源——以及测量原则。",
+    },
+    repoSource: ["docs/FLEET.md", "docs/MODES.md", "docs/public-surface-facts.json"],
+    hasPage: true,
+    category: "core-concepts",
   },
   {
     id: "configuration",
@@ -62,7 +86,7 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "config.toml 参考、环境变量、项目覆盖和旧版路径。",
     },
     repoSource: ["docs/CONFIGURATION.md", "docs/LEGACY_PATHS.md"],
-    hasPage: false,
+    hasPage: true,
     category: "getting-started",
   },
   {
@@ -74,13 +98,14 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "支持的提供商、模型切换、本地运行时（vLLM、Ollama、SGLang）和模型实验室。",
     },
     repoSource: ["docs/PROVIDERS.md", "docs/MODEL_LAB.md"],
-    hasPage: false,
+    hasPage: true,
+    sitePath: "models",
     category: "reference",
   },
   {
     id: "constitution",
     slug: "constitution",
-    label: { en: "Constitution", zh: "嵌套宪法" },
+    label: { en: "Constitution", zh: "嵌套宪章" },
     description: {
       en: "Agent identity, authority hierarchy, evidence rules, and the nested law system.",
       zh: "Agent 自我模型、权威层次、证据规则和嵌套法律系统。",
@@ -94,8 +119,8 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "modes",
     label: { en: "Modes", zh: "模式" },
     description: {
-      en: "Plan, Act, Operate modes and orthogonal approval posture.",
-      zh: "Plan、Act、Operate 三种模式与正交审批姿态。",
+      en: "Plan, Work, Operate modes and orthogonal permission posture.",
+      zh: "Plan、Work、Operate 三种模式与正交权限姿态。",
     },
     repoSource: "docs/MODES.md",
     hasPage: true,
@@ -106,8 +131,20 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "tools",
     label: { en: "Tools", zh: "工具" },
     description: {
-      en: "Typed tool surface, tool lifecycle, and the curated tool catalog.",
-      zh: "类型化工具集、工具生命周期和精选工具目录。",
+      en: "Canonical action tools, deferred discovery, and replay compatibility.",
+      zh: "小型核心工具、按需搜索、会话缓存与精确回放兼容边界。",
+    },
+    repoSource: ["docs/TOOL_SURFACE.md", "docs/RUNTIME_SIMPLIFICATION_DESIGN.md"],
+    hasPage: true,
+    category: "core-concepts",
+  },
+  {
+    id: "work",
+    slug: "work",
+    label: { en: "Work Surface", zh: "工作面板" },
+    description: {
+      en: "The single To-do list, how the model sees it through its own tool results, and how work state flows to the sidebar, relay, and sub-agents.",
+      zh: "唯一的 To-do 列表、模型如何通过自己的工具结果看到它，以及工作状态如何流向侧栏、relay 和子 Agent。",
     },
     repoSource: ["docs/TOOL_SURFACE.md", "docs/TOOL_LIFECYCLE.md"],
     hasPage: true,
@@ -122,7 +159,7 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "并行执行、角色类型、transcript 句柄和嵌套。",
     },
     repoSource: "docs/SUBAGENTS.md",
-    hasPage: false,
+    hasPage: true,
     category: "core-concepts",
   },
   {
@@ -134,7 +171,7 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "Model Context Protocol — 通过 stdio 和 HTTP/SSE 消费和暴露工具。",
     },
     repoSource: "docs/MCP.md",
-    hasPage: false,
+    hasPage: true,
     category: "extending",
   },
   {
@@ -145,7 +182,31 @@ export const DOC_TOPICS: DocTopic[] = [
       en: "Lifecycle hooks for pre/post tool execution, mode changes, and session events.",
       zh: "工具执行前后、模式切换和会话事件的生命周期钩子。",
     },
-    repoSource: "docs/rfcs/1364-hooks-lifecycle.md",
+    repoSource: ["docs/rfcs/1364-hooks-lifecycle.md", "docs/CONFIGURATION.md"],
+    hasPage: true,
+    category: "extending",
+  },
+  {
+    id: "skills",
+    slug: "skills",
+    label: { en: "Skills", zh: "技能" },
+    description: {
+      en: "Install, discover, trust, and load reusable instruction packages.",
+      zh: "安装、发现、信任并加载可复用的指令包。",
+    },
+    repoSource: "docs/SKILLS.md",
+    hasPage: false,
+    category: "extending",
+  },
+  {
+    id: "plugins",
+    slug: "plugins",
+    label: { en: "Plugins", zh: "插件" },
+    description: {
+      en: "Plugin discovery, installation, bundles, trust boundaries, and runtime lifecycle.",
+      zh: "插件发现、安装、Bundle、信任边界与运行时生命周期。",
+    },
+    repoSource: ["docs/PLUGINS.md", "docs/PLUGIN_BUNDLES.md"],
     hasPage: false,
     category: "extending",
   },
@@ -154,11 +215,11 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "sandbox",
     label: { en: "Sandbox & Approval", zh: "沙箱与审批" },
     description: {
-      en: "seatbelt (macOS), landlock (Linux), Windows containment, and approval policies.",
-      zh: "seatbelt（macOS）、landlock（Linux）、Windows 隔离和审批策略。",
+      en: "Available Seatbelt (macOS), opt-in bubblewrap (Linux), platform gaps, and approval policies.",
+      zh: "可用的 Seatbelt（macOS）、显式启用的 bubblewrap（Linux）、平台缺口和审批策略。",
     },
     repoSource: "docs/SANDBOX.md",
-    hasPage: false,
+    hasPage: true,
     category: "core-concepts",
   },
   {
@@ -170,7 +231,19 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "用于集成、桥接和自动化的公开 HTTP API。",
     },
     repoSource: "docs/RUNTIME_API.md",
-    hasPage: false,
+    hasPage: true,
+    category: "extending",
+  },
+  {
+    id: "web",
+    slug: "web",
+    label: { en: "Browser Client", zh: "浏览器客户端" },
+    description: {
+      en: "Run the embedded browser client on loopback, with its one-time bootstrap and session boundaries.",
+      zh: "仅在本机回环地址运行内置浏览器客户端，了解一次性引导与会话边界。",
+    },
+    repoSource: "docs/WEB.md",
+    hasPage: true,
     category: "extending",
   },
   {
@@ -182,7 +255,7 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "持久任务执行、Fleet 管理和 Workflow 编写。",
     },
     repoSource: ["docs/FLEET.md", "docs/WORKFLOW_AUTHORING.md"],
-    hasPage: false,
+    hasPage: true,
     category: "operations",
   },
   {
@@ -194,7 +267,7 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "常见问题、诊断、运维手册和 Docker 说明。",
     },
     repoSource: ["docs/OPERATIONS_RUNBOOK.md", "docs/DOCKER.md"],
-    hasPage: false,
+    hasPage: true,
     category: "operations",
   },
   {
@@ -222,14 +295,27 @@ export function getTopic(id: string): DocTopic | undefined {
 }
 
 /** Group topics by category for sidebar rendering. */
-export function getTopicsByCategory(): Map<string, DocTopic[]> {
-  const map = new Map<string, DocTopic[]>();
+export function getTopicsByCategory(): Map<DocTopic["category"], DocTopic[]> {
+  const map = new Map<DocTopic["category"], DocTopic[]>();
   for (const t of DOC_TOPICS) {
     const group = map.get(t.category) ?? [];
     group.push(t);
     map.set(t.category, group);
   }
   return map;
+}
+
+/** Resolve a topic to its on-site route or canonical repository document. */
+export function docTopicHref(topic: DocTopic, locale: string): string {
+  if (topic.sitePath) return `/${locale}/${topic.sitePath}`;
+  if (topic.hasPage) return `/${locale}/docs/${topic.slug}`;
+  const source = Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource;
+  return `${REPO_DOCS_BASE}/${source}`;
+}
+
+/** Whether following a topic leaves codewhale.net for the source document. */
+export function docTopicIsExternal(topic: DocTopic): boolean {
+  return !topic.hasPage;
 }
 
 /** Repo source base URL for generating direct links. */

@@ -9,8 +9,8 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     locale,
     title: isZh ? "工具 · Codewhale 文档" : "Tools · Codewhale Docs",
     description: isZh
-      ? "类型化工具集、工具生命周期和精选工具目录。"
-      : "Typed tool surface, tool lifecycle, and the curated tool catalog.",
+      ? "六个小型核心工具、按需搜索、会话工具箱缓存与精确回放兼容边界。"
+      : "Six small core tools, on-demand discovery, a conversation toolbox cache, and exact replay compatibility.",
   });
 }
 
@@ -21,12 +21,12 @@ export default async function ToolsPage({ params }: { params: Promise<{ locale: 
   return (
     <section className="space-y-10">
       <section id="overview" className="scroll-mt-32">
-        <h2 className="font-display text-3xl mb-1">
+        <h1 className="font-display text-3xl mb-1">
           {isZh ? "工具" : "Tools"}{" "}
           <span className="font-cjk text-indigo text-2xl ml-2">
             {isZh ? "Tools" : "工具"}
           </span>
-        </h2>
+        </h1>
         <p className={`text-ink-soft mt-3 ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
           {isZh
             ? "精选工具集——设计思路详见 "
@@ -42,32 +42,48 @@ export default async function ToolsPage({ params }: { params: Promise<{ locale: 
         <div className="hairline-t hairline-b mt-6">
           {[
             {
-              group: isZh ? "文件操作" : "File ops",
-              tools: "read_file · list_dir · write_file · edit_file · apply_patch",
+              group: "read",
+              tools: "path · offset? · limit?",
             },
             {
-              group: isZh ? "搜索" : "Search",
-              tools: "grep_files · file_search · web_search · fetch_url",
+              group: "write",
+              tools: "path · content",
             },
             {
-              group: "Shell",
-              tools: "exec_shell · exec_shell_wait · exec_shell_interact",
+              group: "edit",
+              tools: "path · edits",
             },
             {
-              group: isZh ? "Git / 诊断 / 测试" : "Git / diag / test",
-              tools: "git_status · git_diff · diagnostics · run_tests",
+              group: "bash",
+              tools: "command · timeout?",
             },
             {
-              group: isZh ? "子 Agent" : "Sub-agents",
+              group: isZh ? "协调" : "Coordination",
               tools: isZh
-                ? "agent —— 持久会话，并行执行；详见 docs/SUBAGENTS.md"
-                : "agent — persistent sessions, parallel execution; see docs/SUBAGENTS.md",
+                ? "agent · tool_search（始终启用；子 Agent 也有自己的搜索）"
+                : "agent · tool_search (always active; every child has its own search)",
             },
             {
-              group: isZh ? "递归 LM (RLM)" : "Recursive LM (RLM)",
+              group: "todo_write",
+              tools: "content · status (complete replacement list)",
+            },
+            {
+              group: isZh ? "延迟加载" : "Deferred",
               tools: isZh
-                ? "rlm_open · rlm_eval · rlm_configure · rlm_close —— 沙箱 Python REPL，内置 peek/search/chunk/sub_query_batch 等辅助函数"
-                : "rlm_open · rlm_eval · rlm_configure · rlm_close — sandboxed Python REPL with peek/search/chunk/sub_query_batch helpers",
+                ? "Git · Run · tasks · remember · Web · MCP · plugins；只在策略允许时由 tool_search 加载"
+                : "Git · Run · tasks · remember · Web · MCP · plugins; loaded by tool_search only when policy permits",
+            },
+            {
+              group: isZh ? "会话工具箱" : "Conversation toolbox",
+              tools: isZh
+                ? "最多 8 个名称 / 16 KiB schema；每个子 Agent 独立、每轮重新校验"
+                : "8 names / 16 KiB of schemas; independent per child and revalidated every turn",
+            },
+            {
+              group: isZh ? "只读研究" : "Read-only research",
+              tools: isZh
+                ? "侦察与审查子 Agent 可搜索 Web search/fetch，但不能获得写入或任意网络权限"
+                : "Scout and Reviewer children can discover Web search/fetch without gaining mutation or arbitrary network authority",
             },
             {
               group: "MCP",
@@ -91,28 +107,28 @@ export default async function ToolsPage({ params }: { params: Promise<{ locale: 
         </div>
       </section>
 
-      <section id="lifecycle" className="scroll-mt-32">
+      <section id="compatibility" className="scroll-mt-32">
         <h2 className="font-display text-2xl mb-1">
-          {isZh ? "工具生命周期" : "Tool Lifecycle"}
+          {isZh ? "回放兼容" : "Replay compatibility"}
         </h2>
         <p className={`text-ink-soft mt-3 ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
           {isZh
-            ? "工具注册、发现、弃用和稳定的完整流程详见仓库文档。"
-            : "Full lifecycle for tool registration, discovery, deprecation, and stabilization is documented in the repo."}
+            ? "旧名称只为已保存的 transcript 与协议客户端保留。精确旧调用仍使用旧 schema 的处理器，但不会出现在新模型目录或 tool_search 中；未知名称不会被猜测或模糊改写。"
+            : "Legacy names remain only for saved transcripts and protocol clients. An exact old call still reaches the handler for its old schema, but stays out of new catalogs and tool_search; unknown names are never guessed or fuzzily rewritten."}
         </p>
         <Link
-          href="https://github.com/Hmbown/CodeWhale/blob/main/docs/TOOL_LIFECYCLE.md"
+          href="https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_SIMPLIFICATION_DESIGN.md"
           className="inline-block mt-3 font-mono text-xs uppercase tracking-wider text-indigo hover:underline"
         >
-          docs/TOOL_LIFECYCLE.md →
+          docs/RUNTIME_SIMPLIFICATION_DESIGN.md →
         </Link>
       </section>
 
       <section id="source" className="hairline-t pt-8">
         <p className="text-sm text-ink-mute">
           {isZh
-            ? "来源文档：docs/TOOL_SURFACE.md, docs/TOOL_LIFECYCLE.md · 更新时请同步修改 docs-map.ts。"
-            : "Source documents: docs/TOOL_SURFACE.md, docs/TOOL_LIFECYCLE.md · Update docs-map.ts when changing."}
+            ? "来源文档：docs/TOOL_SURFACE.md, docs/RUNTIME_SIMPLIFICATION_DESIGN.md · 更新时请同步修改 docs-map.ts。"
+            : "Source documents: docs/TOOL_SURFACE.md, docs/RUNTIME_SIMPLIFICATION_DESIGN.md · Update docs-map.ts when changing."}
         </p>
       </section>
     </section>

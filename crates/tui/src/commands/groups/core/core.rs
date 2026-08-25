@@ -4,12 +4,13 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
-    normalize_model_name_for_provider,
+    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    normalize_custom_model_id, normalize_model_name_for_provider,
 };
-use crate::localization::{MessageId, tr};
-use crate::route_runtime::resolve_route_candidate;
-use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
+use crate::localization::{Locale, MessageId, tr};
+#[cfg(test)]
+use crate::tui::app::ReasoningEffort;
+use crate::tui::app::{App, AppAction, AppMode};
 use crate::tui::views::{HelpView, ModalKind, SubAgentsView, subagent_view_agents};
 
 use super::CommandResult;
@@ -17,6 +18,14 @@ use super::CommandResult;
 /// Show help information
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
+        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
+            Some(&app.workspace),
+            Clone::clone,
+        );
+        if let Some(command) = user_commands.get(topic) {
+            return CommandResult::message(user_command_help(app.ui_locale, command));
+        }
+
         // Show help for specific command
         if let Some(cmd) = crate::commands::get_command_info(topic) {
             let mut help = format!(
@@ -26,16 +35,37 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
                 tr(app.ui_locale, MessageId::HelpUsageLabel),
                 cmd.usage
             );
-            if !cmd.aliases.is_empty() {
+            let visible_aliases = cmd
+                .aliases
+                .iter()
+                .filter(|alias| user_commands.get(alias).is_none())
+                .copied()
+                .collect::<Vec<_>>();
+            if !visible_aliases.is_empty() {
                 let _ = write!(
                     help,
                     "\n  {} {}",
                     tr(app.ui_locale, MessageId::HelpAliasesLabel),
-                    cmd.aliases.join(", ")
+                    visible_aliases.join(", ")
                 );
+            }
+            if cmd.name == "config" {
+                help.push_str(
+                    "\n\n  Provider context window: set `context_window = 262144` under the active `[providers.<name>]` table to cap a 1M model to 256K. Use `/config context_window` to inspect the configured and effective values.",
+                );
+                help.push('\n');
+                help.push_str(&tr(app.ui_locale, MessageId::ConfigHelpDiscoverable));
             }
             return CommandResult::message(help);
         }
+
+        // Skills are user-invocable but were never a `/help` topic (#3912):
+        // they execute and autocomplete, yet the surface that teaches the
+        // product claimed they did not exist.
+        if let Some(help) = skill_help(app, topic) {
+            return CommandResult::message(help);
+        }
+
         return CommandResult::error(
             tr(app.ui_locale, MessageId::HelpUnknownCommand).replace("{topic}", topic),
         );
@@ -43,9 +73,80 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
     // Show help overlay
     if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
+            .with_groups_expanded(app.help_expand_groups);
+        app.view_stack.push(help);
     }
     CommandResult::ok()
+}
+
+/// `/help <skill>` for a discovered skill (#3912).
+///
+/// Matches the cached skill list case-insensitively, accepting the bare name
+/// as well as either invocation shape the dispatcher supports, so `/help
+/// $review` and `/help /skill review` resolve the same as `/help review`.
+fn skill_help(app: &App, topic: &str) -> Option<String> {
+    let needle = topic
+        .trim()
+        .trim_start_matches('$')
+        .trim_start_matches('/')
+        .trim_start_matches("skill ")
+        .trim();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let (name, description) = app
+        .cached_skills
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(needle))?;
+
+    let mut help = format!("${name}");
+    if !description.trim().is_empty() {
+        let _ = write!(help, "\n\n  {}", description.trim());
+    }
+    // Both shapes are advertised because both dispatch (`commands::execute`).
+    let _ = write!(
+        help,
+        "\n\n  {} ${name}\n  {} /skill {name}",
+        tr(app.ui_locale, MessageId::HelpUsageLabel),
+        tr(app.ui_locale, MessageId::HelpUsageLabel),
+    );
+    Some(help)
+}
+
+fn user_command_help(
+    locale: Locale,
+    command: &crate::commands::user_registry::UserCommandMetadata,
+) -> String {
+    let mut help = command.name.clone();
+    if let Some(description) = command
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+    {
+        let _ = write!(help, "\n\n  {description}");
+    }
+
+    let usage = command
+        .display_usage()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("/{}", command.name));
+    let _ = write!(
+        help,
+        "\n\n  {} {}",
+        tr(locale, MessageId::HelpUsageLabel),
+        usage
+    );
+    if !command.aliases.is_empty() {
+        let _ = write!(
+            help,
+            "\n  {} {}",
+            tr(locale, MessageId::HelpAliasesLabel),
+            command.aliases.join(", ")
+        );
+    }
+    help
 }
 
 /// Clear conversation history
@@ -63,6 +164,7 @@ pub fn clear(app: &mut App) -> CommandResult {
     app.current_session_id = None;
     app.current_session_metadata = None;
     app.session_title = None;
+    app.window_title = None;
     let locale = app.ui_locale;
     let message = tr(locale, MessageId::ClearConversation).to_string();
     CommandResult::with_message_and_action(
@@ -86,6 +188,10 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     if !app.clear_todos() {
         return false;
     }
+    // Atomically retire background accounting before zeroing the session.
+    // Late reports retain the old scope token and are discarded instead of
+    // appearing in the new conversation.
+    let _settled_old_cost_scope = crate::cost_status::close_current_scope();
     app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
@@ -95,14 +201,16 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.queued_draft = None;
     app.session.total_tokens = 0;
     app.session.total_conversation_tokens = 0;
+    app.last_billed_input_tokens = None;
     app.session.reset_token_breakdown();
     app.session.session_cost = 0.0;
     app.session.session_cost_cny = 0.0;
     app.session.subagent_cost = 0.0;
     app.session.subagent_cost_cny = 0.0;
-    app.session.subagent_cost_event_seqs.clear();
+    app.session.subagent_usage_sources.clear();
     app.session.displayed_cost_high_water = 0.0;
     app.session.displayed_cost_high_water_cny = 0.0;
+    app.reset_cost_coverage();
     app.tool_log.clear();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
@@ -133,6 +241,15 @@ pub fn exit() -> CommandResult {
 /// picker (Pro/Flash + thinking effort) per #39 — gives users a discoverable
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
+    if model_name.is_some_and(|name| name.eq_ignore_ascii_case("save-default")) {
+        // Explicit persistence of the pending session route as the startup
+        // default — only an explicit command can write settings after an
+        // in-session route change.
+        let message = app.apply_route_save_choice(
+            crate::tui::views::route_save_prompt::RouteSaveChoice::SaveAsDefault,
+        );
+        return CommandResult::message(message);
+    }
     if let Some(name) = model_name {
         // Manual Models.dev catalog refresh (#4187). Dispatched async so the
         // TUI event loop is not blocked; failure keeps prior/bundled rows.
@@ -142,11 +259,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         if name.trim().eq_ignore_ascii_case("auto") {
             let old_model = app.model_display_label();
             let model_changed = !app.auto_model || app.model != "auto";
-            app.auto_model = true;
-            app.model = "auto".to_string();
-            app.last_effective_model = None;
-            app.reasoning_effort = ReasoningEffort::Auto;
-            app.last_effective_reasoning_effort = None;
+            app.set_model_selection("auto".to_string());
             app.active_route_limits = app.context_window_override_limits();
             app.update_model_compaction_budget();
             if model_changed {
@@ -156,16 +269,17 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.session.last_completion_tokens = None;
                 app.session.last_output_throughput = None;
             }
+            let provider_identity = app.provider_identity_for_persistence().to_string();
             app.provider_models
-                .insert(app.api_provider.as_str().to_string(), "auto".to_string());
-            let persist_warning =
-                provider_model_selection_persist_warning(app.api_provider, "auto");
+                .insert(provider_identity.clone(), "auto".to_string());
+            // Temporary by default; the route-save prompt owns persistence.
+            app.note_session_route_change(&provider_identity, "auto");
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
                 .replace("{new}", "auto");
-            if let Some(warning) = persist_warning {
-                message.push_str(&warning);
-            }
+            message.push_str(
+                " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
+            );
             return CommandResult::with_message_and_action(
                 message,
                 AppAction::UpdateCompaction(app.compaction_config()),
@@ -181,8 +295,8 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         } else {
             let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
                 return CommandResult::error(format!(
-                    "Invalid model '{name}'. Expected auto or a model for the active provider. Common DeepSeek models: {}",
-                    COMMON_DEEPSEEK_MODELS.join(", ")
+                    "Invalid model '{name}'. Expected auto or a model for the active provider ({}).",
+                    app.api_provider.as_str()
                 ));
             };
             model_id
@@ -192,27 +306,51 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.api_provider,
                 ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
             );
-        let route_limits = if strict_direct_custom_endpoint {
+        let route_resolution = if strict_direct_custom_endpoint {
             None
         } else {
-            match resolve_route_candidate(
+            // `/model` normally resolves against the active provider's
+            // catalog-default endpoint so it retains the existing local
+            // provider/model validation. The one endpoint-sensitive model
+            // selection is Kimi Code's bare `k3`: resolve it against the
+            // committed Kimi Code route rather than silently falling back to
+            // Moonshot's direct API route. Do not pass an unrelated stale
+            // endpoint through here; doing so would turn a foreign provider
+            // model into an apparent custom-route selection.
+            let route_base_url = crate::config::is_exact_kimi_code_k3_route(
+                app.api_provider,
+                &app.active_route_base_url,
+                &model_id,
+            )
+            .then(|| app.active_route_base_url.clone());
+            match crate::route_runtime::resolve_route_candidate_with_context_metadata(
                 app.api_provider,
                 Some(&model_id),
                 None,
-                None,
+                route_base_url,
                 app.active_context_window_override,
+                None,
             ) {
-                Ok(candidate) => Some(candidate.limits),
+                Ok(resolution) => Some(resolution),
                 Err(reason) => return CommandResult::error(reason),
             }
         };
         let old_model = app.model_display_label();
         let model_changed = app.auto_model || app.model != model_id;
         app.set_model_selection(model_id.clone());
-        if let Some(limits) = route_limits {
-            app.set_active_route_limits(limits);
+        if let Some(resolution) = route_resolution {
+            app.set_active_route_resolution(
+                resolution.candidate.endpoint().base_url.clone(),
+                resolution.candidate.limits(),
+                resolution.context_window.source,
+            );
         } else {
             app.active_route_limits = app.context_window_override_limits();
+            app.active_context_window_source = if app.active_context_window_override.is_some() {
+                crate::route_runtime::ContextWindowSource::Configured
+            } else {
+                crate::route_runtime::ContextWindowSource::Fallback
+            };
         }
         app.update_model_compaction_budget();
         if model_changed {
@@ -222,15 +360,19 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             app.session.last_completion_tokens = None;
             app.session.last_output_throughput = None;
         }
+        let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
-            .insert(app.api_provider.as_str().to_string(), model_id.clone());
-        let persist_warning = provider_model_selection_persist_warning(app.api_provider, &model_id);
+            .insert(provider_identity.clone(), model_id.clone());
+        app.enable_provider_model(&provider_identity, &model_id);
+        // Route changes are temporary by default: nothing is written here.
+        // The route-save prompt offers the explicit persistence choices.
+        app.note_session_route_change(&provider_identity, &model_id);
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
             .replace("{new}", &model_id);
-        if let Some(warning) = persist_warning {
-            message.push_str(&warning);
-        }
+        message.push_str(
+            " (session only — /fleet save updates this Fleet, /fleet save-as saves a new Fleet, /model save-default remembers the default)",
+        );
         CommandResult::with_message_and_action(
             message,
             AppAction::UpdateCompaction(app.compaction_config()),
@@ -240,22 +382,25 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
     }
 }
 
-fn provider_model_selection_persist_warning(provider: ApiProvider, model: &str) -> Option<String> {
-    crate::settings::Settings::persist_provider_model_selection(provider, model)
-        .err()
-        .map(|err| format!(" (not persisted: {err})"))
-}
-
 /// Fetch and list available models from the configured API endpoint.
 pub fn models(_app: &mut App) -> CommandResult {
     CommandResult::action(AppAction::FetchModels)
 }
 
 /// List Fleet worker status from the engine.
+/// Request a refresh and print the agent roster into the transcript once it
+/// lands. One-shot: the flag is cleared by the event handler, so ambient
+/// refreshes (sidebar polls, spawn/complete events) never spam the transcript.
+pub fn subagents_roster(app: &mut App) -> CommandResult {
+    app.agent_roster_print_requested = true;
+    app.status_message = Some(tr(app.ui_locale, MessageId::SubagentsFetching).to_string());
+    CommandResult::action(AppAction::ListSubAgents)
+}
+
 pub fn subagents(app: &mut App) -> CommandResult {
     if app.view_stack.top_kind() != Some(ModalKind::SubAgents) {
         let agents = subagent_view_agents(app, &app.subagent_cache);
-        app.view_stack.push(SubAgentsView::new(agents));
+        app.view_stack.push(SubAgentsView::for_app(app, agents));
     }
     app.status_message = Some(tr(app.ui_locale, MessageId::SubagentsFetching).to_string());
     CommandResult::action(AppAction::ListSubAgents)
@@ -313,175 +458,72 @@ pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
 
 fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
     if path == "~" {
-        return dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string());
+        return crate::config::effective_home_dir()
+            .ok_or_else(|| "Could not resolve home directory".to_string());
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let home =
-            dirs::home_dir().ok_or_else(|| "Could not resolve home directory".to_string())?;
+        let home = crate::config::effective_home_dir()
+            .ok_or_else(|| "Could not resolve home directory".to_string())?;
         return Ok(home.join(rest));
     }
     Ok(PathBuf::from(path))
 }
 
-struct ProviderLinkInfo {
-    key_url: Option<&'static str>,
-    docs_url: &'static str,
-    note: &'static str,
-}
-
-fn provider_link_info(provider_id: &str) -> ProviderLinkInfo {
-    match provider_id {
-        "deepseek" => ProviderLinkInfo {
-            key_url: Some("https://platform.deepseek.com/api_keys"),
-            docs_url: "https://api-docs.deepseek.com/",
-            note: "Create an API key in the DeepSeek platform console.",
-        },
-        "nvidia-nim" => ProviderLinkInfo {
-            key_url: Some("https://build.nvidia.com/settings/api-keys"),
-            docs_url: "https://build.nvidia.com/explore/discover",
-            note: "NVIDIA NIM keys are managed from the NVIDIA build console.",
-        },
-        "openai" => ProviderLinkInfo {
-            key_url: Some("https://platform.openai.com/api-keys"),
-            docs_url: "https://platform.openai.com/docs/api-reference",
-            note: "Use this for OpenAI or compatible endpoints that share OpenAI-style auth.",
-        },
-        "atlascloud" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://atlascloud.ai/docs/en/api-keys",
-            note: "Atlas Cloud documents API key creation in its API Keys guide.",
-        },
-        "wanjie-ark" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://platform.lingyiwanwu.com/docs",
-            note: "Use the Wanjie/01.AI platform console for provider credentials.",
-        },
-        "volcengine" => ProviderLinkInfo {
-            key_url: Some("https://console.volcengine.com/ark/apiKey"),
-            docs_url: "https://www.volcengine.com/docs/82379/1541594",
-            note: "Volcengine Ark API keys are managed in the Ark console.",
-        },
-        "openrouter" => ProviderLinkInfo {
-            key_url: Some("https://openrouter.ai/settings/keys"),
-            docs_url: "https://openrouter.ai/docs/api/reference/authentication",
-            note: "OpenRouter keys can include app credit limits and model routing controls.",
-        },
-        "xiaomi-mimo" => ProviderLinkInfo {
-            key_url: Some("https://platform.xiaomimimo.com/token-plan"),
-            docs_url: "https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/subscription",
-            note: "Token Plan keys use the base URL shown on the Xiaomi MiMo Token Plan page.",
-        },
-        "novita" => ProviderLinkInfo {
-            key_url: Some("https://novita.ai/en/settings/key-management"),
-            docs_url: "https://novita.ai/docs/guides/quickstart",
-            note: "Novita keys are managed from Key Management in account settings.",
-        },
-        "fireworks" => ProviderLinkInfo {
-            key_url: Some("https://fireworks.ai/api-keys"),
-            docs_url: "https://docs.fireworks.ai/getting-started/quickstart",
-            note: "Create a Fireworks API key before exporting FIREWORKS_API_KEY.",
-        },
-        "siliconflow" => ProviderLinkInfo {
-            key_url: Some("https://cloud.siliconflow.com/account/ak"),
-            docs_url: "https://docs.siliconflow.com/en/userguide/quickstart",
-            note: "Use the global SiliconFlow console unless your route is the China endpoint.",
-        },
-        "siliconflow-CN" => ProviderLinkInfo {
-            key_url: Some("https://cloud.siliconflow.cn/account/ak"),
-            docs_url: "https://docs.siliconflow.cn/en/userguide/quickstart",
-            note: "Use the China SiliconFlow console for the China endpoint.",
-        },
-        "arcee" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.arcee.ai/other/create-your-first-api-key",
-            note: "Arcee documents key creation from the platform API Keys page.",
-        },
-        "moonshot" => ProviderLinkInfo {
-            key_url: Some("https://platform.kimi.ai/console/api-keys"),
-            docs_url: "https://platform.kimi.ai/docs/api/overview",
-            note: "Moonshot/Kimi keys are managed in the Kimi Open Platform console.",
-        },
-        "sglang" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.sglang.ai/",
-            note: "Self-hosted SGLang usually needs a local base URL, not a hosted token.",
-        },
-        "vllm" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.vllm.ai/en/stable/serving/openai_compatible_server/",
-            note: "Self-hosted vLLM usually needs a local base URL, not a hosted token.",
-        },
-        "ollama" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.ollama.com/api",
-            note: "Local Ollama does not require an API key by default.",
-        },
-        "huggingface" => ProviderLinkInfo {
-            key_url: Some("https://huggingface.co/settings/tokens"),
-            docs_url: "https://huggingface.co/docs/hub/en/security-tokens",
-            note: "Use a scoped Hugging Face access token.",
-        },
-        "together" => ProviderLinkInfo {
-            key_url: Some("https://api.together.ai/settings/api-keys"),
-            docs_url: "https://docs.together.ai/docs/api-keys-authentication",
-            note: "Together API keys are project-scoped.",
-        },
-        "openai-codex" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://developers.openai.com/codex/",
-            note: "This route uses Codex/ChatGPT auth instead of a normal provider API key.",
-        },
-        "anthropic" => ProviderLinkInfo {
-            key_url: Some("https://console.anthropic.com/settings/keys"),
-            docs_url: "https://docs.anthropic.com/en/api/overview",
-            note: "Create Claude API keys from the Anthropic Console.",
-        },
-        "zai" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://docs.z.ai/api-reference/introduction",
-            note: "Create or manage Z.ai API keys from the API Keys page linked in the docs.",
-        },
-        "stepfun" => ProviderLinkInfo {
-            key_url: Some("https://platform.stepfun.ai/"),
-            docs_url: "https://platform.stepfun.ai/docs/en/quickstart/overview",
-            note: "Open Account Management > Interface Keys in the StepFun console.",
-        },
-        "minimax" => ProviderLinkInfo {
-            key_url: Some(
-                "https://platform.minimax.io/user-center/basic-information/interface-key",
-            ),
-            docs_url: "https://platform.minimax.io/docs/api-reference/api-overview",
-            note: "MiniMax has separate pay-as-you-go API keys and Token Plan subscription keys.",
-        },
-        "deepinfra" => ProviderLinkInfo {
-            key_url: Some("https://deepinfra.com/dash/api_keys"),
-            docs_url: "https://docs.deepinfra.com/quickstart",
-            note: "Create DeepInfra API keys from the dashboard.",
-        },
-        "qianfan" => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://cloud.baidu.com/doc/qianfan/index.html",
-            note: "Create Baidu Qianfan API keys from the Qianfan console.",
-        },
-        _ => ProviderLinkInfo {
-            key_url: None,
-            docs_url: "https://codewhale.net/en/docs",
-            note: "Use the provider console for credentials, then configure the matching env var.",
-        },
+fn public_site_locale_segment(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhHans | Locale::ZhHant => "zh",
+        Locale::Ja => "ja",
+        Locale::Vi => "vi",
+        Locale::Ko => "ko",
+        Locale::Es419 => "es",
+        Locale::PtBr => "pt-BR",
+        Locale::Ru => "ru",
+        Locale::Uk => "uk",
+        // Not shipped on the website yet — English pages are the fallback.
+        Locale::En | Locale::Ca | Locale::De | Locale::Fr | Locale::Id | Locale::Hi => "en",
     }
 }
 
-/// Show provider dashboard, token, and docs links.
-pub fn deepseek_links(app: &mut App) -> CommandResult {
+/// Show Codewhale documentation, community, managed-app, and provider links.
+pub fn codewhale_links(app: &mut App) -> CommandResult {
     let locale = app.ui_locale;
     let active_provider = app.api_provider.as_str();
+    let site_locale = public_site_locale_segment(locale);
     let mut message = format!(
         "{}\n─────────────────────────────\n",
+        tr(locale, MessageId::LinksProjectTitle)
+    );
+
+    let _ = writeln!(
+        message,
+        "{} `https://codewhale.net/{site_locale}/docs`",
+        tr(locale, MessageId::LinksDocumentation)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://codewhale.net/{site_locale}/community`",
+        tr(locale, MessageId::LinksCommunity)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://github.com/Hmbown/CodeWhale`",
+        tr(locale, MessageId::LinksGitHub)
+    );
+    let _ = writeln!(
+        message,
+        "{} `https://app.codewhale.net`",
+        tr(locale, MessageId::LinksManagedApp)
+    );
+    let _ = writeln!(message, "{}", tr(locale, MessageId::LinksManagedAppNote));
+
+    let _ = write!(
+        message,
+        "\n{}\n─────────────────────────────\n",
         tr(locale, MessageId::LinksTitle)
     );
 
     for provider in codewhale_config::provider::providers_sorted_for_display() {
-        let links = provider_link_info(provider.id());
+        let links = provider.credential_help();
         let active_marker = if provider.id() == active_provider {
             " <- current"
         } else {
@@ -494,7 +536,7 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
             provider.id(),
             active_marker
         );
-        if let Some(key_url) = links.key_url {
+        if let Some(key_url) = links.credential_url {
             let _ = writeln!(
                 message,
                 "{} `{}`",
@@ -506,15 +548,26 @@ pub fn deepseek_links(app: &mut App) -> CommandResult {
                 message,
                 "{} {}",
                 tr(locale, MessageId::LinksDashboard),
-                links.note
+                links.guidance
             );
         }
-        let _ = writeln!(
-            message,
-            "{}      `{}`",
-            tr(locale, MessageId::LinksDocs),
-            links.docs_url
-        );
+        if let Some(docs_url) = links.docs_url {
+            let _ = writeln!(
+                message,
+                "{}      `{}`",
+                tr(locale, MessageId::LinksDocs),
+                docs_url
+            );
+        }
+        if provider.kind() == codewhale_config::ProviderKind::Moonshot {
+            let _ = writeln!(
+                message,
+                "{}",
+                tr(locale, MessageId::LinksKimiCodeRouteNote)
+                    .replace("{route}", DEFAULT_KIMI_CODE_BASE_URL)
+                    .replace("{console}", KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL)
+            );
+        }
         let env_vars = provider.env_vars();
         if env_vars.is_empty() {
             let _ = writeln!(message, "Env: none");
@@ -605,6 +658,9 @@ pub fn home_dashboard(app: &mut App) -> CommandResult {
     // Quick actions section
     let _ = writeln!(stats, "\n{}", tr(locale, MessageId::HomeQuickActions));
     let _ = writeln!(stats, "--------------------------------------------");
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickWorkspace));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickRestore));
+    let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickTokens));
     let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickLinks));
     let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickSkills));
     let _ = writeln!(stats, "{}", tr(locale, MessageId::HomeQuickConfig));
@@ -662,6 +718,7 @@ mod tests {
     use crate::client::PromptInspection;
     use crate::config::Config;
     use crate::models::Message;
+    use crate::models::Role;
     use crate::tui::app::{App, AppMode, TuiOptions, TurnCacheRecord};
     use crate::tui::history::HistoryCell;
     use std::ffi::OsString;
@@ -669,10 +726,53 @@ mod tests {
     use std::time::Instant;
     use tempfile::{TempDir, tempdir};
 
+    #[test]
+    fn help_topic_resolves_a_discovered_skill_and_both_shapes() {
+        // #3912: `/help <skill>` said "Unknown command" for a skill that
+        // executes and autocompletes.
+        let mut app = create_test_app();
+        app.cached_skills = vec![(
+            "codereview".to_string(),
+            "Review a diff for defects".to_string(),
+        )];
+
+        for topic in [
+            "codereview",
+            "CodeReview",
+            "$codereview",
+            "/skill codereview",
+        ] {
+            let result = help(&mut app, Some(topic));
+            let message = result
+                .message
+                .as_deref()
+                .unwrap_or_else(|| panic!("{topic} should resolve to skill help"));
+            assert!(message.contains("Review a diff for defects"), "{message}");
+            assert!(message.contains("$codereview"), "{message}");
+            assert!(message.contains("/skill codereview"), "{message}");
+        }
+    }
+
+    #[test]
+    fn help_topic_still_errors_for_an_unknown_name() {
+        let mut app = create_test_app();
+        app.cached_skills = vec![("codereview".to_string(), "Review a diff".to_string())];
+        let result = help(&mut app, Some("definitely-not-a-thing"));
+        assert!(result.is_error, "unknown topics must still be an error");
+        assert!(
+            !result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Review a diff"),
+            "the skill fallback must not match an unrelated topic"
+        );
+    }
+
     struct SettingsPathGuard {
         _tmp: TempDir,
         previous: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl SettingsPathGuard {
@@ -710,25 +810,8 @@ mod tests {
 
     fn create_test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("/tmp/test-workspace"),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
             skills_dir: PathBuf::from("/tmp/test-skills"),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("/tmp/test-workspace"))
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = crate::localization::Locale::En;
@@ -767,6 +850,11 @@ mod tests {
         assert!(msg.contains("config"));
         assert!(msg.contains("Inspect and change settings"));
         assert!(msg.contains("Usage: /config"));
+        assert!(msg.contains("context_window = 262144"));
+        assert!(msg.contains("/config context_window"));
+        assert!(msg.contains("/config search.provider"));
+        assert!(msg.contains("/config prompt_suggestion"));
+        assert!(msg.contains("/config notifications"));
     }
 
     #[test]
@@ -775,7 +863,7 @@ mod tests {
         let result = help(&mut app, Some("links"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("links"));
-        assert!(msg.contains("Show provider token, dashboard, and docs links"));
+        assert!(msg.contains("Show Codewhale, community, and provider links"));
         assert!(msg.contains("Usage: /links"));
         assert!(msg.contains("Aliases: dashboard, api"));
     }
@@ -817,7 +905,7 @@ mod tests {
             content: "test".to_string(),
         });
         app.api_messages.push(Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![],
         });
         app.session.total_conversation_tokens = 100;
@@ -856,7 +944,7 @@ mod tests {
             content: "keep me".to_string(),
         });
         app.api_messages.push(Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![],
         });
         app.current_session_id = Some("current-session".to_string());
@@ -882,7 +970,7 @@ mod tests {
             content: "keep active turn".to_string(),
         });
         app.api_messages.push(Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![],
         });
         app.current_session_id = Some("active-session".to_string());
@@ -907,12 +995,17 @@ mod tests {
         app.session.session_cost_cny = 3.05;
         app.session.subagent_cost = 0.11;
         app.session.subagent_cost_cny = 0.80;
-        app.session.subagent_cost_event_seqs.insert(7);
+        app.session
+            .subagent_usage_sources
+            .insert(crate::cost_status::usage_source_fingerprint(
+                "response-test",
+            ));
         app.session.displayed_cost_high_water = 0.53;
         app.session.displayed_cost_high_water_cny = 3.85;
         app.session.last_prompt_cache_hit_tokens = Some(70);
         app.session.last_prompt_cache_miss_tokens = Some(30);
         app.session.last_reasoning_replay_tokens = Some(12);
+        app.session.total_cache_write_tokens = 99;
         app.session.last_warmup_key = None;
         app.session.last_tool_catalog = Some(Vec::new());
         app.session.last_base_url = Some("https://api.deepseek.com".to_string());
@@ -924,6 +1017,7 @@ mod tests {
         });
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -931,6 +1025,9 @@ mod tests {
             cache_hit_tokens: Some(70),
             cache_miss_tokens: Some(30),
             reasoning_replay_tokens: Some(12),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            cost_audit: None,
             recorded_at: Instant::now(),
         });
 
@@ -942,12 +1039,13 @@ mod tests {
         assert_eq!(app.session.session_cost_cny, 0.0);
         assert_eq!(app.session.subagent_cost, 0.0);
         assert_eq!(app.session.subagent_cost_cny, 0.0);
-        assert!(app.session.subagent_cost_event_seqs.is_empty());
+        assert!(app.session.subagent_usage_sources.is_empty());
         assert_eq!(app.session.displayed_cost_high_water, 0.0);
         assert_eq!(app.session.displayed_cost_high_water_cny, 0.0);
         assert_eq!(app.session.last_prompt_cache_hit_tokens, None);
         assert_eq!(app.session.last_prompt_cache_miss_tokens, None);
         assert_eq!(app.session.last_reasoning_replay_tokens, None);
+        assert_eq!(app.session.total_cache_write_tokens, 0);
         assert!(app.session.turn_cache_history.is_empty());
         assert_eq!(app.session.last_cache_inspection, None);
         assert_eq!(app.session.last_warmup_key, None);
@@ -1038,7 +1136,50 @@ mod tests {
     }
 
     #[test]
-    fn model_command_persists_active_provider_model_scoped() {
+    fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.model_ids_passthrough = true;
+        app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
+        app.active_context_window_override = None;
+
+        let result = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+
+        assert!(
+            !result.is_error,
+            "Kimi Code K3 route should resolve: {result:?}"
+        );
+        assert_eq!(app.model, crate::config::KIMI_CODE_K3_MODEL);
+        assert_eq!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
+
+        // Switching to the direct platform endpoint requires the direct model
+        // id (`kimi-k3`); bare `k3` is fail-closed (#4687).
+        app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
+        let rejected = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+        assert!(
+            rejected.is_error,
+            "bare k3 on direct Moonshot must fail closed: {rejected:?}"
+        );
+
+        let direct = model(&mut app, Some(crate::config::MOONSHOT_KIMI_K3_MODEL));
+        assert!(
+            !direct.is_error,
+            "direct Moonshot kimi-k3 remains valid: {direct:?}"
+        );
+        assert_ne!(
+            app.active_route_limits
+                .and_then(|limits| limits.context_tokens),
+            Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
+        );
+    }
+
+    #[test]
+    fn model_command_is_session_local_until_explicitly_saved() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
 
@@ -1049,29 +1190,42 @@ mod tests {
             app.provider_models.get("deepseek").map(String::as_str),
             Some("deepseek-v4-flash")
         );
+        // The live session changed and the save decision is pending — the
+        // route-save prompt owns persistence now.
+        let pending = app.pending_route_save.as_ref().expect("pending save");
+        assert_eq!(pending.provider_identity, "deepseek");
+        assert_eq!(pending.model, "deepseek-v4-flash");
+
+        // NOTHING was written to settings: no scoped model, no default
+        // provider, no default model. The message says the change is
+        // session-only.
         let settings = crate::settings::Settings::load().expect("load settings");
-        // #3227: `/model` is session-local. It records the model under the
-        // provider-scoped entry only; it must NOT rewrite the shared global
-        // `default_provider`/`default_model` that other terminals read on
-        // startup.
         assert_eq!(
             settings
                 .provider_models
                 .as_ref()
-                .and_then(|models| models.get("deepseek"))
-                .map(String::as_str),
-            Some("deepseek-v4-flash")
+                .and_then(|models| models.get("deepseek")),
+            None
         );
         assert_eq!(settings.default_provider.as_deref(), None);
         assert_eq!(settings.default_model.as_deref(), None);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("session only"),
+            "the receipt must say the change is temporary: {:?}",
+            result.message
+        );
     }
 
     #[test]
     fn model_command_does_not_mutate_shared_default_provider() {
-        // Regression for #3227: a `/model` change on a non-default provider
-        // must not drag the global `default_provider` onto it. Here the saved
-        // default is DeepSeek; selecting a model while the session is on Z.ai
-        // changes only Z.ai's scoped model.
+        // Regression for #3227, strengthened: a `/model` change must not drag
+        // the global `default_provider` onto it AND must not write the scoped
+        // model either — the change is session-local until the user explicitly
+        // saves it via the route-save prompt.
         let _settings = SettingsPathGuard::new();
         {
             let seed = crate::settings::Settings {
@@ -1093,14 +1247,42 @@ mod tests {
         let settings = crate::settings::Settings::load().expect("load settings");
         // The shared default provider is untouched.
         assert_eq!(settings.default_provider.as_deref(), Some("deepseek"));
-        // Only Z.ai's scoped entry changed.
+        // No scoped entry was written either — session-local.
         assert_eq!(
             settings
                 .provider_models
                 .as_ref()
-                .and_then(|models| models.get("zai"))
-                .map(String::as_str),
-            Some("GLM-5.2")
+                .and_then(|models| models.get("zai")),
+            None
+        );
+        // The in-memory route changed and the decision is pending.
+        assert_eq!(app.model, "GLM-5.2");
+        let pending = app.pending_route_save.as_ref().expect("pending save");
+        assert_eq!(pending.provider_identity, "zai");
+    }
+
+    #[test]
+    fn model_command_keeps_glm_53_as_its_own_wire_id() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Zai;
+        app.model_ids_passthrough = false;
+        app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
+        app.auto_model = false;
+
+        let result = model(&mut app, Some("glm-5.3"));
+
+        assert!(!result.is_error, "GLM-5.3 is valid on Z.ai: {result:?}");
+        assert_eq!(app.model, crate::config::ZAI_GLM_5_3_MODEL);
+        assert_eq!(
+            app.provider_models.get("zai").map(String::as_str),
+            Some(crate::config::ZAI_GLM_5_3_MODEL)
+        );
+        assert_eq!(
+            app.pending_route_save
+                .as_ref()
+                .map(|pending| pending.model.as_str()),
+            Some(crate::config::ZAI_GLM_5_3_MODEL)
         );
     }
 
@@ -1141,17 +1323,19 @@ mod tests {
         assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
-        // Shared settings: per-provider scoped models recorded for both, and
-        // the global default provider was never flipped by either `/model`.
+        // Shared settings: NOTHING was written by either `/model` — both
+        // changes are session-local with a pending save decision, and the
+        // global default provider was never flipped.
         let settings = crate::settings::Settings::load().expect("load settings");
         assert_eq!(settings.default_provider.as_deref(), None);
-        let provider_models = settings.provider_models.expect("provider_models");
+        assert_eq!(settings.provider_models, None);
+        // Both sessions carry their own pending save decisions.
         assert_eq!(
-            provider_models.get("zai").map(String::as_str),
+            app_a.pending_route_save.as_ref().map(|p| p.model.as_str()),
             Some("GLM-5.2")
         );
         assert_eq!(
-            provider_models.get("deepseek").map(String::as_str),
+            app_b.pending_route_save.as_ref().map(|p| p.model.as_str()),
             Some("deepseek-v4-flash")
         );
     }
@@ -1188,6 +1372,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1195,6 +1380,9 @@ mod tests {
             cache_hit_tokens: Some(70),
             cache_miss_tokens: Some(30),
             reasoning_replay_tokens: Some(12),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            cost_audit: None,
             recorded_at: Instant::now(),
         });
 
@@ -1212,6 +1400,7 @@ mod tests {
         app.model = "deepseek-v4-pro".to_string();
         app.push_turn_cache_record(TurnCacheRecord {
             provider: None,
+            provider_identity: None,
             model: None,
             auto_model: false,
             input_tokens: 100,
@@ -1219,6 +1408,9 @@ mod tests {
             cache_hit_tokens: Some(70),
             cache_miss_tokens: Some(30),
             reasoning_replay_tokens: Some(12),
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            cost_audit: None,
             recorded_at: Instant::now(),
         });
 
@@ -1233,6 +1425,7 @@ mod tests {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
         app.reasoning_effort = ReasoningEffort::Off;
+        app.reasoning_effort_preference = None;
 
         let result = model(&mut app, Some("auto"));
 
@@ -1242,6 +1435,24 @@ mod tests {
         assert_eq!(app.reasoning_effort, ReasoningEffort::Auto);
         assert!(app.last_effective_model.is_none());
         assert!(app.last_effective_reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn test_model_auto_preserves_raw_explicit_thinking() {
+        let _settings = SettingsPathGuard::new();
+        let mut app = create_test_app();
+        app.api_provider = ApiProvider::OpenaiCodex;
+        app.auto_model = false;
+        app.reasoning_effort = ReasoningEffort::Low;
+        app.reasoning_effort_preference = Some(ReasoningEffort::Off);
+
+        let result = model(&mut app, Some("auto"));
+
+        assert!(result.message.is_some());
+        assert!(app.auto_model);
+        assert_eq!(app.model, "auto");
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
+        assert_eq!(app.reasoning_effort_preference, Some(ReasoningEffort::Off));
     }
 
     #[test]
@@ -1301,8 +1512,8 @@ mod tests {
         let msg = result.message.unwrap();
         assert!(msg.contains("Invalid model"));
         assert!(msg.contains("active provider"));
-        assert!(msg.contains("deepseek-v4-pro"));
-        assert!(msg.contains("deepseek-v4-flash"));
+        assert!(msg.contains("deepseek"));
+        assert!(!msg.contains("Common DeepSeek models"));
         assert!(result.action.is_none());
     }
 
@@ -1364,18 +1575,38 @@ mod tests {
     }
 
     #[test]
-    fn test_deepseek_links() {
+    fn test_codewhale_links() {
         let mut app = create_test_app();
-        let result = deepseek_links(&mut app);
+        let result = codewhale_links(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
+        assert!(msg.contains("Codewhale & community"));
+        assert!(msg.contains("https://codewhale.net/en/docs"));
+        assert!(msg.contains("https://codewhale.net/en/community"));
+        assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+        assert!(msg.contains("https://app.codewhale.net"));
+        assert!(msg.contains("separate sign-in"));
+        assert!(msg.contains("not connected to the current local session"));
         assert!(msg.contains("Provider Links"));
         assert!(msg.contains("DeepSeek (deepseek) <- current"));
         assert!(msg.contains("https://platform.deepseek.com/api_keys"));
         assert!(msg.contains("Xiaomi MiMo (xiaomi-mimo)"));
         assert!(msg.contains("https://platform.xiaomimimo.com/token-plan"));
+        assert!(msg.contains("Moonshot/Kimi (moonshot)"));
+        assert!(msg.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(msg.contains("https://platform.kimi.ai/docs/overview"));
+        assert!(msg.contains("https://api.kimi.com/coding/v1"));
+        assert!(msg.contains("https://www.kimi.com/code/console"));
+        assert!(msg.contains("never imports Kimi CLI credentials"));
+        assert!(msg.contains("https://console.openmodel.ai/"));
+        assert!(msg.contains("https://docs.openmodel.ai/en/docs/getting-started/authentication"));
+        assert!(msg.contains("https://console.sakana.ai/api-keys"));
+        assert!(msg.contains("https://console.sakana.ai/get-started"));
         assert!(msg.contains("Baidu Qianfan (qianfan)"));
         assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
+        assert!(msg.contains("Local Ollama is keyless by default"));
+        assert!(msg.contains("Run `codex login`"));
+        assert!(msg.contains("no canonical vendor credential page exists"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));
         assert!(!msg.contains("https://codewhale.dev/docs/providers"));
@@ -1385,7 +1616,7 @@ mod tests {
     #[test]
     fn provider_links_emit_urls_as_inline_code_for_narrow_transcripts() {
         let mut app = create_test_app();
-        let result = deepseek_links(&mut app);
+        let result = codewhale_links(&mut app);
         let msg = result.message.expect("links should return a message");
 
         assert!(msg.contains("`https://platform.openai.com/api-keys`"));
@@ -1407,11 +1638,31 @@ mod tests {
     }
 
     #[test]
-    fn provider_link_fallback_uses_current_codewhale_docs() {
-        let links = provider_link_info("unknown-provider");
+    fn provider_link_metadata_marks_custom_routes_as_configuration_owned() {
+        let links =
+            codewhale_config::provider::provider_for_kind(codewhale_config::ProviderKind::Custom)
+                .credential_help();
 
-        assert_eq!(links.docs_url, "https://codewhale.net/en/docs");
-        assert_eq!(links.key_url, None);
+        assert_eq!(
+            links.acquisition,
+            codewhale_config::provider::CredentialAcquisition::Configuration
+        );
+        assert_eq!(links.docs_url, None);
+        assert_eq!(links.credential_url, None);
+    }
+
+    #[test]
+    fn project_links_follow_the_available_public_site_locale() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::ZhHans;
+
+        let msg = codewhale_links(&mut app)
+            .message
+            .expect("links should return a message");
+
+        assert!(msg.contains("`https://codewhale.net/zh/docs`"));
+        assert!(msg.contains("`https://codewhale.net/zh/community`"));
+        assert!(msg.contains("`https://app.codewhale.net`"));
     }
 
     #[test]
@@ -1421,7 +1672,8 @@ mod tests {
         let result = home_dashboard(&mut app);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
-        assert!(msg.contains("codewhale Home Dashboard"));
+        assert!(msg.contains("Codewhale"));
+        assert!(!msg.contains("codewhale Home Dashboard"));
         assert!(msg.contains("Model:"));
         assert!(msg.contains("Mode:"));
         assert!(msg.contains("Workspace:"));
@@ -1470,7 +1722,10 @@ mod tests {
         let msg = result
             .message
             .expect("home dashboard should return message");
-        assert!(msg.contains("/links      - Dashboard & API links"));
+        assert!(msg.contains("/workspace   - Switch folders or worktrees"));
+        assert!(msg.contains("/restore     - Roll files back to a turn snapshot"));
+        assert!(msg.contains("/tokens      - Show session spend and context"));
+        assert!(msg.contains("/links       - Codewhale, community & provider links"));
         assert!(msg.contains("/config      - Inspect and change settings"));
         assert!(
             !msg.lines()
@@ -1488,7 +1743,10 @@ mod tests {
         let msg = result
             .message
             .expect("home dashboard should return message");
-        assert!(msg.contains("主面板"), "missing zh-Hans title:\n{msg}");
+        assert!(
+            msg.contains("Codewhale"),
+            "missing canonical product title:\n{msg}"
+        );
         assert!(msg.contains("模型"), "missing zh-Hans model label:\n{msg}");
         assert!(
             msg.contains("快捷操作"),

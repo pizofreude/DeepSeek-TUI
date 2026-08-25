@@ -9,39 +9,35 @@
 //!   * **output token cap** — the output reservation actually used to compute
 //!     that budget (clamped so it never starves the window);
 //!   * **compaction trigger** — the input-token level at which compaction
-//!     should be suggested (default: ~75% of the window);
+//!     should be suggested (default: ~75% of the full window, clamped to the
+//!     spendable input ceiling);
 //!   * **[`PressureLevel`]** — a coarse Low/Medium/High/Critical signal the UI
 //!     can render without re-deriving thresholds.
 //!
 //! This module is the budget-math *foundation*. It is intentionally pure (no
-//! I/O, no clock, no engine/config types) so it can be unit-tested in isolation
-//! and later consumed by the engine capacity checkpoints and the TUI pressure
-//! indicator. Those consumers are wired in a separate pass; nothing here calls
-//! into them.
+//! I/O, no clock, no engine/config types) so it can be unit-tested in isolation.
+//! Its consumers live outside it and call in, never the reverse: `route_budget`
+//! and `core::engine::context` for [`ContextBudget`], `context_report` for
+//! [`PressureLevel`].
 //!
-//! ### Why the output reservation is window-dependent
+//! ### Route ceilings stay independent
 //!
-//! The engine's existing input-budget helper
-//! (`core::engine::context::context_input_budget_for_window`) computes
-//! `window - reserved_output - headroom` and learned the hard way that
-//! reserving a large fixed output (262K for V4-class interleaved thinking) on a
-//! *small* self-hosted window (e.g. a 256K vLLM deployment) underflows to a
-//! negative budget and silently disables every preflight/recovery path. We
-//! mirror that lesson here with saturating arithmetic and an output cap that is
-//! always clamped to leave at least [`MIN_INPUT_BUDGET_TOKENS`] of input room,
-//! so the budget can never collapse to zero on a legitimately sized window.
+//! A route can publish a total context window, an output ceiling, and a
+//! separate input ceiling. [`ContextBudget::new_with_input_limit`] intersects
+//! all three without treating one as a substitute for another: the output
+//! reservation is the exact route-effective wire request, the total-window
+//! arithmetic remains saturating, and a concrete input limit clamps the final
+//! spendable ceiling and compaction trigger.
 
-// Foundation module: the public surface is exercised by unit tests but is not
-// yet referenced by the engine capacity checkpoints or the TUI pressure
-// indicator (those consumers are wired in a later pass). Allow dead_code so the
-// substrate can land warning-clean ahead of its callers, matching how other
-// not-yet-wired primitives in this crate are gated.
-//
-// Note: the context report now consumes `PressureLevel::from_usage_percent` and
-// `label`, but the rest of the substrate (`ContextBudget` and its methods,
-// `PressureLevel::suggests_compaction`) is still pending its engine/TUI
-// consumers, so the blanket allow stays until those land.
-#![allow(dead_code)]
+// This module IS wired. `ContextBudget` is consumed by `route_budget.rs` and
+// `core/engine/context.rs`; `PressureLevel` by `context_report.rs`. It sits on
+// the do-not-delete list in AGENTS.md because a blanket `allow(dead_code)` here,
+// plus a comment that used to claim the module was "not yet referenced," taught
+// several dead-code audits to propose deleting a live file. The suppression is
+// now `#[cfg_attr(not(test), expect(dead_code))]` on the three methods unused
+// outside tests, so a suppression that stops matching the lint fails the
+// build instead of hiding behind a module-wide waiver. Tests call them, so
+// a bare `#[expect(dead_code)]` would be unfulfilled under `cfg(test)`.
 
 /// Fraction of the window, expressed as a percentage, at or above which
 /// compaction should be suggested. Mirrors the "high" pressure boundary the
@@ -53,8 +49,9 @@ pub const DEFAULT_COMPACTION_TRIGGER_PERCENT: f64 = 75.0;
 pub const CRITICAL_PRESSURE_PERCENT: f64 = 90.0;
 
 /// Percentage of the window at or above which pressure is [`PressureLevel::High`].
-/// This is the compaction trigger by default, so High and "compaction
-/// suggested" coincide at the seeded thresholds.
+/// Pressure and the requested compaction trigger are window-relative. The
+/// trigger is clamped to the spendable input ceiling, so it can fire before
+/// this UI boundary when output reservation consumes substantial window space.
 pub const HIGH_PRESSURE_PERCENT: f64 = DEFAULT_COMPACTION_TRIGGER_PERCENT;
 
 /// Percentage of the window at or above which pressure is [`PressureLevel::Medium`].
@@ -123,7 +120,11 @@ impl PressureLevel {
 
     /// Whether this level is at or past the point where compaction should be
     /// suggested to the user.
+    ///
+    /// Unused by the engine today; kept as the pressure-level counterpart of
+    /// `ContextBudget::should_compact` so both live next to their thresholds.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn suggests_compaction(self) -> bool {
         matches!(self, PressureLevel::High | PressureLevel::Critical)
     }
@@ -145,11 +146,16 @@ pub struct ContextBudget {
     /// Derived from the configured cap, clamped to fit the window while leaving
     /// at least [`MIN_INPUT_BUDGET_TOKENS`] of input room.
     pub output_cap_tokens: u64,
+    /// Spendable input ceiling for the turn (`window - output_cap - headroom`,
+    /// saturating at 0). Compaction percentages use the full window and clamp
+    /// their resulting token threshold to this ceiling.
+    pub input_budget_ceiling: u64,
     /// Input tokens still available before hitting the reserved boundary
-    /// (`window - output_cap - headroom - input`, saturating at 0).
+    /// (`input_budget_ceiling - input`, saturating at 0).
     pub available_input_tokens: u64,
     /// Input-token level at or above which compaction should be suggested
-    /// (`DEFAULT_COMPACTION_TRIGGER_PERCENT` of the window).
+    /// (`DEFAULT_COMPACTION_TRIGGER_PERCENT` of the window, clamped to the
+    /// input budget ceiling).
     pub compaction_trigger_tokens: u64,
     /// Coarse pressure level derived from window usage.
     pub pressure: PressureLevel,
@@ -160,24 +166,41 @@ impl ContextBudget {
     ///
     /// * `window_tokens` — the route-effective context window (input + output).
     /// * `input_tokens` — current estimated input tokens for the turn.
-    /// * `configured_output_cap` — the output reservation the caller would like
-    ///   (e.g. the engine's `TURN_MAX_OUTPUT_TOKENS`). It is clamped down so it
-    ///   never consumes the headroom or the minimum input budget; on a window
-    ///   too small to hold even the minimum input budget plus headroom, the cap
-    ///   collapses to whatever is left (possibly zero).
+    /// * `configured_output_cap` — the route-effective output request the
+    ///   caller needs to reserve. It is clamped down so it never consumes the
+    ///   headroom or the minimum input budget; on a window too small to hold
+    ///   even the minimum input budget plus headroom, the cap collapses to
+    ///   whatever is left (possibly zero).
     ///
     /// Never panics and never underflows: all arithmetic saturates.
     #[must_use]
     pub fn new(window_tokens: u64, input_tokens: u64, configured_output_cap: u64) -> Self {
+        Self::new_with_input_limit(window_tokens, input_tokens, configured_output_cap, None)
+    }
+
+    /// Build a budget snapshot and intersect it with a provider's independent
+    /// hard input ceiling when one is published by the resolved route.
+    #[must_use]
+    pub fn new_with_input_limit(
+        window_tokens: u64,
+        input_tokens: u64,
+        configured_output_cap: u64,
+        input_limit_tokens: Option<u64>,
+    ) -> Self {
         let output_cap_tokens = clamp_output_cap(window_tokens, configured_output_cap);
 
         // Reserve output + safety headroom; whatever remains is spendable input.
         let reserved = output_cap_tokens.saturating_add(CONTEXT_HEADROOM_TOKENS);
-        let input_budget_ceiling = window_tokens.saturating_sub(reserved);
+        let window_input_ceiling = window_tokens.saturating_sub(reserved);
+        let input_budget_ceiling = input_limit_tokens
+            .filter(|limit| *limit > 0)
+            .map_or(window_input_ceiling, |limit| {
+                window_input_ceiling.min(limit)
+            });
         let available_input_tokens = input_budget_ceiling.saturating_sub(input_tokens);
 
         let compaction_trigger_tokens =
-            percent_of(window_tokens, DEFAULT_COMPACTION_TRIGGER_PERCENT);
+            percent_of(window_tokens, DEFAULT_COMPACTION_TRIGGER_PERCENT).min(input_budget_ceiling);
 
         let pressure =
             PressureLevel::from_usage_percent(usage_percent(window_tokens, input_tokens));
@@ -186,10 +209,32 @@ impl ContextBudget {
             window_tokens,
             input_tokens,
             output_cap_tokens,
+            input_budget_ceiling,
             available_input_tokens,
             compaction_trigger_tokens,
             pressure,
         }
+    }
+
+    /// Derive a compaction trigger from a window percentage.
+    ///
+    /// The percentage means what the user-facing context meter says it means:
+    /// a fraction of the full route window (`80` on a 1M window is 800K input
+    /// tokens before the route ceiling clamp). One internal clamp applies:
+    ///
+    /// ```text
+    /// trigger = min(window × percent, window − output reservation − headroom)
+    /// ```
+    ///
+    /// so a late percentage can never push the trigger past the spendable
+    /// input ceiling and overflow the provider window. Previously the
+    /// percentage was applied to the ceiling itself, which silently pulled an
+    /// "80%" setting down to ~60% of the window on routes with large output
+    /// reservations; UI surfaces should disclose the clamp when it engages
+    /// instead of redefining what the percentage means.
+    #[must_use]
+    pub fn compaction_trigger_for_percent(&self, percent: f64) -> u64 {
+        percent_of(self.window_tokens, percent).min(self.input_budget_ceiling)
     }
 
     /// Fraction of the window currently consumed by input, as a percentage in
@@ -202,6 +247,7 @@ impl ContextBudget {
     /// Whether current input has reached the compaction trigger and compaction
     /// should be suggested.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn should_compact(&self) -> bool {
         self.window_tokens > 0 && self.input_tokens >= self.compaction_trigger_tokens
     }
@@ -209,6 +255,7 @@ impl ContextBudget {
     /// Whether another `additional_input_tokens` of input would fit within the
     /// available budget (i.e. not exceed the reserved boundary).
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn fits_additional(&self, additional_input_tokens: u64) -> bool {
         additional_input_tokens <= self.available_input_tokens
     }
@@ -313,16 +360,16 @@ mod tests {
     // -- Compaction trigger -------------------------------------------------
 
     #[test]
-    fn compaction_trigger_is_three_quarters_of_window() {
+    fn compaction_trigger_is_window_percent_clamped_to_input_ceiling() {
         for &window in WINDOWS {
             let budget = ContextBudget::new(window, 0, 64_000);
-            let expected = percent_of(window, DEFAULT_COMPACTION_TRIGGER_PERCENT);
+            let expected = percent_of(window, DEFAULT_COMPACTION_TRIGGER_PERCENT)
+                .min(budget.input_budget_ceiling);
             assert_eq!(
                 budget.compaction_trigger_tokens, expected,
-                "window {window}: trigger should be 75% of window"
+                "window {window}: trigger should be 75% of the window, clamped to the ceiling"
             );
-            // The trigger must always sit strictly inside the window.
-            assert!(budget.compaction_trigger_tokens < window);
+            assert!(budget.compaction_trigger_tokens <= budget.input_budget_ceiling);
         }
     }
 
@@ -330,24 +377,50 @@ mod tests {
     fn should_compact_flips_at_the_trigger() {
         let window = 1_048_576;
         let cap = 262_144;
-        let trigger = percent_of(window, DEFAULT_COMPACTION_TRIGGER_PERCENT);
+        let trigger = ContextBudget::new(window, 0, cap).compaction_trigger_tokens;
+        assert!(trigger > 0);
 
         let below = ContextBudget::new(window, trigger - 1, cap);
         assert!(!below.should_compact());
-        assert!(!below.pressure.suggests_compaction());
 
         let at = ContextBudget::new(window, trigger, cap);
         assert!(at.should_compact());
-        assert!(at.pressure.suggests_compaction());
 
         let above = ContextBudget::new(window, trigger + 1, cap);
         assert!(above.should_compact());
     }
 
     #[test]
+    fn trigger_never_exceeds_input_ceiling() {
+        const WINDOWS: &[u64] = &[
+            0, 512, 8_192, 65_536, 131_072, 262_144, 500_000, 1_048_576, 2_000_000,
+        ];
+        const CAPS: &[u64] = &[0, 1_024, 64_000, 131_072, 262_144, 1_000_000];
+        const INPUTS: &[u64] = &[0, 1_024, 200_000, 2_000_000];
+        const PERCENTS: &[f64] = &[10.0, 50.0, 75.0, 80.0, 95.0, 100.0];
+
+        for &window in WINDOWS {
+            for &cap in CAPS {
+                for &input in INPUTS {
+                    let budget = ContextBudget::new(window, input, cap);
+                    assert!(budget.compaction_trigger_tokens <= budget.input_budget_ceiling);
+                    for &percent in PERCENTS {
+                        assert!(
+                            budget.compaction_trigger_for_percent(percent)
+                                <= budget.input_budget_ceiling,
+                            "window={window} cap={cap} input={input} percent={percent}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn zero_window_never_suggests_compaction() {
         let budget = ContextBudget::new(0, 0, 64_000);
         assert_eq!(budget.compaction_trigger_tokens, 0);
+        assert_eq!(budget.input_budget_ceiling, 0);
         assert!(!budget.should_compact());
         assert_eq!(budget.pressure, PressureLevel::Low);
         assert_eq!(budget.available_input_tokens, 0);

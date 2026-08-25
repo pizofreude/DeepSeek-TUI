@@ -71,10 +71,20 @@ pub struct GateSpec {
     /// Optional artifact type this gate produces/consumes (e.g. `findings`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_kind: Option<String>,
+    /// Require a standalone first-line PASS/APPROVE/BLOCK/FAIL verdict from a
+    /// successfully completed role. When enabled, missing or malformed
+    /// verdicts fail closed instead of inheriting legacy pass-on-success
+    /// behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_explicit_verdict: bool,
 }
 
 fn default_max_retries() -> u32 {
     1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Live state of one gate within a lane.
@@ -259,6 +269,32 @@ impl LaneGateBoard {
         })
     }
 
+    /// Remove and return the latest handoffs addressed to `to_role` (newest
+    /// first), up to `limit`.
+    ///
+    /// Handoffs are single-use: the consumer that receives one is also issued
+    /// a `HandoffConsumed` receipt, so leaving the artifact on the board would
+    /// re-deliver it to every later same-role task — stale evidence, repeated
+    /// token cost, and a receipt that lies about being spent.
+    pub fn consume_handoffs_for(&mut self, to_role: &str, limit: usize) -> Vec<HandoffArtifact> {
+        // Collect matching indices newest-first; removing in descending index
+        // order keeps every not-yet-removed index valid.
+        let mut picked: Vec<usize> = Vec::new();
+        for (index, artifact) in self.artifacts.iter().enumerate().rev() {
+            if picked.len() >= limit {
+                break;
+            }
+            if artifact.to_role.eq_ignore_ascii_case(to_role) {
+                picked.push(index);
+            }
+        }
+        let mut consumed = Vec::with_capacity(picked.len());
+        for index in picked {
+            consumed.push(self.artifacts.remove(index));
+        }
+        consumed
+    }
+
     /// Persist board under a lane directory (JSON).
     pub fn save_to_dir(&self, dir: &Path) -> Result<PathBuf, GateError> {
         std::fs::create_dir_all(dir).map_err(|e| GateError::Io(e.to_string()))?;
@@ -320,6 +356,7 @@ pub fn stopship_gate_pipeline() -> Vec<GateSpec> {
             blocks_role: Some("implementer".into()),
             max_retries: 0,
             artifact_kind: Some("findings".into()),
+            require_explicit_verdict: false,
         },
         GateSpec {
             id: "reviewer-diff".into(),
@@ -330,6 +367,7 @@ pub fn stopship_gate_pipeline() -> Vec<GateSpec> {
             blocks_role: Some("verifier".into()),
             max_retries: 1,
             artifact_kind: Some("diff_review".into()),
+            require_explicit_verdict: false,
         },
         GateSpec {
             id: "verifier-suite".into(),
@@ -340,6 +378,7 @@ pub fn stopship_gate_pipeline() -> Vec<GateSpec> {
             blocks_role: Some("release_lead".into()),
             max_retries: 2,
             artifact_kind: Some("verify_report".into()),
+            require_explicit_verdict: false,
         },
     ]
 }
@@ -377,6 +416,43 @@ mod tests {
         let state = board.evaluate(&gates[0], GateOutcome::Pass).unwrap();
         assert_eq!(state, GateState::Passed);
         assert!(board.role_is_blocked(&gates, "implementer").is_none());
+    }
+
+    #[test]
+    fn handoff_is_consumed_exactly_once() {
+        let mut board = LaneGateBoard::new("lane-consume");
+        let record = |board: &mut LaneGateBoard, id: &str, to_role: &str, payload: &str| {
+            board
+                .record_handoff(HandoffArtifact {
+                    id: id.into(),
+                    lane_id: "lane-consume".into(),
+                    from_role: "scout".into(),
+                    to_role: to_role.into(),
+                    kind: "findings".into(),
+                    payload: payload.into(),
+                    created_at: "2026-08-03T00:00:00Z".into(),
+                })
+                .unwrap();
+        };
+        record(&mut board, "art-old", "implementer", "first");
+        record(&mut board, "art-new", "implementer", "second");
+        record(&mut board, "art-other", "reviewer", "untouched");
+
+        let consumed = board.consume_handoffs_for("implementer", 4);
+        assert_eq!(consumed.len(), 2);
+        assert_eq!(consumed[0].id, "art-new", "newest handoff delivers first");
+        assert_eq!(consumed[1].id, "art-old");
+
+        assert!(
+            board.consume_handoffs_for("implementer", 4).is_empty(),
+            "a consumed handoff must not be delivered again"
+        );
+        assert_eq!(
+            board.artifacts.len(),
+            1,
+            "handoffs for other roles stay on the board"
+        );
+        assert_eq!(board.artifacts[0].id, "art-other");
     }
 
     #[test]

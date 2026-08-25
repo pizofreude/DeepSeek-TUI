@@ -1,63 +1,79 @@
-<!-- source: README.md sha256:561a074b0e36 -->
-# CodeWhale
+<!-- source: README.md sha256:a56bca473dbd -->
+# Codewhale
 
-一个运行在终端里的编程智能体。适配任意模型；开放模型优先。
+Codewhale 是一款面向终端的开源编程智能体，使用 Rust 构建，并与用户一起在公开协作中不断改进。
 
-你给它一个 provider、一个模型和一个任务。它读代码、改文件、跑命令、检查结果，一直做到任务完成或需要你介入为止。交互式工作用 TUI，脚本和 CI 用 `codewhale exec`。Rust 编写，MIT 许可，完全在你自己的机器上运行。
+![Codewhale 在终端中运行](assets/screenshot.webp)
 
-它最初叫 `deepseek-tui`。围绕它形成的社区需要更多 provider，于是现在 DeepSeek、Claude、GPT、Kimi、GLM 以及其他 30 多个模型都跑在同一套运行时和工具之上。
-
-[English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
+[English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-
-![CodeWhale 在终端中运行](assets/screenshot.png)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 ## 安装
 
 ```bash
 npm install -g codewhale
+codewhale
 ```
 
-Cargo、Docker、Nix、Scoop、预编译归档、Android/Termux，以及面向无法访问 GitHub 用户的 CNB 镜像，均见 [docs/INSTALL.md](docs/INSTALL.md)。从 `deepseek-tui` 迁移过来？你的配置和会话可以直接沿用——见 [docs/REBRAND.md](docs/REBRAND.md)。
+首次运行会帮助你连接提供商，也可以选择保持离线。Codewhale 还支持 Cargo、Docker、Nix、Scoop、预构建压缩包、Android/Termux 和 CNB 镜像。请参阅[安装指南](docs/INSTALL.md)。
+
+每种 shell 只需一条命令即可启用 Tab 补全——`codewhale completion bash|zsh|fish|powershell|elvish`。请参阅 [shell 补全](docs/INSTALL.md#8-shell-completions)。
 
 ## 使用
 
-```bash
-codewhale auth set --provider deepseek   # or export ANTHROPIC_API_KEY, etc.
-codewhale                                # open the TUI
-codewhale exec "fix the failing test"    # headless
+像与队友交流一样向 Codewhale 描述任务：
+
+```text
+Fix the failing tests and explain what changed.
 ```
 
-在 TUI 中：`/model` 同时切换 provider 和模型，`/fleet` 运行一组 worker，`/restore` 撤销某一轮，`Tab` 在 Plan / Act / Operate 之间循环切换，`Shift+Tab` 在 Ask / Auto-Review / Full Access 审批姿态之间循环切换，`!` 让 shell 命令经由正常的审批路径运行。
+也可以不打开 TUI，直接运行任务：
 
-## 它做什么
+```bash
+codewhale exec "fix the failing tests and explain what changed"
+```
 
-- 把你选定的 provider + 模型解析为一条具体路由：端点、传输协议、上下文上限、价格。上下文预算与费用显示都取自真实路由；价格未知时就显示未知，而不是 $0。（[docs/PROVIDERS.md](docs/PROVIDERS.md)）
-- 可连接托管的开放模型 provider（`deepseek`、`openrouter`、`moonshot`、`zai`、`minimax`、`nvidia-nim` 等），可无 key 直连你自己的 `vllm` / `sglang` / `ollama`，也能通过 Messages API 原生对接 Anthropic，支持 thinking 与 prompt 缓存。
-- 以可持久化的方式运行多个 worker：Fleet 把工作记录在只追加的账本里，运行不会因重启而丢失，`fleet resume` 能从中断处继续。Workflow 把更大的任务规划成可恢复、可验证的 lane。（[docs/FLEET.md](docs/FLEET.md)）
-- 风险把关靠代码，不靠感觉：三种模式（Plan 为只读）、独立的审批姿态、操作系统级沙箱（Seatbelt、Landlock + seccomp、bwrap）、可对每次工具调用做 allow/deny/ask 决策的 hooks，以及 side-git 快照——`/restore` 永远不会碰你真正的提交历史。
-- 允许仓库声明自己的法律：`.codewhale/constitution.json` 中的不变量会编译成写入拦截，连 Full Access 也无法跳过。（[docs/CONFIGURATION.md](docs/CONFIGURATION.md)）
-- 双向支持 MCP，可加载可复用的 skills，对外提供 HTTP/SSE 与 ACP 运行时 API，并支撑社区维护的 [VS Code GUI](https://github.com/HengQuWorld/CodeWhale-VSCode)。
-- TUI 把工作显示为可逐条查验的回执，同一时间只让一行保持动态，内置真实的上下文查看器、12 套主题、减弱动效与 ASCII 安全模式，界面语言覆盖英语、简体中文、日语、越南语、西班牙语、葡萄牙语和韩语，繁体中文为部分翻译。
+Codewhale 可以读取你的代码仓库、编辑文件、运行命令、检查结果，并持续推进目标。由你决定授予它多少访问权限。
 
-其余内容——配置、键位绑定、沙箱细节、架构——见 [docs](docs) 与 [codewhale.net](https://codewhale.net/)。
+## 为什么选择 Codewhale
 
-## 贡献
+- **使用你想要的模型。** 连接托管提供商，或通过 Ollama、vLLM、SGLang 使用本地模型。使用 `/model` 切换提供商和模型。
+- **掌控始终在你手中。** Plan 模式为只读。Ask、Auto-Review 和 Full Access 会清晰展示审批行为。`/undo` 可撤销上一轮操作，`/restore` 可将工作区恢复到较早的快照。
+- **让长时间任务井然有序。** 保存会话、设置持久的 `/goal`、在工作流运行前进行审查，并协调多个智能体，同时不让其内部指令混入你的对话记录。
+- **扩展你已有的智能体。** 连接 MCP 服务器和技能、配置钩子，并将智能体角色作为可读文件保存在项目或个人设置中。
 
-所有反馈都是礼物。Issue、PR、复现步骤、日志、功能请求和第一次贡献，在这里都算真实的项目工作。当一个 PR 无法原样合并时，维护者会吸收其中可用的部分，作者的署名会保留——在提交、更新日志和 [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) 中。如果你在用的某个模型或 provider 还不支持，或者有什么东西在你机器上坏了，告诉我们就是你能做的最有用的事。
+在 TUI 中运行 `/help` 可查看命令和键盘快捷键。
 
-- [开放 issue](https://github.com/Hmbown/CodeWhale/issues) —— 适合入门的贡献在这里
-- [CONTRIBUTING.md](CONTRIBUTING.md) —— 开发环境搭建与 PR 流程
-- [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) —— 每一位塑造过这个项目的人
-- [Buy me a coffee](https://www.buymeacoffee.com/hmbown)
+## 安全
 
-感谢 [DeepSeek](https://github.com/deepseek-ai) 提供让项目起步的模型与支持，感谢 [DataWhale](https://github.com/datawhalechina) 🐋 欢迎我们加入“鲸兄弟”大家庭，也感谢 [OpenWarp](https://github.com/zerx-lab/warp) 与 [Open Design](https://github.com/nexu-io/open-design) 在终端智能体体验上的协作。
+Codewhale 在你的机器上运行，并仅拥有你授予的访问权限。审批模式和仓库规则会限制智能体的行为；在支持的平台上，可选的操作系统沙箱可提供更强的执行边界。未知的模型价格会保持显示为未知，而不会被误报为免费。
+
+阅读[授权顺序](docs/AUTHORIZATION_ORDER.md)了解确切的策略层级，阅读[配置](docs/CONFIGURATION.md)了解本地设置。
+
+## 文档
+
+- [提供商和本地模型](docs/PROVIDERS.md)
+- [智能体团队](docs/FLEET.md)
+- [MCP](docs/MCP.md)、[钩子](docs/HOOKS.md)和[配置](docs/CONFIGURATION.md)
+- [本地 Web 客户端](docs/WEB.md)
+- [全部文档](docs)
+
+## 加入社区
+
+当人们使用 Codewhale、反馈不顺手之处并帮助修复问题时，它就会变得更好。如果缺少某个提供商、工作流体验不佳，或终端界面妨碍了你，请[提交 issue](https://github.com/Hmbown/CodeWhale/issues)。如果你知道如何改进，请[提交 pull request](CONTRIBUTING.md)。我们欢迎首次贡献，贡献者也会保留已合入工作的署名。
+
+加入 [Discord](https://discord.gg/37gfS3ksug)，或在微信添加 Hunter（`hunterbown`）并申请加入 Whale Brothers 群。
+
+## 项目历史
+
+Codewhale 起初名为 `deepseek-tui`，至今仍保留与其配置和会话的兼容性。如今它已不偏向任何提供商，由社区独立维护，也不隶属于任何模型提供商。
+
+感谢每一位贡献者，以及帮助项目成长的开源社区。请参阅[贡献者记录](docs/CONTRIBUTORS.md)。
 
 ## 许可证
 
-[MIT](LICENSE)。独立的社区项目，与任何模型 provider 均无隶属关系。
-
-[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/CodeWhale&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FCodeWhale&type=date)
+[MIT](LICENSE)。从其他开源项目改编的部分记录在[第三方声明](docs/THIRD_PARTY_NOTICES.md)中。

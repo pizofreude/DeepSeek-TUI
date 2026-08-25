@@ -9,6 +9,9 @@ function isVersionFlag(args = process.argv.slice(2)) {
 
 function printVersionFallback(binaryName) {
   const binVersion =
+    process.env.CODEWHALE_VERSION ||
+    process.env.DEEPSEEK_TUI_VERSION ||
+    process.env.DEEPSEEK_VERSION ||
     pkg.codewhaleBinaryVersion || pkg.deepseekBinaryVersion || pkg.version;
   console.log(`${binaryName} (npm wrapper) v${pkg.version}`);
   console.log(`binary version: v${binVersion}`);
@@ -51,7 +54,11 @@ async function runCodeWhale() {
 }
 
 async function runCodeWhaleTui() {
-  await run("codewhale-tui");
+  // v0.9.5 single-binary: tui is now an alias to codewhale (kept for backwards compat, will warn)
+  if (!process.env.CODEWHALE_SUPPRESS_TUI_DEPRECATION) {
+    process.stderr.write("codewhale-tui: deprecated alias to `codewhale` (single binary since v0.9.5). Use `codewhale` instead.\n");
+  }
+  await run("codewhale");
 }
 
 module.exports = {

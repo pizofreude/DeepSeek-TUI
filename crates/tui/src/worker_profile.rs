@@ -16,7 +16,7 @@
 
 #![allow(dead_code)] // foundation: consumers are wired in a follow-up (#3217).
 
-use crate::tools::subagent::SubAgentType;
+use crate::tools::subagent::FleetRole;
 use serde::{Deserialize, Serialize};
 
 /// Coarse capability classes a worker may exercise, beyond read access (reads
@@ -44,6 +44,20 @@ impl PermissionSet {
         Self {
             write: false,
             network: false,
+        }
+    }
+
+    /// Read-only inspection: read-only on the workspace, but network-capable.
+    ///
+    /// The read-only investigator posture (scout/reviewer): it must not
+    /// mutate the workspace, but real read-only inspection needs
+    /// `git`/`gh`/web reach — the old `read_only()` default left such lanes
+    /// with no way to run any command or reach any remote, which made default
+    /// scout lanes useless for the inspection they exist for.
+    pub const fn read_only_with_network() -> Self {
+        Self {
+            write: false,
+            network: true,
         }
     }
 
@@ -126,7 +140,7 @@ pub enum ModelRoute {
 /// The capability contract a single worker runs under.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRuntimeProfile {
-    pub role: SubAgentType,
+    pub role: FleetRole,
     pub permissions: PermissionSet,
     pub shell: ShellPolicy,
     pub tools: ToolScope,
@@ -152,7 +166,8 @@ pub struct WorkerRuntimeProfile {
     /// `max_spawn_depth > 0`; each level decrements it. Clamped to the workspace
     /// ceiling.
     pub max_spawn_depth: u32,
-    /// Finite model-turn budget for this role.
+    /// Optional model-turn cap. Zero means unbounded, matching the normal
+    /// Codex and GrokBuild agent loop; an operator may still set a cap.
     #[serde(default = "default_general_max_steps")]
     pub max_steps: u32,
     /// Whether the worker runs detached (background) or inline (foreground).
@@ -160,22 +175,20 @@ pub struct WorkerRuntimeProfile {
 }
 
 impl WorkerRuntimeProfile {
-    /// Maximum model turns for read-mostly workers.
-    pub const READ_ONLY_MAX_STEPS: u32 = 60;
-    /// Maximum model turns for workers that may implement changes.
-    pub const GENERAL_MAX_STEPS: u32 = 120;
+    /// Default model turns for every role: unbounded unless explicitly capped.
+    pub const READ_ONLY_MAX_STEPS: u32 = 0;
+    pub const GENERAL_MAX_STEPS: u32 = 0;
 
-    /// Return the finite model-turn budget appropriate for this role.
+    /// Return the default model-turn cap for this role (zero = unbounded).
     #[must_use]
-    pub const fn default_max_steps(role: SubAgentType) -> u32 {
+    pub const fn default_max_steps(role: FleetRole) -> u32 {
         match role {
-            SubAgentType::Explore
-            | SubAgentType::Review
-            | SubAgentType::Plan
-            | SubAgentType::Verifier => Self::READ_ONLY_MAX_STEPS,
-            SubAgentType::Implementer | SubAgentType::General | SubAgentType::Custom => {
-                Self::GENERAL_MAX_STEPS
-            }
+            FleetRole::Scout
+            | FleetRole::Reviewer
+            | FleetRole::Planner
+            | FleetRole::Verifier
+            | FleetRole::Consultant => Self::READ_ONLY_MAX_STEPS,
+            FleetRole::Builder | FleetRole::Worker | FleetRole::Custom => Self::GENERAL_MAX_STEPS,
         }
     }
 
@@ -183,22 +196,45 @@ impl WorkerRuntimeProfile {
     /// stances documented in `docs/SUBAGENTS.md` (explore/plan/review are
     /// read-only; verifier runs tests; implementer/general write).
     #[must_use]
-    pub fn for_role(role: SubAgentType) -> Self {
+    pub fn for_role(role: FleetRole) -> Self {
+        // A role's default is what the role *intends*, expressed as the widest
+        // posture the role can be given; the parent's effective posture is the
+        // ceiling (`derive_child` intersects, never widens). Read-only roles
+        // stay read-only on the workspace by intent. Nothing else is taken
+        // away by default: network reach is a read, and a worker cut off from
+        // the network or from shell for no role reason cannot do its job.
         let (permissions, shell) = match role {
-            // Read-only investigators.
-            SubAgentType::Explore | SubAgentType::Review => {
-                (PermissionSet::read_only(), ShellPolicy::ReadOnly)
+            // Read-only investigators: no workspace writes, but network reach
+            // and the bounded verification surface so a scout/reviewer lane
+            // can run git/gh/web inspection. Raw shell stays denied by the
+            // registry clamp (read-only classifier), so this widens capability
+            // without widening mutation authority.
+            FleetRole::Scout | FleetRole::Reviewer => {
+                (PermissionSet::read_only_with_network(), ShellPolicy::Full)
             }
-            // Planner: analysis only, no shell.
-            SubAgentType::Plan => (PermissionSet::read_only(), ShellPolicy::None),
-            // Verifier: doesn't modify code, but runs the test suite.
-            SubAgentType::Verifier => (PermissionSet::read_only(), ShellPolicy::Full),
-            // Doers.
-            SubAgentType::Implementer | SubAgentType::General => {
+            // Planner: analysis only. Reads the workspace and the web and may
+            // run read-only shell probes (`git log`, `rg`) under the read-only
+            // classifier; never mutates.
+            FleetRole::Planner => (
+                PermissionSet::read_only_with_network(),
+                ShellPolicy::ReadOnly,
+            ),
+            // Consultant: counsel only. Reads (workspace and web) to ground
+            // its advice; never acts on the workspace, so no shell (#4752).
+            FleetRole::Consultant => (PermissionSet::read_only_with_network(), ShellPolicy::None),
+            // Verifier: doesn't modify code, but runs the bounded built-in
+            // verification surface (test/check selections) under a full shell
+            // ceiling clamped by ChildAuthority: writes are denied and
+            // unbounded shell forms are refused (#5186). The old wording
+            // promised "runs the test suite" without saying the surface is
+            // bounded. See the roster description and VERIFIER_AGENT_INTRO.
+            FleetRole::Verifier => (PermissionSet::read_only_with_network(), ShellPolicy::Full),
+            // Doers, and Custom: inherit the parent's effective posture. A
+            // custom worker is narrowed by its explicit tool list and by the
+            // spawning call, not by a silent locked-down default.
+            FleetRole::Builder | FleetRole::Worker | FleetRole::Custom => {
                 (PermissionSet::full(), ShellPolicy::Full)
             }
-            // Custom starts locked down; the caller opens specific tools explicitly.
-            SubAgentType::Custom => (PermissionSet::read_only(), ShellPolicy::None),
         };
         Self {
             role: role.clone(),
@@ -207,7 +243,11 @@ impl WorkerRuntimeProfile {
             tools: ToolScope::Inherit,
             model: ModelRoute::Inherit,
             provider: None,
-            reasoning_effort: None,
+            // A Consultant is asked for judgement, so it defaults to the highest
+            // reasoning tier rather than inheriting the session's (#4752).
+            // Still only a default: an explicit spawn-time or profile value
+            // wins via `derive_child`, same as every other role.
+            reasoning_effort: matches!(role, FleetRole::Consultant).then(|| "high".to_string()),
             denied_tools: Vec::new(),
             max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
             max_steps: Self::default_max_steps(role.clone()),
@@ -293,8 +333,39 @@ const fn default_general_max_steps() -> u32 {
 
 impl Default for WorkerRuntimeProfile {
     fn default() -> Self {
-        Self::for_role(SubAgentType::General)
+        Self::for_role(FleetRole::Worker)
     }
+}
+
+/// Unified pre-launch manifest for a child agent (#414).
+///
+/// Everything needed to provision, launch, and resume a child — prompt, role,
+/// model, tools, permissions, workspace boundary, budget, and identity — comes
+/// from this single persisted record. No field is derived ad-hoc at launch time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChildLaunchManifest {
+    pub owner_session: String,
+    pub child_id: String,
+    pub profile: WorkerRuntimeProfile,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub worktree: bool,
+    pub writable_roots: Vec<String>,
+    #[serde(default)]
+    pub writable_files: Vec<String>,
+    #[serde(default)]
+    pub coordination_contracts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_artifact: Option<String>,
+    pub token_budget: Option<u64>,
+    pub resume_identity: Option<String>,
+    #[serde(default)]
+    pub generation: u32,
+    /// Agent id this child was resumed from via `resume_from`, if any.
+    /// Carries provenance across continuation chains so receipts can trace
+    /// the lineage without inspecting the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from_agent_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -328,20 +399,28 @@ mod tests {
 
     #[test]
     fn for_role_postures_match_role_stances() {
-        let explore = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+        let explore = WorkerRuntimeProfile::for_role(FleetRole::Scout);
         assert!(!explore.permissions.write, "explore must not write");
-        assert_eq!(explore.shell, ShellPolicy::ReadOnly);
+        assert!(
+            explore.permissions.network,
+            "explore/read-only inspection lanes keep network reach"
+        );
+        assert_eq!(
+            explore.shell,
+            ShellPolicy::Full,
+            "explore/read-only inspection lanes hold shell authority so the bounded              verification surface survives the clamp (raw shell still              requires write)"
+        );
         assert_eq!(
             explore.model,
             ModelRoute::Inherit,
             "explore should not silently downgrade the child model"
         );
 
-        let implementer = WorkerRuntimeProfile::for_role(SubAgentType::Implementer);
+        let implementer = WorkerRuntimeProfile::for_role(FleetRole::Builder);
         assert!(implementer.permissions.write, "implementer writes");
         assert_eq!(implementer.shell, ShellPolicy::Full);
 
-        let verifier = WorkerRuntimeProfile::for_role(SubAgentType::Verifier);
+        let verifier = WorkerRuntimeProfile::for_role(FleetRole::Verifier);
         assert!(
             !verifier.permissions.write,
             "verifier reports, does not patch"
@@ -349,22 +428,22 @@ mod tests {
         assert_eq!(
             verifier.shell,
             ShellPolicy::Full,
-            "verifier runs the test suite"
+            "verifier holds shell authority for the bounded verification surface (unbounded forms are refused by the policy seam)"
         );
     }
 
     #[test]
-    fn role_step_budgets_are_finite_and_profile_owned() {
+    fn role_step_budgets_are_unbounded_by_default_and_profile_owned() {
         for role in [
-            SubAgentType::Explore,
-            SubAgentType::Review,
-            SubAgentType::Plan,
-            SubAgentType::Verifier,
-            SubAgentType::Implementer,
-            SubAgentType::General,
-            SubAgentType::Custom,
+            FleetRole::Scout,
+            FleetRole::Reviewer,
+            FleetRole::Planner,
+            FleetRole::Verifier,
+            FleetRole::Builder,
+            FleetRole::Worker,
+            FleetRole::Custom,
         ] {
-            assert!(WorkerRuntimeProfile::for_role(role.clone()).max_steps > 0);
+            assert_eq!(WorkerRuntimeProfile::for_role(role.clone()).max_steps, 0);
             assert_eq!(
                 WorkerRuntimeProfile::for_role(role.clone()).max_steps,
                 WorkerRuntimeProfile::default_max_steps(role)
@@ -372,28 +451,81 @@ mod tests {
         }
     }
 
+    /// #4752: Consultant is counsel, not labour. Its posture has to be read-only
+    /// and shell-less by construction, not by the caller remembering to pass
+    /// `write_authority: read-only`.
+    #[test]
+    fn consultant_is_read_only_shell_less_and_high_reasoning_by_default() {
+        let consultant = WorkerRuntimeProfile::for_role(FleetRole::Consultant);
+
+        assert!(
+            !consultant.permissions.write,
+            "a consultant advises, it never writes"
+        );
+        assert_eq!(
+            consultant.shell,
+            ShellPolicy::None,
+            "a consultant has no reason to run commands"
+        );
+        assert_eq!(
+            consultant.reasoning_effort.as_deref(),
+            Some("high"),
+            "the point of asking a consultant is the reasoning tier"
+        );
+        assert_eq!(
+            consultant.model,
+            ModelRoute::Inherit,
+            "tier is a reasoning-effort default, not a hardcoded model"
+        );
+        assert_eq!(
+            consultant.max_steps,
+            WorkerRuntimeProfile::READ_ONLY_MAX_STEPS,
+            "consultants are unbounded by default like every other role"
+        );
+    }
+
+    /// The reasoning default must not become a ceiling: an explicit request
+    /// still wins, exactly as it does for every other role.
+    #[test]
+    fn an_explicit_reasoning_tier_overrides_the_consultant_default() {
+        let parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Consultant);
+        requested.reasoning_effort = Some("max".to_string());
+
+        let child = parent.derive_child(&requested);
+
+        assert_eq!(child.reasoning_effort.as_deref(), Some("max"));
+        assert!(!child.permissions.write, "still read-only");
+    }
+
     #[test]
     fn child_cannot_escalate_beyond_a_readonly_parent() {
-        let parent = WorkerRuntimeProfile::for_role(SubAgentType::Explore); // read-only
-        let greedy = WorkerRuntimeProfile::for_role(SubAgentType::Implementer); // wants write + full shell
+        // Scout now carries the read-only inspection posture: no writes, but network reach
+        // and full shell authority (bounded verification surface; raw shell
+        // still requires write at the clamp).
+        let parent = WorkerRuntimeProfile::for_role(FleetRole::Scout); // read-only inspection
+        let greedy = WorkerRuntimeProfile::for_role(FleetRole::Builder); // wants write + full shell
         let child = parent.derive_child(&greedy);
         assert!(
             !child.permissions.write,
             "a read-only parent cannot bear a writing child"
         );
-        assert!(!child.permissions.network);
+        assert!(
+            child.permissions.network,
+            "child inherits the read-only inspection parent's network reach"
+        );
         assert_eq!(
             child.shell,
-            ShellPolicy::ReadOnly,
-            "child shell clamped to parent's"
+            ShellPolicy::Full,
+            "child shell clamped to parent's read-only inspection posture"
         );
     }
 
     #[test]
     fn child_explicit_tools_are_bounded_by_parent() {
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.tools = ToolScope::Explicit(vec!["read_file".into(), "grep_files".into()]);
-        let mut requested = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         requested.tools = ToolScope::Explicit(vec!["read_file".into(), "write_file".into()]);
         let child = parent.derive_child(&requested);
         match child.tools {
@@ -410,9 +542,9 @@ mod tests {
 
     #[test]
     fn spawn_depth_decrements_and_clamps() {
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.max_spawn_depth = 2;
-        let mut requested = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         requested.max_spawn_depth = 99; // tries to grab more than the parent has
         let child = parent.derive_child(&requested);
         assert_eq!(
@@ -421,7 +553,7 @@ mod tests {
         );
         assert!(child.can_spawn_child());
 
-        let mut leaf_parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut leaf_parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         leaf_parent.max_spawn_depth = 1;
         let grandchild = leaf_parent.derive_child(&requested);
         assert_eq!(grandchild.max_spawn_depth, 0);
@@ -433,23 +565,23 @@ mod tests {
 
     #[test]
     fn child_provider_falls_back_to_parent() {
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.provider = Some("moonshot".to_string());
-        let requested = WorkerRuntimeProfile::for_role(SubAgentType::Explore); // provider None
+        let requested = WorkerRuntimeProfile::for_role(FleetRole::Scout); // provider None
         let child = parent.derive_child(&requested);
         assert_eq!(child.provider.as_deref(), Some("moonshot"));
     }
 
     #[test]
     fn child_reasoning_effort_uses_requested_then_parent() {
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.reasoning_effort = Some("low".to_string());
 
-        let requested = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+        let requested = WorkerRuntimeProfile::for_role(FleetRole::Scout);
         let inherited = parent.derive_child(&requested);
         assert_eq!(inherited.reasoning_effort.as_deref(), Some("low"));
 
-        let mut requested = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+        let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Scout);
         requested.reasoning_effort = Some("max".to_string());
         let overridden = parent.derive_child(&requested);
         assert_eq!(overridden.reasoning_effort.as_deref(), Some("max"));
@@ -459,17 +591,87 @@ mod tests {
     fn child_denied_tools_union_never_drops_parent_restriction() {
         // A child may only *add* deny entries; it can never drop a restriction
         // an ancestor imposed (#4042 non-escalation invariant).
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.denied_tools = vec!["exec_shell".into(), "mcp_*".into()];
 
         // Child asks for its own deny list and (tryingly) tries to omit the
         // parent's exec_shell — the union keeps both.
-        let mut requested = WorkerRuntimeProfile::for_role(SubAgentType::Implementer);
+        let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Builder);
         requested.denied_tools = vec!["write_file".into()];
 
         let child = parent.derive_child(&requested);
         assert!(child.denied_tools.contains(&"exec_shell".to_string()));
         assert!(child.denied_tools.contains(&"mcp_*".to_string()));
         assert!(child.denied_tools.contains(&"write_file".to_string()));
+    }
+
+    /// Every built-in role keeps network reads by default: a worker cut off
+    /// from the network for no role reason cannot do its job. Only workspace
+    /// mutation is a role intent.
+    #[test]
+    fn every_role_default_keeps_network_reads_and_only_read_only_roles_withhold_writes() {
+        for role in [
+            FleetRole::Scout,
+            FleetRole::Reviewer,
+            FleetRole::Planner,
+            FleetRole::Verifier,
+            FleetRole::Consultant,
+            FleetRole::Builder,
+            FleetRole::Worker,
+            FleetRole::Custom,
+        ] {
+            let profile = WorkerRuntimeProfile::for_role(role.clone());
+            assert!(
+                profile.permissions.network,
+                "{role:?} must keep network reads"
+            );
+            let read_only_by_intent = matches!(
+                role,
+                FleetRole::Scout
+                    | FleetRole::Reviewer
+                    | FleetRole::Planner
+                    | FleetRole::Verifier
+                    | FleetRole::Consultant
+            );
+            assert_eq!(
+                profile.permissions.write, !read_only_by_intent,
+                "{role:?} write default"
+            );
+        }
+        // Custom inherits (full ceiling); Planner probes read-only shell;
+        // Consultant never acts on the workspace.
+        assert_eq!(
+            WorkerRuntimeProfile::for_role(FleetRole::Custom).shell,
+            ShellPolicy::Full
+        );
+        assert_eq!(
+            WorkerRuntimeProfile::for_role(FleetRole::Planner).shell,
+            ShellPolicy::ReadOnly
+        );
+        assert_eq!(
+            WorkerRuntimeProfile::for_role(FleetRole::Consultant).shell,
+            ShellPolicy::None
+        );
+    }
+
+    /// The parent's effective posture is the ceiling: a full-default child role
+    /// under a read-only, no-network, read-only-shell parent inherits exactly
+    /// that, never more.
+    #[test]
+    fn derive_child_inherits_the_parent_ceiling_and_never_widens() {
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        parent.permissions = PermissionSet::read_only();
+        parent.shell = ShellPolicy::ReadOnly;
+        for role in [FleetRole::Custom, FleetRole::Builder, FleetRole::Worker] {
+            let child = parent.derive_child(&WorkerRuntimeProfile::for_role(role.clone()));
+            assert!(!child.permissions.write, "{role:?} widened write");
+            assert!(!child.permissions.network, "{role:?} widened network");
+            assert_eq!(child.shell, ShellPolicy::ReadOnly, "{role:?} widened shell");
+        }
+        // And a full parent hands a doer its full posture.
+        let full = WorkerRuntimeProfile::for_role(FleetRole::Worker)
+            .derive_child(&WorkerRuntimeProfile::for_role(FleetRole::Custom));
+        assert!(full.permissions.write && full.permissions.network);
+        assert_eq!(full.shell, ShellPolicy::Full);
     }
 }

@@ -21,7 +21,8 @@ use crate::tools::goal::SharedGoalState;
 use super::schema_canonicalize;
 use super::schema_sanitize;
 use super::spec::{
-    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+    ApprovalRequirement, RichToolResult, ToolCapability, ToolContext, ToolError, ToolResult,
+    ToolResultContentBlock, ToolSpec,
 };
 
 // === Types ===
@@ -33,7 +34,7 @@ pub struct ToolRegistry {
     /// Memoised serialised tool catalog. Rebuilt lazily on first
     /// `to_api_tools` call after a mutation; pinned across reads so the
     /// description and schema bytes stay byte-stable for DeepSeek's KV
-    /// prefix cache. Invalidated on `register` / `remove` / `clear`.
+    /// prefix cache. Invalidated on `register` / `remove_tool`.
     api_cache: OnceLock<Vec<Tool>>,
 }
 
@@ -78,23 +79,8 @@ impl ToolRegistry {
 
     /// Get all registered tool names.
     #[must_use]
-    #[allow(dead_code)]
     pub fn names(&self) -> Vec<&str> {
         self.tools.keys().map(std::string::String::as_str).collect()
-    }
-
-    /// Get the number of registered tools.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Check if the registry is empty.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
     }
 
     /// Get all registered tools.
@@ -103,50 +89,99 @@ impl ToolRegistry {
         self.tools.values().cloned().collect()
     }
 
-    /// Execute a tool by name with the given input.
-    #[allow(dead_code)]
-    pub async fn execute(&self, name: &str, input: Value) -> Result<String, ToolError> {
-        let tool = self
-            .get(name)
-            .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
-
-        let result = tool.execute(input, &self.context).await?;
-        Ok(result.content)
-    }
-
     /// Execute a tool by name, returning the full `ToolResult`.
     pub async fn execute_full(&self, name: &str, input: Value) -> Result<ToolResult, ToolError> {
+        self.execute_rich_full(name, input)
+            .await
+            .map(RichToolResult::into_result)
+    }
+
+    pub(crate) async fn execute_rich_full(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<RichToolResult, ToolError> {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
-        tool.execute(input, &self.context).await
+        enforce_tool_authority(name, &input, tool.as_ref(), &self.context)?;
+        tool.execute_rich(input, &self.context)
+            .await
+            .map(crate::image_attach::bound_rich_tool_result)
     }
 
     /// Execute a tool with an optional context override.
     ///
     /// This is used for retrying tools with elevated sandbox policies.
-    /// After execution, large results are routed through the workshop (#548).
+    /// After execution, results are stamped with adaptive evidence routing.
+    #[allow(dead_code)] // compatibility seam for text-only internal callers
     pub async fn execute_full_with_context(
         &self,
         name: &str,
         input: Value,
         context_override: Option<&ToolContext>,
     ) -> Result<ToolResult, ToolError> {
+        self.execute_rich_full_with_context(name, input, context_override)
+            .await
+            .map(RichToolResult::into_result)
+    }
+
+    pub(crate) async fn execute_rich_full_with_context(
+        &self,
+        name: &str,
+        input: Value,
+        context_override: Option<&ToolContext>,
+    ) -> Result<RichToolResult, ToolError> {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
 
         let ctx = context_override.unwrap_or(&self.context);
-        let result = tool.execute(input.clone(), ctx).await?;
+        enforce_tool_authority(name, &input, tool.as_ref(), ctx)?;
+        let mut rich = crate::image_attach::bound_rich_tool_result(
+            tool.execute_rich(input.clone(), ctx).await?,
+        );
+        let result = &mut rich.result;
 
-        // Large-output routing (#548): if the result exceeds the threshold and
-        // the caller did not request `raw=true`, synthesise via the workshop.
+        // Adaptive evidence routing (#4619) is storage-free here because this
+        // layer does not own a call id. The engine/subagent completion boundary
+        // publishes the exact artifact. Classic workshop previews remain an
+        // explicit local rollback path.
         let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if let Some(router) = ctx.large_output_router.as_ref() {
-            use crate::tools::large_output_router::{LargeOutputRouter, RouteDecision};
-            match router.route(name, &result, raw_bypass) {
+            use crate::tools::large_output_router::{
+                EvidenceRouting, LargeOutputRouter, RouteDecision, classic_output_routing_enabled,
+            };
+            if !classic_output_routing_enabled() {
+                let (estimated_routing, estimated_tokens, threshold) =
+                    router.evidence_routing(name, result, raw_bypass);
+                let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(object) = metadata.as_object_mut() {
+                    // A tool that self-bounds its output behind its own
+                    // recovery contract (e.g. read_file's `next_start_line`
+                    // paging) declares its routing itself; the size estimate
+                    // must not override that and double-wrap the result.
+                    let routing = object
+                        .get("evidence_routing")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
+                        .unwrap_or(estimated_routing);
+                    object.insert(
+                        "evidence_routing".to_string(),
+                        serde_json::to_value(routing)
+                            .unwrap_or_else(|_| serde_json::json!("inline")),
+                    );
+                    object.insert(
+                        "evidence_estimated_tokens".to_string(),
+                        estimated_tokens.into(),
+                    );
+                    object.insert("evidence_threshold_tokens".to_string(), threshold.into());
+                }
+                return Ok(rich);
+            }
+            match router.route(name, result, raw_bypass) {
                 RouteDecision::PassThrough => {}
                 RouteDecision::Synthesise {
                     estimated_tokens,
@@ -184,12 +219,12 @@ impl ToolRegistry {
                         threshold,
                         "large-output routed through workshop"
                     );
-                    return Ok(ToolResult::success(wrapped));
+                    return Ok(RichToolResult::plain(ToolResult::success(wrapped)));
                 }
             }
         }
 
-        Ok(result)
+        Ok(rich)
     }
 
     /// Get the current tool context.
@@ -221,13 +256,34 @@ impl ToolRegistry {
     }
 
     fn build_api_tools(&self) -> Vec<Tool> {
+        let read_only_authority = self.context.tool_authority.as_deref().filter(|authority| {
+            authority.authority == super::spec::ToolMutationAuthority::ReadOnly
+        });
+        let evidence_only = read_only_authority.is_some();
+        let evidence_network = self
+            .context
+            .tool_authority
+            .as_ref()
+            .is_none_or(|authority| authority.network_access == Some(true));
         let mut tools: Vec<&Arc<dyn ToolSpec>> = self.tools.values().collect();
         tools.sort_by(|a, b| a.name().cmp(b.name()));
         tools
             .into_iter()
             .filter(|tool| tool.model_visible())
+            .filter(|tool| {
+                read_only_authority.is_none_or(|authority| {
+                    readonly_evidence_tool(tool.as_ref())
+                        || (tool.name() == "Run"
+                            && authority.verification
+                                == super::spec::ToolVerificationAuthority::Bounded)
+                })
+            })
+            .filter(|tool| evidence_network || !matches!(tool.name(), "Web" | "web.run"))
             .map(|tool| {
                 let mut schema = tool.input_schema();
+                if evidence_only {
+                    project_readonly_evidence_schema(tool.name(), &mut schema);
+                }
                 schema_sanitize::sanitize(&mut schema);
                 schema_canonicalize::canonicalize_schema(&mut schema);
                 Tool {
@@ -261,77 +317,37 @@ impl ToolRegistry {
         tools
     }
 
-    /// Filter tools by capability.
+    /// Flatten every registered tool into the exact facts the read-only
+    /// request projection is allowed to report: name, description, model
+    /// visibility, declared capabilities, declared approval requirement, and
+    /// whether the tool came from the plugin surface.
+    ///
+    /// This hands out *data*, never tool objects, so the projection layer
+    /// cannot execute anything. Output is sorted by name and does not touch the
+    /// registry's own ordering or the memoised API catalog.
     #[must_use]
-    #[allow(dead_code)]
-    pub fn filter_by_capability(&self, capability: ToolCapability) -> Vec<Arc<dyn ToolSpec>> {
-        self.tools
+    pub fn registry_facts(
+        &self,
+        plugin_names: &std::collections::HashSet<String>,
+    ) -> Vec<crate::tool_inspection::RegistryFacts> {
+        let mut facts: Vec<crate::tool_inspection::RegistryFacts> = self
+            .tools
             .values()
-            .filter(|t| t.capabilities().contains(&capability))
-            .cloned()
-            .collect()
-    }
-
-    /// Get read-only tools.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn read_only_tools(&self) -> Vec<Arc<dyn ToolSpec>> {
-        self.tools
-            .values()
-            .filter(|t| t.is_read_only())
-            .cloned()
-            .collect()
-    }
-
-    /// Get tools that require approval.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn approval_required_tools(&self) -> Vec<Arc<dyn ToolSpec>> {
-        self.tools
-            .values()
-            .filter(|t| t.approval_requirement() == ApprovalRequirement::Required)
-            .cloned()
-            .collect()
-    }
-
-    /// Get tools that suggest approval.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn approval_suggested_tools(&self) -> Vec<Arc<dyn ToolSpec>> {
-        self.tools
-            .values()
-            .filter(|t| {
-                matches!(
-                    t.approval_requirement(),
-                    ApprovalRequirement::Suggest | ApprovalRequirement::Required
-                )
+            .map(|tool| crate::tool_inspection::RegistryFacts {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                model_visible: tool.model_visible(),
+                capabilities: tool
+                    .capabilities()
+                    .iter()
+                    .map(|capability| format!("{capability:?}"))
+                    .collect(),
+                approval: format!("{:?}", tool.approval_requirement()),
+                plugin: plugin_names.contains(tool.name()),
             })
-            .cloned()
-            .collect()
-    }
-
-    /// Update the context (e.g., when workspace changes).
-    #[allow(dead_code)]
-    pub fn set_context(&mut self, context: ToolContext) {
-        self.context = context;
-    }
-
-    /// Get a mutable reference to the current context.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn context_mut(&mut self) -> &mut ToolContext {
-        &mut self.context
-    }
-
-    /// Remove a tool by name.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn ToolSpec>> {
-        let removed = self.tools.remove(name);
-        if removed.is_some() {
-            self.invalidate_api_cache();
-        }
-        removed
+            .collect();
+        facts.sort_by(|a, b| a.name.cmp(&b.name));
+        facts
     }
 
     /// Resolve a non-canonical tool name to a registered canonical name.
@@ -341,10 +357,12 @@ impl ToolRegistry {
     /// 2. Hyphens/spaces → underscores (read-file → read_file).
     /// 3. CamelCase → snake_case (ReadFile → read_file).
     /// 4. Strip trailing `_tool` / `-tool` suffix (twice).
-    /// 5. Fuzzy match via simple prefix/suffix similarity.
     ///
-    /// Returns `None` when no resolution is found (let the caller surface
-    /// "Unknown tool").
+    /// Returns `None` when no normalization matches (the caller surfaces
+    /// "Unknown tool … did you mean: …"). There is deliberately **no fuzzy
+    /// step**: a prefix guess over the registry would execute an arbitrary
+    /// sibling tool the model never asked for (#5123-class) — a hallucinated
+    /// name must fail, never dispatch.
     #[must_use]
     pub fn resolve(&self, requested: &str) -> Option<&str> {
         let names: Vec<&str> = self.tools.keys().map(String::as_str).collect();
@@ -379,22 +397,7 @@ impl ToolRegistry {
         {
             return Some(n);
         }
-        // 5. fuzzy: simple prefix match (at least 3 chars)
-        if lower.len() >= 3 {
-            for n in &names {
-                if n.len() >= 3 && (n.starts_with(&lower) || lower.starts_with(n)) {
-                    return Some(n);
-                }
-            }
-        }
         None
-    }
-
-    /// Clear all tools from the registry.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.tools.clear();
-        self.invalidate_api_cache();
     }
 
     /// Remove a tool from the registry by name. Returns `true` if the tool
@@ -482,6 +485,210 @@ impl ToolRegistry {
     }
 }
 
+/// The complete model-visible and dispatchable surface for a machine or role
+/// whose contract is evidence collection without project/process mutation.
+pub(crate) fn readonly_evidence_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "bash"
+            | "File"
+            | "Bash"
+            | "Web"
+            | "web.run"
+            | "load_skill"
+            | "handle_read"
+            | "retrieve_tool_result"
+            | "todo_write"
+    )
+}
+
+/// True when a concrete registered tool is safe on the read-only evidence
+/// surface. Static read-only capability is sufficient except for Git/review:
+/// those may invoke repository-configured helpers, so their safety cannot be
+/// proven from the tool declaration alone. Scouts can still inspect Git through
+/// classifier-bounded lowercase `bash` commands.
+pub(crate) fn readonly_evidence_tool(tool: &dyn ToolSpec) -> bool {
+    readonly_evidence_tool_name(tool.name())
+        || !matches!(tool.name(), "Git" | "review") && tool.is_read_only()
+}
+
+fn project_readonly_evidence_schema(name: &str, schema: &mut Value) {
+    if name == "Bash" {
+        *schema = super::shell::readonly_bash_input_schema();
+        return;
+    }
+    if name == "Run" {
+        // The shared classifier remains authoritative for `args`; the schema
+        // removes the only field that can name verifier programs.
+        if let Some(properties) = schema["properties"].as_object_mut() {
+            properties.remove("commands");
+        }
+        return;
+    }
+    let Some(actions) = schema["properties"]["action"]["enum"].as_array_mut() else {
+        return;
+    };
+    match name {
+        "File" => actions.retain(|action| {
+            action.as_str().is_some_and(|action| {
+                matches!(action, "read" | "list" | "search_name" | "search_content")
+            })
+        }),
+        "Web" => actions.retain(|action| {
+            action
+                .as_str()
+                .is_some_and(|action| matches!(action, "search" | "fetch"))
+        }),
+        _ => {}
+    }
+}
+
+fn enforce_tool_authority(
+    name: &str,
+    input: &Value,
+    tool: &dyn ToolSpec,
+    context: &ToolContext,
+) -> Result<(), ToolError> {
+    let Some(authority) = context.tool_authority.as_ref() else {
+        return Ok(());
+    };
+    let evidence_only = authority.authority == super::spec::ToolMutationAuthority::ReadOnly;
+    let bounded_verifier = evidence_only
+        && name == "Run"
+        && authority.verification == super::spec::ToolVerificationAuthority::Bounded;
+    if evidence_only && !readonly_evidence_tool(tool) && !bounded_verifier {
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: it is outside the read-only evidence tool profile",
+            authority.owner
+        )));
+    }
+    if evidence_only && matches!(name, "Web" | "web.run") && authority.network_access != Some(true)
+    {
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: its authority envelope does not grant network access",
+            authority.owner
+        )));
+    }
+    let capabilities = tool.capabilities();
+    if matches!(name, "bash" | "Bash" | "exec_shell") {
+        if tool.is_read_only_for(input) {
+            if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
+                return Err(ToolError::permission_denied(format!(
+                    "worker '{}' cannot run {name}: its machine-readable authority envelope does not grant read-only shell access",
+                    authority.owner
+                )));
+            }
+            let networked_read = input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(crate::command_safety::is_github_readonly_command);
+            if networked_read && authority.network_access != Some(true) {
+                return Err(ToolError::permission_denied(format!(
+                    "worker '{}' cannot use read-only GitHub CLI access: its machine-readable authority envelope does not grant network access",
+                    authority.owner
+                )));
+            }
+            return Ok(());
+        }
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
+            authority.owner
+        )));
+    }
+    if name == "Run" {
+        if bounded_verifier {
+            use crate::tools::execution_envelope::{VerificationBound, classify_verification};
+
+            let canonical = crate::tools::canonical_action::canonical_action_alias(name, input);
+            if matches!(
+                classify_verification(canonical, input),
+                Some(VerificationBound::Default | VerificationBound::Filter)
+            ) {
+                return Ok(());
+            }
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot run unbounded verification arguments or commands",
+                authority.owner
+            )));
+        }
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
+            authority.owner
+        )));
+    }
+    if name == "Git" || name.starts_with("git_") || name == "review" {
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: repository-configured Git helpers cannot prove read-only execution under its machine-readable authority envelope",
+            authority.owner
+        )));
+    }
+    if tool.is_read_only_for(input) {
+        return Ok(());
+    }
+    if capabilities.contains(&ToolCapability::ExecutesCode) {
+        return Err(ToolError::permission_denied(format!(
+            "worker '{}' cannot run {name}: code or child execution is outside its machine-readable authority envelope",
+            authority.owner
+        )));
+    }
+    if let Some(paths) = authority_mutation_paths(name, input)? {
+        if paths.is_empty() {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' mutation through {name} did not expose a bounded file target",
+                authority.owner
+            )));
+        }
+        for path in paths {
+            if !authority.permits_mutation_path(context, &path)? {
+                return Err(ToolError::permission_denied(format!(
+                    "worker '{}' cannot mutate '{path}' outside its machine-readable authority envelope",
+                    authority.owner
+                )));
+            }
+        }
+        return Ok(());
+    }
+    Err(ToolError::permission_denied(format!(
+        "worker '{}' cannot run mutating tool {name}: the call has no authorized file target",
+        authority.owner
+    )))
+}
+
+fn authority_mutation_paths(name: &str, input: &Value) -> Result<Option<Vec<String>>, ToolError> {
+    let canonical = crate::tools::canonical_action::canonical_action_alias(name, input);
+    let is_patch = canonical == "apply_patch"
+        || (name == "File" && input.get("action").and_then(Value::as_str) == Some("patch"));
+    if is_patch {
+        let mut patch_input = input.clone();
+        if let Some(object) = patch_input.as_object_mut() {
+            object.remove("action");
+        }
+        let paths = crate::tools::apply_patch::preflight_apply_patch(&patch_input)
+            .map_err(|error| ToolError::invalid_input(error.to_string()))?
+            .touched_files;
+        return Ok(Some(paths));
+    }
+    let path_bound = matches!(canonical, "write_file" | "edit_file" | "fim_edit")
+        || (name == "File"
+            && input
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| matches!(action, "write" | "edit")))
+        || (name == "pandoc_convert" && input.get("output_path").is_some());
+    if !path_bound {
+        return Ok(None);
+    }
+    Ok(Some(
+        input
+            .get("path")
+            .or_else(|| input.get("output_path"))
+            .and_then(Value::as_str)
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default(),
+    ))
+}
+
 /// Builder for constructing a `ToolRegistry` with common tools.
 pub struct ToolRegistryBuilder {
     tools: Vec<Arc<dyn ToolSpec>>,
@@ -501,6 +708,9 @@ pub struct AgentToolSurfaceOptions {
     pub vision_config: Option<crate::config::VisionModelConfig>,
     pub speech_output_dir: Option<PathBuf>,
     pub goal_state: Option<SharedGoalState>,
+    /// Register the agent-callable `verify` self-critique tool (#4196).
+    /// Gated by `Feature::Verify` (`[features] verify_tool`), default on.
+    pub verify_tool_enabled: bool,
 }
 
 impl AgentToolSurfaceOptions {
@@ -514,6 +724,7 @@ impl AgentToolSurfaceOptions {
             vision_config: None,
             speech_output_dir: None,
             goal_state: None,
+            verify_tool_enabled: true,
         }
     }
 }
@@ -546,7 +757,15 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_file_tools(self) -> Self {
         use super::file::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
-        self.with_tool(Arc::new(ReadFileTool))
+        use super::file_tool::{EditTool, FileTool, ReadTool, WriteTool};
+        self.with_tool(Arc::new(ReadTool))
+            .with_tool(Arc::new(WriteTool))
+            .with_tool(Arc::new(EditTool))
+            // Compatibility-only execution names for saved transcripts and
+            // protocol clients. `model_visible=false` keeps them out of new
+            // catalogs.
+            .with_tool(Arc::new(FileTool::new("File")))
+            .with_tool(Arc::new(ReadFileTool))
             .with_tool(Arc::new(WriteFileTool))
             .with_tool(Arc::new(EditFileTool))
             .with_tool(Arc::new(ListDirTool))
@@ -554,30 +773,51 @@ impl ToolRegistryBuilder {
 
     /// Include only read-only file tools (read, list).
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_read_only_file_tools(self) -> Self {
         use super::file::{ListDirTool, ReadFileTool};
-        self.with_tool(Arc::new(ReadFileTool))
+        use super::file_tool::FileTool;
+        use super::file_tool::ReadTool;
+        self.with_tool(Arc::new(ReadTool))
+            .with_tool(Arc::new(FileTool::read_only("File")))
+            .with_tool(Arc::new(ReadFileTool))
             .with_tool(Arc::new(ListDirTool))
             .with_tool(Arc::new(
                 super::tool_result_retrieval::RetrieveToolResultTool,
             ))
     }
 
-    /// Include shell execution tool.
+    /// Include shell execution tools.
+    ///
+    /// New turns expose lowercase `bash`; uppercase `Bash` remains a hidden
+    /// compatibility name for saved v0.9.x transcripts.
     #[must_use]
     pub fn with_shell_tools(self) -> Self {
-        use super::shell::{ExecShellTool, ShellCancelTool, ShellInteractTool, ShellWaitTool};
-        self.with_tool(Arc::new(ExecShellTool))
-            .with_tool(Arc::new(ShellWaitTool::new("exec_shell_wait")))
-            .with_tool(Arc::new(ShellInteractTool::new("exec_shell_interact")))
-            .with_tool(Arc::new(ShellCancelTool))
-            .with_tool(Arc::new(ShellWaitTool::new("exec_wait")))
-            .with_tool(Arc::new(ShellInteractTool::new("exec_interact")))
-            .with_terminal_tools()
+        self.with_foreground_shell_tools().with_terminal_tools()
+    }
+
+    /// Include only the cancellable foreground shell tool.
+    ///
+    /// Protocol hosts that cannot safely own a persistent PTY session use
+    /// this surface instead of [`Self::with_shell_tools`].
+    #[must_use]
+    pub fn with_foreground_shell_tools(self) -> Self {
+        use super::shell::{BashTool, LowercaseBashTool};
+        self.with_tool(Arc::new(LowercaseBashTool))
+            .with_tool(Arc::new(BashTool::new("Bash")))
+    }
+
+    /// Include only the foreground, direct-argv read-only shell surface.
+    #[must_use]
+    pub fn with_read_only_shell_tool(self) -> Self {
+        use super::shell::{BashTool, LowercaseBashTool};
+        self.with_tool(Arc::new(LowercaseBashTool))
+            .with_tool(Arc::new(BashTool::read_only("Bash")))
     }
 
     /// Include the stateful PTY terminal tools. Like `exec_shell`, these are
     /// only exposed when the active shell policy allows shell access.
+    #[cfg(not(target_env = "ohos"))]
     #[must_use]
     pub fn with_terminal_tools(self) -> Self {
         use super::terminal_session::{
@@ -591,30 +831,32 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(TerminalResetTool))
     }
 
-    /// Include search tools (`grep_files`).
+    /// OpenHarmony does not include the `portable-pty` dependency, so keep the
+    /// ordinary shell tools without advertising unavailable persistent PTYs.
+    #[cfg(target_env = "ohos")]
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        self
+    }
+
+    /// Search is part of the canonical `File` action surface.
     #[must_use]
     pub fn with_search_tools(self) -> Self {
-        use super::file_search::FileSearchTool;
-        use super::search::GrepFilesTool;
-        self.with_tool(Arc::new(GrepFilesTool))
-            .with_tool(Arc::new(FileSearchTool))
+        self.with_tool(Arc::new(super::file_search::FileSearchTool))
+            .with_tool(Arc::new(super::search::GrepFilesTool))
     }
 
-    /// Include git inspection tools (`git_status`, `git_diff`).
+    /// Include the canonical `Git` inspection/history surface.
     #[must_use]
     pub fn with_git_tools(self) -> Self {
-        use super::git::{GitDiffTool, GitStatusTool};
-        self.with_tool(Arc::new(GitStatusTool))
-            .with_tool(Arc::new(GitDiffTool))
+        use super::git_tool::GitTool;
+        self.with_tool(Arc::new(GitTool::new("Git")))
     }
 
-    /// Include git history tools (`git_log`, `git_show`, `git_blame`).
+    /// Git history is part of the canonical `Git` action surface.
     #[must_use]
     pub fn with_git_history_tools(self) -> Self {
-        use super::git_history::{GitBlameTool, GitLogTool, GitShowTool};
-        self.with_tool(Arc::new(GitLogTool))
-            .with_tool(Arc::new(GitShowTool))
-            .with_tool(Arc::new(GitBlameTool))
+        self
     }
 
     /// Include workspace diagnostics tool.
@@ -622,6 +864,14 @@ impl ToolRegistryBuilder {
     pub fn with_diagnostics_tool(self) -> Self {
         use super::diagnostics::DiagnosticsTool;
         self.with_tool(Arc::new(DiagnosticsTool))
+    }
+
+    /// Include the `tui_help` command/keybinding reference (#1708). The
+    /// catalog it reads is compiled in, so there is nothing to probe.
+    #[must_use]
+    pub fn with_tui_help_tool(self) -> Self {
+        use super::tui_help::TuiHelpTool;
+        self.with_tool(Arc::new(TuiHelpTool))
     }
 
     /// Include the `pandoc_convert` tool only when the `pandoc`
@@ -652,6 +902,13 @@ impl ToolRegistryBuilder {
         }
     }
 
+    /// Include the `read_media` tool for safe multimodal media inspection.
+    #[must_use]
+    pub fn with_read_media_tool(self) -> Self {
+        use super::read_media::ReadMediaTool;
+        self.with_tool(Arc::new(ReadMediaTool))
+    }
+
     /// Include the `load_skill` tool (#434) so the model can pull a
     /// SKILL.md body + companion file list into context with one
     /// call instead of `read_file` + `list_dir` against the path
@@ -672,10 +929,8 @@ impl ToolRegistryBuilder {
     /// Include cargo test runner tool.
     #[must_use]
     pub fn with_test_runner_tool(self) -> Self {
-        use super::test_runner::RunTestsTool;
-        use super::verifier::RunVerifiersTool;
-        self.with_tool(Arc::new(RunTestsTool))
-            .with_tool(Arc::new(RunVerifiersTool))
+        use super::run_tool::RunTool;
+        self.with_tool(Arc::new(RunTool::new("Run")))
     }
 
     /// Include structured data validation tool (`validate_data`).
@@ -694,53 +949,30 @@ impl ToolRegistryBuilder {
 
     /// Include durable task, gate, PR-attempt, GitHub, and automation tools.
     ///
+    /// Each family is one tool with an `action` parameter (`tasks`, `github`,
+    /// `automation`). Per-action execution aliases were removed in v0.9.3.
+    ///
     /// Shell-related task tools (`task_shell_start`, `task_shell_wait`) are
-    /// *not* included here — use [`with_runtime_task_shell_tools`] to register
+    /// *not* included here — use `with_runtime_task_shell_tools` to register
     /// them when `allow_shell` is true.
     #[must_use]
     pub fn with_runtime_task_tools(self) -> Self {
-        use super::automation::{
-            AutomationCreateTool, AutomationDeleteTool, AutomationListTool, AutomationPauseTool,
-            AutomationReadTool, AutomationResumeTool, AutomationRunTool, AutomationUpdateTool,
-        };
-        use super::github::{
-            GithubCloseIssueTool, GithubClosePrTool, GithubCommentTool, GithubIssueContextTool,
-            GithubPrContextTool,
-        };
-        use super::tasks::{
-            PrAttemptListTool, PrAttemptPreflightTool, PrAttemptReadTool, PrAttemptRecordTool,
-            TaskCancelTool, TaskCreateTool, TaskGateRunTool, TaskListTool, TaskReadTool,
-        };
+        use super::automation::AutomationTool;
+        use super::github::GithubTool;
+        use super::send_later::SendLaterTool;
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskCreateTool))
-            .with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
-            .with_tool(Arc::new(TaskCancelTool))
-            .with_tool(Arc::new(TaskGateRunTool))
-            .with_tool(Arc::new(GithubIssueContextTool))
-            .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptRecordTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
-            .with_tool(Arc::new(PrAttemptPreflightTool))
-            .with_tool(Arc::new(AutomationCreateTool))
-            .with_tool(Arc::new(AutomationListTool))
-            .with_tool(Arc::new(AutomationReadTool))
-            .with_tool(Arc::new(AutomationUpdateTool))
-            .with_tool(Arc::new(AutomationPauseTool))
-            .with_tool(Arc::new(AutomationResumeTool))
-            .with_tool(Arc::new(AutomationDeleteTool))
-            .with_tool(Arc::new(AutomationRunTool))
-            .with_tool(Arc::new(GithubCommentTool))
-            .with_tool(Arc::new(GithubCloseIssueTool))
-            .with_tool(Arc::new(GithubClosePrTool))
+        self.with_tool(Arc::new(TasksTool::new("tasks")))
+            .with_tool(Arc::new(GithubTool::new("github")))
+            .with_tool(Arc::new(AutomationTool::new("automation")))
+            .with_tool(Arc::new(SendLaterTool::new("send_later")))
     }
 
     /// Include shell-related task tools (`task_shell_start`, `task_shell_wait`).
     ///
     /// These are gated behind `allow_shell` because `task_shell_start`
-    /// delegates directly to `ExecShellTool`, providing the same shell
-    /// execution capability as `exec_shell`.
+    /// delegates directly to `BashTool`, providing the same shell
+    /// execution capability as `Bash`.
     #[must_use]
     pub fn with_runtime_task_shell_tools(self) -> Self {
         use super::tasks::{TaskShellStartTool, TaskShellWaitTool};
@@ -751,20 +983,21 @@ impl ToolRegistryBuilder {
     /// Include only read-only durable task, PR-attempt, GitHub, and automation
     /// inspection tools. Plan mode uses this surface so it can observe state
     /// without starting work, changing remotes, or mutating automation config.
+    ///
+    /// The model sees the same canonical `tasks` / `github` / `automation` /
+    /// `send_later` tools as the full surface, restricted to their read-only
+    /// actions.
     #[must_use]
     pub fn with_runtime_read_only_task_tools(self) -> Self {
-        use super::automation::{AutomationListTool, AutomationReadTool};
-        use super::github::{GithubIssueContextTool, GithubPrContextTool};
-        use super::tasks::{PrAttemptListTool, PrAttemptReadTool, TaskListTool, TaskReadTool};
+        use super::automation::AutomationTool;
+        use super::github::GithubTool;
+        use super::send_later::SendLaterTool;
+        use super::tasks::TasksTool;
 
-        self.with_tool(Arc::new(TaskListTool))
-            .with_tool(Arc::new(TaskReadTool))
-            .with_tool(Arc::new(GithubIssueContextTool))
-            .with_tool(Arc::new(GithubPrContextTool))
-            .with_tool(Arc::new(PrAttemptListTool))
-            .with_tool(Arc::new(PrAttemptReadTool))
-            .with_tool(Arc::new(AutomationListTool))
-            .with_tool(Arc::new(AutomationReadTool))
+        self.with_tool(Arc::new(TasksTool::read_only("tasks")))
+            .with_tool(Arc::new(GithubTool::read_only("github")))
+            .with_tool(Arc::new(AutomationTool::read_only("automation")))
+            .with_tool(Arc::new(SendLaterTool::read_only("send_later")))
     }
 
     /// Include web search and fetch tools.
@@ -774,13 +1007,9 @@ impl ToolRegistryBuilder {
     /// NOT gated behind the web-search feature.
     #[must_use]
     pub fn with_web_tools(self) -> Self {
-        use super::dev_server_readiness::WaitForDevServerTool;
-        use super::fetch_url::FetchUrlTool;
         use super::web_run::WebRunTool;
-        use super::web_search::WebSearchTool;
-        self.with_tool(Arc::new(WebSearchTool))
-            .with_tool(Arc::new(FetchUrlTool))
-            .with_tool(Arc::new(WaitForDevServerTool))
+        use super::web_tool::WebTool;
+        self.with_tool(Arc::new(WebTool::new("Web")))
             .with_tool(Arc::new(WebRunTool))
     }
 
@@ -798,21 +1027,16 @@ impl ToolRegistryBuilder {
     /// Register the `image_analyze` vision tool.
     /// Only registered when `[vision_model]` is configured in config.toml.
     #[must_use]
-    pub fn with_vision_tools(self, config: crate::config::VisionModelConfig) -> Self {
+    pub fn with_vision_tools(
+        self,
+        config: crate::config::VisionModelConfig,
+        route_client: Option<DeepSeekClient>,
+    ) -> Self {
         use crate::vision::tools::ImageAnalyzeTool;
-        self.with_tool(Arc::new(ImageAnalyzeTool::new(config)))
-    }
-
-    /// Previously registered the OpenAI-style `multi_tool_use.parallel`
-    /// meta-tool. DeepSeek-V4 has native parallel tool calls (multiple
-    /// `tool_calls` entries in one assistant turn) and the meta-tool name
-    /// triggered the model to hallucinate OpenAI-internal XML wrappers
-    /// (`<multi_tool_use.parallel><tool_name>…</tool_name>…`) instead of
-    /// emitting native calls. Kept as a no-op so existing callers compile;
-    /// the engine's compatibility dispatcher still handles legacy emissions.
-    #[must_use]
-    pub fn with_parallel_tool(self) -> Self {
-        self
+        self.with_tool(Arc::new(ImageAnalyzeTool::new_with_route_client(
+            config,
+            route_client,
+        )))
     }
 
     /// Include request_user_input tool.
@@ -825,8 +1049,9 @@ impl ToolRegistryBuilder {
     /// Include patch tools (`apply_patch`).
     #[must_use]
     pub fn with_patch_tools(self) -> Self {
-        use super::apply_patch::ApplyPatchTool;
-        self.with_tool(Arc::new(ApplyPatchTool))
+        use super::file_tool::FileTool;
+        self.with_tool(Arc::new(FileTool::with_patch("File")))
+            .with_tool(Arc::new(super::apply_patch::ApplyPatchTool))
     }
 
     /// Include the `revert_turn` tool. Approval-gated since it mutates
@@ -855,17 +1080,20 @@ impl ToolRegistryBuilder {
         .with_tool(Arc::new(SpeechTool::new("tts", client, output_dir)))
     }
 
-    /// Include persistent RLM session tools.
+    /// Include the canonical persistent RLM session tool.
     #[must_use]
-    pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, _root_model: String) -> Self {
-        use super::rlm::{
-            RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool, RlmSessionObjectsTool,
-        };
-        self.with_tool(Arc::new(RlmSessionObjectsTool))
-            .with_tool(Arc::new(RlmOpenTool))
-            .with_tool(Arc::new(RlmEvalTool::new(client)))
-            .with_tool(Arc::new(RlmConfigureTool))
-            .with_tool(Arc::new(RlmCloseTool))
+    pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, root_model: String) -> Self {
+        use super::rlm::RlmTool;
+        self.with_tool(Arc::new(
+            RlmTool::new("rlm", client).with_root_model(root_model),
+        ))
+    }
+
+    /// Include the persistent, project-scoped continual-harness controller.
+    #[must_use]
+    pub fn with_harness_tool(self) -> Self {
+        use super::harness::HarnessTool;
+        self.with_tool(Arc::new(HarnessTool))
     }
 
     /// Include `handle_read`, the bounded projection reader for symbolic
@@ -881,6 +1109,15 @@ impl ToolRegistryBuilder {
     pub fn with_review_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
         use super::review::ReviewTool;
         self.with_tool(Arc::new(ReviewTool::new(client, model)))
+    }
+
+    /// Include the agent-callable `verify` self-critique tool (#4196). The
+    /// critic runs at elevated reasoning (default `Max`) independent of the
+    /// session tier and is given no tools, so it cannot recurse into `verify`.
+    #[must_use]
+    pub fn with_verify_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+        use super::verify::VerifyTool;
+        self.with_tool(Arc::new(VerifyTool::new(client, model)))
     }
 
     /// Include note tool.
@@ -907,28 +1144,21 @@ impl ToolRegistryBuilder {
         self.with_tool(Arc::new(RememberTool))
     }
 
-    /// Include the slop ledger tools (#2127) — durable tracking of
-    /// unresolved architectural residue: append, query, update, export.
-    /// Registered unconditionally; the ledger JSON file is auto-created
-    /// on first append.
+    /// Include the native-memory retrieval tools alongside reviewed capture.
     #[must_use]
-    pub fn with_slop_ledger_tools(self) -> Self {
-        use crate::slop_ledger::{
-            SlopLedgerAppendTool, SlopLedgerExportTool, SlopLedgerQueryTool, SlopLedgerUpdateTool,
-        };
-        self.with_tool(Arc::new(SlopLedgerAppendTool))
-            .with_tool(Arc::new(SlopLedgerQueryTool))
-            .with_tool(Arc::new(SlopLedgerUpdateTool))
-            .with_tool(Arc::new(SlopLedgerExportTool))
+    pub fn with_native_memory_tools(self) -> Self {
+        use super::native_memory::{MemoryGetTool, MemorySearchTool};
+        self.with_tool(Arc::new(MemorySearchTool))
+            .with_tool(Arc::new(MemoryGetTool))
     }
 
-    /// Read-only subset of slop ledger tools (#2127) for plan mode:
-    /// only query and export — no append or update.
+    /// Include the model-facing LSP intelligence tools. They reuse the
+    /// session [`crate::lsp::LspManager`] attached to `ToolContext` and never
+    /// spawn a second server lifecycle.
     #[must_use]
-    pub fn with_slop_ledger_read_only_tools(self) -> Self {
-        use crate::slop_ledger::{SlopLedgerExportTool, SlopLedgerQueryTool};
-        self.with_tool(Arc::new(SlopLedgerQueryTool))
-            .with_tool(Arc::new(SlopLedgerExportTool))
+    pub fn with_lsp_tool(self) -> Self {
+        use super::lsp::LspTool;
+        self.with_tool(Arc::new(LspTool))
     }
 
     /// Include the `notify` tool — model-callable desktop notification
@@ -985,19 +1215,28 @@ impl ToolRegistryBuilder {
         self
     }
 
-    /// Include all agent tools (file tools + shell + note + search).
-    ///
-    /// Web and patch tools are NOT registered here — callers must add them
-    /// via `.with_web_tools()` and `.with_patch_tools()` after checking
-    /// feature flags (see `tool_setup.rs`). This prevents double-registration
-    /// when `tool_setup.rs` conditionally registers them on top of
-    /// `with_agent_tools`.
+    /// Register the `registry_sync` tool for fetching and caching
+    /// MCP Registry server metadata.
     #[must_use]
-    #[allow(dead_code)] // legacy allow_shell convenience wrapper; used by tests, prod uses with_agent_tools_policy
-    pub fn with_agent_tools(self, allow_shell: bool) -> Self {
-        self.with_agent_tools_policy(crate::worker_profile::ShellPolicy::from_legacy_allow_shell(
-            allow_shell,
-        ))
+    pub fn with_registry_mcp_sync_tool(mut self) -> Self {
+        self.tools
+            .push(Arc::new(super::mcp_registry::McpSyncRegistry::new()));
+        self
+    }
+
+    /// Register the structured Registry launcher. Unlike `start_mcp_server`,
+    /// this accepts no free-form command and can only launch cached,
+    /// zero-environment stdio candidates.
+    #[must_use]
+    pub fn with_registry_mcp_start_tool(
+        mut self,
+        mcp_pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+    ) -> Self {
+        self.tools
+            .push(Arc::new(super::mcp_registry::StartRegistryMcpServer::new(
+                mcp_pool,
+            )));
+        self
     }
 
     /// Include all agent tools under a typed shell policy.
@@ -1008,10 +1247,11 @@ impl ToolRegistryBuilder {
             .with_note_tool()
             .with_search_tools()
             .with_user_input_tool()
-            .with_parallel_tool()
             .with_git_tools()
             .with_git_history_tools()
             .with_diagnostics_tool()
+            .with_tui_help_tool()
+            .with_lsp_tool()
             .with_project_tools()
             .with_skill_tools()
             .with_test_runner_tool()
@@ -1022,12 +1262,15 @@ impl ToolRegistryBuilder {
             .with_revert_turn_tool()
             .with_pandoc_tools()
             .with_image_ocr_tools()
+            .with_read_media_tool()
             .with_finance_tool();
 
-        if shell_policy.allows_shell() {
-            builder.with_shell_tools().with_runtime_task_shell_tools()
-        } else {
-            builder
+        match shell_policy {
+            crate::worker_profile::ShellPolicy::Full => {
+                builder.with_shell_tools().with_runtime_task_shell_tools()
+            }
+            crate::worker_profile::ShellPolicy::ReadOnly => builder.with_read_only_shell_tool(),
+            crate::worker_profile::ShellPolicy::None => builder,
         }
     }
 
@@ -1043,16 +1286,22 @@ impl ToolRegistryBuilder {
         plan_state: super::plan::SharedPlanState,
     ) -> Self {
         let speech_client = client.clone();
+        let vision_client = client.clone();
+        let verify_client = client.clone();
+        let verify_model = model.clone();
         let mut builder = self
             .with_agent_tools_policy(options.shell_policy)
             .with_todo_tool(todo_list)
             .with_plan_tool(plan_state)
             .with_review_tool(client.clone(), model.clone())
-            .with_slop_ledger_tools()
             .with_rlm_tool(client.clone(), model.clone())
+            .with_harness_tool()
             .with_fim_tool(client, model)
             .with_speech_tools(speech_client, options.speech_output_dir.clone());
 
+        if options.verify_tool_enabled {
+            builder = builder.with_verify_tool(verify_client, verify_model);
+        }
         if let Some(goal_state) = options.goal_state {
             builder = builder.with_goal_tools(goal_state);
         }
@@ -1063,47 +1312,13 @@ impl ToolRegistryBuilder {
             builder = builder.with_web_tools();
         }
         if options.memory_tool_enabled {
-            builder = builder.with_remember_tool();
+            builder = builder.with_remember_tool().with_native_memory_tools();
         }
         if let Some(vision_config) = options.vision_config {
-            builder = builder.with_vision_tools(vision_config);
+            builder = builder.with_vision_tools(vision_config, vision_client);
         }
 
         builder.with_notify_tool()
-    }
-
-    /// Legacy convenience wrapper for the full child-inherited Agent surface.
-    ///
-    /// New production callers should prefer [`Self::with_full_agent_surface_options`]
-    /// so feature/config-gated families (web, patch, memory, vision, etc.)
-    /// stay in parity with the parent Agent-mode registry.
-    ///
-    /// `allow_shell` mirrors the session's shell permission. `manager` and
-    /// `runtime` are the sub-agent runtime — children pass through their own
-    /// runtime so grandchildren can spawn within the same depth/cancellation
-    /// envelope.
-    #[must_use]
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_full_agent_surface(
-        self,
-        client: Option<DeepSeekClient>,
-        model: String,
-        manager: super::subagent::SharedSubAgentManager,
-        runtime: super::subagent::SubAgentRuntime,
-        allow_shell: bool,
-        todo_list: super::todo::SharedTodoList,
-        plan_state: super::plan::SharedPlanState,
-    ) -> Self {
-        self.with_full_agent_surface_policy(
-            client,
-            model,
-            manager,
-            runtime,
-            crate::worker_profile::ShellPolicy::from_legacy_allow_shell(allow_shell),
-            todo_list,
-            plan_state,
-        )
     }
 
     /// Include the full child-inherited Agent surface under resolved
@@ -1124,47 +1339,30 @@ impl ToolRegistryBuilder {
             .with_subagent_tools(manager, runtime)
     }
 
-    /// Legacy typed-shell wrapper for the full child-inherited Agent surface.
-    ///
-    /// New production callers should pass resolved [`AgentToolSurfaceOptions`]
-    /// to [`Self::with_full_agent_surface_options`].
-    #[must_use]
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_full_agent_surface_policy(
-        self,
-        client: Option<DeepSeekClient>,
-        model: String,
-        manager: super::subagent::SharedSubAgentManager,
-        runtime: super::subagent::SubAgentRuntime,
-        shell_policy: crate::worker_profile::ShellPolicy,
-        todo_list: super::todo::SharedTodoList,
-        plan_state: super::plan::SharedPlanState,
-    ) -> Self {
-        let mut options = AgentToolSurfaceOptions::new(shell_policy);
-        options.speech_output_dir = runtime.speech_output_dir.clone();
-        self.with_full_agent_surface_options(
-            client, model, manager, runtime, options, todo_list, plan_state,
-        )
-    }
-
-    /// Include the todo / work-progress tools with a shared `TodoList`.
-    ///
-    /// `work_update` is the sole model-visible progress surface (#4132).
-    /// `checklist_*` and `todo_*` remain registered as hidden compat aliases
-    /// so saved transcripts and older prompts still replay.
+    /// Include the canonical work-progress tool with a shared `TodoList`.
+    /// Canonical is `todo_write`; `work_update`/`TodoWrite`/`todo` are hidden
+    /// compat aliases (not model-visible) for saved-transcript replay.
     #[must_use]
     pub fn with_todo_tool(self, todo_list: super::todo::SharedTodoList) -> Self {
-        use super::todo::{TodoAddTool, TodoListTool, TodoUpdateTool, TodoWriteTool};
-        self.with_tool(Arc::new(TodoWriteTool::work_update(todo_list.clone())))
-            .with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoWriteTool::todo(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::todo(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::todo(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::todo(todo_list.clone())))
+        use super::todo::TodoWriteTool;
+        self.with_tool(Arc::new(TodoWriteTool::new(todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::alias(
+                "work_update",
+                todo_list.clone(),
+            )))
+            .with_tool(Arc::new(TodoWriteTool::alias(
+                "TodoWrite",
+                todo_list.clone(),
+            )))
+            .with_tool(Arc::new(TodoWriteTool::alias("todo", todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::alias(
+                "checklist_write",
+                todo_list.clone(),
+            )))
+            .with_tool(Arc::new(TodoWriteTool::alias(
+                "checklist_update",
+                todo_list,
+            )))
     }
 
     /// Include the plan tool with a shared `PlanState`.
@@ -1246,11 +1444,21 @@ fn to_snake_case(s: &str) -> String {
 
 /// Adapter that wraps an MCP tool definition so it can live in the
 /// unified `ToolRegistry` alongside native tools (§5.B).
-#[allow(dead_code)]
 struct McpToolAdapter {
     name: String,
     tool: crate::mcp::McpTool,
     pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+}
+
+fn is_mcp_read_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "list_mcp_resources"
+            | "list_mcp_resource_templates"
+            | "mcp_read_resource"
+            | "read_mcp_resource"
+            | "mcp_get_prompt"
+    )
 }
 
 #[async_trait::async_trait]
@@ -1272,666 +1480,139 @@ impl ToolSpec for McpToolAdapter {
     fn capabilities(&self) -> Vec<ToolCapability> {
         // Conservatively treat MCP tools as requiring approval and
         // network access unless they're known discovery helpers.
-        let name_lower = self.name.to_lowercase();
-        if name_lower.contains("list_mcp")
-            || name_lower.contains("read_mcp")
-            || name_lower.contains("mcp_read")
-            || name_lower.contains("mcp_get_prompt")
-        {
+        if is_mcp_read_helper(&self.name) {
             vec![ToolCapability::ReadOnly]
         } else {
             vec![ToolCapability::Network, ToolCapability::RequiresApproval]
         }
     }
 
-    fn defer_loading(&self) -> bool {
-        // Discovery helpers stay loaded; everything else is deferred.
-        let keep_loaded = matches!(
-            self.name.as_str(),
-            "list_mcp_resources"
-                | "list_mcp_resource_templates"
-                | "mcp_read_resource"
-                | "read_mcp_resource"
-                | "mcp_get_prompt"
-        );
-        !keep_loaded
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        if is_mcp_read_helper(&self.name) {
+            ApprovalRequirement::Auto
+        } else {
+            ApprovalRequirement::Required
+        }
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    fn defer_loading(&self) -> bool {
+        // Discovery helpers stay loaded; everything else is deferred.
+        !is_mcp_read_helper(&self.name)
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        self.execute_rich(input, context)
+            .await
+            .map(RichToolResult::into_result)
+    }
+
+    async fn execute_rich(
+        &self,
+        input: Value,
+        _context: &ToolContext,
+    ) -> Result<RichToolResult, ToolError> {
         let mut pool = self.pool.lock().await;
         let result = pool
             .call_tool(&self.name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
-        Ok(ToolResult::success(content))
+        Ok(mcp_result_to_bounded_rich_tool_result(result))
     }
+}
+
+const MCP_IMAGE_TEXT_PLACEHOLDER: &str = "[MCP image payload removed from text output]";
+
+/// Map an MCP `tools/call` result to the provider-neutral rich result used by
+/// native tools. Image payloads travel as typed blocks instead of being
+/// duplicated into the JSON text as multi-megabyte base64 strings.
+///
+/// MCP servers signal tool failure with `isError: true` on an otherwise
+/// successful JSON-RPC response. Error results keep their text payload
+/// verbatim so the model still sees the server's message (#5123-class).
+fn mcp_result_to_rich_tool_result(mut result: Value) -> RichToolResult {
+    let mut content_blocks = Vec::new();
+    if let Some(items) = result.get_mut("content").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            if object.get("type").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+
+            let mime_type = object
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let data = object.remove("data");
+            if data.is_some() {
+                object.insert(
+                    "data".to_string(),
+                    Value::String(MCP_IMAGE_TEXT_PLACEHOLDER.to_string()),
+                );
+            }
+            // Keep malformed image entries in the typed stream with empty
+            // fields so the shared rich-result boundary rejects them and
+            // emits the same visible omission receipt as invalid base64,
+            // unsupported MIME types, oversized images, and extra images.
+            // Dropping them here would silently remove the payload before the
+            // boundary had anything to count.
+            let (mime_type, data) = match (mime_type, data) {
+                (Some(mime_type), Some(Value::String(data))) => (mime_type, data),
+                _ => (String::new(), String::new()),
+            };
+            content_blocks.push(ToolResultContentBlock::Image { mime_type, data });
+        }
+    }
+
+    let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result = if is_error {
+        let text = result
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or(content);
+        ToolResult::error(text)
+    } else {
+        ToolResult::success(content)
+    };
+    RichToolResult::with_content_blocks(result, content_blocks)
+}
+
+/// Convert and bound an MCP result at the shared direct/parallel execution
+/// seam. The registry applies the same boundary to every rich tool; keeping it
+/// here too protects the engine's MCP fast path and text-only adapter callers.
+pub(crate) fn mcp_result_to_bounded_rich_tool_result(result: Value) -> RichToolResult {
+    crate::image_attach::bound_rich_tool_result(mcp_result_to_rich_tool_result(result))
+}
+
+#[cfg(test)]
+pub(super) fn mcp_tool_adapter_for_test(name: &str) -> Arc<dyn ToolSpec> {
+    Arc::new(McpToolAdapter {
+        name: name.to_string(),
+        tool: crate::mcp::McpTool {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        },
+        pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
+            crate::mcp::McpConfig::default(),
+        ))),
+    })
 }
 
 // === Unit Tests ===
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use serde_json::{Value, json};
-    use tempfile::tempdir;
-
-    use crate::config::ToolOverride;
-    use crate::tools::ToolRegistryBuilder;
-    use crate::tools::spec::{
-        ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
-    };
-
-    use super::ToolRegistry;
-
-    /// A simple test tool for unit testing
-    struct TestTool {
-        name: String,
-        description: String,
-    }
-
-    #[async_trait::async_trait]
-    impl ToolSpec for TestTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            &self.description
-        }
-
-        fn input_schema(&self) -> Value {
-            json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string" }
-                },
-                "required": ["message"]
-            })
-        }
-
-        fn capabilities(&self) -> Vec<ToolCapability> {
-            vec![ToolCapability::ReadOnly]
-        }
-
-        async fn execute(
-            &self,
-            input: Value,
-            _context: &ToolContext,
-        ) -> Result<ToolResult, ToolError> {
-            let message = required_str(&input, "message")?;
-            Ok(ToolResult::success(format!("Echo: {message}")))
-        }
-    }
-
-    fn make_test_tool(name: &str) -> Arc<TestTool> {
-        Arc::new(TestTool {
-            name: name.to_string(),
-            description: "A test tool".to_string(),
-        })
-    }
-
-    #[test]
-    fn test_registry_register_and_get() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        let tool = make_test_tool("test_tool");
-        registry.register(tool);
-
-        assert!(registry.contains("test_tool"));
-        assert!(!registry.contains("nonexistent"));
-        assert_eq!(registry.len(), 1);
-    }
-
-    #[test]
-    fn resolve_exact_match_is_ascii_case_insensitive() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("read_file"));
-
-        assert_eq!(registry.resolve("READ_FILE"), Some("read_file"));
-    }
-
-    #[test]
-    fn todo_aliases_stay_callable_but_hidden_from_model_catalog() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let registry = ToolRegistryBuilder::new()
-            .with_todo_tool(crate::tools::todo::new_shared_todo_list())
-            .build(ctx);
-
-        // Canonical + legacy spellings stay callable for replay.
-        for name in [
-            "work_update",
-            "checklist_write",
-            "checklist_add",
-            "checklist_update",
-            "checklist_list",
-            "todo_write",
-            "todo_add",
-            "todo_update",
-            "todo_list",
-        ] {
-            assert!(registry.contains(name), "{name} should remain callable");
-        }
-
-        let api_names = registry
-            .to_api_tools()
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-
-        assert!(
-            api_names.iter().any(|name| name == "work_update"),
-            "work_update should be the sole model-visible progress surface"
-        );
-        for hidden in [
-            "checklist_write",
-            "checklist_add",
-            "checklist_update",
-            "checklist_list",
-            "todo_write",
-            "todo_add",
-            "todo_update",
-            "todo_list",
-        ] {
-            assert!(
-                api_names.iter().all(|name| name != hidden),
-                "{hidden} should be hidden from the model catalog"
-            );
-        }
-    }
-
-    #[test]
-    fn apply_overrides_removes_original_when_replacement_is_missing() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistryBuilder::new()
-            .with_read_only_file_tools()
-            .build(ctx);
-
-        assert!(registry.contains("read_file"));
-        assert!(registry.contains("list_dir"));
-
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            "read_file".to_string(),
-            ToolOverride::Script {
-                path: "missing-wrapper.sh".to_string(),
-                args: None,
-            },
-        );
-
-        registry.apply_overrides(&overrides, tmp.path());
-
-        assert!(!registry.contains("read_file"));
-        assert!(registry.contains("list_dir"));
-    }
-
-    #[test]
-    fn builder_registers_speech_alias_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let registry = ToolRegistryBuilder::new()
-            .with_speech_tools(None, None)
-            .build(ctx);
-
-        assert!(registry.contains("speech"));
-        assert!(registry.contains("tts"));
-    }
-
-    #[test]
-    fn test_registry_names() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("tool_a"));
-        registry.register(make_test_tool("tool_b"));
-
-        let names = registry.names();
-        assert_eq!(names.len(), 2);
-        assert!(names.contains(&"tool_a"));
-        assert!(names.contains(&"tool_b"));
-    }
-
-    #[test]
-    fn test_registry_to_api_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("my_tool"));
-
-        let api_tools = registry.to_api_tools();
-        assert_eq!(api_tools.len(), 1);
-        assert_eq!(api_tools[0].name, "my_tool");
-        assert_eq!(api_tools[0].description, "A test tool");
-    }
-
-    #[test]
-    fn api_tools_with_cache_marks_last_tool_ephemeral() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("tool_a"));
-        registry.register(make_test_tool("tool_b"));
-
-        let api_tools = registry.to_api_tools_with_cache(true);
-        assert_eq!(api_tools.len(), 2);
-        assert!(api_tools[0].cache_control.is_none());
-        assert_eq!(
-            api_tools[1]
-                .cache_control
-                .as_ref()
-                .map(|c| c.cache_type.as_str()),
-            Some("ephemeral")
-        );
-    }
-
-    /// Tool whose `description()` advances through a script of pre-built
-    /// strings, one per call. Used to demonstrate that the api-tools cache
-    /// pins the description bytes on first read instead of re-sampling them
-    /// each turn (#263 follow-up; mirrors reference-cc's `getToolSchemaCache`).
-    struct VaryingDescriptionTool {
-        name: String,
-        descriptions: Vec<String>,
-        next: std::sync::atomic::AtomicUsize,
-    }
-
-    impl VaryingDescriptionTool {
-        fn new(name: &str, descriptions: &[&str]) -> Self {
-            Self {
-                name: name.to_string(),
-                descriptions: descriptions.iter().map(|s| (*s).to_string()).collect(),
-                next: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ToolSpec for VaryingDescriptionTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            let idx = self
-                .next
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                .min(self.descriptions.len() - 1);
-            &self.descriptions[idx]
-        }
-
-        fn input_schema(&self) -> Value {
-            json!({"type": "object", "properties": {}, "required": []})
-        }
-
-        fn capabilities(&self) -> Vec<ToolCapability> {
-            vec![ToolCapability::ReadOnly]
-        }
-
-        async fn execute(
-            &self,
-            _input: Value,
-            _context: &ToolContext,
-        ) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult::success("ok".to_string()))
-        }
-    }
-
-    #[test]
-    fn to_api_tools_pins_description_bytes_across_calls() {
-        // Regression for the cache-stability follow-up: an MCP adapter that
-        // returns a different `description()` on reconnect (or any other
-        // tool whose description isn't a `&'static str`) would otherwise
-        // rewrite the catalog bytes mid-session and miss the prefix cache.
-        // The registry pins the first call's value until it's mutated.
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-        registry.register(Arc::new(VaryingDescriptionTool::new(
-            "varying",
-            &["first description", "second description"],
-        )));
-
-        let first = registry.to_api_tools();
-        let second = registry.to_api_tools();
-
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].description, "first description");
-        assert_eq!(
-            first, second,
-            "api-tools catalog must be byte-identical across reads with no mutation in between"
-        );
-    }
-
-    #[test]
-    fn register_invalidates_api_tools_cache() {
-        // Counter-test: when a real change happens (a new tool registers,
-        // an existing one is removed, or `clear` is called), the cache must
-        // be discarded so the next read reflects the live registry.
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-        registry.register(Arc::new(VaryingDescriptionTool::new(
-            "varying",
-            &["first description", "second description"],
-        )));
-
-        let before = registry.to_api_tools();
-        assert_eq!(before.len(), 1);
-
-        registry.register(make_test_tool("late_arrival"));
-
-        let after = registry.to_api_tools();
-        assert_eq!(after.len(), 2, "cache must rebuild after register");
-        assert!(after.iter().any(|t| t.name == "varying"));
-        assert!(after.iter().any(|t| t.name == "late_arrival"));
-        // The varying tool's description advances on cache rebuild — the
-        // first read above sampled `first description`; this rebuild samples
-        // `second description`. The point is just that the bytes *can*
-        // change after a real mutation, not that they always do.
-        let varying_after = after
-            .iter()
-            .find(|t| t.name == "varying")
-            .expect("varying tool present");
-        assert_eq!(varying_after.description, "second description");
-    }
-
-    #[test]
-    fn remove_and_clear_invalidate_api_tools_cache() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-        registry.register(make_test_tool("alpha"));
-        registry.register(make_test_tool("beta"));
-
-        let before = registry.to_api_tools();
-        assert_eq!(before.len(), 2);
-
-        let _ = registry.remove("alpha");
-        let after_remove = registry.to_api_tools();
-        assert_eq!(after_remove.len(), 1);
-        assert_eq!(after_remove[0].name, "beta");
-
-        registry.clear();
-        let after_clear = registry.to_api_tools();
-        assert!(after_clear.is_empty(), "cache must clear with the registry");
-    }
-
-    #[test]
-    fn to_api_tools_emits_alphabetical_order_regardless_of_registration_order() {
-        // Regression for #263: HashMap iteration is non-deterministic across
-        // process launches, which busts DeepSeek's KV prefix cache for every
-        // cross-session resume. `to_api_tools` must emit by name regardless
-        // of registration order so two consecutive calls (and two distinct
-        // launches) produce byte-identical output.
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let order_a = {
-            let mut registry = ToolRegistry::new(ctx.clone());
-            registry.register(make_test_tool("zebra"));
-            registry.register(make_test_tool("alpha"));
-            registry.register(make_test_tool("mango"));
-            registry
-                .to_api_tools()
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>()
-        };
-
-        let order_b = {
-            let mut registry = ToolRegistry::new(ctx.clone());
-            registry.register(make_test_tool("alpha"));
-            registry.register(make_test_tool("mango"));
-            registry.register(make_test_tool("zebra"));
-            registry
-                .to_api_tools()
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(order_a, vec!["alpha", "mango", "zebra"]);
-        assert_eq!(order_a, order_b);
-    }
-
-    #[test]
-    fn test_registry_remove() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("removable"));
-        assert!(registry.contains("removable"));
-
-        let _ = registry.remove("removable");
-        assert!(!registry.contains("removable"));
-    }
-
-    #[test]
-    fn test_registry_clear() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("tool1"));
-        registry.register(make_test_tool("tool2"));
-        assert_eq!(registry.len(), 2);
-
-        registry.clear();
-        assert!(registry.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_registry_execute() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("echo"));
-
-        let result = registry
-            .execute("echo", json!({"message": "hello"}))
-            .await
-            .expect("execute");
-
-        assert_eq!(result, "Echo: hello");
-    }
-
-    #[tokio::test]
-    async fn test_registry_execute_unknown_tool() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let registry = ToolRegistry::new(ctx);
-
-        let result = registry.execute("nonexistent", json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_builder_basic() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new()
-            .with_tool(make_test_tool("custom"))
-            .build(ctx);
-
-        assert!(registry.contains("custom"));
-    }
-
-    #[test]
-    fn test_filter_by_capability() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("readonly_tool"));
-
-        let readonly = registry.filter_by_capability(ToolCapability::ReadOnly);
-        assert_eq!(readonly.len(), 1);
-
-        let writes = registry.filter_by_capability(ToolCapability::WritesFiles);
-        assert_eq!(writes.len(), 0);
-    }
-
-    #[test]
-    fn test_read_only_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let mut registry = ToolRegistry::new(ctx);
-
-        registry.register(make_test_tool("reader"));
-
-        let readonly = registry.read_only_tools();
-        assert_eq!(readonly.len(), 1);
-        assert_eq!(readonly[0].name(), "reader");
-    }
-
-    #[test]
-    fn test_builder_with_web_tools_no_longer_includes_finance() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new().with_web_tools().build(ctx);
-
-        // finance was moved to with_finance_tool() in v0.8.49;
-        // with_web_tools() registers web search/fetch plus local dev-server readiness.
-        assert!(registry.contains("web_search"));
-        assert!(registry.contains("fetch_url"));
-        assert!(registry.contains("wait_for_dev_server"));
-        assert!(registry.contains("web.run"));
-        assert!(!registry.contains("finance"));
-    }
-
-    #[test]
-    fn test_builder_with_finance_tool() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new().with_finance_tool().build(ctx);
-
-        assert!(registry.contains("finance"));
-    }
-
-    #[test]
-    fn test_builder_with_agent_tools_includes_finance() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new()
-            .with_agent_tools(false)
-            .build(ctx);
-
-        assert!(registry.contains("finance"));
-    }
-
-    #[test]
-    fn agent_tools_with_allow_shell_false_excludes_shell_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new()
-            .with_agent_tools(false)
-            .build(ctx);
-
-        assert!(
-            !registry.contains("exec_shell"),
-            "exec_shell should be excluded when allow_shell is false"
-        );
-        assert!(
-            !registry.contains("task_shell_start"),
-            "task_shell_start should be excluded when allow_shell is false"
-        );
-        assert!(
-            !registry.contains("task_shell_wait"),
-            "task_shell_wait should be excluded when allow_shell is false"
-        );
-    }
-
-    #[test]
-    fn agent_tools_with_shell_policy_readonly_includes_shell_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new()
-            .with_agent_tools_policy(crate::worker_profile::ShellPolicy::ReadOnly)
-            .build(ctx);
-
-        assert!(
-            registry.contains("exec_shell"),
-            "read-only shell policy should expose shell tools; execution enforces mutating-command denial"
-        );
-        assert!(registry.contains("task_shell_start"));
-        assert!(registry.contains("task_shell_wait"));
-    }
-
-    #[test]
-    fn agent_tools_with_allow_shell_true_includes_shell_tools() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-
-        let registry = ToolRegistryBuilder::new().with_agent_tools(true).build(ctx);
-
-        assert!(
-            registry.contains("exec_shell"),
-            "exec_shell should be included when allow_shell is true"
-        );
-        assert!(
-            registry.contains("task_shell_start"),
-            "task_shell_start should be included when allow_shell is true"
-        );
-        assert!(
-            registry.contains("task_shell_wait"),
-            "task_shell_wait should be included when allow_shell is true"
-        );
-    }
-
-    /// #2683 — `exec_wait` and `exec_interact` are legacy aliases for
-    /// `exec_shell_wait` and `exec_shell_interact`. They must remain
-    /// callable (for saved transcript replay) but hidden from the
-    /// model-facing catalog.
-    #[test]
-    fn shell_alias_tools_hidden_from_model_catalog() {
-        let tmp = tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let registry = ToolRegistryBuilder::new().with_shell_tools().build(ctx);
-
-        // Legacy aliases stay callable.
-        for alias in ["exec_wait", "exec_interact"] {
-            assert!(registry.contains(alias), "{alias} should remain callable");
-        }
-
-        let api_names: Vec<String> = registry
-            .to_api_tools()
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
-
-        // Canonical names are model-visible.
-        for canonical in ["exec_shell_wait", "exec_shell_interact"] {
-            assert!(
-                api_names.iter().any(|n| n == canonical),
-                "{canonical} should be model-visible"
-            );
-        }
-
-        // Legacy aliases are hidden.
-        for alias in ["exec_wait", "exec_interact"] {
-            assert!(
-                api_names.iter().all(|n| n != alias),
-                "{alias} should be hidden from the model catalog"
-            );
-        }
-    }
-}
+mod tests;

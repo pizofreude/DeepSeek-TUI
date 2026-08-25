@@ -1,8 +1,10 @@
 # Workflow Authoring
 
-> **Ordinary multi-agent work does not require this file.** Prefer natural
-> language + soft-auto launch: CodeWhale decides, indicates the plan, and may
-> ask setup questions via the TUI modal. See
+> **Ordinary multi-agent work does not require this file.** In Operate, send
+> normal messages; Codewhale can work directly or prefer background workers
+> when parallelism, isolation, or duration makes delegation useful. Use Workflow
+> when ordered phases, gates, shared budgets, replay, or deterministic fan-in
+> matter; Act/Agent may also use optional soft-auto launch. See
 > [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
 
 Workflow has one runtime boundary: authored source lowers to typed
@@ -87,6 +89,12 @@ roster profile. The name is trimmed and lowercased at compile time and must be
 a single token (no whitespace, quotes, or `=`); the saved roster is resolved at
 dispatch time, and explicit fields on the agent override profile defaults.
 
+The runtime `task()` surface also accepts `cwd` for an existing repository-
+relative working directory. This is required when a workflow is launched from
+a multi-repository workspace and the child needs shell or file access. `cwd`
+is validated by the host, does not grant mutation authority, and should be
+paired with `worktree: true` when the child needs an isolated checkout.
+
 The compiler rejects effectful constructs such as `import`, `require`, `fetch`,
 `process`, `Deno`, `Bun`, `child_process`, file reads/writes, `eval`, `async`,
 and `await`. This is intentionally stricter than JavaScript: workflow source is
@@ -106,22 +114,42 @@ Workflow source, show the plan for the current permission mode, and then let
 the runtime compile and monitor it.
 
 Workflow owns the plan: phases, branches, loops, reducers, and intermediate
-results. Fleet owns the durable sub-agent configuration: slots, profiles,
-models, tool posture, launch concurrency, leases, heartbeats, logs, receipts,
-and resume/stop/restart controls. In other words, a workflow can choose and
-monitor Fleet slots, but it must not become a second executor with its own shell
-or filesystem authority.
+results. Fleet owns the durable roster, member identity, semantic role, and
+saved provider/model pins or inheritance. Runtime owns tool posture, launch
+concurrency, leases, heartbeats, logs, receipts, and resume/stop/restart
+controls. In other words, a workflow can select Fleet members and monitor their
+Runtime runs, but it must not become a second executor with its own shell or
+filesystem authority.
 
-Fleet launch validation applies a conservative default shape before any
-Workflow IR is lowered to workers:
+Workflow-to-Runtime launch validation applies a conservative default shape
+before any Workflow IR is lowered to selected workers:
 
-- up to 100 total worker agents per workflow run;
-- up to 5 recursive Fleet rings;
+- up to 1,000 total worker agents per Workflow run;
+- up to 16 live worker agents at once; larger populations queue (block) on the
+  host's per-run concurrency gate until a live slot frees, then select through
+  Fleet and execute through Runtime;
+- Workflow IR structural nesting no deeper than 5;
+- Runtime child delegation defaults to 3 levels and has an opt-in hard ceiling
+  of 8; that execution budget is independent of Workflow IR shape;
 - loops require `max_iterations`;
 - dynamic `expand` nodes require `max_children` and a template.
 
-Those limits bound the workflow population, not instantaneous launch
-concurrency. A valid 100-agent workflow can still drain through a smaller Fleet
-worker pool. Model selection stays per slot: a DeepSeek preset can suggest
+Those limits distinguish population from instantaneous launch concurrency. A
+valid 1,000-agent Workflow can still drain through a smaller Runtime worker
+pool. Model selection stays per member: a DeepSeek preset can suggest
 `deepseek-v4-pro` for the orchestrator and `deepseek-v4-flash` for nearby
 workers, but users and agents may override any slot when the task calls for it.
+
+## Experimental search is a Workflow option
+
+Experimental search generalizes the existing best-of-N recipe without adding a
+new product mode, scheduler, or sub-agent API. A provider-neutral
+`WorkflowSearchSpec` freezes the objective, baseline, model request and resolved
+version, public evidence, evaluator hash, hard gates, scoring rule, budgets,
+write scope, rounds, and review-only integration policy before admission.
+
+The current JS starter supports structured generation and read-only review with
+`strategy: "search"`. Runtime-owned command gates, hidden evaluation, benchmark
+scoring, and clean-baseline replay are an explicit host seam still to wire; a
+candidate's self-verdict must never be promoted into evaluator truth. See
+[Workflow Experimental Search](WORKFLOW_EXPERIMENTAL_SEARCH.md).

@@ -31,6 +31,10 @@ impl ToolSpec for GitStatusTool {
         "git_status"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run `git status --porcelain=v1 -b` in the workspace (optionally scoped to a path)."
     }
@@ -61,7 +65,7 @@ impl ToolSpec for GitStatusTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
+        let git_ctx = resolve_git_context(context, optional_str(&input, "path")?)?;
 
         let mut args = vec![
             "-c".to_string(),
@@ -112,6 +116,10 @@ impl ToolSpec for GitDiffTool {
         "git_diff"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run `git diff` in the workspace with sensible defaults and safe truncation."
     }
@@ -153,9 +161,9 @@ impl ToolSpec for GitDiffTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
-        let cached = optional_bool(&input, "cached", false);
-        let unified = optional_u64(&input, "unified", DEFAULT_UNIFIED).min(MAX_UNIFIED);
+        let git_ctx = resolve_git_context(context, optional_str(&input, "path")?)?;
+        let cached = optional_bool(&input, "cached", false)?;
+        let unified = optional_u64(&input, "unified", DEFAULT_UNIFIED)?.min(MAX_UNIFIED);
 
         let mut args = vec![
             "-c".to_string(),

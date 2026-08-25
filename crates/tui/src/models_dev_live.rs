@@ -5,7 +5,7 @@
 //! - fetches `https://models.dev/catalog.json` in the background with a bounded
 //!   timeout and explicit user-agent (no credentials),
 //! - writes the cache atomically via temp file + rename,
-//! - compiles parsed rows into [`CatalogOffering`]s and publishes them into
+//! - compiles parsed rows into `CatalogOffering`s and publishes them into
 //!   [`crate::provider_lake`],
 //! - falls back to the prior cache or the bundled snapshot on any failure.
 //!
@@ -85,7 +85,7 @@ struct PersistedModelsDevCache {
     schema_version: u32,
     /// Unix seconds the payload was fetched (or loaded from an override path).
     fetched_at: u64,
-    /// Fingerprint of the source URL/path used for [`CatalogSource::Live`].
+    /// Fingerprint of the source URL/path used for `CatalogSource::Live`.
     source_fingerprint: String,
     /// Human-readable source label (URL or `file:…`); never a secret.
     source_label: String,
@@ -118,8 +118,25 @@ impl std::fmt::Display for ModelsDevRefreshError {
 }
 
 /// Resolve the on-disk cache path under the CodeWhale `catalog` state dir.
+///
+/// Under `cfg(test)` this is confined the same way settings and config paths
+/// are: `resolve_state_dir` lives in `codewhale-config`, which is compiled as a
+/// plain dependency here and so has no view of this crate's isolated test root.
+/// Without this shield a test that never asked for the developer's catalog read
+/// their real `~/.codewhale/catalog` and rendered against whatever models they
+/// last fetched (#5359).
 #[must_use]
 pub fn cache_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if !crate::test_support::guarded_environment_provides_state_paths() {
+            return Some(
+                crate::test_support::unsealed_test_state_root()
+                    .join("catalog")
+                    .join(CACHE_FILE),
+            );
+        }
+    }
     codewhale_config::resolve_state_dir("catalog")
         .ok()
         .map(|dir| dir.join(CACHE_FILE))
@@ -361,7 +378,10 @@ fn publish_from_body(
         return Err(err);
     }
     let count = offerings.len();
-    crate::provider_lake::set_live_snapshot(CatalogSnapshot { offerings });
+    crate::provider_lake::set_live_snapshot(
+        CatalogSnapshot { offerings },
+        crate::provider_lake::LiveSource::ModelsDev,
+    );
     set_status(ModelsDevStatus {
         freshness,
         offering_count: count,
@@ -460,6 +480,41 @@ mod tests {
         }
       }
     }"#;
+
+    /// An unguarded test must not resolve the developer's catalog cache.
+    ///
+    /// `resolve_state_dir` lives in `codewhale-config`, which is a plain
+    /// dependency here and cannot see this crate's isolated test root, so this
+    /// path had no equivalent of the settings confinement (#5359). A picker
+    /// test then rendered against whatever models the developer last fetched.
+    #[test]
+    fn unguarded_cache_path_stays_inside_the_isolated_test_root() {
+        let path = cache_path().expect("cache path");
+        let isolated = crate::test_support::isolated_test_state_root();
+        assert!(
+            path.starts_with(isolated),
+            "catalog cache escaped the isolated test root: {}",
+            path.display()
+        );
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(CACHE_FILE));
+    }
+
+    /// A test that does seal the environment still resolves it, so the
+    /// confinement above cannot silently break the guarded callers.
+    #[test]
+    fn guarded_cache_path_follows_the_sealed_home() {
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+
+        let path = cache_path().expect("cache path");
+
+        assert!(
+            path.starts_with(home.path()),
+            "sealed CODEWHALE_HOME was ignored: {}",
+            path.display()
+        );
+    }
 
     #[test]
     fn resolve_catalog_url_defaults_and_overrides() {

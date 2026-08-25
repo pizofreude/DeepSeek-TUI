@@ -4,6 +4,7 @@
 release_crates=(
   codewhale-build-support
   codewhale-mcp
+  codewhale-paths
   codewhale-protocol
   codewhale-release
   codewhale-secrets
@@ -14,10 +15,15 @@ release_crates=(
   codewhale-hooks
   codewhale-tools
   codewhale-config
+  # Path+version dependency of cli/tui — must publish before those crates.
+  codewhale-telemetry
   codewhale-lane
   codewhale-agent
-  codewhale-tui
   codewhale-core
+  # Prototype command boundary depends on core; future TUI/commands adapters
+  # consume it without changing current production dispatch in FEAT-014.
+  codewhale-command-contract
+  codewhale-tui
   codewhale-app-server
   codewhale-cli
 )

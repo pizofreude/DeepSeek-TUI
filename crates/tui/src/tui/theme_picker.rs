@@ -19,13 +19,14 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette::{SELECTABLE_THEMES, ThemeId, UiTheme};
+use crate::tui::menu_style;
 use crate::tui::settings_picker::{
     PickerNavResult, SettingAvailability, SettingOption, SettingValues, SettingsPickerController,
     SettingsPickerLayout, handle_nav_key,
@@ -44,6 +45,10 @@ pub struct ThemePickerView {
     /// Effective session treatment, reported separately from theme so the
     /// picker never claims an ombre is active under Terminal or Flat.
     ocean_treatment: crate::tui::ocean::OceanTreatment,
+    /// User-configured background applied on top of every named-theme preview.
+    /// Without carrying this into the picker, a customized Solarized Light
+    /// session would render ombre behind the modal but report Flat inside it.
+    background_override: Option<Color>,
     row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     last_mouse_selected: Option<usize>,
     /// UI locale captured from the app at construction (#4057 wave 2).
@@ -60,7 +65,7 @@ fn theme_options(original_name: &str) -> Vec<SettingOption> {
             SettingOption::builder(name, id.display_name())
                 .summary(id.tagline())
                 .detail(id.tagline())
-                .help("Pick a theme — preview is live; Enter saves to settings.toml.")
+                .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
                     Cow::Borrowed("system"),
@@ -85,11 +90,21 @@ impl ThemePickerView {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn new_with_treatment(
         original_name: String,
         ocean_treatment: crate::tui::ocean::OceanTreatment,
         locale: Locale,
+    ) -> Self {
+        Self::new_with_treatment_and_background(original_name, ocean_treatment, locale, None)
+    }
+
+    fn new_with_treatment_and_background(
+        original_name: String,
+        ocean_treatment: crate::tui::ocean::OceanTreatment,
+        locale: Locale,
+        background_override: Option<Color>,
     ) -> Self {
         let options = theme_options(&original_name);
         let mut controller = SettingsPickerController::new(options, original_name.clone());
@@ -105,6 +120,7 @@ impl ThemePickerView {
             controller,
             system_ui_theme: UiTheme::detect(),
             ocean_treatment,
+            background_override,
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
             locale,
@@ -119,11 +135,13 @@ impl ThemePickerView {
         original_name: String,
         ocean_treatment: crate::tui::ocean::OceanTreatment,
         locale: Locale,
+        background_override: Option<Color>,
     ) -> Box<dyn ModalView> {
-        Box::new(Self::new_with_treatment(
+        Box::new(Self::new_with_treatment_and_background(
             original_name,
             ocean_treatment,
             locale,
+            background_override,
         ))
     }
 
@@ -147,11 +165,13 @@ impl ThemePickerView {
     /// Resolve a theme to a `UiTheme`, returning the cached `System`
     /// resolution to avoid repeated env-var reads inside `render`.
     fn ui_theme_for(&self, id: ThemeId) -> UiTheme {
-        if matches!(id, ThemeId::System) {
+        let theme = if matches!(id, ThemeId::System) {
             self.system_ui_theme
         } else {
             id.ui_theme()
-        }
+        };
+        self.background_override
+            .map_or(theme, |background| theme.with_background_color(background))
     }
 
     fn preview_event(&self) -> ViewAction {
@@ -272,16 +292,12 @@ impl ModalView for ThemePickerView {
         // Theme rows prefer list-when-narrow; layout still drives scroll math.
         let _layout = SettingsPickerLayout::resolve(content, 34, self.controller.selected_option());
 
-        let mut lines: Vec<Line> = Vec::with_capacity(SELECTABLE_THEMES.len() + 5);
-        lines.push(Line::from(Span::styled(
-            "Pick a theme — preview is live; Enter saves to settings.toml.",
-            Style::default().fg(live.text_muted),
-        )));
-        lines.push(Line::from(""));
-
+        let mut lines: Vec<Line> = Vec::with_capacity(SELECTABLE_THEMES.len() + 3);
         let treatment = if matches!(self.current(), ThemeId::Terminal) {
             tr(self.locale, MessageId::ThemeTreatmentOmbreUnavailable)
-        } else if self.ocean_treatment.is_flat() {
+        } else if self.ocean_treatment.is_flat()
+            || crate::tui::ocean::OceanRamp::for_theme(&live).is_none()
+        {
             tr(self.locale, MessageId::ThemeTreatmentFlatActive)
         } else {
             tr(self.locale, MessageId::ThemeTreatmentOmbreActive)
@@ -329,10 +345,7 @@ impl ModalView for ThemePickerView {
                 .unwrap_or(ThemeId::System);
             let is_selected = visible_idx == selected_visible;
             let row_style = if is_selected {
-                Style::default()
-                    .fg(live.text_body)
-                    .bg(live.selection_bg)
-                    .add_modifier(Modifier::BOLD)
+                menu_style::theme_selected_row_style(&live)
             } else {
                 Style::default().fg(live.text_body)
             };
@@ -349,7 +362,7 @@ impl ModalView for ThemePickerView {
             } else {
                 Style::default().fg(live.text_hint)
             };
-            let pointer = if is_selected { "▶" } else { " " };
+            let pointer = crate::tui::glyphs::selection_marker(is_selected);
 
             // 3-cell color swatch per row using the candidate theme's own
             // accent + panel + border colors so the picker doubles as a
@@ -587,6 +600,37 @@ mod tests {
             .collect::<String>();
         assert!(terminal_text.contains("Ombre unavailable"));
         assert!(terminal_text.contains("Terminal owns the background"));
+
+        let solarized = ThemePickerView::new_with_treatment(
+            "solarized-light".to_string(),
+            crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
+        );
+        let mut solarized_buf = ratatui::buffer::Buffer::empty(area);
+        solarized.render(area, &mut solarized_buf);
+        let solarized_text = solarized_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(solarized_text.contains("Treatment  Flat — active"));
+        assert!(!solarized_text.contains("Treatment  Ombre — active"));
+
+        let solarized_custom = ThemePickerView::new_with_treatment_and_background(
+            "solarized-light".to_string(),
+            crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
+            Some(Color::Rgb(0x1a, 0x1b, 0x26)),
+        );
+        let mut solarized_custom_buf = ratatui::buffer::Buffer::empty(area);
+        solarized_custom.render(area, &mut solarized_custom_buf);
+        let solarized_custom_text = solarized_custom_buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(solarized_custom_text.contains("Treatment  Ombre — active"));
+        assert!(!solarized_custom_text.contains("Treatment  Flat — active"));
     }
 
     #[test]

@@ -242,6 +242,10 @@ impl ToolSpec for RunVerifiersTool {
         "run_verifiers"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run independent verifier gates in parallel across detected Rust, Node, Python, and Go projects. Supports explicit custom verifier commands as program+args without requiring Bash."
     }
@@ -286,7 +290,6 @@ impl ToolSpec for RunVerifiersTool {
                             "args": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "default": [],
                                 "description": "Arguments passed directly to the executable."
                             },
                             "cwd": {
@@ -297,12 +300,11 @@ impl ToolSpec for RunVerifiersTool {
                         "required": ["name", "program"],
                         "additionalProperties": false
                     },
-                    "default": []
                 },
                 "background": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates; completion is tracked in task/status state, and exec_shell_wait/task_shell_wait are only for early output, final output, or true dependency barriers."
+                    "description": "Start verifier gates as background shell jobs and return task_ids immediately. Use for long build/test/lint gates; completion is tracked in task/status state, and `Bash` with action 'wait' / task_shell_wait are only for early output, final output, or true dependency barriers."
                 }
             },
             "additionalProperties": false
@@ -566,7 +568,7 @@ fn start_background_gates(
                 .shell_manager
                 .lock()
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            manager.execute_with_options_env(
+            manager.execute_with_options_env_for_session(
                 &command,
                 Some(&cwd),
                 BACKGROUND_GATE_TIMEOUT_MS,
@@ -575,6 +577,7 @@ fn start_background_gates(
                 false,
                 context.elevated_sandbox_policy.clone(),
                 env,
+                &context.state_namespace,
             )
         };
 
@@ -1304,8 +1307,12 @@ mod tests {
             .as_str()
             .expect("background description");
 
-        assert!(background_description.contains("exec_shell_wait"));
+        assert!(background_description.contains("Bash"));
         assert!(background_description.contains("task_shell_wait"));
+        assert!(
+            !background_description.contains("exec_shell"),
+            "live descriptions must not teach the retired exec_shell name"
+        );
         assert!(tool.starts_detached_for(&json!({"background": true})));
         assert!(!tool.starts_detached_for(&json!({"profile": "auto"})));
     }
@@ -1484,18 +1491,28 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn run_verifiers_background_starts_shell_jobs_and_returns_task_ids() {
-        if !crate::dependencies::RustC::available() {
-            return;
-        }
-        // The spawned `rustc` is usually the rustup shim, which resolves its
-        // toolchain through $HOME. Hold the process-wide env mutex so tests
-        // that temporarily swap HOME cannot break the child process.
-        let _env_lock = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path());
         let tool = RunVerifiersTool;
+        // Unix: drive this very libtest binary with `--list` (no rustup, no
+        // $HOME). Windows: the background gate is rendered with POSIX
+        // quoting and handed to PowerShell, which cannot parse a quoted
+        // absolute path with backslashes, so use a bare `cmd` there — the
+        // listing shape (`name: test`) is the same either way.
+        #[cfg(not(windows))]
+        let (program, args) = (
+            std::env::current_exe()
+                .expect("test executable")
+                .to_string_lossy()
+                .into_owned(),
+            vec!["--list".to_string()],
+        );
+        #[cfg(windows)]
+        let (program, args) = (
+            "cmd".to_string(),
+            vec!["/c".to_string(), "echo test-list: test".to_string()],
+        );
         let result = tool
             .execute(
                 json!({
@@ -1503,9 +1520,9 @@ mod tests {
                     "background": true,
                     "commands": [
                         {
-                            "name": "rustc-version",
-                            "program": crate::dependencies::RustC::resolve().expect("rustc"),
-                            "args": ["--version"]
+                            "name": "test-list",
+                            "program": program,
+                            "args": args
                         }
                     ]
                 }),
@@ -1566,8 +1583,8 @@ mod tests {
             output.stderr
         );
         assert!(
-            output.stdout.contains("rustc"),
-            "stdout should include rustc version: {:?}",
+            output.stdout.lines().any(|line| line.ends_with(": test")),
+            "stdout should include the test listing: {:?}",
             output.stdout
         );
     }

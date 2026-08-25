@@ -18,12 +18,13 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
 };
+use crate::models::Role;
 
 const DEFAULT_MAX_CHARS: usize = 200_000;
 const MAX_MAX_CHARS: usize = 1_000_000;
-const REVIEW_MAX_TOKENS: u32 = 2048;
 const FALLBACK_MAX_CHARS: usize = 4000;
 const REVIEW_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const REVIEW_CLIENT_UNAVAILABLE: &str = "Review tool requires an active Codewhale model client";
 
 const REVIEW_SYSTEM_PROMPT: &str = "You are a senior code reviewer. Return ONLY valid JSON with \
 the following schema:\n\
@@ -470,9 +471,7 @@ impl ToolSpec for ReviewTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let Some(client) = self.client.clone() else {
-            return Err(ToolError::not_available(
-                "Review tool requires an active DeepSeek client".to_string(),
-            ));
+            return Err(ToolError::not_available(REVIEW_CLIENT_UNAVAILABLE));
         };
 
         let target = required_str(&input, "target")?.trim();
@@ -480,11 +479,11 @@ impl ToolSpec for ReviewTool {
             return Err(ToolError::invalid_input("target cannot be empty"));
         }
 
-        let kind = optional_str(&input, "kind").map(|s| s.trim().to_ascii_lowercase());
-        let base = optional_str(&input, "base").map(|s| s.trim().to_string());
-        let staged = optional_bool(&input, "staged", false);
+        let kind = optional_str(&input, "kind")?.map(|s| s.trim().to_ascii_lowercase());
+        let base = optional_str(&input, "base")?.map(|s| s.trim().to_string());
+        let staged = optional_bool(&input, "staged", false)?;
         let max_chars =
-            usize::try_from(optional_u64(&input, "max_chars", DEFAULT_MAX_CHARS as u64))
+            usize::try_from(optional_u64(&input, "max_chars", DEFAULT_MAX_CHARS as u64)?)
                 .unwrap_or(DEFAULT_MAX_CHARS)
                 .clamp(1, MAX_MAX_CHARS);
 
@@ -493,16 +492,20 @@ impl ToolSpec for ReviewTool {
                 .await?;
         let prompt = build_review_prompt(&source, max_chars);
 
+        let route = client.effective_route_envelope(&self.model, chrono::Utc::now());
         let request = MessageRequest {
             model: self.model.clone(),
             messages: vec![Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: prompt,
                     cache_control: None,
                 }],
             }],
-            max_tokens: REVIEW_MAX_TOKENS,
+            // A review is a deliberative call: on thinking-default routes the
+            // reasoning stream shares this budget, so it gets the route's
+            // normal output allowance, not a review-only ceiling.
+            max_tokens: client.effective_max_output_tokens(&route.model),
             system: Some(SystemPrompt::Text(REVIEW_SYSTEM_PROMPT.to_string())),
             tools: None,
             tool_choice: None,
@@ -510,8 +513,11 @@ impl ToolSpec for ReviewTool {
             thinking: None,
             reasoning_effort: None,
             stream: Some(false),
-            temperature: Some(0.2),
-            top_p: Some(0.9),
+            // Route parity with ordinary turns: no sampling params, so every
+            // provider's own defaults apply and fixed-sampling routes don't
+            // reject the request.
+            temperature: None,
+            top_p: None,
         };
 
         let response = client
@@ -519,27 +525,36 @@ impl ToolSpec for ReviewTool {
             .await
             .map_err(|e| ToolError::execution_failed(format!("Review request failed: {e}")))?;
 
+        if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+            return Ok(ToolResult::error(format!(
+                "Review model response incomplete: provider stop reason `{}`; the partial review was not accepted.",
+                crate::models::stop_reason_detail(response.stop_reason.as_deref())
+            ))
+            .with_metadata(review_usage_metadata(&route, &response.usage)));
+        }
+
         let response_text = extract_text(&response.content);
         let output = ReviewOutput::from_str(&response_text);
-        let metadata = review_usage_metadata(&response.model, &response.usage);
+        let metadata = review_usage_metadata(&route, &response.usage);
         let result =
             ToolResult::json(&output).map_err(|e| ToolError::execution_failed(e.to_string()))?;
         Ok(result.with_metadata(metadata))
     }
 }
 
-fn review_usage_metadata(model: &str, usage: &Usage) -> Value {
-    json!({
+fn review_usage_metadata(
+    route: &crate::cost_status::EffectiveRouteEnvelope,
+    usage: &Usage,
+) -> Value {
+    let mut metadata = json!({
         "tool": "review",
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
-        "child_model": model,
-        "child_input_tokens": usage.input_tokens,
-        "child_output_tokens": usage.output_tokens,
-        "child_prompt_cache_hit_tokens": usage.prompt_cache_hit_tokens,
-        "child_prompt_cache_miss_tokens": usage.prompt_cache_miss_tokens,
-        "child_reasoning_tokens": usage.reasoning_tokens,
-    })
+    });
+    // Every billable class, from the one shared producer, so a child turn can be
+    // priced with the same completeness as a parent turn (#4318).
+    crate::cost_status::attach_child_usage_metadata(&mut metadata, route, usage);
+    metadata
 }
 
 enum ReviewSource {
@@ -629,24 +644,76 @@ async fn resolve_diff_target(
     staged: bool,
     base: Option<&str>,
 ) -> Result<String, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Git::command() else {
-        return Err(ToolError::execution_failed("git not found"));
+    let base = base.map(str::trim).filter(|base| !base.is_empty());
+    let base_commit = if let Some(base) = base {
+        // Resolve the user-supplied ref before placing it in `git diff`. This
+        // both rejects option-looking input and gives the staged path a real
+        // commit from which it can compute the merge base.
+        let revision = format!("{base}^{{commit}}");
+        let output = run_review_git(
+            workspace,
+            vec![
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--end-of-options".to_string(),
+                revision,
+            ],
+            "resolve review base",
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ToolError::invalid_input(format!(
+                "Invalid git base ref '{base}': {}",
+                stderr.trim()
+            )));
+        }
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if commit.is_empty() || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ToolError::execution_failed(format!(
+                "git resolved base ref '{base}' to an invalid commit id"
+            )));
+        }
+        Some(commit)
+    } else {
+        None
     };
-    cmd.arg("diff");
-    if staged {
-        cmd.arg("--cached");
-    }
-    if let Some(base) = base
-        && !base.trim().is_empty()
-    {
-        cmd.arg(format!("{base}...HEAD"));
-    }
-    cmd.current_dir(workspace);
 
-    let output = tokio::task::spawn_blocking(move || cmd.output())
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("git diff task panicked: {e}")))?
-        .map_err(|e| ToolError::execution_failed(format!("Failed to run git diff: {e}")))?;
+    let mut args = vec!["diff".to_string()];
+    if staged {
+        args.push("--cached".to_string());
+        if let Some(base_commit) = base_commit {
+            // `git diff --cached <base>...HEAD` is invalid because the index
+            // is already one side of this diff. Preserve triple-dot semantics
+            // by resolving the merge base first, then compare that tree with
+            // the index (committed branch work plus the staged snapshot).
+            let output = run_review_git(
+                workspace,
+                vec!["merge-base".to_string(), base_commit, "HEAD".to_string()],
+                "resolve staged review merge base",
+            )
+            .await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ToolError::execution_failed(format!(
+                    "git merge-base failed: {}",
+                    stderr.trim()
+                )));
+            }
+            let merge_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if merge_base.is_empty() || !merge_base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ToolError::execution_failed(
+                    "git merge-base returned an invalid commit id",
+                ));
+            }
+            args.push(merge_base);
+        }
+    } else if let Some(base_commit) = base_commit {
+        args.push(format!("{base_commit}...HEAD"));
+    }
+    args.push("--".to_string());
+
+    let output = run_review_git(workspace, args, "generate review diff").await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ToolError::execution_failed(format!(
@@ -659,6 +726,24 @@ async fn resolve_diff_target(
         return Err(ToolError::invalid_input("No diff to review"));
     }
     Ok(diff)
+}
+
+async fn run_review_git(
+    workspace: &Path,
+    args: Vec<String>,
+    operation: &'static str,
+) -> Result<std::process::Output, ToolError> {
+    let workspace = workspace.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Some(mut cmd) = crate::dependencies::Git::command() else {
+            return Err(ToolError::execution_failed("git not found"));
+        };
+        cmd.args(args).current_dir(workspace).output().map_err(|e| {
+            ToolError::execution_failed(format!("Failed to {operation} with git: {e}"))
+        })
+    })
+    .await
+    .map_err(|e| ToolError::execution_failed(format!("git {operation} task panicked: {e}")))?
 }
 
 async fn gh_pr_diff(pr: &PullRequestRef, workspace: &Path) -> Result<String, ToolError> {
@@ -816,6 +901,74 @@ fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn missing_review_client_uses_codewhale_provider_neutral_language() {
+        let tool = ReviewTool::new(None, "unused".to_string());
+        let context = ToolContext::new(PathBuf::from("."));
+
+        let error = tool
+            .execute(json!({}), &context)
+            .await
+            .expect_err("review requires a configured model client")
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Failed to locate tool: Review tool requires an active Codewhale model client"
+        );
+        assert!(!error.contains("DeepSeek"));
+    }
+
+    fn fixture_git(workspace: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = crate::dependencies::Git::command().expect("git test dependency");
+        let output = command
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    #[tokio::test]
+    async fn staged_diff_with_base_compares_merge_base_to_index() {
+        let repo = tempfile::TempDir::new().expect("temp git repository");
+        fixture_git(repo.path(), &["init"]);
+        fixture_git(repo.path(), &["config", "user.name", "Codewhale Test"]);
+        fixture_git(
+            repo.path(),
+            &["config", "user.email", "codewhale-test@example.invalid"],
+        );
+
+        let tracked = repo.path().join("tracked.txt");
+        fs::write(&tracked, "base\n").expect("write base fixture");
+        fixture_git(repo.path(), &["add", "tracked.txt"]);
+        fixture_git(repo.path(), &["commit", "-m", "base"]);
+        let base =
+            String::from_utf8_lossy(&fixture_git(repo.path(), &["rev-parse", "HEAD"]).stdout)
+                .trim()
+                .to_string();
+
+        fs::write(&tracked, "base\ncommitted\n").expect("write committed fixture");
+        fixture_git(repo.path(), &["add", "tracked.txt"]);
+        fixture_git(repo.path(), &["commit", "-m", "branch change"]);
+        fs::write(&tracked, "base\ncommitted\nstaged\n").expect("write staged fixture");
+        fixture_git(repo.path(), &["add", "tracked.txt"]);
+        fs::write(&tracked, "base\ncommitted\nstaged\nunstaged\n").expect("write unstaged fixture");
+
+        let diff = resolve_diff_target(repo.path(), true, Some(&base))
+            .await
+            .expect("staged review diff from base");
+        assert!(diff.contains("+committed"), "{diff}");
+        assert!(diff.contains("+staged"), "{diff}");
+        assert!(!diff.contains("unstaged"), "{diff}");
+    }
+
     #[test]
     fn parses_pr_url() {
         let pr =
@@ -907,8 +1060,16 @@ mod tests {
 
     #[test]
     fn review_usage_metadata_reports_child_tokens_for_cost_accrual() {
-        let metadata = review_usage_metadata(
+        let route = crate::cost_status::EffectiveRouteEnvelope::capture(
+            None,
+            crate::config::ApiProvider::Deepseek,
+            "deepseek",
             "deepseek-v4-flash",
+            Some("https://api.deepseek.com/v1"),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch"),
+        );
+        let metadata = review_usage_metadata(
+            &route,
             &Usage {
                 input_tokens: 123,
                 output_tokens: 45,

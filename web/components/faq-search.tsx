@@ -1,6 +1,9 @@
 "use client";
 
 import { useState, useMemo, useRef, useCallback, useEffect } from "react";
+import { faqSourceHref } from "@/lib/faq-source";
+import { extractText } from "@/lib/react-text";
+import { highlightSpan } from "@/lib/search-utils";
 
 export interface FaqSearchItem {
   q: string;
@@ -9,36 +12,20 @@ export interface FaqSearchItem {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Text extraction from React nodes for full-text matching            */
-/* ------------------------------------------------------------------ */
-
-function extractText(node: React.ReactNode): string {
-  if (node == null || typeof node === "boolean") return "";
-  if (typeof node === "string") return node;
-  if (typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(extractText).join(" ");
-  if (typeof node === "object" && "props" in node) {
-    const props = (node as { props?: { children?: React.ReactNode } }).props;
-    return props ? extractText(props.children) : "";
-  }
-  return "";
-}
-
-/* ------------------------------------------------------------------ */
 /*  Highlight helper                                                   */
 /* ------------------------------------------------------------------ */
 
 function highlight(text: string, query: string): React.ReactNode {
-  const q = query.trim().toLowerCase();
-  if (!q) return text;
-  const lower = text.toLowerCase();
-  const idx = lower.indexOf(q);
-  if (idx === -1) return text;
+  // Index arithmetic lives in search-utils: lowercasing can change a
+  // string's length, so `text` cannot be sliced with indices taken from
+  // its lowercased copy.
+  const span = highlightSpan(text, query);
+  if (!span) return text;
   return (
     <>
-      {text.slice(0, idx)}
-      <mark className="search-highlight">{text.slice(idx, idx + q.length)}</mark>
-      {text.slice(idx + q.length)}
+      {span.before}
+      <mark className="search-highlight">{span.match}</mark>
+      {span.after}
     </>
   );
 }
@@ -126,7 +113,7 @@ export function FaqSearch({
           )}
         </div>
         {hasQuery && (
-          <div className="mt-2 font-mono text-[0.7rem] text-ink-mute">
+          <div className="mt-2 font-mono text-[0.7rem] text-ink-mute" aria-live="polite">
             {matched > 0
               ? isZh
                 ? `${matched} / ${total} 个问题匹配 "${query.trim()}"`
@@ -161,9 +148,22 @@ export function FaqSearch({
                     <span className="font-mono text-[0.66rem] text-ink-mute uppercase tracking-wider">
                       {isZh ? "来源" : "Sources"}:
                     </span>
-                    {item.sources.map((s) => (
-                      <span key={s} className="font-mono text-[0.7rem] text-indigo">{s}</span>
-                    ))}
+                    {item.sources.map((s) => {
+                      const href = faqSourceHref(s);
+                      return href ? (
+                        <a
+                          key={s}
+                          href={href}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-mono text-[0.7rem] text-indigo hover:underline"
+                        >
+                          {s}
+                        </a>
+                      ) : (
+                        <span key={s} className="font-mono text-[0.7rem] text-indigo">{s}</span>
+                      );
+                    })}
                   </div>
                 )}
               </div>

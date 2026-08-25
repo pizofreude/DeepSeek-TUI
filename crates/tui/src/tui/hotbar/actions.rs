@@ -2,13 +2,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::commands::{self, CommandInfo, CommandResult};
 use crate::config::{ApiProvider, Config};
 use crate::localization::{Locale, MessageId, tr};
 use crate::provider_lake::all_catalog_models_for_provider;
-use crate::tui::app::{App, AppAction, AppMode, SidebarFocus};
+use crate::tui::app::{App, AppAction, AppMode};
 use crate::tui::command_palette::{
     CommandPaletteView, build_entries as build_command_palette_entries,
 };
@@ -16,7 +16,7 @@ use crate::tui::command_palette::{
 pub const HOTBAR_COMPACT_LABEL_MAX_WIDTH: usize = 7;
 
 /// Result of firing a hotbar action.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)] // AppAction is intentionally large; boxing would force clone churn on the hot path
 #[derive(Debug, Clone, PartialEq)]
 pub enum HotbarDispatch {
     /// The action was fully handled by mutating [`App`].
@@ -26,7 +26,6 @@ pub enum HotbarDispatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 pub enum HotbarActionCategory {
     App,
     Route,
@@ -50,7 +49,7 @@ impl HotbarActionCategory {
     }
 
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "app" => Some(Self::App),
@@ -85,7 +84,6 @@ impl HotbarArgsBehavior {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum HotbarSafetyClass {
     LocalUi,
     LocalState,
@@ -104,7 +102,6 @@ pub enum HotbarRecommendation {
 
 impl HotbarRecommendation {
     #[must_use]
-    #[allow(dead_code)]
     pub const fn is_recommendable(self) -> bool {
         matches!(self, Self::Default | Self::Eligible)
     }
@@ -307,7 +304,7 @@ pub trait HotbarActionSource {
 }
 
 /// Uniform interface for actions that can be bound to a hotbar slot.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub trait HotbarAction: Send + Sync {
     /// Stable action id used in config and dispatch.
     fn id(&self) -> &str;
@@ -388,7 +385,7 @@ pub fn recommend_hotbar_actions(
 }
 
 #[must_use]
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn recommended_hotbar_bindings(
     app: &App,
     options: HotbarRecommendationOptions,
@@ -527,6 +524,16 @@ impl HotbarActionRegistry {
         self.register_source(&SkillHotbarActionSource { skills });
     }
 
+    /// Atomically replace the Skill-derived action source while retaining
+    /// built-ins, configured routes, slash commands, and live MCP actions.
+    /// Plugin lifecycle changes call this from the same cache refresh that
+    /// updates command dispatch, preventing stale revoked bindings.
+    pub(crate) fn replace_skills(&mut self, skills: &[(String, String)]) {
+        self.actions
+            .retain(|_, action| action.category() != HotbarActionCategory::Skill.as_str());
+        self.register_skills(skills);
+    }
+
     /// Replace the MCP-tool hotbar actions with the tools in `snapshot`.
     ///
     /// Called when a live MCP discovery snapshot lands (or is refreshed) so
@@ -585,7 +592,7 @@ impl HotbarActionSource for BuiltinHotbarActionSource {
             "mode.operate",
             "operate",
             "Operate mode",
-            "Coordinate a Fleet for multi-step work.",
+            "Send tasks while Fleet workers run in parallel.",
             AppHotbarKind::Mode(AppMode::Operate),
         ));
         registry.register(AppHotbarAction::new(
@@ -756,36 +763,33 @@ impl HotbarActionSource for ConfiguredRouteHotbarActionSource<'_> {
 }
 
 impl HotbarActionRegistry {
-    #[allow(dead_code)]
     #[must_use]
     pub fn get(&self, id: &str) -> Option<Arc<dyn HotbarAction>> {
         self.actions.get(id).cloned()
     }
 
-    #[allow(dead_code)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.actions.len()
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &dyn HotbarAction> {
         self.actions.values().map(Arc::as_ref)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     #[must_use]
     pub fn metadata(&self, locale: Locale) -> Vec<HotbarActionMetadata> {
         self.iter().map(|action| action.metadata(locale)).collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     #[must_use]
     pub fn metadata_validation_errors(&self, locale: Locale) -> Vec<String> {
         let mut errors = Vec::new();
@@ -839,7 +843,6 @@ enum AppHotbarKind {
     TrustToggle,
 }
 
-#[allow(dead_code)]
 struct AppHotbarAction {
     id: &'static str,
     short_label: &'static str,
@@ -970,28 +973,17 @@ impl HotbarAction for AppHotbarAction {
     fn is_active(&self, app: &App) -> bool {
         match self.kind {
             AppHotbarKind::VoiceToggle => app.voice_enabled,
-            AppHotbarKind::SessionCompact => app.is_compacting,
+            AppHotbarKind::SessionCompact => app.is_compacting || app.manual_compaction_queued,
             AppHotbarKind::Mode(mode) => app.mode == mode,
             AppHotbarKind::ReasoningCycle => {
-                !app.auto_model && app.reasoning_effort != crate::tui::app::ReasoningEffort::Off
+                app.reasoning_effort != crate::tui::app::ReasoningEffort::Off
             }
-            AppHotbarKind::SidebarToggle => app.sidebar_focus != SidebarFocus::Hidden,
+            AppHotbarKind::SidebarToggle => {
+                app.work_surface.placement != crate::tui::work_surface::WorkSurfacePlacement::Off
+            }
             AppHotbarKind::FileTreeToggle => app.file_tree.is_some(),
             AppHotbarKind::PaletteOpen => false,
             AppHotbarKind::TrustToggle => app.trust_mode,
-        }
-    }
-
-    fn disabled_reason(&self, app: &App) -> Option<String> {
-        match self.kind {
-            AppHotbarKind::ReasoningCycle if app.auto_model => Some(
-                tr(
-                    app.ui_locale,
-                    MessageId::HotbarActionReasoningCycleAutoDisabled,
-                )
-                .into_owned(),
-            ),
-            _ => None,
         }
     }
 
@@ -1002,46 +994,44 @@ impl HotbarAction for AppHotbarAction {
                 Ok(dispatch_command_result(app, result))
             }
             AppHotbarKind::SessionCompact => {
-                if app.is_compacting {
-                    app.status_message = Some("Compaction is already running.".to_string());
-                    return Ok(HotbarDispatch::Handled);
-                }
-                Ok(HotbarDispatch::AppAction(AppAction::CompactContext))
+                Ok(HotbarDispatch::AppAction(AppAction::CompactContext {
+                    focus: None,
+                }))
             }
             AppHotbarKind::Mode(mode) => {
-                let changed = app.set_mode(mode);
-                if changed {
+                // User-facing selection: persists the startup default too.
+                let outcome = app.select_mode(mode);
+                // Only a live change needs an `AppAction`; a persisted-same
+                // selection still gets its own receipt so the row does not look
+                // inert when it actually wrote the startup default.
+                app.report_mode_selection(mode, outcome);
+                if outcome.changed_live_state() {
                     Ok(HotbarDispatch::AppAction(AppAction::ModeChanged(mode)))
                 } else {
                     Ok(HotbarDispatch::Handled)
                 }
             }
             AppHotbarKind::ReasoningCycle => {
-                if app.auto_model {
-                    bail!("Reasoning effort is controlled by auto model routing.");
+                if app.cycle_effort().changed_live_state() {
+                    Ok(HotbarDispatch::AppAction(AppAction::UpdateCompaction(
+                        app.compaction_config(),
+                    )))
+                } else {
+                    Ok(HotbarDispatch::Handled)
                 }
-                app.reasoning_effort = app
-                    .reasoning_effort
-                    .cycle_next_for_provider(app.api_provider);
-                app.last_effective_reasoning_effort = None;
-                app.update_model_compaction_budget();
-                app.status_message = Some(format!(
-                    "Reasoning effort: {}",
-                    app.reasoning_effort
-                        .display_label_for_provider(app.api_provider)
-                ));
-                Ok(HotbarDispatch::AppAction(AppAction::UpdateCompaction(
-                    app.compaction_config(),
-                )))
             }
             AppHotbarKind::SidebarToggle => {
-                if app.sidebar_focus == SidebarFocus::Hidden {
-                    app.set_sidebar_focus(SidebarFocus::Pinned);
-                    app.status_message = Some("Sidebar focus: pinned".to_string());
+                if app.work_surface.placement == crate::tui::work_surface::WorkSurfacePlacement::Off
+                {
+                    app.work_surface.placement =
+                        crate::tui::work_surface::WorkSurfacePlacement::Top;
+                    app.status_message = Some("Rail: top placement".to_string());
                 } else {
-                    app.set_sidebar_focus(SidebarFocus::Hidden);
-                    app.status_message = Some("Sidebar hidden".to_string());
+                    app.work_surface.placement =
+                        crate::tui::work_surface::WorkSurfacePlacement::Off;
+                    app.status_message = Some("Rail is off".to_string());
                 }
+                app.needs_redraw = true;
                 Ok(HotbarDispatch::Handled)
             }
             AppHotbarKind::FileTreeToggle => {
@@ -1083,7 +1073,6 @@ impl HotbarAction for AppHotbarAction {
     }
 }
 
-#[allow(dead_code)]
 struct SlashHotbarAction {
     info: &'static CommandInfo,
     id: String,
@@ -1092,10 +1081,14 @@ struct SlashHotbarAction {
 
 impl SlashHotbarAction {
     fn new(info: &'static CommandInfo) -> Self {
+        let short_label = match info.name {
+            "workflow" => "wf".to_string(),
+            other => other.chars().take(7).collect(),
+        };
         Self {
             info,
             id: format!("slash.{}", info.name),
-            short_label: info.name.chars().take(7).collect(),
+            short_label,
         }
     }
 
@@ -1118,11 +1111,18 @@ impl HotbarAction for SlashHotbarAction {
     }
 
     fn metadata(&self, locale: Locale) -> HotbarActionMetadata {
-        let recommendation = match self.info.discovery() {
-            crate::commands::traits::CommandDiscovery::Primary => HotbarRecommendation::Eligible,
-            crate::commands::traits::CommandDiscovery::Advanced
-            | crate::commands::traits::CommandDiscovery::Compatibility => {
-                HotbarRecommendation::Advanced
+        let recommendation = if codewhale_config::DEFAULT_HOTBAR_ACTIONS.contains(&self.id.as_str())
+        {
+            HotbarRecommendation::Default
+        } else {
+            match self.info.discovery() {
+                crate::commands::traits::CommandDiscovery::Primary => {
+                    HotbarRecommendation::Eligible
+                }
+                crate::commands::traits::CommandDiscovery::Advanced
+                | crate::commands::traits::CommandDiscovery::Compatibility => {
+                    HotbarRecommendation::Advanced
+                }
             }
         };
         HotbarActionMetadata {
@@ -1162,7 +1162,6 @@ impl HotbarAction for SlashHotbarAction {
     }
 }
 
-#[allow(dead_code)]
 struct RouteHotbarAction {
     provider: ApiProvider,
     model: String,
@@ -1452,25 +1451,9 @@ mod tests {
         config: &Config,
     ) -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace,
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
             skills_dir,
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
             start_in_agent_mode: true,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(workspace)
         };
         let mut app = App::new(options, config);
         app.ui_locale = crate::localization::Locale::En;
@@ -1498,6 +1481,11 @@ mod tests {
             read_timeout: 5,
             connected: enabled,
             error: None,
+            capability_metadata: if enabled {
+                crate::mcp::McpServerCapabilityMetadata::LegacyFallback
+            } else {
+                crate::mcp::McpServerCapabilityMetadata::NotObserved
+            },
             tools,
             resources: Vec::new(),
             prompts: Vec::new(),
@@ -1505,7 +1493,7 @@ mod tests {
         McpManagerSnapshot {
             config_path: PathBuf::from("mcp.json"),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 server(
                     "search",
@@ -1831,8 +1819,12 @@ mod tests {
                 .get(id)
                 .unwrap_or_else(|| panic!("missing default hotbar action {id}"));
             let metadata = action.metadata(Locale::En);
-            assert_eq!(metadata.category, HotbarActionCategory::App);
-            assert_eq!(metadata.args, HotbarArgsBehavior::None);
+            if id.starts_with("slash.") {
+                assert_eq!(metadata.category, HotbarActionCategory::Slash);
+            } else {
+                assert_eq!(metadata.category, HotbarActionCategory::App);
+                assert_eq!(metadata.args, HotbarArgsBehavior::None);
+            }
             assert_eq!(metadata.recommendation, HotbarRecommendation::Default);
             assert!(
                 metadata.recommendation.is_recommendable(),
@@ -1854,7 +1846,8 @@ mod tests {
         assert_eq!(compact.category, HotbarActionCategory::Slash);
         assert_eq!(compact.source_id, "command:compact");
         assert_eq!(compact.display_name, "/compact");
-        assert_eq!(compact.args, HotbarArgsBehavior::None);
+        // `/compact [focus]` takes an optional summary focus (2026-07-23).
+        assert_eq!(compact.args, HotbarArgsBehavior::Optional);
         assert_eq!(compact.safety, HotbarSafetyClass::ExistingCommand);
         assert_eq!(compact.recommendation, HotbarRecommendation::Eligible);
 
@@ -1873,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn app_action_metadata_exposes_dynamic_disabled_reason() {
+    fn reasoning_action_remains_available_for_auto_model_routing() {
         let registry = HotbarActionRegistry::with_builtins();
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
@@ -1885,10 +1878,7 @@ mod tests {
         assert!(reasoning.disabled_reason(&app).is_none());
 
         app.auto_model = true;
-        assert_eq!(
-            reasoning.disabled_reason(&app).as_deref(),
-            Some("Reasoning effort is controlled by auto model routing.")
-        );
+        assert!(reasoning.disabled_reason(&app).is_none());
     }
 
     #[test]
@@ -1912,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_recommendations_exclude_disabled_actions() {
+    fn hotbar_recommendations_keep_reasoning_for_auto_model() {
         let mut app = test_app();
         app.auto_model = true;
 
@@ -1920,7 +1910,7 @@ mod tests {
             recommend_hotbar_actions(&app, HotbarRecommendationOptions::for_setup_wizard());
 
         assert!(
-            !recommendations
+            recommendations
                 .iter()
                 .any(|entry| entry.metadata.id == "reasoning.cycle")
         );
@@ -1964,7 +1954,16 @@ mod tests {
             .iter()
             .filter(|entry| entry.metadata.category == HotbarActionCategory::Slash)
             .collect::<Vec<_>>();
-        assert_eq!(slash_recommendations.len(), 1);
+        let default_slash = slash_recommendations
+            .iter()
+            .filter(|entry| entry.metadata.recommendation == HotbarRecommendation::Default)
+            .count();
+        let eligible_slash = slash_recommendations
+            .iter()
+            .filter(|entry| entry.metadata.recommendation == HotbarRecommendation::Eligible)
+            .count();
+        assert_eq!(default_slash, 3);
+        assert_eq!(eligible_slash, 1);
     }
 
     #[test]
@@ -1986,14 +1985,14 @@ mod tests {
                 .map(|binding| (binding.slot, binding.label.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                (1, Some("voice")),
-                (2, Some("compact")),
-                (3, Some("plan")),
-                (4, Some("agent")),
-                (5, Some("operate")),
-                (6, Some("palette")),
-                (7, Some("side")),
-                (8, Some("trust")),
+                (1, Some("wf")),
+                (2, Some("goal")),
+                (3, Some("auto")),
+                (4, Some("plan")),
+                (5, Some("agent")),
+                (6, Some("operate")),
+                (7, Some("palette")),
+                (8, Some("side")),
             ]
         );
 
@@ -2118,6 +2117,60 @@ mod tests {
         }
     }
 
+    /// #1888: the hotbar is not a control surface. It binds the owning slash
+    /// command and dispatches it through `commands::execute` with no argument,
+    /// so what runs is the slash surface — there is no hotbar verb table and
+    /// no `ControlSurface::Hotbar` for a test to assert into existence.
+    ///
+    /// What must hold is narrower and real: every owning command is bound and
+    /// directly dispatchable, and a bare press can only reach a verb that
+    /// declares `hotbar_bare_dispatch` — which is necessarily targetless and
+    /// read-only, because a keypress supplies no id.
+    #[test]
+    fn control_plane_commands_are_bound_and_bare_dispatch_is_read_only() {
+        use codewhale_lane::control::OPERATIONS;
+        use codewhale_lane::{ControlAuthority, ControlSurface, TargetKind};
+
+        let registry = HotbarActionRegistry::with_builtins();
+        for descriptor in OPERATIONS {
+            let action_id = descriptor.hotbar_action_id();
+            assert_eq!(action_id, format!("slash.{}", descriptor.slash_command));
+            let action = registry
+                .get(&action_id)
+                .unwrap_or_else(|| panic!("{} has no hotbar action {action_id}", descriptor.id));
+            assert_eq!(action.category(), "slash");
+            // The dispatch runs as the slash surface, which must therefore be
+            // one the descriptor actually offers.
+            assert!(descriptor.offers(ControlSurface::Slash));
+
+            // A bare hotbar press fires the command with no arguments, so the
+            // owning command must never require one — otherwise the slot would
+            // silently become a composer prefill instead of the verb.
+            let info = commands::get_command_info(descriptor.slash_command)
+                .unwrap_or_else(|| panic!("/{} is not registered", descriptor.slash_command));
+            assert!(
+                !info.requires_required_argument(),
+                "/{} must stay directly dispatchable",
+                descriptor.slash_command
+            );
+
+            if descriptor.hotbar_bare_dispatch {
+                assert_eq!(descriptor.target, TargetKind::None, "{}", descriptor.id);
+                assert_eq!(
+                    descriptor.authority,
+                    ControlAuthority::Read,
+                    "{} would mutate durable state from one keypress",
+                    descriptor.id
+                );
+            }
+        }
+
+        // Both control domains are bound.
+        for id in ["slash.lane", "slash.fleet"] {
+            assert!(registry.get(id).is_some(), "{id} must be bindable");
+        }
+    }
+
     #[test]
     fn slash_hotbar_action_dispatches_argless_command() {
         let registry = HotbarActionRegistry::with_builtins();
@@ -2187,6 +2240,36 @@ mod tests {
         assert_eq!(metadata.safety, HotbarSafetyClass::ExistingCommand);
         assert_eq!(metadata.recommendation, HotbarRecommendation::Eligible);
         assert!(registry.metadata_validation_errors(Locale::En).is_empty());
+    }
+
+    #[test]
+    fn replacing_skills_removes_stale_plugin_actions_atomically() {
+        let mut registry = HotbarActionRegistry::with_builtins();
+        registry.register_skills(&[
+            ("native".to_string(), "native Skill".to_string()),
+            (
+                "demo:review".to_string(),
+                "reviewed plugin Skill".to_string(),
+            ),
+        ]);
+        assert!(registry.get("skill.demo:review").is_some());
+        let builtin_count = registry
+            .iter()
+            .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+            .count();
+
+        registry.replace_skills(&[("native".to_string(), "refreshed".to_string())]);
+
+        assert!(registry.get("skill.demo:review").is_none());
+        assert!(registry.get("skill.native").is_some());
+        assert_eq!(
+            registry
+                .iter()
+                .filter(|action| action.category() != HotbarActionCategory::Skill.as_str())
+                .count(),
+            builtin_count,
+            "refresh must preserve every non-Skill action source"
+        );
     }
 
     #[test]
@@ -2364,7 +2447,7 @@ mod tests {
         assert!(!compact.is_active(&app));
         assert_eq!(
             compact.dispatch(&mut app).expect("dispatch compact"),
-            HotbarDispatch::AppAction(AppAction::CompactContext)
+            HotbarDispatch::AppAction(AppAction::CompactContext { focus: None })
         );
         app.is_compacting = true;
         assert!(compact.is_active(&app));
@@ -2372,11 +2455,7 @@ mod tests {
             compact
                 .dispatch(&mut app)
                 .expect("dispatch compact while busy"),
-            HotbarDispatch::Handled
-        );
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Compaction is already running.")
+            HotbarDispatch::AppAction(AppAction::CompactContext { focus: None })
         );
     }
 
@@ -2393,16 +2472,61 @@ mod tests {
             reasoning.dispatch(&mut app).expect("dispatch reasoning"),
             HotbarDispatch::AppAction(AppAction::UpdateCompaction(_))
         ));
-        assert_eq!(app.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
         assert!(reasoning.is_active(&app));
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Reasoning effort: high")
-        );
+        assert_eq!(app.status_message.as_deref(), Some("Reasoning effort: low"));
 
         app.auto_model = true;
-        assert!(!reasoning.is_active(&app));
-        assert!(reasoning.dispatch(&mut app).is_err());
+        assert!(reasoning.is_active(&app));
+        assert!(matches!(
+            reasoning
+                .dispatch(&mut app)
+                .expect("dispatch reasoning under auto model"),
+            HotbarDispatch::AppAction(AppAction::UpdateCompaction(_))
+        ));
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn reasoning_cycle_is_inert_while_a_turn_is_running() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _user_profile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join(".codewhale"));
+        let _deepseek_config = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_config = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+        let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
+
+        crate::settings::Settings::transact(|settings| {
+            settings.reasoning_effort = Some("off".to_string());
+            Ok(())
+        })
+        .expect("seed startup reasoning");
+
+        let registry = HotbarActionRegistry::with_builtins();
+        let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
+        let mut app = test_app();
+        app.api_provider = ApiProvider::Deepseek;
+        app.auto_model = false;
+        app.reasoning_effort = ReasoningEffort::Off;
+        app.is_loading = true;
+
+        assert_eq!(
+            reasoning.dispatch(&mut app).expect("dispatch while busy"),
+            HotbarDispatch::Handled
+        );
+        assert_eq!(app.reasoning_effort, ReasoningEffort::Off);
+        assert_eq!(app.startup_defaults.pending_len(), 0);
+        assert_eq!(
+            crate::settings::Settings::load()
+                .expect("reload settings")
+                .reasoning_effort
+                .as_deref(),
+            Some("off"),
+            "a refused hotbar action must not persist a different tier"
+        );
     }
 
     #[test]
@@ -2438,18 +2562,24 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let sidebar = registry.get("sidebar.toggle").expect("sidebar action");
         let mut app = test_app();
-        app.sidebar_focus = SidebarFocus::Pinned;
+        app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
 
         assert!(sidebar.is_active(&app));
         assert_eq!(
-            sidebar.dispatch(&mut app).expect("dispatch sidebar hide"),
+            sidebar.dispatch(&mut app).expect("dispatch rail hide"),
             HotbarDispatch::Handled
         );
-        assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
+        assert_eq!(
+            app.work_surface.placement,
+            crate::tui::work_surface::WorkSurfacePlacement::Off
+        );
         assert!(!sidebar.is_active(&app));
 
-        sidebar.dispatch(&mut app).expect("dispatch sidebar show");
-        assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
+        sidebar.dispatch(&mut app).expect("dispatch rail show");
+        assert_eq!(
+            app.work_surface.placement,
+            crate::tui::work_surface::WorkSurfacePlacement::Top
+        );
         assert!(sidebar.is_active(&app));
     }
 

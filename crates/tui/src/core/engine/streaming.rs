@@ -20,6 +20,9 @@ pub(super) struct ToolUseState {
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
+    /// Google thought signature captured on the tool call; replayed with the
+    /// assistant tool-call message on later turns.
+    pub(super) thought_signature: Option<String>,
     pub(super) input_buffer: String,
     pub(super) input_parse_error: Option<String>,
 }
@@ -73,6 +76,74 @@ pub(super) fn should_transparently_retry_stream(
 /// (#2990).
 pub(super) const MAX_STREAM_RETRIES: u32 = 3;
 
+/// Typed, engine-internal state for one mid-stream drop recovery.
+///
+/// This enum **is** the retry mechanism. A resumed turn used to append a
+/// synthetic `[runtime]` *user* message to the persisted conversation, which
+/// polluted the transcript and — when only hidden reasoning had streamed —
+/// promised a preserved partial answer that never existed (0.9.10
+/// regression). The retry is now modeled as this value, carried out of the
+/// stream decoder in [`StreamOutcome`] and consumed exactly once per drop:
+///
+/// * it is never persisted to the user transcript, and
+/// * nothing it triggers is serialized into the provider request history as
+///   a user role — the retried request is simply the persisted conversation
+///   re-issued, ending (when a visible fragment was preserved) with that
+///   assistant fragment so the provider continues from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StreamResume {
+    /// The stream died before anything actionable was streamed (#103
+    /// Phase 3): discard the fragment and re-issue the identical request.
+    NoContentStreamDeath,
+    /// The host slept mid-stream (#2990): the partial output predates the
+    /// sleep and no operator watched it — discard and re-issue.
+    AfterSleep,
+    /// Mid-stream network drop on a headless host (v0.9.4 Terminal-Bench
+    /// P0): the fragment was never committed and no tool from it ran, so
+    /// discard and re-issue the identical request.
+    HeadlessNetworkDrop,
+    /// Mid-stream network drop in the interactive TUI. A fragment with
+    /// sendable content is preserved as the trailing assistant message and
+    /// the request is re-issued; a thinking-only fragment has nothing
+    /// visible to preserve, so it is discarded exactly like the headless
+    /// resume and the copy must never claim otherwise.
+    InteractiveNetworkDrop,
+}
+
+/// Bounded authorization for drop-resume retries.
+///
+/// Mechanism, not comment: [`StreamRetryBudget::authorize`] is the only way
+/// to spend a resume and it returns `None` once [`MAX_STREAM_RETRIES`]
+/// resumes have been issued, so no call site can loop past the budget even
+/// if a guard predicate is relaxed. A healthy stream round resets it.
+#[derive(Debug, Default)]
+pub(super) struct StreamRetryBudget {
+    spent: u32,
+}
+
+impl StreamRetryBudget {
+    /// Drop-resumes already issued without a healthy round in between.
+    pub(super) fn spent(&self) -> u32 {
+        self.spent
+    }
+
+    /// Spend one resume and return its 1-based attempt number, or `None`
+    /// when the budget is exhausted.
+    pub(super) fn authorize(&mut self) -> Option<u32> {
+        if self.spent >= MAX_STREAM_RETRIES {
+            return None;
+        }
+        self.spent = self.spent.saturating_add(1);
+        Some(self.spent)
+    }
+
+    /// A healthy round clears the chain: the next drop starts a fresh,
+    /// still-bounded budget.
+    pub(super) fn reset(&mut self) {
+        self.spent = 0;
+    }
+}
+
 /// Wall-clock vs monotonic divergence above which we conclude the host slept
 /// mid-stream (#2990). `Instant` pauses during system sleep (CLOCK_UPTIME_RAW
 /// on macOS, CLOCK_MONOTONIC on Linux) while `SystemTime` keeps advancing, so
@@ -104,9 +175,63 @@ pub(super) fn should_resume_after_sleep(
     sleep_detected && retry_attempts < MAX_STREAM_RETRIES && !cancelled
 }
 
+/// Decide whether a failed stream should be re-issued after a mid-stream
+/// network drop in a headless host (`exec` / stream-json / app-server), even
+/// though content already streamed.
+///
+/// This extends the #2990 sleep-resume contract to ordinary transport drops
+/// for hosts with no operator watching: the partial assistant fragment has
+/// not been committed to the conversation and no tool call from the
+/// incomplete response has executed, so discarding the fragment and
+/// re-issuing the identical request cannot duplicate side effects. The
+/// double-billing risk that blocks post-content retries in the interactive
+/// TUI (#103) is accepted here because the alternative is a dead turn that
+/// forfeits the entire headless run — the exact tradeoff #2990 already makes
+/// for sleep-resume. Interactive sessions keep the #103 surface-the-warning
+/// behavior: the user saw the partial deltas, and replaying would render the
+/// same prefix twice.
+pub(super) fn should_resume_after_network_drop(
+    headless_host: bool,
+    network_class_error: bool,
+    retry_attempts: u32,
+    cancelled: bool,
+) -> bool {
+    headless_host && network_class_error && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+}
+
+/// Decide whether an interactive TUI stream should be re-issued after a
+/// mid-stream network drop, preserving a visible partial reply.
+///
+/// Unlike the headless resume, this keeps a sendable fragment: the user has
+/// already seen the deltas, so the assistant message is committed and the
+/// re-issued request ends with that fragment, which is the provider-neutral
+/// continuation contract. No synthetic user turn is appended — the retry is
+/// typed state ([`StreamResume::InteractiveNetworkDrop`]), invisible to the
+/// transcript and to the provider request history as a user role. A
+/// thinking-only fragment preserves nothing and must not be described as a
+/// preserved reply. Tool calls are never resumed because an incomplete tool
+/// call could be re-issued and duplicate side effects. Bounded by
+/// `MAX_STREAM_RETRIES` and gated on a network/timeout-class error so
+/// model/parse/auth failures still surface normally.
+pub(super) fn should_resume_interactive_after_network_drop(
+    terminal_chrome_enabled: bool,
+    network_class_error: bool,
+    any_content_received: bool,
+    tool_uses_empty: bool,
+    retry_attempts: u32,
+    cancelled: bool,
+) -> bool {
+    terminal_chrome_enabled
+        && network_class_error
+        && any_content_received
+        && tool_uses_empty
+        && retry_attempts < MAX_STREAM_RETRIES
+        && !cancelled
+}
+
 /// Convert low-level reqwest/hyper stream read errors into an operator-facing
 /// message. The raw provider error remains attached, but the lead sentence
-/// explains why CodeWhale may retry before any output and why it must surface
+/// explains why Codewhale may retry before any output and why it must surface
 /// the warning once partial output has already streamed.
 pub(super) fn stream_read_error_user_message(message: &str, any_content_received: bool) -> String {
     let lower = message.to_ascii_lowercase();
@@ -119,46 +244,34 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
     }
 
     let retry_note = if any_content_received {
-        "Some output had already streamed, so CodeWhale is surfacing the warning instead of replaying the request and risking duplicated output."
+        "Some output had already streamed, so Codewhale is surfacing the warning instead of replaying the request and risking duplicated output."
     } else {
-        "No output had streamed yet, so CodeWhale will retry automatically while retry budget remains."
+        "No output had streamed yet, so Codewhale will retry automatically while retry budget remains."
     };
     format!(
         "Provider stream connection dropped while reading the response body. {retry_note} Details: {message}"
     )
 }
 
-pub(crate) const TOOL_CALL_START_MARKERS: [&str; 12] = [
-    "[TOOL_CALL]",
-    "<codewhale:tool_call",
-    "<tool_call",
-    "<invoke ",
-    "<function_calls>",
-    "<｜DSML｜tool_calls>",
-    "<｜DSML｜invoke ",
-    "<|DSML|tool_calls>",
-    "<|DSML|invoke ",
-    "<|dsml|tool_calls>",
-    "<|dsml|invoke ",
-    "<|tool_calls>",
-];
-
-pub(crate) const TOOL_CALL_END_MARKERS: [&str; 12] = [
-    "[/TOOL_CALL]",
-    "</codewhale:tool_call>",
-    "</tool_call>",
-    "</invoke>",
-    "</function_calls>",
-    "</｜DSML｜tool_calls>",
-    "</｜DSML｜invoke>",
-    "</|DSML|tool_calls>",
-    "</|DSML|invoke>",
-    "</|dsml|tool_calls>",
-    "</|dsml|invoke>",
-    "</|tool_calls>",
-];
-
-const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 12] = [
+/// Wrapper shapes a model may emit as plain text instead of using the API tool
+/// channel. Each pair is `(start, end)`; the tables below are projections of
+/// this one and must stay in sync with it.
+///
+/// Three families are covered:
+///
+/// 1. Generic/Anthropic-style (`[TOOL_CALL]`, `<invoke …>`, `<function_calls>`).
+/// 2. DSML wrappers, in fullwidth `｜` (U+FF5C) and ASCII `|` delimiters, upper
+///    and lower case.
+/// 3. **DeepSeek's native tool-call tokens** (#3880). DeepSeek's chat template
+///    separates words with `▁` (U+2581 LOWER ONE EIGHTH BLOCK), not a space or
+///    underscore, so `<｜tool▁calls▁begin｜>` does not match any DSML entry and
+///    leaked into visible output. Both the `▁` and `_` separators are listed
+///    because a partially-normalizing tokenizer can emit either, and both
+///    delimiter forms because the ASCII fallback shows up in some renderings.
+///
+/// When adding a shape, add it here and to the two marker tables below.
+/// `marker_tables_are_consistent` enforces that they agree.
+pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
     ("<codewhale:tool_call", "</codewhale:tool_call>"),
     ("<tool_call", "</tool_call>"),
@@ -171,6 +284,87 @@ const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 12] = [
     ("<|dsml|tool_calls>", "</|dsml|tool_calls>"),
     ("<|dsml|invoke ", "</|dsml|invoke>"),
     ("<|tool_calls>", "</|tool_calls>"),
+    // DeepSeek native, fullwidth delimiters, U+2581 separator.
+    ("<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>"),
+    ("<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>"),
+    ("<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>"),
+    ("<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>"),
+    // DeepSeek native, ASCII delimiters, U+2581 separator.
+    ("<|tool▁calls▁begin|>", "<|tool▁calls▁end|>"),
+    ("<|tool▁call▁begin|>", "<|tool▁call▁end|>"),
+    ("<|tool▁outputs▁begin|>", "<|tool▁outputs▁end|>"),
+    ("<|tool▁output▁begin|>", "<|tool▁output▁end|>"),
+    // DeepSeek native, underscore separator.
+    ("<｜tool_calls_begin｜>", "<｜tool_calls_end｜>"),
+    ("<｜tool_call_begin｜>", "<｜tool_call_end｜>"),
+    ("<｜tool_outputs_begin｜>", "<｜tool_outputs_end｜>"),
+    ("<｜tool_output_begin｜>", "<｜tool_output_end｜>"),
+    ("<|tool_calls_begin|>", "<|tool_calls_end|>"),
+    ("<|tool_call_begin|>", "<|tool_call_end|>"),
+    ("<|tool_outputs_begin|>", "<|tool_outputs_end|>"),
+    ("<|tool_output_begin|>", "<|tool_output_end|>"),
+];
+
+pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
+    "[TOOL_CALL]",
+    "<codewhale:tool_call",
+    "<tool_call",
+    "<invoke ",
+    "<function_calls>",
+    "<｜DSML｜tool_calls>",
+    "<｜DSML｜invoke ",
+    "<|DSML|tool_calls>",
+    "<|DSML|invoke ",
+    "<|dsml|tool_calls>",
+    "<|dsml|invoke ",
+    "<|tool_calls>",
+    "<｜tool▁calls▁begin｜>",
+    "<｜tool▁call▁begin｜>",
+    "<｜tool▁outputs▁begin｜>",
+    "<｜tool▁output▁begin｜>",
+    "<|tool▁calls▁begin|>",
+    "<|tool▁call▁begin|>",
+    "<|tool▁outputs▁begin|>",
+    "<|tool▁output▁begin|>",
+    "<｜tool_calls_begin｜>",
+    "<｜tool_call_begin｜>",
+    "<｜tool_outputs_begin｜>",
+    "<｜tool_output_begin｜>",
+    "<|tool_calls_begin|>",
+    "<|tool_call_begin|>",
+    "<|tool_outputs_begin|>",
+    "<|tool_output_begin|>",
+];
+
+pub(crate) const TOOL_CALL_END_MARKERS: [&str; 28] = [
+    "[/TOOL_CALL]",
+    "</codewhale:tool_call>",
+    "</tool_call>",
+    "</invoke>",
+    "</function_calls>",
+    "</｜DSML｜tool_calls>",
+    "</｜DSML｜invoke>",
+    "</|DSML|tool_calls>",
+    "</|DSML|invoke>",
+    "</|dsml|tool_calls>",
+    "</|dsml|invoke>",
+    "</|tool_calls>",
+    "<｜tool▁calls▁end｜>",
+    "<｜tool▁call▁end｜>",
+    "<｜tool▁outputs▁end｜>",
+    "<｜tool▁output▁end｜>",
+    "<|tool▁calls▁end|>",
+    "<|tool▁call▁end|>",
+    "<|tool▁outputs▁end|>",
+    "<|tool▁output▁end|>",
+    "<｜tool_calls_end｜>",
+    "<｜tool_call_end｜>",
+    "<｜tool_outputs_end｜>",
+    "<｜tool_output_end｜>",
+    "<|tool_calls_end|>",
+    "<|tool_call_end|>",
+    "<|tool_outputs_end|>",
+    "<|tool_output_end|>",
 ];
 
 #[derive(Debug, Default)]

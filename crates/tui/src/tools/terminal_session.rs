@@ -39,6 +39,10 @@ const OUTPUT_LIMIT: usize = 12 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[cfg(unix)]
 const MAX_TIMEOUT_SECS: u64 = 600;
+#[cfg(unix)]
+const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const CANCEL_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
 struct TerminalSession {
@@ -49,6 +53,9 @@ struct TerminalSession {
     command: Option<CommandState>,
     durable: DurableTerminalRecord,
     durable_path: PathBuf,
+    /// True when the live PTY was started through a real sandbox backend.
+    /// A later narrowed posture must not reuse an unsandboxed shell.
+    sandbox_confined: bool,
 }
 
 #[cfg(unix)]
@@ -193,7 +200,60 @@ fn persist_durable(path: &Path, record: &DurableTerminalRecord) -> Result<(), St
 }
 
 #[cfg(unix)]
-fn create_session(name: &str, workspace: &std::path::Path) -> Result<SharedSession, String> {
+fn pty_lacks_required_sandbox(
+    policy: &crate::sandbox::SandboxPolicy,
+    applied: crate::sandbox::SandboxType,
+) -> bool {
+    policy.should_sandbox() && matches!(applied, crate::sandbox::SandboxType::None)
+}
+
+#[cfg(unix)]
+fn pty_sandbox_policy(context: &ToolContext) -> crate::sandbox::SandboxPolicy {
+    context.elevated_sandbox_policy.clone().unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn prepare_pty_shell(
+    shell: &str,
+    workspace: &std::path::Path,
+    policy: crate::sandbox::SandboxPolicy,
+) -> Result<(crate::sandbox::ExecEnv, bool), String> {
+    let spec = crate::sandbox::CommandSpec {
+        program: shell.to_string(),
+        args: vec!["-i".to_string()],
+        cwd: workspace.to_path_buf(),
+        env: std::collections::HashMap::new(),
+        timeout: Duration::from_secs(24 * 60 * 60),
+        sandbox_policy: policy.clone(),
+        justification: Some("persistent PTY shell".to_string()),
+        requested_command: None,
+    };
+    let prepared = crate::sandbox::SandboxManager::new().prepare(&spec);
+    if pty_lacks_required_sandbox(&policy, prepared.sandbox_type) {
+        return Err(
+            "terminal PTY tools cannot run unsandboxed under a narrowed filesystem posture; use Full Access / ExternalSandbox or enable seatbelt/bwrap"
+                .to_string(),
+        );
+    }
+    if prepared.command.is_empty() {
+        return Err("sandbox prepare returned an empty PTY command".to_string());
+    }
+    let confined = !matches!(prepared.sandbox_type, crate::sandbox::SandboxType::None);
+    Ok((prepared, confined))
+}
+
+#[cfg(unix)]
+fn create_session(
+    name: &str,
+    workspace: &std::path::Path,
+    policy: crate::sandbox::SandboxPolicy,
+) -> Result<SharedSession, String> {
+    // Unit tests exercise the persistent-PTY contract, not a developer's
+    // interactive shell startup files. Keep their deadlines deterministic and
+    // avoid racing process-global HOME/SHELL overrides from parallel tests.
+    #[cfg(test)]
+    let shell = "/bin/sh".to_string();
+    #[cfg(not(test))]
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let workspace = workspace
         .canonicalize()
@@ -216,9 +276,15 @@ fn create_session(name: &str, workspace: &std::path::Path) -> Result<SharedSessi
         })
         .map_err(|e| format!("failed to open PTY: {e}"))?;
 
-    let mut command = portable_pty::CommandBuilder::new(&shell);
-    command.arg("-i");
-    command.cwd(&workspace);
+    let (prepared, sandbox_confined) = prepare_pty_shell(&shell, &workspace, policy)?;
+    let mut command = portable_pty::CommandBuilder::new(&prepared.command[0]);
+    for arg in &prepared.command[1..] {
+        command.arg(arg);
+    }
+    command.cwd(&prepared.cwd);
+    for (key, value) in &prepared.env {
+        command.env(key, value);
+    }
     let child = pair
         .slave
         .spawn_command(command)
@@ -281,19 +347,35 @@ fn create_session(name: &str, workspace: &std::path::Path) -> Result<SharedSessi
         command: None,
         durable,
         durable_path,
+        sandbox_confined,
     })))
 }
 
 #[cfg(unix)]
-fn get_or_create(name: &str, workspace: &std::path::Path) -> Result<SharedSession, String> {
+fn get_or_create(
+    name: &str,
+    workspace: &std::path::Path,
+    policy: crate::sandbox::SandboxPolicy,
+) -> Result<SharedSession, String> {
     let key = session_key(name, workspace);
     let mut registry = sessions()
         .lock()
         .map_err(|_| "terminal session registry lock poisoned".to_string())?;
     if let Some(session) = registry.get(&key) {
+        let confined = session
+            .lock()
+            .ok()
+            .map(|guard| guard.sandbox_confined)
+            .unwrap_or(false);
+        if policy.should_sandbox() && !confined {
+            return Err(
+                "existing PTY session was started without a sandbox; start a new session name under the current posture or use Full Access"
+                    .to_string(),
+            );
+        }
         return Ok(Arc::clone(session));
     }
-    let session = create_session(name, workspace)?;
+    let session = create_session(name, workspace, policy)?;
     registry.insert(key, Arc::clone(&session));
     Ok(session)
 }
@@ -471,6 +553,51 @@ fn wait_shared_session(
     }
 }
 
+/// Interrupt a foreground command and wait until the persistent shell confirms
+/// that it is ready again.
+///
+/// Canonical PTYs may flush queued input when they process ETX. Resubmit the
+/// completion sentinel until the shell acknowledges it so a busy host cannot
+/// strand the session merely because the one post-interrupt write raced that
+/// flush.
+#[cfg(unix)]
+fn cancel_shared_session(session: &SharedSession) -> Result<(i32, String), ToolError> {
+    let marker = {
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if session.command.is_none() || completion(&session).is_some() {
+            return Err(ToolError::execution_failed(
+                "terminal session has no running foreground command",
+            ));
+        }
+        write_bytes(&session, &[3]).map_err(ToolError::execution_failed)?;
+        session
+            .command
+            .as_ref()
+            .expect("running command checked above")
+            .marker
+            .clone()
+    };
+    let deadline = Instant::now() + CANCEL_CONFIRM_TIMEOUT;
+
+    loop {
+        std::thread::sleep(CANCEL_SENTINEL_RETRY_INTERVAL);
+        let session = session
+            .lock()
+            .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
+        if let Some(done) = completion(&session) {
+            return Ok(done);
+        }
+        if Instant::now() >= deadline {
+            return Err(ToolError::execution_failed(
+                "terminal interrupt was sent, but cancellation was not confirmed within 2 seconds",
+            ));
+        }
+        write_completion_sentinel(&session, &marker, 130).map_err(ToolError::execution_failed)?;
+    }
+}
+
 #[cfg(unix)]
 fn session_result(
     session: &mut TerminalSession,
@@ -541,8 +668,10 @@ fn session_name(input: &serde_json::Value, required: bool) -> Result<&str, ToolE
 }
 
 #[cfg(unix)]
-fn timeout_secs(input: &serde_json::Value, key: &str) -> Duration {
-    Duration::from_secs(optional_u64(input, key, DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS))
+fn timeout_secs(input: &serde_json::Value, key: &str) -> Result<Duration, ToolError> {
+    Ok(Duration::from_secs(
+        optional_u64(input, key, DEFAULT_TIMEOUT_SECS)?.clamp(1, MAX_TIMEOUT_SECS),
+    ))
 }
 
 fn shell_allowed(context: &ToolContext) -> Result<(), ToolError> {
@@ -600,9 +729,9 @@ impl ToolSpec for TerminalRunTool {
         {
             let command = required_str(&input, "command")?.to_string();
             let name = session_name(&input, false)?.to_string();
-            let session =
-                get_or_create(&name, &context.workspace).map_err(ToolError::execution_failed)?;
-            let timeout = timeout_secs(&input, "timeout_secs");
+            let session = get_or_create(&name, &context.workspace, pty_sandbox_policy(context))
+                .map_err(ToolError::execution_failed)?;
+            let timeout = timeout_secs(&input, "timeout_secs")?;
             return tokio::task::spawn_blocking(move || {
                 {
                     let mut session = session.lock().map_err(|_| {
@@ -648,7 +777,7 @@ impl ToolSpec for TerminalSendTool {
             let name = session_name(&input, true)?.to_string();
             let text = required_str(&input, "text")?.as_bytes().to_vec();
             let session = find(&name, &context.workspace).map_err(ToolError::execution_failed)?;
-            let wait = Duration::from_millis(optional_u64(&input, "wait_ms", 250).min(60_000));
+            let wait = Duration::from_millis(optional_u64(&input, "wait_ms", 250)?.min(60_000));
             return tokio::task::spawn_blocking(move || {
                 let mut session = session
                     .lock()
@@ -689,7 +818,7 @@ impl ToolSpec for TerminalWaitTool {
         {
             let name = session_name(&input, true)?.to_string();
             let session = find(&name, &context.workspace).map_err(ToolError::execution_failed)?;
-            let timeout = timeout_secs(&input, "timeout_secs");
+            let timeout = timeout_secs(&input, "timeout_secs")?;
             return tokio::task::spawn_blocking(move || {
                 let (done, timed_out) = wait_shared_session(&session, timeout)?;
                 let mut session = session
@@ -729,40 +858,11 @@ impl ToolSpec for TerminalCancelTool {
             let name = session_name(&input, true)?.to_string();
             let session = find(&name, &context.workspace).map_err(ToolError::execution_failed)?;
             return tokio::task::spawn_blocking(move || {
-                let marker = {
-                    let session = session.lock().map_err(|_| {
-                        ToolError::execution_failed("terminal session lock poisoned")
-                    })?;
-                    if session.command.is_none() || completion(&session).is_some() {
-                        return Err(ToolError::execution_failed(
-                            "terminal session has no running foreground command",
-                        ));
-                    }
-                    write_bytes(&session, &[3]).map_err(ToolError::execution_failed)?;
-                    session
-                        .command
-                        .as_ref()
-                        .expect("running command checked above")
-                        .marker
-                        .clone()
-                };
-                // Canonical-mode terminals flush queued input on ETX. That can
-                // discard the sentinel originally queued behind the foreground
-                // command, so enqueue it again after the interrupt has reached
-                // the process group. A duplicate sentinel is harmless.
-                std::thread::sleep(Duration::from_millis(50));
-                {
-                    let session = session.lock().map_err(|_| {
-                        ToolError::execution_failed("terminal session lock poisoned")
-                    })?;
-                    write_completion_sentinel(&session, &marker, 130)
-                        .map_err(ToolError::execution_failed)?;
-                }
-                let (done, _) = wait_shared_session(&session, Duration::from_secs(2))?;
+                let done = cancel_shared_session(&session)?;
                 let mut session = session
                     .lock()
                     .map_err(|_| ToolError::execution_failed("terminal session lock poisoned"))?;
-                let mut result = session_result(&mut session, done, false);
+                let mut result = session_result(&mut session, Some(done), false);
                 result.success = true;
                 if let Some(metadata) = result.metadata.as_mut() {
                     metadata["status"] = json!("canceled");
@@ -802,6 +902,7 @@ impl ToolSpec for TerminalResetTool {
             let name = session_name(&input, true)?.to_string();
             let old = find(&name, &context.workspace).map_err(ToolError::execution_failed)?;
             let workspace = context.workspace.clone();
+            let policy = pty_sandbox_policy(context);
             return tokio::task::spawn_blocking(move || {
                 if let Ok(mut old) = old.lock() { let _ = old.child.kill(); }
                 if let Ok(mut old) = old.lock() {
@@ -809,7 +910,8 @@ impl ToolSpec for TerminalResetTool {
                     old.durable.updated_at = chrono::Utc::now().to_rfc3339();
                     let _ = persist_durable(&old.durable_path, &old.durable);
                 }
-                let fresh = create_session(&name, &workspace).map_err(ToolError::execution_failed)?;
+                let fresh = create_session(&name, &workspace, policy)
+                    .map_err(ToolError::execution_failed)?;
                 sessions().lock().map_err(|_| ToolError::execution_failed("terminal session registry lock poisoned"))?.insert(session_key(&name, &workspace), fresh);
                 Ok(ToolResult { content: format!("Reset terminal session '{name}'. Lost shell state and any running command."), success: true, metadata: Some(json!({"session":name,"reset":true,"lost_state":["cwd","environment","functions","activated environments","running command"]})) })
             }).await.map_err(|e| ToolError::execution_failed(e.to_string()))?;
@@ -827,11 +929,21 @@ mod tests {
     use super::*;
 
     fn fresh(name: &str) -> SharedSession {
-        let session = get_or_create(name, std::path::Path::new("/tmp")).unwrap();
+        let session = get_or_create(
+            name,
+            std::path::Path::new("/tmp"),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         let mut session_guard = session.lock().unwrap();
         let _ = session_guard.child.kill();
         drop(session_guard);
-        let replacement = create_session(name, std::path::Path::new("/tmp")).unwrap();
+        let replacement = create_session(
+            name,
+            std::path::Path::new("/tmp"),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         sessions().lock().unwrap().insert(
             session_key(name, Path::new("/tmp")),
             Arc::clone(&replacement),
@@ -900,7 +1012,12 @@ mod tests {
                 .contains("present")
         );
         let _ = session.lock().unwrap().child.kill();
-        let replacement = create_session("test-reset", std::path::Path::new("/tmp")).unwrap();
+        let replacement = create_session(
+            "test-reset",
+            std::path::Path::new("/tmp"),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         sessions().lock().unwrap().insert(
             session_key("test-reset", Path::new("/tmp")),
             Arc::clone(&replacement),
@@ -945,25 +1062,16 @@ mod tests {
             let mut guard = worker.lock().unwrap();
             start_command(&mut guard, "sleep 10").unwrap();
         }
-        let started = Instant::now();
         let handle = std::thread::spawn(move || {
             let (done, timed_out) = wait_shared_session(&worker, Duration::from_secs(30)).unwrap();
             let mut guard = worker.lock().unwrap();
             session_result(&mut guard, done, timed_out)
         });
         std::thread::sleep(Duration::from_millis(150));
-        let marker = {
-            let guard = session.lock().unwrap();
-            write_bytes(&guard, &[3]).unwrap();
-            guard.command.as_ref().unwrap().marker.clone()
-        };
-        std::thread::sleep(Duration::from_millis(50));
-        write_completion_sentinel(&session.lock().unwrap(), &marker, 130).unwrap();
-        let _ = handle.join().unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "cancel was blocked behind the foreground waiter"
-        );
+        let done = cancel_shared_session(&session).unwrap();
+        let result = handle.join().unwrap();
+        assert_eq!(done.0, 130);
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 130);
         assert!(
             run(&session, "printf alive", Duration::from_secs(3))
                 .content
@@ -972,12 +1080,47 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_posture_without_a_backend_fails_closed() {
+        assert!(pty_lacks_required_sandbox(
+            &crate::sandbox::SandboxPolicy::ReadOnly,
+            crate::sandbox::SandboxType::None,
+        ));
+        assert!(!pty_lacks_required_sandbox(
+            &crate::sandbox::SandboxPolicy::DangerFullAccess,
+            crate::sandbox::SandboxType::None,
+        ));
+    }
+
+    #[test]
+    fn full_access_prepares_an_unsandboxed_pty() {
+        let (prepared, confined) = prepare_pty_shell(
+            "/bin/sh",
+            Path::new("/tmp"),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .expect("full access may start a PTY");
+        assert!(!confined);
+        assert_eq!(prepared.command[0], "/bin/sh");
+        assert_eq!(prepared.command[1], "-i");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn session_names_are_scoped_to_workspace() {
         let first_workspace = tempfile::tempdir().unwrap();
         let second_workspace = tempfile::tempdir().unwrap();
-        let first = get_or_create("shared-name", first_workspace.path()).unwrap();
-        let second = get_or_create("shared-name", second_workspace.path()).unwrap();
+        let first = get_or_create(
+            "shared-name",
+            first_workspace.path(),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
+        let second = get_or_create(
+            "shared-name",
+            second_workspace.path(),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(find("shared-name", first_workspace.path()).is_ok());
         assert!(find("shared-name", second_workspace.path()).is_ok());
@@ -990,7 +1133,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let canonical_workspace = workspace.path().canonicalize().unwrap();
         let name = format!("restart-proof-{}", Uuid::new_v4());
-        let first = create_session(&name, workspace.path()).unwrap();
+        let first = create_session(
+            &name,
+            workspace.path(),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         let first_record = first.lock().unwrap().durable.clone();
         assert_eq!(first_record.state, DurableTerminalState::Idle);
         assert_eq!(first_record.last_known_cwd, canonical_workspace);
@@ -1009,7 +1157,12 @@ mod tests {
         assert!(stale.contains("stale/lost"), "{stale}");
         assert!(stale.contains("start a replacement"), "{stale}");
 
-        let replacement = create_session(&name, workspace.path()).unwrap();
+        let replacement = create_session(
+            &name,
+            workspace.path(),
+            crate::sandbox::SandboxPolicy::DangerFullAccess,
+        )
+        .unwrap();
         let replacement = replacement.lock().unwrap();
         assert_ne!(replacement.durable.session_id, first_record.session_id);
         let previous = replacement.durable.previous.as_deref().unwrap();

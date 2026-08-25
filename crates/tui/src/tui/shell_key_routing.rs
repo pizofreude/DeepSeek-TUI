@@ -67,19 +67,45 @@ pub fn binding(id: ShellBindingId) -> &'static ShellBinding {
         .expect("shell binding catalog is exhaustive")
 }
 
-/// Render a portable `Alt+X` chord for the current platform. macOS shows
-/// `⌥X` — never `Alt` or `Cmd` (TUI-DOG-002 acceptance).
+/// Platform-aware chord for opening complete tool or approval details.
 #[must_use]
-pub fn display_chord(chord: &'static str) -> Cow<'static, str> {
-    display_chord_for_platform(chord, cfg!(target_os = "macos"))
+pub fn tool_details_chord() -> Cow<'static, str> {
+    display_chord(binding(ShellBindingId::ToolDetails).footer_chord)
 }
 
+/// Render a portable `Alt+X` chord for the current platform. macOS normally
+/// shows `⌥X`; ASCII-safe terminals retain the portable `Alt+X` spelling.
+#[must_use]
+pub fn display_chord(chord: &'static str) -> Cow<'static, str> {
+    display_chord_for_platform_and_ascii(
+        chord,
+        cfg!(target_os = "macos"),
+        crate::tui::color_compat::ascii_safe_enabled(),
+    )
+}
+
+#[cfg(test)]
 #[must_use]
 pub fn display_chord_for_platform(chord: &'static str, is_macos: bool) -> Cow<'static, str> {
-    if is_macos && chord.contains("Alt+") {
-        Cow::Owned(chord.replace("Alt+", "⌥"))
-    } else {
+    display_chord_for_platform_and_ascii(chord, is_macos, false)
+}
+
+fn display_chord_for_platform_and_ascii(
+    chord: &'static str,
+    is_macos: bool,
+    ascii_safe: bool,
+) -> Cow<'static, str> {
+    if ascii_safe {
+        return Cow::Borrowed(chord);
+    }
+    if !is_macos {
+        return Cow::Borrowed(chord);
+    }
+    let rendered = chord.replace("Alt+", "⌥").replace("F1", "fn+F1");
+    if rendered == chord {
         Cow::Borrowed(chord)
+    } else {
+        Cow::Owned(rendered)
     }
 }
 
@@ -87,14 +113,34 @@ pub fn display_chord_for_platform(chord: &'static str, is_macos: bool) -> Cow<'s
 /// `{keys}`) are localized by the caller.
 #[must_use]
 pub fn footer_action_hints(include_context: bool) -> String {
-    footer_action_hints_for_platform(include_context, cfg!(target_os = "macos"))
+    footer_action_hints_for_platform_and_ascii(
+        include_context,
+        cfg!(target_os = "macos"),
+        crate::tui::color_compat::ascii_safe_enabled(),
+    )
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn footer_action_hints_for_platform(include_context: bool, is_macos: bool) -> String {
-    let details =
-        display_chord_for_platform(binding(ShellBindingId::ToolDetails).footer_chord, is_macos);
-    let help = binding(ShellBindingId::Help).footer_chord;
+    footer_action_hints_for_platform_and_ascii(include_context, is_macos, false)
+}
+
+fn footer_action_hints_for_platform_and_ascii(
+    include_context: bool,
+    is_macos: bool,
+    ascii_safe: bool,
+) -> String {
+    let details = display_chord_for_platform_and_ascii(
+        binding(ShellBindingId::ToolDetails).footer_chord,
+        is_macos,
+        ascii_safe,
+    );
+    let help = display_chord_for_platform_and_ascii(
+        binding(ShellBindingId::Help).footer_chord,
+        is_macos,
+        ascii_safe,
+    );
     if include_context {
         format!(
             "{details}:{{output}} · {}:{{context}} · {help}:{{keys}}",
@@ -127,12 +173,33 @@ pub fn is_help_shortcut(key: &KeyEvent) -> bool {
     if matches!(key.code, KeyCode::F(1)) {
         return true;
     }
-    if matches!(key.code, KeyCode::Char('/')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Windows delivers AltGr as Ctrl+Alt, so a layout-emitted glyph (e.g.
+    // AltGr+Q typing '/' on ABNT2) would satisfy a bare CONTROL check.
+    // AltGr chords are text, never shortcuts (#4723).
+    let altgr = crate::tui::widgets::key_hint::is_altgr(key.modifiers);
+    if matches!(key.code, KeyCode::Char('/'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !altgr
+    {
+        return true;
+    }
+    // Some legacy terminal stacks encode Ctrl+/ as the ASCII unit separator,
+    // which crossterm reports as Ctrl+7 or Ctrl+_. Accept both portable
+    // decodings so the documented fallback remains real.
+    if matches!(key.code, KeyCode::Char('7') | KeyCode::Char('_'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !altgr
+    {
         return true;
     }
     // Alt+? still opens help where the terminal delivers it, but it is not
     // advertised anywhere (TUI-DOG-003).
     matches!(key.code, KeyCode::Char('?')) && key_shortcuts::alt_nav_modifiers(key.modifiers)
+}
+
+#[must_use]
+pub fn is_settings_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(2)) && key.modifiers.is_empty()
 }
 
 #[cfg(test)]
@@ -170,6 +237,18 @@ mod tests {
     }
 
     #[test]
+    fn ascii_safe_macos_hints_keep_portable_chords() {
+        assert_eq!(
+            display_chord_for_platform_and_ascii("Alt+V", true, true),
+            "Alt+V"
+        );
+        let hints = footer_action_hints_for_platform_and_ascii(true, true, true);
+        assert!(hints.starts_with("Alt+V:"), "{hints}");
+        assert!(hints.contains("F1:"), "{hints}");
+        assert!(!hints.contains('⌥'), "{hints}");
+    }
+
+    #[test]
     fn footer_hints_never_advertise_bare_v_alt_question_or_alt_c() {
         for is_macos in [true, false] {
             for include_context in [true, false] {
@@ -179,6 +258,9 @@ mod tests {
                 assert!(!hints.contains("Alt+?"), "{hints}");
                 assert!(!hints.contains("Alt+C"), "{hints}");
                 assert!(hints.contains("F1:"), "{hints}");
+                if is_macos {
+                    assert!(hints.contains("fn+F1:"), "{hints}");
+                }
                 if include_context {
                     assert!(hints.contains("/context:"), "{hints}");
                 }
@@ -196,6 +278,14 @@ mod tests {
             KeyCode::Char('/'),
             KeyModifiers::CONTROL
         )));
+        assert!(is_help_shortcut(&KeyEvent::new(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_help_shortcut(&KeyEvent::new(
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL
+        )));
         // Unadvertised but accepted where the terminal delivers them.
         assert!(is_help_shortcut(&KeyEvent::new(
             KeyCode::Char('?'),
@@ -203,6 +293,49 @@ mod tests {
         )));
         let inverted_question = KeyEvent::new(KeyCode::Char('\u{00bf}'), KeyModifiers::NONE);
         assert!(!is_help_shortcut(&inverted_question));
+    }
+
+    #[test]
+    fn altgr_slash_types_text_instead_of_opening_help() {
+        // Windows encodes AltGr as Ctrl+Alt: AltGr+Q on ABNT2 delivers '/'
+        // with CONTROL|ALT and must reach the composer as text (#4723).
+        let altgr_slash = KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let altgr_seven = KeyEvent::new(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        if cfg!(windows) {
+            assert!(!is_help_shortcut(&altgr_slash));
+            assert!(!is_help_shortcut(&altgr_seven));
+        } else {
+            // Elsewhere Ctrl+Alt is a deliberate chord and keeps working.
+            assert!(is_help_shortcut(&altgr_slash));
+            assert!(is_help_shortcut(&altgr_seven));
+        }
+        // Plain Ctrl+/ still opens help everywhere.
+        assert!(is_help_shortcut(&KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn settings_accepts_only_plain_f2() {
+        assert!(is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(2),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(1),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]

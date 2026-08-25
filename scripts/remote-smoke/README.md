@@ -4,7 +4,7 @@ Status: experimental smoke-lab scripts for the US-first remote-workbench lane
 (issue #1990). Not part of the supported install paths until the smoke passes
 and this graduates into a documented setup.
 
-This concretizes `docs/REMOTE_VM_US.md`: a cheap US VPS running the CodeWhale
+This concretizes `docs/REMOTE_VM_US.md`: a cheap US VPS running the Codewhale
 runtime on `127.0.0.1` plus the Telegram long-polling bridge, reusing the
 provider-agnostic Ubuntu scripts under `scripts/tencent-lighthouse/` (audited:
 nothing in them is Tencent-specific).
@@ -97,7 +97,9 @@ docs/REMOTE_VM_US.md default spec).
 - `codewhale-runtime.service` hard-fails activation if
   `/home/codewhale/.codewhale` or `/home/codewhale/.deepseek` don't exist
   (`ReadWritePaths`); `setup-vm.sh` pre-creates them.
-- Both binaries are required (`codewhale` delegates to `codewhale-tui`).
+- Current installs place the byte-identical `codewhale` and `codew` commands
+  side by side. The runtime is consolidated; no third `codewhale-tui` command
+  is required.
 - Exactly one bridge process per bot token — a second poller causes endless
   Telegram 409s. Stop any local bridge before starting the VM one.
 - `/interrupt` is queued behind an active streaming turn (known limitation,

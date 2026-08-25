@@ -9,11 +9,17 @@
 //!
 //! 1. **Fingerprints** the immutable prefix (system prompt + tool specs)
 //!    at session start, using SHA-256 for strong collision resistance.
-//! 2. **Detects drift** by comparing the current prefix against the
-//!    pinned fingerprint before every request.
-//! 3. **Diagnoses** the cause of drift — did the system prompt change?
-//!    Did the tool set change? Both?
+//! 2. **Verifies** the current prefix against the pinned fingerprint before
+//!    every request.
+//! 3. **Attributes** every change: a header change the engine declared
+//!    (`/model`, `/mode`, goal edits, MCP or deferred-tool activation,
+//!    session sync) re-pins under a logged reason; an undeclared change is
+//!    *drift* — it is recorded and reported, and the original pin stays so
+//!    later checks keep counting the miss instead of quietly adopting it.
 //! 4. **Emits events** so the TUI can surface stability to the user.
+//!
+//! The invariant this guards: after session start, system and tools are
+//! frozen bytes; history only grows; a miss is allowed only when we log why.
 //!
 //! ## Three-region model (from Reasonix)
 //!
@@ -32,7 +38,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,15 +61,18 @@ impl PrefixFingerprint {
     /// Compute a fingerprint from system prompt text and tool list.
     ///
     /// Tools are serialized to the same JSON shape the chat API receives
-    /// (`type`, `name`, `description`, `parameters`, `strict`), sorted
-    /// lexicographically by JSON text, then SHA-256 hashed. This catches
-    /// schema/description drift that actually affects the API prefix,
-    /// while ignoring internal-only fields like `allowed_callers` (#2264).
+    /// (`type`, `name`, `description`, `parameters`, `strict`) **in provider
+    /// wire order**, then SHA-256 hashed. Order is load-bearing: the provider
+    /// KV cache is order-sensitive, so sorting before hashing could read a
+    /// false-green while the real prefix cache misses every turn (ops C1,
+    /// DSH invariant). This also catches schema/description drift that
+    /// actually affects the API prefix, while ignoring internal-only fields
+    /// like `allowed_callers` (#2264).
     ///
     /// This entry point shares a process-local [`ToolCatalogCache`] with
     /// every other call, so a stable tool set (the common case after the
     /// first turn of a session) avoids the per-tool JSON serialization
-    /// and sort/join entirely. Callers that hold their own cache — e.g.
+    /// and join entirely. Callers that hold their own cache — e.g.
     /// [`PrefixStabilityManager`] — should use
     /// [`Self::compute_with_tool_cache`] to share *that* cache instead
     /// and avoid the thread-local lookup.
@@ -75,9 +83,9 @@ impl PrefixFingerprint {
     }
 
     /// Compute a fingerprint while reusing a [`ToolCatalogCache`] for the
-    /// tool-side work. The cache holds the joined+sorted+SHA-256'd catalog
+    /// tool-side work. The cache holds the joined+SHA-256'd catalog
     /// under a content-derived identity so the per-tool JSON serialization
-    /// and the sort/join only run on the first call for a given tool set.
+    /// and the join only run on the first call for a given tool set.
     ///
     /// On a cache hit this function avoids the entire tool serialization
     /// path, which can be 100+ microseconds for a 60-tool catalog.
@@ -179,28 +187,67 @@ pub struct PrefixStabilityManager {
     change_count: u64,
     /// Total number of stability checks performed.
     check_count: u64,
+    /// Why the current pin exists: `initial`, `resume`, or `change:<what>`.
+    pin_reason: Option<String>,
+    /// Bounded log of every attributed change and every undeclared drift.
+    history: VecDeque<PrefixHistoryEntry>,
+    /// Explanation of the most recent expected cache miss (a declared header
+    /// change, a history reset such as compaction, or undeclared drift).
+    last_miss_reason: Option<String>,
+    /// `<context_update>` snapshots appended this session (workspace drift
+    /// delivered as history, with the pinned header untouched).
+    context_update_count: u64,
     /// Process-local cache for the tool-catalog JSON serialization. Avoids
-    /// re-running `tool_to_api_json` + sort + join on every `check_and_update`
+    /// re-running `tool_to_api_json` + join on every `check_and_update`
     /// when the tool set is unchanged (the common case once tools are
     /// registered at session start).
     tool_catalog_cache: ToolCatalogCache,
+}
+
+/// Maximum retained [`PrefixHistoryEntry`] records per session.
+const PREFIX_HISTORY_CAP: usize = 32;
+
+/// One attributed prefix event: a declared header change (re-pinned) or an
+/// undeclared drift (pin kept).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefixHistoryEntry {
+    /// `change:<what>` for declared header changes, `drift:<component>` for
+    /// undeclared changes, `reset:<what>` for history resets.
+    pub reason: String,
+    /// Whether the pin was replaced by this event.
+    pub repinned: bool,
+    /// Combined SHA-256 before the event.
+    pub from_sha256: String,
+    /// Combined SHA-256 the request actually carried.
+    pub to_sha256: String,
+}
+
+/// Outcome of [`PrefixStabilityManager::check`].
+#[derive(Debug, Clone)]
+pub enum PrefixCheck {
+    /// The request prefix matches the pin byte-for-byte.
+    Stable,
+    /// The prefix changed and the engine declared why; the pin moved.
+    Repinned {
+        reason: String,
+        change: PrefixChange,
+    },
+    /// The prefix changed with no declared reason. The pin did NOT move.
+    Drift { change: PrefixChange },
 }
 
 /// Default capacity for the tool-catalog serialization cache. Sized for
 /// "session + 1 or 2 forked subagent catalogs" without unbounded growth.
 const TOOL_CATALOG_CACHE_CAPACITY: usize = 8;
 
-/// Bounded LRU cache of `(tool_set_identity) -> (sha256_hex, joined_string)`.
+/// Bounded LRU cache of `(tool_set_identity) -> sha256_hex`.
 ///
 /// The cache key is a content-derived `u64` hash of the tool list (length +
 /// per-tool `name` + `description` + serialized `input_schema`). On a hit,
-/// `PrefixFingerprint::compute` skips the per-tool JSON serialization, the
-/// sort, and the join — a workload that can be 100+ microseconds for a
-/// 60-tool catalog. On a miss, the work runs once and the result is stored.
-///
-/// The cache is intentionally *not* generic over `PrefixFingerprint` because
-/// only the joined string is large; the SHA-256 is recomputed from the cached
-/// joined string when the catalog changes (cheap, ≤ a few hundred bytes).
+/// `PrefixFingerprint::compute` skips the per-tool JSON serialization and
+/// the join — a workload that can be 100+ microseconds for a
+/// 60-tool catalog. On a miss, the work runs once and only the digest is
+/// retained (#3854); the joined catalog string is ephemeral.
 #[derive(Debug, Default, Clone)]
 pub struct ToolCatalogCache {
     by_identity: HashMap<u64, CachedCatalog>,
@@ -208,18 +255,11 @@ pub struct ToolCatalogCache {
     capacity: usize,
 }
 
-/// One entry in [`ToolCatalogCache`]. Stores the joined JSON catalog plus
-/// the pre-computed SHA-256 hex digest so [`PrefixFingerprint::compute`]
-/// does not need to re-hash on the hot path.
+/// One entry in [`ToolCatalogCache`]. Production only needs the pre-computed
+/// SHA-256 digest of the in-order joined catalog.
 #[derive(Debug, Clone)]
 pub struct CachedCatalog {
-    /// The newline-joined, sorted tool-catalog JSON. Wrapped in an `Arc` so
-    /// multiple cache consumers can hold the same allocation. Exposed for
-    /// observability (debug builds, `/status` chip) and for tests that
-    /// need to assert byte-stability of the joined catalog.
-    #[allow(dead_code)] // observability + tests; not consumed on the hot path
-    pub joined: Arc<String>,
-    /// SHA-256 hex digest of `joined`, computed once on cache miss.
+    /// SHA-256 hex digest of the newline-joined, in-order tool-catalog JSON.
     pub sha256_hex: String,
 }
 
@@ -248,20 +288,18 @@ impl ToolCatalogCache {
     pub fn fingerprint_for(&mut self, tools: &[Tool]) -> CachedCatalog {
         let identity = tool_set_identity(tools);
         if let Some(cached) = self.by_identity.get(&identity) {
-            // Hit: clone the `Arc` so the caller can hold the joined string
-            // without keeping a reference to the cache.
             return cached.clone();
         }
 
-        // Miss: serialize, sort, join, hash. Store the joined string in an
-        // `Arc` so a later hit can return the same allocation.
-        let mut serialized: Vec<String> = tools.iter().filter_map(tool_to_api_json).collect();
-        serialized.sort();
-        let joined = Arc::new(serialized.join("\n"));
-        let sha256_hex = sha256_hex(joined.as_bytes());
+        // Miss: serialize, join, hash — in wire order, never sorted. The
+        // provider cache is order-sensitive; a sorted fingerprint can say
+        // "stable" while the real prefix misses every turn (ops C1). Keep
+        // only the digest in the cache — the joined string is not needed on
+        // the hot path (#3854).
+        let serialized: Vec<String> = tools.iter().filter_map(tool_to_api_json).collect();
+        let joined = serialized.join("\n");
         let entry = CachedCatalog {
-            joined: Arc::clone(&joined),
-            sha256_hex,
+            sha256_hex: sha256_hex(joined.as_bytes()),
         };
 
         if self.by_identity.len() >= self.capacity
@@ -378,7 +416,7 @@ fn hash_json_value<H: Hasher>(value: &serde_json::Value, state: &mut H) {
     }
 }
 
-/// Process-local fallback cache used by [`PrefixFingerprint::compute`]
+/// Process-local fallback cache used by `PrefixFingerprint::compute`
 /// (when available). Callers that maintain their own cache (e.g.
 /// [`PrefixStabilityManager`]) should prefer
 /// [`PrefixFingerprint::compute_with_tool_cache`] and pass the cache in
@@ -396,6 +434,10 @@ impl PrefixStabilityManager {
             last_change: None,
             change_count: 0,
             check_count: 0,
+            pin_reason: Some("initial".to_string()),
+            history: VecDeque::new(),
+            last_miss_reason: None,
+            context_update_count: 0,
             tool_catalog_cache: cache,
         }
     }
@@ -409,6 +451,10 @@ impl PrefixStabilityManager {
             last_change: None,
             change_count: 0,
             check_count: 0,
+            pin_reason: None,
+            history: VecDeque::new(),
+            last_miss_reason: None,
+            context_update_count: 0,
             tool_catalog_cache: ToolCatalogCache::new(),
         }
     }
@@ -418,6 +464,16 @@ impl PrefixStabilityManager {
     /// Note: does NOT increment `check_count` — that counter is reserved
     /// for `check_and_update` calls so `stability_ratio()` stays accurate.
     pub fn pin(&mut self, system_text: &str, tools: Option<&[Tool]>) -> bool {
+        self.pin_with_reason(system_text, tools, "initial")
+    }
+
+    /// Pin under an explicit reason (`initial`, `resume`, `change:<what>`).
+    pub fn pin_with_reason(
+        &mut self,
+        system_text: &str,
+        tools: Option<&[Tool]>,
+        reason: &str,
+    ) -> bool {
         let fp = PrefixFingerprint::compute_with_tool_cache(
             system_text,
             tools,
@@ -426,26 +482,72 @@ impl PrefixStabilityManager {
         let was_unpinned = self.pinned.is_none();
         self.pinned = Some(fp.clone());
         self.current = Some(fp);
+        self.pin_reason = Some(reason.to_string());
         was_unpinned
     }
 
-    /// Check whether the current prefix matches the pinned fingerprint.
-    /// Updates internal state and returns:
-    /// - `Ok(true)` if the prefix is stable (fingerprint matches pinned).
-    /// - `Ok(false)` if the prefix changed but was automatically re-pinned.
-    /// - `Err(change)` if the prefix changed; caller should surface this.
+    /// Record an expected miss that is not a header change (compaction,
+    /// `/clear`, an edited turn). The pin is untouched; the reason is kept so
+    /// `/cache stats` can explain the next low hit-rate turn.
+    pub fn note_history_reset(&mut self, what: &str) {
+        let hash = self
+            .pinned
+            .as_ref()
+            .map(|fp| fp.combined_sha256.clone())
+            .unwrap_or_default();
+        self.push_history(PrefixHistoryEntry {
+            reason: format!("reset:{what}"),
+            repinned: false,
+            from_sha256: hash.clone(),
+            to_sha256: hash,
+        });
+        self.last_miss_reason = Some(format!("reset:{what}"));
+    }
+
+    /// Record that workspace drift was delivered as a `<context_update>`
+    /// history append. Not a miss: the pin and the prefix are unchanged.
+    pub fn note_context_update(&mut self) {
+        self.context_update_count = self.context_update_count.saturating_add(1);
+        let hash = self
+            .pinned
+            .as_ref()
+            .map(|fp| fp.combined_sha256.clone())
+            .unwrap_or_default();
+        self.push_history(PrefixHistoryEntry {
+            reason: "context_update".to_string(),
+            repinned: false,
+            from_sha256: hash.clone(),
+            to_sha256: hash,
+        });
+    }
+
+    /// Number of `<context_update>` snapshots appended this session.
+    pub fn context_update_count(&self) -> u64 {
+        self.context_update_count
+    }
+
+    fn push_history(&mut self, entry: PrefixHistoryEntry) {
+        if self.history.len() >= PREFIX_HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
+    }
+
+    /// Verify the request prefix against the pin, attributing any change.
     ///
-    /// After calling this, `last_change()` returns the detected change.
-    pub fn check_and_update(
+    /// `declared_change` names a header change the engine performed on
+    /// purpose (`model`, `mode`, `goal`, `tools:+web_fetch`, `mcp`, …). When
+    /// the prefix changed and a reason is declared, the pin moves and the
+    /// change is logged as `change:<reason>`. When it changed with no
+    /// declared reason, that is drift: it is logged as `drift:<component>`
+    /// and the pin stays put, so the same undeclared prefix keeps counting as
+    /// a miss instead of becoming the new baseline.
+    pub fn check(
         &mut self,
         system_text: &str,
         tools: Option<&[Tool]>,
-    ) -> Result<bool, Box<PrefixChange>> {
-        // Use the cached tool-catalog fingerprint path so a stable tool set
-        // (the common case after the first turn) does not re-serialize the
-        // full tool list. The system-prompt side is hashed on every call
-        // because the system prompt changes more often (mode flips,
-        // project-context refreshes, canonical state overlays).
+        declared_change: Option<&str>,
+    ) -> PrefixCheck {
         let fp = PrefixFingerprint::compute_with_tool_cache(
             system_text,
             tools,
@@ -455,40 +557,91 @@ impl PrefixStabilityManager {
         self.check_count += 1;
 
         let pinned = match &self.pinned {
-            Some(p) => p,
+            Some(p) => p.clone(),
             None => {
-                // First check: pin now.
                 self.pinned = Some(fp);
+                self.pin_reason = Some(declared_change.unwrap_or("initial").to_string());
                 self.last_change = None;
-                return Ok(true);
+                return PrefixCheck::Stable;
             }
         };
 
         if fp.combined_sha256 == pinned.combined_sha256 {
-            // Stable — no change.
-            Ok(true)
-        } else {
-            // Change detected.
-            let old = old_fp.unwrap_or_else(|| pinned.clone());
-            let system_changed = fp.system_sha256 != pinned.system_sha256;
-            let tools_changed = fp.tools_sha256 != pinned.tools_sha256;
+            return PrefixCheck::Stable;
+        }
 
-            let change = PrefixChange {
-                old,
-                new: fp.clone(),
-                system_changed,
-                tools_changed,
-            };
+        let old = old_fp.unwrap_or_else(|| pinned.clone());
+        let system_changed = fp.system_sha256 != pinned.system_sha256;
+        let tools_changed = fp.tools_sha256 != pinned.tools_sha256;
+        let change = PrefixChange {
+            old,
+            new: fp.clone(),
+            system_changed,
+            tools_changed,
+        };
+        self.last_change = Some(change.clone());
+        self.change_count += 1;
 
-            self.last_change = Some(change.clone());
-            self.change_count += 1;
+        match declared_change {
+            Some(reason) => {
+                let reason = format!("change:{reason}");
+                self.push_history(PrefixHistoryEntry {
+                    reason: reason.clone(),
+                    repinned: true,
+                    from_sha256: pinned.combined_sha256.clone(),
+                    to_sha256: fp.combined_sha256.clone(),
+                });
+                self.last_miss_reason = Some(reason.clone());
+                self.pinned = Some(fp);
+                self.pin_reason = Some(reason.clone());
+                PrefixCheck::Repinned { reason, change }
+            }
+            None => {
+                let reason = format!("drift:{}", change.label());
+                self.push_history(PrefixHistoryEntry {
+                    reason: reason.clone(),
+                    repinned: false,
+                    from_sha256: pinned.combined_sha256.clone(),
+                    to_sha256: fp.combined_sha256.clone(),
+                });
+                self.last_miss_reason = Some(reason);
+                PrefixCheck::Drift { change }
+            }
+        }
+    }
 
-            // Re-pin to the new prefix so subsequent checks are
-            // against the latest baseline. Use the original fp
-            // (avoid recomputing the hash — clone was for the change record).
-            self.pinned = Some(fp);
+    /// Why the current pin exists.
+    pub fn pin_reason(&self) -> Option<&str> {
+        self.pin_reason.as_deref()
+    }
 
-            Err(Box::new(change))
+    /// Attributed change/drift/reset history, oldest first.
+    pub fn history(&self) -> impl Iterator<Item = &PrefixHistoryEntry> {
+        self.history.iter()
+    }
+
+    /// Explanation of the most recent expected miss, if any.
+    pub fn last_miss_reason(&self) -> Option<&str> {
+        self.last_miss_reason.as_deref()
+    }
+
+    /// Check whether the current prefix matches the pinned fingerprint
+    /// without a declared header change.
+    ///
+    /// - `Ok(true)` when the prefix is stable (or this was the first pin).
+    /// - `Err(change)` when the prefix drifted. The pin is **kept**: an
+    ///   undeclared change never becomes the new baseline. Use [`Self::check`]
+    ///   with a declared reason to move the pin on purpose.
+    pub fn check_and_update(
+        &mut self,
+        system_text: &str,
+        tools: Option<&[Tool]>,
+    ) -> Result<bool, Box<PrefixChange>> {
+        match self.check(system_text, tools, None) {
+            PrefixCheck::Stable => Ok(true),
+            PrefixCheck::Repinned { change, .. } | PrefixCheck::Drift { change } => {
+                Err(Box::new(change))
+            }
         }
     }
 
@@ -580,6 +733,80 @@ fn sha256_hex(bytes: &[u8]) -> String {
     crate::hashing::sha256_hex(bytes)
 }
 
+/// Bounded line delta between the session context the model last saw and a
+/// fresh composition, rendered as a `<context_update>` user-role message.
+///
+/// The pinned system prompt is never rewritten; this is how workspace,
+/// instruction, skills, memory, and goal drift reaches the model as a normal
+/// history append. Returns `None` when the two texts are line-identical (only
+/// whitespace/ordering noise), so no empty update is ever sent.
+pub const CONTEXT_UPDATE_MAX_LINES: usize = 80;
+pub const CONTEXT_UPDATE_MAX_BYTES: usize = 6_000;
+
+pub fn context_update_message(known: &str, current: &str) -> Option<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, i64> = HashMap::new();
+    for line in known.lines() {
+        *counts.entry(line).or_insert(0) -= 1;
+    }
+    for line in current.lines() {
+        *counts.entry(line).or_insert(0) += 1;
+    }
+    let mut added: Vec<&str> = Vec::new();
+    for line in current.lines() {
+        if let Some(count) = counts.get_mut(line)
+            && *count > 0
+        {
+            *count -= 1;
+            if !line.trim().is_empty() {
+                added.push(line);
+            }
+        }
+    }
+    let mut removed: Vec<&str> = Vec::new();
+    for line in known.lines() {
+        if let Some(count) = counts.get_mut(line)
+            && *count < 0
+        {
+            *count += 1;
+            if !line.trim().is_empty() {
+                removed.push(line);
+            }
+        }
+    }
+    if added.is_empty() && removed.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "<context_update>\nSession context changed since it was pinned; the pinned system \
+         prompt is unchanged. Delta (+ added, - removed):\n",
+    );
+    let mut lines_written = 0usize;
+    let mut truncated = 0usize;
+    for (sign, group) in [("+ ", &added), ("- ", &removed)] {
+        for line in group {
+            if lines_written >= CONTEXT_UPDATE_MAX_LINES
+                || out.len() + sign.len() + line.len() + 1 > CONTEXT_UPDATE_MAX_BYTES
+            {
+                truncated += 1;
+                continue;
+            }
+            out.push_str(sign);
+            out.push_str(line);
+            out.push('\n');
+            lines_written += 1;
+        }
+    }
+    if truncated > 0 {
+        out.push_str(&format!(
+            "(+{truncated} more changed lines; re-read the files you need)\n"
+        ));
+    }
+    out.push_str("</context_update>");
+    Some(out)
+}
+
 /// Extract the system prompt text from an optional SystemPrompt,
 /// returning an owned String. This is used for prefix fingerprinting
 /// and avoids lifetime/leak issues with the rare SystemPrompt::Blocks case.
@@ -631,12 +858,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_order_does_not_affect_fingerprint() {
+    fn tool_order_affects_fingerprint() {
+        // The provider KV cache is order-sensitive; sorting before hashing
+        // could read a false-green while the real prefix cache missed every
+        // turn (ops C1).
         let tools_a = vec![make_tool("read_file"), make_tool("write_file")];
         let tools_b = vec![make_tool("write_file"), make_tool("read_file")];
         let a = PrefixFingerprint::compute("system", Some(&tools_a));
         let b = PrefixFingerprint::compute("system", Some(&tools_b));
-        assert_eq!(a.combined_sha256, b.combined_sha256);
+        assert_ne!(a.combined_sha256, b.combined_sha256);
     }
 
     #[test]
@@ -680,12 +910,95 @@ mod tests {
     }
 
     #[test]
-    fn manager_re_pins_after_change() {
+    fn undeclared_drift_never_moves_the_pin() {
         let mut mgr = PrefixStabilityManager::new("old", None);
-        let _ = mgr.check_and_update("new", None);
-        // After re-pin, the new "new" should be stable.
-        assert!(mgr.check_and_update("new", None).unwrap());
-        assert_eq!(mgr.change_count(), 1);
+        assert_eq!(mgr.pin_reason(), Some("initial"));
+        assert!(mgr.check_and_update("new", None).is_err());
+        // The pin stays on "old": the same undeclared prefix is still a miss.
+        assert!(mgr.check_and_update("new", None).is_err());
+        assert!(mgr.check_and_update("old", None).unwrap());
+        assert_eq!(mgr.change_count(), 2);
+        assert_eq!(mgr.last_miss_reason(), Some("drift:sys"));
+        let history: Vec<_> = mgr.history().collect();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|entry| !entry.repinned));
+        assert_eq!(mgr.pin_reason(), Some("initial"));
+    }
+
+    #[test]
+    fn declared_header_change_repins_under_a_logged_reason() {
+        let mut mgr = PrefixStabilityManager::new("old", None);
+        match mgr.check("new", None, Some("model")) {
+            PrefixCheck::Repinned { reason, change } => {
+                assert_eq!(reason, "change:model");
+                assert!(change.system_changed);
+            }
+            other => panic!("expected repin, got {other:?}"),
+        }
+        assert_eq!(mgr.pin_reason(), Some("change:model"));
+        assert!(matches!(mgr.check("new", None, None), PrefixCheck::Stable));
+        assert!(matches!(
+            mgr.check("newer", None, None),
+            PrefixCheck::Drift { .. }
+        ));
+        assert_eq!(mgr.pin_reason(), Some("change:model"));
+        let reasons: Vec<&str> = mgr.history().map(|e| e.reason.as_str()).collect();
+        assert_eq!(reasons, vec!["change:model", "drift:sys"]);
+    }
+
+    #[test]
+    fn declared_reason_on_a_stable_prefix_is_a_noop() {
+        let mut mgr = PrefixStabilityManager::new("same", None);
+        assert!(matches!(
+            mgr.check("same", None, Some("mode")),
+            PrefixCheck::Stable
+        ));
+        assert_eq!(mgr.change_count(), 0);
+        assert_eq!(mgr.pin_reason(), Some("initial"));
+    }
+
+    #[test]
+    fn context_update_message_reports_added_and_removed_lines_bounded() {
+        let known = "## Files\nsrc/a.rs\nsrc/b.rs\n## Instructions\nbe kind\n";
+        let current = "## Files\nsrc/a.rs\nsrc/b.rs\nsrc/c.rs\n## Instructions\nbe precise\n";
+        let update = context_update_message(known, current).expect("delta");
+        assert!(update.starts_with("<context_update>"));
+        assert!(update.ends_with("</context_update>"));
+        assert!(update.contains("+ src/c.rs"));
+        assert!(update.contains("+ be precise"));
+        assert!(update.contains("- be kind"));
+        assert!(!update.contains("- src/a.rs"));
+        assert!(context_update_message(known, known).is_none());
+
+        let mut big = String::new();
+        for i in 0..500 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        let bounded = context_update_message("", &big).expect("delta");
+        assert!(
+            bounded.len() <= CONTEXT_UPDATE_MAX_BYTES + 128,
+            "{}",
+            bounded.len()
+        );
+        assert!(bounded.contains("more changed lines"));
+    }
+
+    #[test]
+    fn context_update_is_logged_but_is_not_a_miss() {
+        let mut mgr = PrefixStabilityManager::new("sys", None);
+        mgr.note_context_update();
+        assert_eq!(mgr.context_update_count(), 1);
+        assert_eq!(mgr.last_miss_reason(), None);
+        assert!(matches!(mgr.check("sys", None, None), PrefixCheck::Stable));
+    }
+
+    #[test]
+    fn history_reset_is_logged_without_moving_the_pin() {
+        let mut mgr = PrefixStabilityManager::new("sys", None);
+        mgr.note_history_reset("compaction");
+        assert_eq!(mgr.last_miss_reason(), Some("reset:compaction"));
+        assert!(matches!(mgr.check("sys", None, None), PrefixCheck::Stable));
+        assert_eq!(mgr.history().count(), 1);
     }
 
     #[test]
@@ -702,7 +1015,7 @@ mod tests {
     fn stability_ratio_reflects_change_rate() {
         let mut mgr = PrefixStabilityManager::new("hello", None);
         mgr.check_and_update("hello", None).unwrap(); // check 1: stable
-        let _ = mgr.check_and_update("world", None); // check 2: changed
+        let _ = mgr.check("world", None, Some("model")); // check 2: declared change
         mgr.check_and_update("world", None).unwrap(); // check 3: stable
         // 2 stable out of 3 checks = 0.666...
         // (check_count=0 at start, so 3 checks: 3 checks - 1 change = 2 stable)
@@ -778,7 +1091,7 @@ mod tests {
     // ── ToolCatalogCache tests ──────────────────────────────────
 
     #[test]
-    fn tool_catalog_cache_miss_then_hit_returns_same_arc() {
+    fn tool_catalog_cache_miss_then_hit_returns_same_digest() {
         let mut cache = ToolCatalogCache::new();
         let tools = vec![make_tool("read_file"), make_tool("write_file")];
 
@@ -787,7 +1100,6 @@ mod tests {
 
         let second = cache.fingerprint_for(&tools);
         assert_eq!(cache.len(), 1, "second call should be a cache hit");
-        assert!(Arc::ptr_eq(&first.joined, &second.joined));
         assert_eq!(first.sha256_hex, second.sha256_hex);
     }
 
@@ -801,24 +1113,26 @@ mod tests {
         let entry_b = cache.fingerprint_for(&b);
         assert_eq!(cache.len(), 2);
         assert_ne!(entry_a.sha256_hex, entry_b.sha256_hex);
-        assert!(!Arc::ptr_eq(&entry_a.joined, &entry_b.joined));
     }
 
     #[test]
-    fn tool_catalog_cache_pinned_by_input_order() {
+    fn tool_catalog_cache_fingerprint_is_order_sensitive_like_the_provider_cache() {
         // The identity hash includes the input order so re-registering the
         // same set with a different permutation produces a separate cache
-        // entry. The sorted-and-joined digest still matches the order-
-        // independent fingerprint that the chat API sees.
+        // entry. The digest is now order-sensitive too: the provider KV cache
+        // is order-sensitive, so a sorted fingerprint read a false-green while
+        // the real prefix missed every turn (ops C1). Different wire order =
+        // different prefix = different fingerprint.
         let mut cache = ToolCatalogCache::new();
         let a = vec![make_tool("read_file"), make_tool("write_file")];
         let b = vec![make_tool("write_file"), make_tool("read_file")];
         let entry_a = cache.fingerprint_for(&a);
         let entry_b = cache.fingerprint_for(&b);
-        // Joined output is the same (sorted) but the two cache entries are
-        // distinct because their identities differ.
-        assert_eq!(entry_a.joined.as_str(), entry_b.joined.as_str());
+        assert_ne!(entry_a.sha256_hex, entry_b.sha256_hex);
         assert_eq!(cache.len(), 2);
+        // Re-requesting the original order returns the cached digest.
+        let again = cache.fingerprint_for(&a);
+        assert_eq!(again.sha256_hex, entry_a.sha256_hex);
     }
 
     #[test]
@@ -847,9 +1161,9 @@ mod tests {
         // capacity 2 means oldest is evicted when we insert the 3rd unique.
         // After inserting a, the cache holds the most recent 2: {c, a}.
         assert_eq!(cache.len(), 2);
-        // The returned entry should be the same as a fresh fingerprint.
+        // The returned digest should match a fresh fingerprint of the same set.
         let fresh = cache.fingerprint_for(&[make_tool("a")]);
-        assert!(Arc::ptr_eq(&re_entry.joined, &fresh.joined));
+        assert_eq!(re_entry.sha256_hex, fresh.sha256_hex);
     }
 
     #[test]
@@ -869,7 +1183,7 @@ mod tests {
         let entry = cache.fingerprint_for(&[]);
         assert!(!entry.sha256_hex.is_empty());
         let again = cache.fingerprint_for(&[]);
-        assert!(Arc::ptr_eq(&entry.joined, &again.joined));
+        assert_eq!(entry.sha256_hex, again.sha256_hex);
     }
 
     #[test]

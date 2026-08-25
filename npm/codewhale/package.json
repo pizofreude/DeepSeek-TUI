@@ -1,8 +1,8 @@
 {
   "name": "codewhale",
-  "version": "0.8.68",
-  "codewhaleBinaryVersion": "0.8.68",
-  "description": "Install and run CodeWhale, the agentic terminal for open-source and open-weight coding models, from GitHub release artifacts.",
+  "version": "0.9.11",
+  "codewhaleBinaryVersion": "0.9.11",
+  "description": "Terminal coding agent for supported hosted and local models. One runtime on your machine. Rust, MIT.",
   "author": "Hmbown",
   "license": "MIT",
   "funding": [
@@ -35,13 +35,12 @@
   "type": "commonjs",
   "bin": {
     "codewhale": "bin/codewhale.js",
-    "codew": "bin/codew.js",
-    "codewhale-tui": "bin/codewhale-tui.js"
+    "codew": "bin/codew.js"
   },
   "scripts": {
     "release:check": "node scripts/verify-release-assets.js",
     "postinstall": "node scripts/install.js --optional",
-    "prepublishOnly": "node scripts/verify-release-assets.js",
+    "prepublishOnly": "bash ../../scripts/release/require-release-tag-checkout.sh && bash ../../scripts/release/verify-release-assets.sh",
     "prepack": "node scripts/install.js",
     "test": "node --test test/*.test.js"
   },

@@ -170,11 +170,11 @@ pub fn resolve_python_interpreter() -> Option<String> {
 }
 
 /// Resolve `pdftotext` (from Poppler) once per process. Used by
-/// `read_file`'s PDF path for graceful fallback messaging. Unlike
+/// file and web PDF paths for truthful availability diagnostics. Unlike
 /// the Python case, `read_file` itself still works for text files
 /// when `pdftotext` is missing — this resolver exists so the doctor
-/// command can surface the miss explicitly rather than the user
-/// hitting "PDF unsupported" on a read attempt.
+/// command can surface the miss before a PDF read returns its typed
+/// `binary_unavailable` result.
 pub fn resolve_pdftotext() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE
@@ -300,7 +300,6 @@ pub trait ExternalTool {
     fn resolve() -> Option<String>;
 
     /// Quick availability check — true when the tool was found on PATH.
-    #[allow(dead_code)]
     fn available() -> bool {
         Self::resolve().is_some()
     }

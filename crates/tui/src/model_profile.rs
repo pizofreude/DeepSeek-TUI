@@ -10,30 +10,10 @@
 
 use crate::config::{ApiProvider, RequestPayloadMode, provider_capability};
 use crate::model_registry::{self, ModelProvider};
+use codewhale_config::route::{RouteCapabilities, RouteLimits};
 
-/// Three-state support facts. Unknown is distinct from unsupported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SupportState {
-    Supported,
-    Unsupported,
-    Unknown,
-}
-
-impl SupportState {
-    #[must_use]
-    pub const fn from_bool(value: bool) -> Self {
-        if value {
-            Self::Supported
-        } else {
-            Self::Unsupported
-        }
-    }
-
-    #[must_use]
-    pub const fn is_supported(self) -> bool {
-        matches!(self, Self::Supported)
-    }
-}
+/// Compatibility name for the canonical config-layer three-state fact.
+pub use codewhale_config::route::CapabilityState as SupportState;
 
 /// Coarse tool-catalog budget for the selected route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +29,11 @@ pub enum ToolSurfaceBudget {
 /// Fact provenance for diagnostics and route explanations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactProvenance {
+    ResolvedRouteCandidate,
     SeededModelRegistry,
     LegacyModelHeuristics,
     ConservativeUnknownFallback,
-    ProviderCapabilityMatrix,
+    LegacyProviderFallback,
     UserOverride,
 }
 
@@ -67,6 +48,7 @@ pub struct IntrinsicCapabilityProfile {
     pub structured_output: SupportState,
     pub streaming: SupportState,
     pub prompt_caching: SupportState,
+    pub image_input: SupportState,
     pub tool_surface_budget: ToolSurfaceBudget,
 }
 
@@ -92,6 +74,7 @@ pub struct CapabilityOverride {
     pub structured_output: Option<SupportState>,
     pub streaming: Option<SupportState>,
     pub prompt_caching: Option<SupportState>,
+    pub image_input: Option<SupportState>,
     pub tool_surface_budget: Option<ToolSurfaceBudget>,
 }
 
@@ -110,6 +93,7 @@ pub struct CapabilityProfile {
     pub structured_output: SupportState,
     pub streaming: SupportState,
     pub prompt_caching: SupportState,
+    pub image_input: SupportState,
     pub tool_surface_budget: ToolSurfaceBudget,
     pub provenance: Vec<FactProvenance>,
 }
@@ -118,6 +102,11 @@ impl CapabilityProfile {
     #[must_use]
     pub fn supports_reasoning(&self) -> bool {
         self.reasoning.is_supported()
+    }
+
+    #[must_use]
+    pub fn supports_image_input(&self) -> bool {
+        self.image_input.is_supported()
     }
 
     #[must_use]
@@ -166,12 +155,13 @@ pub fn model_profile(model: &str) -> ModelProfile {
                 capabilities: IntrinsicCapabilityProfile {
                     context_window: meta.context_window,
                     max_output: meta.max_output,
-                    reasoning: SupportState::from_bool(meta.supports_reasoning),
+                    reasoning: bool_state(meta.supports_reasoning),
                     native_tool_calls: SupportState::Unknown,
                     parallel_tool_calls: SupportState::Unknown,
                     structured_output: SupportState::Unknown,
                     streaming: SupportState::Supported,
                     prompt_caching: SupportState::Unknown,
+                    image_input: SupportState::Unknown,
                     tool_surface_budget: tool_surface_for_window(meta.context_window),
                 },
                 provenance,
@@ -191,6 +181,7 @@ pub fn model_profile(model: &str) -> ModelProfile {
                 structured_output: SupportState::Unknown,
                 streaming: SupportState::Unknown,
                 prompt_caching: SupportState::Unknown,
+                image_input: SupportState::Unknown,
                 tool_surface_budget: ToolSurfaceBudget::Compact,
             },
             provenance: FactProvenance::ConservativeUnknownFallback,
@@ -198,7 +189,11 @@ pub fn model_profile(model: &str) -> ModelProfile {
     }
 }
 
-/// Resolve route capabilities from intrinsic model facts plus provider facts.
+/// Resolve a profile from legacy model/provider heuristics.
+///
+/// This remains a picker/startup fallback for call sites that do not yet hold
+/// an executable route candidate. Runtime execution should use
+/// [`resolved_capability_profile_for_route`], where exact offering facts win.
 #[must_use]
 pub fn resolved_capability_profile(
     provider: ApiProvider,
@@ -211,7 +206,7 @@ pub fn resolved_capability_profile(
     )
 }
 
-/// Resolve route capabilities and apply explicit user/config overrides last.
+/// Resolve legacy fallback capabilities and apply explicit overrides last.
 #[must_use]
 pub fn resolved_capability_profile_with_overrides(
     provider: ApiProvider,
@@ -226,13 +221,17 @@ pub fn resolved_capability_profile_with_overrides(
             .context_window
             .unwrap_or(provider_cap.context_window),
     );
-    let max_output = Some(overrides.max_output.unwrap_or(provider_cap.max_output));
+    // An explicit override wins; otherwise carry the compatibility cap through
+    // *including its unknown state*, so pickers and diagnostics render `?`
+    // rather than a fabricated ceiling.
+    let max_output = overrides.max_output.or(provider_cap.max_output);
     let reasoning = overrides
         .reasoning
-        .unwrap_or_else(|| SupportState::from_bool(provider_cap.thinking_supported));
+        .unwrap_or_else(|| bool_state(provider_cap.thinking_supported));
     let prompt_caching = overrides
         .prompt_caching
-        .unwrap_or_else(|| SupportState::from_bool(provider_cap.cache_telemetry_supported));
+        .unwrap_or_else(|| bool_state(provider_cap.cache_telemetry_supported));
+    let image_input = overrides.image_input.unwrap_or(SupportState::Unknown);
     let native_tool_calls = overrides
         .native_tool_calls
         .unwrap_or_else(|| native_tool_support_for_payload(request_payload_mode));
@@ -247,7 +246,7 @@ pub fn resolved_capability_profile_with_overrides(
         .tool_surface_budget
         .unwrap_or_else(|| tool_surface_for_window(context_window));
 
-    let mut provenance = vec![model.provenance, FactProvenance::ProviderCapabilityMatrix];
+    let mut provenance = vec![model.provenance, FactProvenance::LegacyProviderFallback];
     if overrides != CapabilityOverride::default() {
         provenance.push(FactProvenance::UserOverride);
     }
@@ -265,8 +264,121 @@ pub fn resolved_capability_profile_with_overrides(
         structured_output,
         streaming,
         prompt_caching,
+        image_input,
         tool_surface_budget,
         provenance,
+    }
+}
+
+/// Resolve capabilities for an exact route candidate.
+///
+/// Sourced route facts and limits win. Legacy provider/model behavior is used
+/// only for fields the selected offering leaves `Unknown`, and that fallback
+/// remains visible in provenance.
+#[must_use]
+pub fn resolved_capability_profile_for_route(
+    provider: ApiProvider,
+    wire_model_id: &str,
+    route_capabilities: RouteCapabilities,
+    route_limits: RouteLimits,
+) -> CapabilityProfile {
+    let mut profile = resolved_capability_profile(provider, wire_model_id);
+    profile.context_window = route_limits
+        .context_tokens
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .or(profile.context_window);
+    profile.max_output = route_limits
+        .output_tokens
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .or(profile.max_output);
+    profile.reasoning = route_fact_or_fallback(route_capabilities.reasoning, profile.reasoning);
+    profile.native_tool_calls = route_fact_or_fallback(
+        route_capabilities.native_tool_calls,
+        profile.native_tool_calls,
+    );
+    profile.parallel_tool_calls = route_fact_or_fallback(
+        route_capabilities.parallel_tool_calls,
+        profile.parallel_tool_calls,
+    );
+    profile.structured_output = route_fact_or_fallback(
+        route_capabilities.structured_output,
+        profile.structured_output,
+    );
+    profile.streaming = route_fact_or_fallback(route_capabilities.streaming, profile.streaming);
+    profile.prompt_caching =
+        route_fact_or_fallback(route_capabilities.prompt_caching, profile.prompt_caching);
+    profile.image_input =
+        route_fact_or_fallback(route_capabilities.image_input, profile.image_input);
+    profile.tool_surface_budget = tool_surface_for_window(profile.context_window);
+    profile
+        .provenance
+        .insert(0, FactProvenance::ResolvedRouteCandidate);
+    profile
+}
+
+/// Resolve an exact route profile, then apply explicit user/config overrides.
+#[must_use]
+pub fn resolved_capability_profile_for_route_with_overrides(
+    provider: ApiProvider,
+    wire_model_id: &str,
+    route_capabilities: RouteCapabilities,
+    route_limits: RouteLimits,
+    overrides: CapabilityOverride,
+) -> CapabilityProfile {
+    let mut profile = resolved_capability_profile_for_route(
+        provider,
+        wire_model_id,
+        route_capabilities,
+        route_limits,
+    );
+    if let Some(context_window) = overrides.context_window {
+        profile.context_window = Some(context_window);
+    }
+    if let Some(max_output) = overrides.max_output {
+        profile.max_output = Some(max_output);
+    }
+    if let Some(reasoning) = overrides.reasoning {
+        profile.reasoning = reasoning;
+    }
+    if let Some(native_tool_calls) = overrides.native_tool_calls {
+        profile.native_tool_calls = native_tool_calls;
+    }
+    if let Some(parallel_tool_calls) = overrides.parallel_tool_calls {
+        profile.parallel_tool_calls = parallel_tool_calls;
+    }
+    if let Some(structured_output) = overrides.structured_output {
+        profile.structured_output = structured_output;
+    }
+    if let Some(streaming) = overrides.streaming {
+        profile.streaming = streaming;
+    }
+    if let Some(prompt_caching) = overrides.prompt_caching {
+        profile.prompt_caching = prompt_caching;
+    }
+    if let Some(image_input) = overrides.image_input {
+        profile.image_input = image_input;
+    }
+    profile.tool_surface_budget = overrides
+        .tool_surface_budget
+        .unwrap_or_else(|| tool_surface_for_window(profile.context_window));
+    if overrides != CapabilityOverride::default() {
+        profile.provenance.push(FactProvenance::UserOverride);
+    }
+    profile
+}
+
+const fn bool_state(value: bool) -> SupportState {
+    if value {
+        SupportState::Supported
+    } else {
+        SupportState::Unsupported
+    }
+}
+
+const fn route_fact_or_fallback(route_fact: SupportState, fallback: SupportState) -> SupportState {
+    match route_fact {
+        SupportState::Unknown => fallback,
+        sourced => sourced,
     }
 }
 
@@ -380,5 +492,90 @@ mod tests {
         assert!(!compact.has_large_context());
         assert!(!compact.prefers_full_tool_surface());
         assert!(!compact.suitable_for_broad_fleet_worker());
+    }
+
+    #[test]
+    fn exact_route_facts_override_legacy_provider_heuristics() {
+        let profile = resolved_capability_profile_for_route(
+            ApiProvider::Openai,
+            "gpt-5.4",
+            RouteCapabilities {
+                reasoning: SupportState::Unsupported,
+                native_tool_calls: SupportState::Unsupported,
+                structured_output: SupportState::Supported,
+                ..RouteCapabilities::default()
+            },
+            RouteLimits {
+                context_tokens: Some(42_000),
+                input_tokens: None,
+                output_tokens: Some(7_000),
+            },
+        );
+
+        assert_eq!(profile.context_window, Some(42_000));
+        assert_eq!(profile.max_output, Some(7_000));
+        assert_eq!(profile.reasoning, SupportState::Unsupported);
+        assert_eq!(profile.native_tool_calls, SupportState::Unsupported);
+        assert_eq!(profile.image_input, SupportState::Unknown);
+        assert_eq!(profile.structured_output, SupportState::Supported);
+        assert!(
+            profile
+                .provenance
+                .starts_with(&[FactProvenance::ResolvedRouteCandidate])
+        );
+        assert!(
+            profile
+                .provenance
+                .contains(&FactProvenance::LegacyProviderFallback)
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins_after_exact_route_fact() {
+        let profile = resolved_capability_profile_for_route_with_overrides(
+            ApiProvider::Openai,
+            "gpt-5.4",
+            RouteCapabilities {
+                reasoning: SupportState::Unsupported,
+                ..RouteCapabilities::default()
+            },
+            RouteLimits::default(),
+            CapabilityOverride {
+                reasoning: Some(SupportState::Supported),
+                ..CapabilityOverride::default()
+            },
+        );
+
+        assert_eq!(profile.reasoning, SupportState::Supported);
+        assert_eq!(
+            profile.provenance.last(),
+            Some(&FactProvenance::UserOverride)
+        );
+    }
+
+    #[test]
+    fn image_input_route_fact_and_override_are_explicit() {
+        let sourced = resolved_capability_profile_for_route(
+            ApiProvider::Openai,
+            "vision-fixture",
+            RouteCapabilities {
+                image_input: SupportState::Supported,
+                ..RouteCapabilities::default()
+            },
+            RouteLimits::default(),
+        );
+        assert!(sourced.supports_image_input());
+
+        let overridden = resolved_capability_profile_for_route_with_overrides(
+            ApiProvider::Openai,
+            "vision-fixture",
+            RouteCapabilities::default(),
+            RouteLimits::default(),
+            CapabilityOverride {
+                image_input: Some(SupportState::Supported),
+                ..CapabilityOverride::default()
+            },
+        );
+        assert!(overridden.supports_image_input());
     }
 }

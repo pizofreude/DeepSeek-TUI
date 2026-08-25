@@ -14,18 +14,18 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::compaction::estimate_input_tokens_conservative;
+use crate::compaction::estimate_input_tokens_for_pressure;
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::SystemPrompt;
 use crate::palette;
 use crate::session_manager::SessionContextReference;
 use crate::tui::app::{App, ToolDetailRecord};
 use crate::tui::file_mention::ContextReferenceSource;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_underwater_surface,
 };
-use crate::utils::estimate_message_chars;
 
 /// Marker used by per-turn working-set metadata. Replicated here so the
 /// context inspector can distinguish stable prompt blocks from volatile
@@ -38,6 +38,27 @@ const MAX_REFERENCE_ROWS: usize = 12;
 const MAX_TOOL_ROWS: usize = 8;
 
 const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
+    (
+        "Bundled constitution",
+        "## Codewhale",
+        PromptLayerKind::Static,
+    ),
+    ("Language policy", "## Language", PromptLayerKind::Static),
+    (
+        "Output formatting",
+        "## Output Formatting",
+        PromptLayerKind::Static,
+    ),
+    (
+        "User-global constitution",
+        "<codewhale_user_constitution",
+        PromptLayerKind::Static,
+    ),
+    (
+        "Repository constitution",
+        "<codewhale_repo_constitution",
+        PromptLayerKind::Static,
+    ),
     (
         "Project context",
         "<project_instructions",
@@ -94,6 +115,15 @@ impl PromptLayerKind {
     }
 }
 
+/// Localize well-known layer labels that already have inspector MessageIds.
+/// Other layer names stay as English product identifiers.
+fn layer_display_name(name: &'static str, locale: Locale) -> Cow<'static, str> {
+    match name {
+        "Volatile working set" => tr(locale, MessageId::CtxInspVolatileWorkingSet),
+        other => Cow::Borrowed(other),
+    }
+}
+
 #[derive(Debug)]
 struct PromptTextLayer<'a> {
     name: &'static str,
@@ -128,6 +158,38 @@ pub fn build_context_inspector_text(app: &App, locale: Locale) -> String {
             tr(locale, MessageId::CtxInspSession),
             crate::session_manager::truncate_id(session_id)
         );
+    }
+    // Real provider-token cache hit rate from the same records /cache
+    // aggregates (C3): only provider-reported cache telemetry counts, so the
+    // number is what the user actually paid to keep, not a predicted guess.
+    let mut cache_turns = 0u64;
+    let (cache_hit, cache_miss) =
+        app.session
+            .turn_cache_history
+            .iter()
+            .fold((0u64, 0u64), |(hit, miss), record| {
+                let Some(hit_tokens_u32) = record.cache_hit_tokens else {
+                    return (hit, miss);
+                };
+                let hit_tokens = u64::from(hit_tokens_u32);
+                let miss_tokens = u64::from(
+                    record
+                        .cache_miss_tokens
+                        .unwrap_or(record.input_tokens.saturating_sub(hit_tokens_u32)),
+                );
+                cache_turns += 1;
+                (hit + hit_tokens, miss + miss_tokens)
+            });
+    let cache_total = cache_hit + cache_miss;
+    if cache_turns > 0 && cache_total > 0 {
+        let cache_percent = (cache_hit as f64 / cache_total as f64 * 100.0).clamp(0.0, 100.0);
+        let _ = writeln!(
+            out,
+            "Provider cache hit rate: {cache_percent:.1}% over {cache_turns} cache-aware turn{}",
+            if cache_turns == 1 { "" } else { "s" },
+        );
+    } else {
+        let _ = writeln!(out, "Provider cache hit rate: no cache telemetry yet");
     }
     let status_label = match context_status(percent) {
         ContextPressure::Critical => tr(locale, MessageId::CtxInspCritical),
@@ -174,10 +236,24 @@ fn context_usage(app: &App) -> (usize, u32, f64) {
         app.effective_model_for_budget(),
         app.active_route_limits,
     );
+    // The meter must show the SAME pressure signal the auto-compaction trigger
+    // decides on (compaction::estimate_input_tokens_for_pressure, the
+    // non-inflated estimate with framing overhead). The old conservative
+    // overflow estimator was ~1.5x larger, so the meter showed the trigger
+    // point as "free" while compaction was still far away (ops T1) — and vice
+    // versa the meter read "free" as negative when the engine was only halfway.
     let estimated =
-        estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
-    let total_chars = estimate_message_chars(&app.api_messages);
-    let used = estimated.max(total_chars / 4);
+        estimate_input_tokens_for_pressure(&app.api_messages, app.system_prompt.as_ref());
+    // The trigger decides on max(estimate, provider-billed prompt); the meter
+    // must too, or a provider billing above the local estimate (non-ASCII
+    // text, server-side framing) makes the meter under-show real pressure
+    // (#5577). The billed receipt is per model call, so it goes stale only
+    // until the next step or compaction updates it.
+    let used = estimated.max(
+        app.last_billed_input_tokens
+            .map(|tokens| tokens as usize)
+            .unwrap_or(0),
+    );
     let percent = ((used as f64 / f64::from(max)) * 100.0).clamp(0.0, 100.0);
     (used, max, percent)
 }
@@ -270,6 +346,23 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 "  {total_lbl}: {} {blocks_unit}, ~{total_est} {tokens_unit}",
                 blocks.len()
             );
+            let layers = blocks
+                .iter()
+                .flat_map(|block| split_text_prompt_layers(&block.text))
+                .filter(|layer| !layer.body.is_empty())
+                .collect::<Vec<_>>();
+            if layers.iter().any(|layer| layer.name != "System prompt") {
+                let _ = writeln!(out, "  {text_prompt_lbl}:");
+                for layer in layers {
+                    let tokens = text_tokens(layer.body);
+                    let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
+                    let _ = writeln!(
+                        out,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
+                    );
+                }
+            }
         }
         Some(SystemPrompt::Text(text)) => {
             let layers = split_text_prompt_layers(text);
@@ -286,10 +379,10 @@ fn push_system_prompt_structure(out: &mut String, app: &App, locale: Locale) {
                 for layer in layers {
                     let tokens = text_tokens(layer.body);
                     let kind_lbl = layer.kind.label(locale);
+                    let layer_name = layer_display_name(layer.name, locale);
                     let _ = writeln!(
                         out,
-                        "  - {}: ~{tokens} {tokens_unit} [{kind_lbl}]",
-                        layer.name,
+                        "  - {layer_name}: ~{tokens} {tokens_unit} [{kind_lbl}]",
                     );
                 }
             } else {
@@ -435,7 +528,17 @@ fn push_tools(out: &mut String, app: &App, locale: Locale) {
     if rendered == 0 {
         let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspNoToolActivity));
     } else {
-        let _ = writeln!(out, "- {}", tr(locale, MessageId::CtxInspVHint));
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        let _ = writeln!(
+            out,
+            "- {}",
+            tr(locale, MessageId::CtxInspVHint).replace("{details}", details.as_ref())
+        );
     }
 }
 
@@ -455,10 +558,15 @@ fn push_tool_row(out: &mut String, locale: Locale, location: &str, detail: &Tool
 }
 
 fn short_tool_id(id: &str) -> String {
-    if id.len() <= 8 {
-        id.to_string()
+    // Slice by characters, not bytes: a tool id from a gateway can contain
+    // multibyte characters, and `&id[..8]` panics on a byte index that lands
+    // mid-codepoint (2026-08-04 review).
+    let mut chars = id.chars();
+    let head: String = chars.by_ref().take(8).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
     } else {
-        format!("{}...", &id[..8])
+        head
     }
 }
 
@@ -506,7 +614,7 @@ impl ContextInspectorView {
 
     pub(crate) fn refresh_from_app(&mut self, app: &App) {
         let (used, max, percent) = context_usage(app);
-        let system_tokens = estimate_input_tokens_conservative(&[], app.system_prompt.as_ref());
+        let system_tokens = estimate_input_tokens_for_pressure(&[], app.system_prompt.as_ref());
         let message_tokens = used.saturating_sub(system_tokens);
         let free_tokens = usize::try_from(max)
             .unwrap_or(usize::MAX)
@@ -689,12 +797,9 @@ impl ModalView for ContextInspectorView {
         self.hitboxes.borrow_mut().clear();
         for (idx, row) in self.rows.iter().enumerate() {
             let selected = idx == self.selected;
-            let marker = if selected { "▸" } else { " " };
+            let marker = crate::tui::glyphs::selection_marker(selected);
             let style = if selected {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-                    .add_modifier(Modifier::BOLD)
+                menu_style::selected_row_style()
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
@@ -721,6 +826,19 @@ impl ModalView for ContextInspectorView {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::models::Role;
+
+    #[test]
+    fn short_tool_id_never_panics_on_multibyte() {
+        // ASCII short/long behave as before.
+        assert_eq!(short_tool_id("abc"), "abc");
+        assert_eq!(short_tool_id("0123456789"), "01234567...");
+        // A multibyte id must truncate on a char boundary, not panic.
+        // 10 chars → first 8 kept, then the ellipsis.
+        assert_eq!(short_tool_id("日本語のツールid名"), "日本語のツールi...");
+        assert_eq!(short_tool_id("café"), "café");
+    }
+
     use crate::models::{ContentBlock, Message};
     use crate::session_manager::SessionContextReference;
     use crate::tui::app::TuiOptions;
@@ -736,24 +854,9 @@ mod tests {
         let mut app = App::new(
             TuiOptions {
                 model: "unknown-model".to_string(),
-                workspace: PathBuf::from("/tmp/project"),
-                config_path: None,
-                config_profile: None,
-                allow_shell: false,
-                use_alt_screen: true,
-                use_mouse_capture: false,
-                use_bracketed_paste: true,
-                max_subagents: 1,
                 skills_dir: PathBuf::from("/tmp/skills"),
-                memory_path: PathBuf::from("memory.md"),
                 notes_path: PathBuf::from("notes.md"),
-                mcp_config_path: PathBuf::from("mcp.json"),
-                use_memory: false,
-                start_in_agent_mode: false,
-                skip_onboarding: true,
-                yolo: false,
-                resume_session_id: None,
-                initial_input: None,
+                ..crate::test_support::test_tui_options(PathBuf::from("/tmp/project"))
             },
             &Config::default(),
         );
@@ -766,6 +869,38 @@ mod tests {
         app.active_route_limits = None;
         app.active_context_window_override = None;
         app
+    }
+
+    #[test]
+    fn inspector_reports_the_provider_cache_hit_rate() {
+        let mut app = test_app();
+        for (input, hit) in [(1_000u32, 800u32), (1_000, 500)] {
+            app.session
+                .turn_cache_history
+                .push_back(crate::tui::app::TurnCacheRecord {
+                    provider: None,
+                    provider_identity: None,
+                    model: None,
+                    auto_model: false,
+                    input_tokens: input,
+                    output_tokens: 0,
+                    cache_hit_tokens: Some(hit),
+                    cache_miss_tokens: None,
+                    reasoning_replay_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    cost_audit: None,
+                    recorded_at: std::time::Instant::now(),
+                });
+        }
+        let text = build_context_inspector_text(&app, Locale::En);
+        assert!(
+            text.contains("Provider cache hit rate: 65.0% over 2 cache-aware turns"),
+            "{text}"
+        );
+
+        let empty = build_context_inspector_text(&test_app(), Locale::En);
+        assert!(empty.contains("no cache telemetry yet"), "{empty}");
     }
 
     #[test]
@@ -817,7 +952,7 @@ mod tests {
     fn inspector_marks_high_context_pressure() {
         let mut app = test_app();
         app.api_messages.push(Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "x".repeat(4_000_000),
                 cache_control: None,
@@ -915,13 +1050,17 @@ mod tests {
     fn inspector_text_prompt_shows_layer_map() {
         let mut app = test_app();
         app.system_prompt = Some(SystemPrompt::Text(
-            "You are CodeWhale.\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
+            "## Codewhale\nBundled base law.\n\n## Language\nUse English.\n\n## Output Formatting\nBe clear.\n\n<codewhale_user_constitution>\nUser law\n</codewhale_user_constitution>\n\n<codewhale_repo_constitution>\nRepo law\n</codewhale_repo_constitution>\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
         ));
 
         let text = build_context_inspector_text(&app, Locale::En);
         assert!(text.contains("System Prompt Structure"));
         assert!(text.contains("Text prompt layers"));
-        assert!(text.contains("Global system prefix"));
+        assert!(text.contains("Bundled constitution"));
+        assert!(text.contains("Language policy"));
+        assert!(text.contains("Output formatting"));
+        assert!(text.contains("User-global constitution"));
+        assert!(text.contains("Repository constitution"));
         assert!(text.contains("Project context"));
         assert!(text.contains("Project context pack"));
         assert!(text.contains("Environment"));

@@ -3,6 +3,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+pub mod check;
+pub mod install;
+pub mod launch;
+pub mod tls;
+
+pub use check::{SuppressionReason, UpdateCheckCache, suppression_reason};
+pub use install::{InstallMethod, current_install_method};
+pub use launch::{LaunchOutcome, VersionChange, record_launch};
+
 /// Filename of the SHA-256 checksum manifest included in every release.
 ///
 /// Mirror directories must contain this file alongside platform binaries so
@@ -41,7 +50,7 @@ pub const LEGACY_UPDATE_VERSION_ENV: &str = "DEEPSEEK_VERSION";
 /// User-Agent header sent with release metadata requests.
 pub const UPDATE_USER_AGENT: &str = "codewhale-updater";
 
-const CNB_RELEASE_ASSET_BASE: &str = "https://cnb.cool/Hmbown/CodeWhale/-/releases";
+const CNB_RELEASE_ASSET_BASE: &str = "https://cnb.cool/codewhale.net/codewhale/-/releases/download";
 const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build a reqwest client builder with the TLS roots appropriate for the
@@ -140,9 +149,27 @@ pub fn resolve_release_query(channel: ReleaseChannel) -> ReleaseQuery {
 }
 
 /// Reads the release base URL from environment variables, falling back to the
-/// CNB mirror if `CODEWHALE_USE_CNB_MIRROR` is set. Returns `None` when no
-/// override is configured.
+/// CNB mirror if `CODEWHALE_USE_CNB_MIRROR=1`. Returns `None` when no override
+/// is configured.
 pub fn release_base_url_from_env(version: &str) -> Option<String> {
+    if let Some(base_url) = explicit_release_base_url_from_env() {
+        return Some(base_url);
+    }
+    if cnb_mirror_requested_from_env() {
+        return Some(cnb_release_base_url(version));
+    }
+    None
+}
+
+fn cnb_mirror_requested_from_env() -> bool {
+    std::env::var(CNB_MIRROR_ENV).is_ok_and(|value| value == "1")
+}
+
+/// Reads an operator-supplied release base URL, ignoring the CNB mirror flag.
+///
+/// Kept separate from [`release_base_url_from_env`] so callers can tell an
+/// explicit mirror directory apart from "use the CNB mirror for this version".
+pub fn explicit_release_base_url_from_env() -> Option<String> {
     for env_name in [
         RELEASE_BASE_URL_ENV,
         LEGACY_RELEASE_BASE_URL_ENV,
@@ -155,11 +182,24 @@ pub fn release_base_url_from_env(version: &str) -> Option<String> {
             }
         }
     }
-
-    if std::env::var(CNB_MIRROR_ENV).is_ok() {
-        return Some(cnb_release_base_url(version));
-    }
     None
+}
+
+/// True when `CODEWHALE_USE_CNB_MIRROR` is the override actually in effect —
+/// it is exactly `1`, and no explicit base URL outranks it.
+pub fn cnb_mirror_override_active() -> bool {
+    explicit_release_base_url_from_env().is_none() && cnb_mirror_requested_from_env()
+}
+
+/// True when the first-party CNB mirror publishes release binaries for this
+/// target.
+///
+/// The CNB tag pipeline (`.cnb.yml`) builds exactly one artifact set — Linux
+/// x64, statically linked against musl. Every other platform is served by
+/// canonical GitHub Releases or by an explicit
+/// [`RELEASE_BASE_URL_ENV`] mirror, so the updater must not offer CNB there.
+pub fn cnb_mirror_supports_target(os: &str, rust_arch: &str) -> bool {
+    os == "linux" && rust_arch == "x86_64"
 }
 
 /// Constructs the CNB mirror asset URL for a given version tag.
@@ -192,12 +232,11 @@ pub fn update_network_fallback_hint() -> String {
     format!(
         "GitHub release downloads may be blocked or slow on this network.\n\
          For mainland China, use one of these fallback paths:\n\
-           1. Source build from the CNB mirror, installing both shipped binaries:\n\
+           1. Source build from the CNB mirror, installing the shipped binary:\n\
               cargo install --git {CNB_REPO_URL} --tag vX.Y.Z codewhale-cli --locked --force\n\
-              cargo install --git {CNB_REPO_URL} --tag vX.Y.Z codewhale-tui --locked --force\n\
            2. Use a binary asset mirror:\n\
               {RELEASE_BASE_URL_ENV}=https://<mirror>/<release-assets>/ {UPDATE_VERSION_ENV}=X.Y.Z codewhale update\n\
-         The mirror directory must contain {CHECKSUM_MANIFEST_ASSET} and the platform binaries."
+         The mirror directory must contain {CHECKSUM_MANIFEST_ASSET} and the codewhale platform binary."
     )
 }
 
@@ -558,7 +597,7 @@ mod tests {
 
         assert_eq!(
             release_base_url_from_env("v1.2.3"),
-            Some("https://cnb.cool/Hmbown/CodeWhale/-/releases/v1.2.3".to_string())
+            Some("https://cnb.cool/codewhale.net/codewhale/-/releases/download/v1.2.3".to_string())
         );
 
         set_release_env(RELEASE_BASE_URL_ENV, "https://explicit.example.com");
@@ -567,6 +606,58 @@ mod tests {
             release_base_url_from_env("1.0.0"),
             Some("https://explicit.example.com".to_string())
         );
+
+        set_release_env(RELEASE_BASE_URL_ENV, "");
+        set_release_env(CNB_MIRROR_ENV, "0");
+        assert_eq!(
+            release_base_url_from_env("1.0.0"),
+            None,
+            "the Rust updater must match npm and require an exact =1 override"
+        );
+    }
+
+    #[test]
+    fn cnb_mirror_override_is_active_only_without_an_explicit_base_url() {
+        let _env = ReleaseEnvGuard::clear();
+        assert!(!cnb_mirror_override_active());
+
+        set_release_env(CNB_MIRROR_ENV, "1");
+        assert!(cnb_mirror_override_active());
+
+        set_release_env(RELEASE_BASE_URL_ENV, "https://explicit.example.com");
+        assert!(
+            !cnb_mirror_override_active(),
+            "an explicit base URL outranks the CNB flag"
+        );
+
+        set_release_env(RELEASE_BASE_URL_ENV, "");
+        for disabled in ["", "0", "true", "yes", " 1 "] {
+            set_release_env(CNB_MIRROR_ENV, disabled);
+            assert!(
+                !cnb_mirror_override_active(),
+                "only CODEWHALE_USE_CNB_MIRROR=1 may force CNB, got {disabled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cnb_mirror_publishes_linux_x64_only() {
+        assert!(cnb_mirror_supports_target("linux", "x86_64"));
+
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("linux", "riscv64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+            ("android", "aarch64"),
+        ] {
+            assert!(
+                !cnb_mirror_supports_target(os, arch),
+                "CNB must not claim {os}/{arch}"
+            );
+        }
     }
 
     #[test]
@@ -613,6 +704,14 @@ mod tests {
         assert!(
             hint.contains(CHECKSUM_MANIFEST_ASSET),
             "hint missing CHECKSUM_MANIFEST_ASSET"
+        );
+        assert!(
+            hint.contains("codewhale platform binary"),
+            "hint must describe the sole implementation asset"
+        );
+        assert!(
+            !hint.contains("codewhale-tui"),
+            "hint must not request the removed TUI implementation asset"
         );
     }
 
@@ -727,11 +826,11 @@ mod tests {
     fn cnb_release_base_url_includes_tag_directory() {
         assert_eq!(
             cnb_release_base_url("0.8.47"),
-            "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.8.47"
         );
         assert_eq!(
             cnb_release_base_url("v0.8.47"),
-            "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.8.47"
         );
     }
 

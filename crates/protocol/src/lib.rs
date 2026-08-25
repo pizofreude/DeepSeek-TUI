@@ -3,7 +3,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod agent_mail;
+pub mod agent_run;
+pub mod event_msg;
 pub mod fleet;
+pub mod ids;
+pub mod journal;
+pub mod op;
 pub mod runtime;
 pub mod workroom;
 
@@ -329,8 +335,8 @@ pub enum AppRequest {
     /// Mirrors the TUI `reload_runtime_config` codepath for everything
     /// reachable from the headless `Runtime`. MCP server connections
     /// are not refreshed — changing `mcp_config_path` or the referenced
-    /// `mcp.json` still requires a restart, matching the TUI's
-    /// `mcp_restart_required` behavior.
+    /// `mcp.json` still requires a headless-runtime restart. The TUI's
+    /// explicit `/mcp reload` operation is not part of this protocol path.
     ConfigReload,
     /// List available models.
     Models,
@@ -463,6 +469,21 @@ pub enum ToolOutput {
         /// The result value returned by the MCP server.
         result: Value,
     },
+}
+
+impl ToolOutput {
+    /// Returns the tool's application-level success independently of transport.
+    ///
+    /// MCP success requires the top-level `isError` field to be omitted or the
+    /// literal boolean `false`; malformed present metadata fails closed.
+    pub fn success(&self) -> bool {
+        match self {
+            Self::Function { success, .. } => *success,
+            Self::Mcp { result } => {
+                matches!(result.get("isError"), None | Some(Value::Bool(false)))
+            }
+        }
+    }
 }
 
 /// Action to take for a network policy rule.

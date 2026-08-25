@@ -20,6 +20,8 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    #[serde(alias = "canceled")]
+    Cancelled,
 }
 
 impl TodoStatus {
@@ -29,6 +31,7 @@ impl TodoStatus {
             TodoStatus::Pending => "pending",
             TodoStatus::InProgress => "in_progress",
             TodoStatus::Completed => "completed",
+            TodoStatus::Cancelled => "cancelled",
         }
     }
 
@@ -37,10 +40,20 @@ impl TodoStatus {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {
             "pending" => Some(TodoStatus::Pending),
-            "in_progress" | "inprogress" => Some(TodoStatus::InProgress),
-            "completed" | "done" => Some(TodoStatus::Completed),
+            "in_progress" | "inprogress" | "in-progress" | "in progress" => {
+                Some(TodoStatus::InProgress)
+            }
+            "completed" | "complete" | "done" => Some(TodoStatus::Completed),
+            "cancelled" | "canceled" => Some(TodoStatus::Cancelled),
             _ => None,
         }
+    }
+
+    /// Whether this item has reached a terminal outcome. Cancellation settles
+    /// work without misreporting it as successful completion.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        matches!(self, TodoStatus::Completed | TodoStatus::Cancelled)
     }
 }
 
@@ -159,22 +172,6 @@ impl TodoList {
         item
     }
 
-    /// Update an item's status by id.
-    pub fn update_status(&mut self, id: u32, status: TodoStatus) -> Option<TodoItem> {
-        let mut updated: Option<TodoItem> = None;
-        if status == TodoStatus::InProgress {
-            self.set_single_in_progress(Some(id));
-        }
-        for item in &mut self.items {
-            if item.id == id {
-                item.status = status;
-                updated = Some(item.clone());
-                break;
-            }
-        }
-        updated
-    }
-
     /// Compute completion percentage for the list.
     #[must_use]
     pub fn completion_percentage(&self) -> u8 {
@@ -182,12 +179,12 @@ impl TodoList {
             return 0;
         }
         let total = self.items.len();
-        let completed = self
+        let settled = self
             .items
             .iter()
-            .filter(|item| item.status == TodoStatus::Completed)
+            .filter(|item| item.status.is_settled())
             .count();
-        let percent = completed.saturating_mul(100);
+        let percent = settled.saturating_mul(100);
         let percent = (percent + total / 2) / total;
         u8::try_from(percent).unwrap_or(u8::MAX)
     }
@@ -227,329 +224,43 @@ pub fn new_shared_todo_list() -> SharedTodoList {
 }
 
 const CANONICAL_WORK_SURFACE: &str = "work";
-const CANONICAL_PROGRESS_TOOL: &str = "work_update";
+const CANONICAL_PROGRESS_TOOL: &str = "todo_write";
 const DURABLE_WORK_OWNER: &str = "fleet_workflow_ledger";
 
 /// Tool for writing and updating the todo list
 pub struct TodoWriteTool {
+    name: &'static str,
     todo_list: SharedTodoList,
-    tool_name: &'static str,
 }
 
 impl TodoWriteTool {
     /// Canonical model-facing progress surface (#4132).
-    pub fn work_update(todo_list: SharedTodoList) -> Self {
+    pub fn new(todo_list: SharedTodoList) -> Self {
         Self {
+            name: CANONICAL_PROGRESS_TOOL,
             todo_list,
-            tool_name: CANONICAL_PROGRESS_TOOL,
         }
     }
 
-    /// Legacy spelling kept for transcript replay and older prompts.
-    pub fn checklist(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "checklist_write",
-        }
-    }
-
-    /// Pre-checklist `todo_*` spelling kept for transcript replay.
-    pub fn todo(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_write",
-        }
-    }
-}
-
-/// Tool for adding a single todo item (legacy compatibility).
-pub struct TodoAddTool {
-    todo_list: SharedTodoList,
-    tool_name: &'static str,
-}
-
-impl TodoAddTool {
-    pub fn checklist(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "checklist_add",
-        }
-    }
-
-    pub fn todo(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_add",
-        }
-    }
-}
-
-#[async_trait]
-impl ToolSpec for TodoAddTool {
-    fn name(&self) -> &'static str {
-        self.tool_name
-    }
-
-    fn description(&self) -> &'static str {
-        if self.tool_name == "todo_add" {
-            "Compatibility alias for work_update/checklist_add. Adds one To-do item on the active thread/task."
-        } else {
-            "Compatibility alias for work_update. Adds one To-do item on the active thread/task. Prefer work_update to replace the full list."
-        }
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "The task description"
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["pending", "in_progress", "completed"],
-                    "description": "Task status (default: pending)"
-                }
-            },
-            "required": ["content"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::WritesFiles]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    fn model_visible(&self) -> bool {
-        // Granular add stays callable for replay; models should use work_update.
-        false
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let content = input
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::invalid_input("Missing 'content'"))?;
-        let status = input
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(TodoStatus::from_str)
-            .unwrap_or(TodoStatus::Pending);
-
-        let mut list = self.todo_list.lock().await;
-        let item = list.add(content.to_string(), status);
-        let snapshot = list.snapshot();
-
-        let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
-        Ok(ToolResult::success(format!(
-            "Added todo #{} ({})\n{}",
-            item.id,
-            item.status.as_str(),
-            result
-        ))
-        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
-    }
-}
-
-/// Tool for updating a todo item's status (legacy compatibility).
-pub struct TodoUpdateTool {
-    todo_list: SharedTodoList,
-    tool_name: &'static str,
-}
-
-impl TodoUpdateTool {
-    pub fn checklist(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "checklist_update",
-        }
-    }
-
-    pub fn todo(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_update",
-        }
-    }
-}
-
-#[async_trait]
-impl ToolSpec for TodoUpdateTool {
-    fn name(&self) -> &'static str {
-        self.tool_name
-    }
-
-    fn description(&self) -> &'static str {
-        if self.tool_name == "todo_update" {
-            "Compatibility alias for work_update/checklist_update. Updates one To-do item by id on the active thread/task."
-        } else {
-            "Compatibility alias for work_update. Updates one To-do item's status by id on the active thread/task."
-        }
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Todo item id"
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["pending", "in_progress", "completed"],
-                    "description": "New status"
-                }
-            },
-            "required": ["id", "status"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::WritesFiles]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    fn model_visible(&self) -> bool {
-        false
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| ToolError::invalid_input("Missing or invalid 'id'"))?;
-        let status = input
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(TodoStatus::from_str)
-            .ok_or_else(|| ToolError::invalid_input("Missing or invalid 'status'"))?;
-
-        let mut list = self.todo_list.lock().await;
-        let updated = list.update_status(id, status);
-        let snapshot = list.snapshot();
-        let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
-
-        match updated {
-            Some(item) => Ok(ToolResult::success(format!(
-                "Updated todo #{} to {}\n{}",
-                item.id,
-                item.status.as_str(),
-                result
-            ))
-            .with_metadata(work_progress_metadata(&snapshot, self.tool_name))),
-            None => Ok(ToolResult::error(format!("Todo id {id} not found"))),
-        }
-    }
-}
-
-/// Tool for listing current todos (legacy compatibility).
-pub struct TodoListTool {
-    todo_list: SharedTodoList,
-    tool_name: &'static str,
-}
-
-impl TodoListTool {
-    pub fn checklist(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "checklist_list",
-        }
-    }
-
-    pub fn todo(todo_list: SharedTodoList) -> Self {
-        Self {
-            todo_list,
-            tool_name: "todo_list",
-        }
-    }
-}
-
-#[async_trait]
-impl ToolSpec for TodoListTool {
-    fn name(&self) -> &'static str {
-        self.tool_name
-    }
-
-    fn description(&self) -> &'static str {
-        if self.tool_name == "todo_list" {
-            "Compatibility alias for work_update/checklist_list. Lists current To-do progress."
-        } else {
-            "Compatibility alias for work_update. Lists current To-do progress for the active thread/task."
-        }
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    fn model_visible(&self) -> bool {
-        false
-    }
-
-    async fn execute(
-        &self,
-        _input: serde_json::Value,
-        _context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let list = self.todo_list.lock().await;
-        let snapshot = list.snapshot();
-        let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
-        Ok(ToolResult::success(format!(
-            "Todo list ({} items, {}% complete)\n{}",
-            snapshot.items.len(),
-            snapshot.completion_pct,
-            result
-        ))
-        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
+    /// Hidden compat alias (`work_update`, `TodoWrite`, `todo`, …) — same
+    /// handler, not model-visible.
+    pub fn alias(name: &'static str, todo_list: SharedTodoList) -> Self {
+        Self { name, todo_list }
     }
 }
 
 #[async_trait]
 impl ToolSpec for TodoWriteTool {
     fn name(&self) -> &'static str {
-        self.tool_name
+        self.name
+    }
+
+    fn model_visible(&self) -> bool {
+        self.name == CANONICAL_PROGRESS_TOOL
     }
 
     fn description(&self) -> &'static str {
-        match self.tool_name {
-            "todo_write" => {
-                "Compatibility alias for work_update. Replace the active thread/task To-do list; durable tasks are the real executable work object."
-            }
-            "checklist_write" => {
-                "Compatibility alias for work_update. Replace the active thread/task To-do list; durable tasks are the real executable work object."
-            }
-            _ => {
-                "Replace the active thread/task To-do list (concrete current work items). This is the canonical progress surface — use it for ordinary in-flight work. Use update_plan only for Strategy metadata/context/route, not as a second checklist. Durable tasks remain the real executable work object."
-            }
-        }
+        "Replace the To-do list shown to the user. Optional: use it when a visible plan helps; at most one item may be in_progress at a time."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -568,7 +279,7 @@ impl ToolSpec for TodoWriteTool {
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
                                 "description": "Task status"
                             }
                         },
@@ -584,29 +295,30 @@ impl ToolSpec for TodoWriteTool {
         vec![ToolCapability::WritesFiles]
     }
 
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+    fn is_read_only_for(&self, _input: &serde_json::Value) -> bool {
+        // This mutates only the caller's in-memory progress list. Sub-agent
+        // runtimes allocate a fresh list per child, so it cannot touch the
+        // workspace, Git, remote services, or a parent/sibling's state. Treat
+        // it as bounded agent-owned state for read-only authority envelopes;
+        // keep WritesFiles above for legacy/UI capability grouping.
+        true
     }
 
-    fn model_visible(&self) -> bool {
-        // Only the canonical work_update spelling is advertised to models.
-        self.tool_name == CANONICAL_PROGRESS_TOOL
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        ApprovalRequirement::Auto
     }
 
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let todos = input
             .get("todos")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ToolError::invalid_input("Missing or invalid 'todos' array"))?;
 
-        let mut list = self.todo_list.lock().await;
-
-        // Clear and rebuild the list
-        list.clear();
+        let mut list = TodoList::new();
 
         for item in todos {
             let content = item
@@ -614,34 +326,60 @@ impl ToolSpec for TodoWriteTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::invalid_input("Todo item missing 'content'"))?;
 
-            let status_str = item
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("pending");
-
-            let status = TodoStatus::from_str(status_str).unwrap_or(TodoStatus::Pending);
+            let status = match item.get("status").and_then(|v| v.as_str()) {
+                Some(raw) => TodoStatus::from_str(raw).ok_or_else(|| {
+                    // #5123-class: unknown statuses used to silently coerce to
+                    // pending on the canonical progress surface.
+                    ToolError::invalid_input(format!(
+                        "unknown todo status '{raw}'; expected pending, in_progress, \
+                         completed, or cancelled"
+                    ))
+                })?,
+                None => TodoStatus::Pending,
+            };
 
             list.add(content.to_string(), status);
         }
 
-        let snapshot = list.snapshot();
+        let snapshot = publish_todo_snapshot(
+            context,
+            &self.todo_list,
+            CANONICAL_PROGRESS_TOOL,
+            list.snapshot(),
+        )
+        .await?;
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
         Ok(ToolResult::success(format!(
-            "Todo list updated ({} items, {}% complete)\n{}",
+            "Todo list updated ({} items, {}% settled)\n{}",
             snapshot.items.len(),
             snapshot.completion_pct,
             result
         ))
-        .with_metadata(work_progress_metadata(&snapshot, self.tool_name)))
+        .with_metadata(work_progress_metadata(&snapshot)))
     }
 }
 
-fn is_compat_alias(tool_name: &str) -> bool {
-    tool_name != CANONICAL_PROGRESS_TOOL
+async fn publish_todo_snapshot(
+    context: &ToolContext,
+    todo_list: &SharedTodoList,
+    tool_name: &str,
+    desired: TodoListSnapshot,
+) -> Result<TodoListSnapshot, ToolError> {
+    if let Some(work) = context.runtime.work.as_ref()
+        && work.matches_todos(todo_list)
+    {
+        return work
+            .apply_todo_update(&context.state_namespace, tool_name, &desired)
+            .await
+            .map_err(ToolError::execution_failed);
+    }
+    *todo_list.lock().await =
+        TodoList::from_snapshot(&desired).map_err(ToolError::execution_failed)?;
+    Ok(desired)
 }
 
-fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_json::Value {
+fn work_progress_metadata(snapshot: &TodoListSnapshot) -> serde_json::Value {
     let items = snapshot
         .items
         .iter()
@@ -655,11 +393,9 @@ fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde
         .collect::<Vec<_>>();
     json!({
         "canonical_tool": CANONICAL_PROGRESS_TOOL,
-        "invoked_as": tool_name,
-        "compat_alias": is_compat_alias(tool_name),
         "work_surface": {
             "canonical": CANONICAL_WORK_SURFACE,
-            "model_visible": tool_name == CANONICAL_PROGRESS_TOOL,
+            "model_visible": true,
             "durable_owner": DURABLE_WORK_OWNER,
             "progress_key": "task_updates.checklist"
         },
@@ -676,7 +412,70 @@ fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn todo_write_is_bounded_agent_owned_state_for_read_only_envelopes() {
+        let tool = super::TodoWriteTool::new(super::new_shared_todo_list());
+        assert!(crate::tools::spec::ToolSpec::is_read_only_for(
+            &tool,
+            &serde_json::json!({
+                "todos": [{"content": "private evidence note", "status": "pending"}]
+            })
+        ));
+        assert!(
+            crate::tools::spec::ToolSpec::capabilities(&tool)
+                .contains(&crate::tools::spec::ToolCapability::WritesFiles),
+            "legacy capability grouping remains intact"
+        );
+    }
+
+    #[test]
+    fn todo_write_description_states_the_tool_without_upkeep_coaching() {
+        // The list is optional support for the user's view, not an obligation.
+        // Behavior coaching ("keep it live", "never batch") pressured models
+        // into list management instead of the actual task.
+        let tool = super::TodoWriteTool::new(super::new_shared_todo_list());
+        let description = crate::tools::spec::ToolSpec::description(&tool);
+        assert!(description.contains("Optional"), "{description}");
+        assert!(
+            description.contains("at most one item may be in_progress"),
+            "{description}"
+        );
+        for coaching in ["keep it live", "never batch", "the moment an item finishes"] {
+            assert!(!description.contains(coaching), "{description}");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn cancelled_is_a_terminal_round_trippable_todo_state() {
+        assert_eq!(
+            TodoStatus::from_str("cancelled"),
+            Some(TodoStatus::Cancelled)
+        );
+        assert_eq!(
+            TodoStatus::from_str("canceled"),
+            Some(TodoStatus::Cancelled)
+        );
+
+        let mut list = TodoList::new();
+        list.add("abandoned approach".to_string(), TodoStatus::Cancelled);
+        let snapshot = list.snapshot();
+        assert_eq!(snapshot.completion_pct, 100);
+        assert_eq!(snapshot.in_progress_id, None);
+        assert_eq!(
+            serde_json::to_value(snapshot.items[0].status).expect("serialize"),
+            serde_json::json!("cancelled")
+        );
+
+        let schema = TodoWriteTool::new(new_shared_todo_list()).input_schema();
+        let statuses = &schema["properties"]["todos"]["items"]["properties"]["status"]["enum"];
+        assert!(statuses.as_array().is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some("cancelled"))
+        }));
+    }
 
     #[test]
     fn persisted_snapshot_restores_ids_status_and_recomputes_metrics() {
@@ -754,8 +553,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_update_rejects_unknown_status_instead_of_coercing_to_pending() {
+        // #5123-class: statuses like "blocked" / "in-progress" used to be
+        // recorded as pending with a success receipt on the canonical
+        // progress surface.
+        let tool = TodoWriteTool::new(new_shared_todo_list());
+        let context = ToolContext::new(std::env::temp_dir());
+        let err = tool
+            .execute(
+                json!({"todos": [{ "content": "x", "status": "blocked" }]}),
+                &context,
+            )
+            .await
+            .expect_err("unknown status must fail fast");
+        assert!(format!("{err}").contains("unknown todo status"), "{err}");
+
+        // Common near-misses resolve via the synonym table.
+        assert_eq!(
+            TodoStatus::from_str("complete"),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            TodoStatus::from_str("in-progress"),
+            Some(TodoStatus::InProgress)
+        );
+        assert_eq!(TodoStatus::from_str("blocked"), None);
+    }
+
+    #[tokio::test]
     async fn work_update_returns_canonical_task_update_metadata() {
-        let tool = TodoWriteTool::work_update(new_shared_todo_list());
+        let tool = TodoWriteTool::new(new_shared_todo_list());
         let context = ToolContext::new(std::env::temp_dir());
         let result = tool
             .execute(
@@ -772,9 +599,7 @@ mod tests {
 
         assert!(tool.model_visible());
         let metadata = result.metadata.expect("metadata");
-        assert_eq!(metadata["canonical_tool"], "work_update");
-        assert_eq!(metadata["invoked_as"], "work_update");
-        assert_eq!(metadata["compat_alias"], false);
+        assert_eq!(metadata["canonical_tool"], "todo_write");
         assert_eq!(metadata["work_surface"]["canonical"], "work");
         assert_eq!(metadata["work_surface"]["model_visible"], true);
         assert_eq!(
@@ -796,54 +621,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checklist_write_compat_alias_still_replays() {
-        let tool = TodoWriteTool::checklist(new_shared_todo_list());
-        let context = ToolContext::new(std::env::temp_dir());
-        let result = tool
+    async fn work_update_routes_through_attached_graph() {
+        let todos = new_shared_todo_list();
+        let plan = crate::tools::plan::new_shared_plan_state();
+        let work = crate::work_graph::new_shared_work_runtime(todos.clone(), plan);
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+
+        TodoWriteTool::new(todos.clone())
             .execute(
-                json!({
-                    "todos": [
-                        { "content": "legacy checklist payload", "status": "completed" }
-                    ]
-                }),
+                json!({"todos": [
+                    {"content": "Graph-owned", "status": "completed"},
+                    {"content": "Discarded branch", "status": "cancelled"}
+                ]}),
                 &context,
             )
             .await
-            .expect("checklist_write compat succeeds");
+            .expect("second work_update");
 
-        assert!(!tool.model_visible());
-        let metadata = result.metadata.expect("metadata");
-        assert_eq!(metadata["canonical_tool"], "work_update");
-        assert_eq!(metadata["invoked_as"], "checklist_write");
-        assert_eq!(metadata["compat_alias"], true);
-        assert_eq!(metadata["work_surface"]["canonical"], "work");
-        assert_eq!(metadata["work_surface"]["model_visible"], false);
+        let state = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture")
+            .expect("graph state");
+        assert_eq!(state.todos.items[0].status, TodoStatus::Completed);
+        assert_eq!(state.todos.items[1].status, TodoStatus::Cancelled);
+        assert_eq!(state.todos.completion_pct, 100);
+        let node = state
+            .graph
+            .node(&state.graph.compat.todos[0].node)
+            .expect("projected node");
+        assert_eq!(node.state, crate::work_graph::NodeState::Completed);
+        let cancelled_node = state
+            .graph
+            .node(&state.graph.compat.todos[1].node)
+            .expect("cancelled projected node");
         assert_eq!(
-            metadata["task_updates"]["checklist"]["items"][0]["content"],
-            "legacy checklist payload"
+            cancelled_node.state,
+            crate::work_graph::NodeState::Cancelled
         );
-    }
-
-    #[tokio::test]
-    async fn todo_write_compat_alias_still_replays() {
-        let tool = TodoWriteTool::todo(new_shared_todo_list());
-        let context = ToolContext::new(std::env::temp_dir());
-        let result = tool
-            .execute(
-                json!({
-                    "todos": [
-                        { "content": "legacy todo payload", "status": "pending" }
-                    ]
-                }),
-                &context,
-            )
-            .await
-            .expect("todo_write compat succeeds");
-
-        assert!(!tool.model_visible());
-        let metadata = result.metadata.expect("metadata");
-        assert_eq!(metadata["canonical_tool"], "work_update");
-        assert_eq!(metadata["invoked_as"], "todo_write");
-        assert_eq!(metadata["compat_alias"], true);
+        assert!(todos.lock().await.snapshot().is_empty());
+        assert_eq!(work.publish_pending().await, Ok(true));
+        assert_eq!(
+            todos.lock().await.snapshot().items[0].status,
+            TodoStatus::Completed
+        );
+        assert_eq!(
+            todos.lock().await.snapshot().items[1].status,
+            TodoStatus::Cancelled
+        );
     }
 }

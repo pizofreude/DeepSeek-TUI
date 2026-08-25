@@ -13,10 +13,16 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+
+/// Serializes all `session_index.jsonl` read/append/compact/rename operations so
+/// concurrent `StateStore` clones cannot interleave an append with a compaction
+/// rename and silently drop entries.
+static SESSION_INDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use codewhale_paths::{CODEWHALE_APP_DIR, LEGACY_APP_DIR, codewhale_home_override};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -291,14 +297,50 @@ impl StateStore {
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open state db {}", db_path.display()))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .with_context(|| format!("failed to enable foreign keys for {}", db_path.display()))?;
+        Self::configure_connection(&conn, &db_path)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             db_path,
             session_index_path,
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Apply connection-level SQLite settings that must hold for every open.
+    ///
+    /// Enables WAL so readers and writers from concurrent CodeWhale processes
+    /// do not block each other as aggressively as the default rollback journal,
+    /// and sets a multi-second busy timeout so a second process retries on
+    /// `SQLITE_BUSY` instead of failing immediately (issue #4734).
+    fn configure_connection(conn: &Connection, db_path: &Path) -> Result<()> {
+        // Install our wait policy before touching database-level settings or
+        // schema. Connection::open may currently provide a dependency default,
+        // but StateStore must not rely on that incidental behavior.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .with_context(|| format!("failed to set busy_timeout for {}", db_path.display()))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .with_context(|| format!("failed to enable foreign keys for {}", db_path.display()))?;
+
+        // WAL persists in the database header, so established stores need no
+        // write-like journal transition on every process start. Fresh or
+        // explicitly downgraded stores still transition once, and we verify
+        // SQLite accepted the requested mode instead of silently retaining the
+        // previous one (for example on an unsupported VFS).
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .with_context(|| format!("failed to read journal mode for {}", db_path.display()))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            let configured_mode: String = conn
+                .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+                .with_context(|| format!("failed to enable WAL for {}", db_path.display()))?;
+            if !configured_mode.eq_ignore_ascii_case("wal") {
+                anyhow::bail!(
+                    "failed to enable WAL for {}: SQLite retained journal mode {configured_mode}",
+                    db_path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Returns the filesystem path of the underlying SQLite database.
@@ -318,7 +360,22 @@ impl StateStore {
     fn init_schema(conn: &Connection) -> Result<()> {
         let mut user_version: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         if user_version == 0 {
-            conn.execute_batch(
+            // Guard each ALTER: a database restored with a v0 header (or
+            // stamped by a racing process that crashed before setting
+            // user_version) can already carry these columns, and an
+            // unguarded ADD COLUMN aborts the whole open with
+            // "duplicate column name".
+            let add_parent_entry_id = if column_exists(conn, "messages", "parent_entry_id")? {
+                ""
+            } else {
+                "ALTER TABLE messages ADD COLUMN parent_entry_id INTEGER NULL;"
+            };
+            let add_current_leaf_id = if column_exists(conn, "threads", "current_leaf_id")? {
+                ""
+            } else {
+                "ALTER TABLE threads ADD COLUMN current_leaf_id INTEGER NULL;"
+            };
+            conn.execute_batch(&format!(
                 r#"
                 BEGIN;
                 CREATE TABLE IF NOT EXISTS threads (
@@ -391,7 +448,7 @@ impl StateStore {
                 CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC);
 
                 -- Add parent_entry_id column, and set to last message before current message
-                ALTER TABLE messages ADD COLUMN parent_entry_id INTEGER NULL;
+                {add_parent_entry_id}
                 UPDATE messages
                     SET parent_entry_id = (
                         SELECT m2.id
@@ -407,10 +464,10 @@ impl StateStore {
                         ORDER BY m2.created_at DESC, m2.id DESC
                         LIMIT 1
                     );
-                CREATE INDEX idx_messages_parent_entry_id ON messages(parent_entry_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_parent_entry_id ON messages(parent_entry_id);
 
                 -- Add current_leaf_id column, and set to last message in thread
-                ALTER TABLE threads ADD COLUMN current_leaf_id INTEGER NULL;
+                {add_current_leaf_id}
                 UPDATE threads
                     SET current_leaf_id = (
                         SELECT m.id
@@ -422,8 +479,8 @@ impl StateStore {
 
                 PRAGMA user_version = 1;
                 COMMIT;
-                "#,
-            )
+                "#
+            ))
             .context("failed to initialize thread schema")?;
             user_version = 1;
         }
@@ -557,16 +614,26 @@ impl StateStore {
             user_version = 3;
         }
         if user_version < 4 {
-            conn.execute_batch(
+            // Same restore/race guard as the v0 block: the column may
+            // already exist even though the header predates version 4.
+            let add_continuation_count = if column_exists(
+                conn,
+                "thread_goals",
+                "continuation_count",
+            )? {
+                ""
+            } else {
+                "ALTER TABLE thread_goals\n                    ADD COLUMN continuation_count INTEGER NOT NULL DEFAULT 0;"
+            };
+            conn.execute_batch(&format!(
                 r#"
                 BEGIN;
-                ALTER TABLE thread_goals
-                    ADD COLUMN continuation_count INTEGER NOT NULL DEFAULT 0;
+                {add_continuation_count}
 
                 PRAGMA user_version = 4;
                 COMMIT;
-                "#,
-            )
+                "#
+            ))
             .context("failed to initialize thread goal continuation schema")?;
         }
         Ok(())
@@ -1506,6 +1573,9 @@ impl StateStore {
         updated_at: i64,
         rollout_path: Option<PathBuf>,
     ) -> Result<()> {
+        // Hold the index lock for the entire append + compaction so a concurrent
+        // `StateStore` clone cannot rename the index while we are appending.
+        let _guard = SESSION_INDEX_LOCK.lock().unwrap();
         if let Some(parent) = self.session_index_path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -1522,19 +1592,75 @@ impl StateStore {
         };
         let encoded =
             serde_json::to_string(&entry).context("failed to serialize session index entry")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.session_index_path)
-            .with_context(|| {
+        // Append and compaction share one lock. Compaction rewrites the file
+        // from a snapshot and renames over it, so an append landing between
+        // that snapshot and the rename would be discarded — silently, since
+        // the append already returned success to its caller.
+        self.with_session_index_lock(|| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.session_index_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open session index {}",
+                        self.session_index_path.display()
+                    )
+                })?;
+            writeln!(file, "{encoded}").context("failed to append session index entry")?;
+            // Durability: without this a crash mid-write can leave a torn
+            // final line. Reads tolerate one (see `session_index_map`), but
+            // not losing the entry beats recovering from having lost it.
+            file.sync_data()
+                .context("failed to flush session index entry")?;
+            drop(file);
+            self.compact_session_index_locked()
+        })
+    }
+
+    /// Run `operation` holding the exclusive session-index lock.
+    ///
+    /// The lock is an adjacent `.lock` file rather than the index itself, so
+    /// compaction's rename cannot pull the lock out from under a waiter. This
+    /// mirrors the discipline `codewhale-config` uses for `config.toml`.
+    fn with_session_index_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Some(parent) = self.session_index_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
                 format!(
-                    "failed to open session index {}",
-                    self.session_index_path.display()
+                    "failed to create session index directory {}",
+                    parent.display()
                 )
             })?;
-        writeln!(file, "{encoded}").context("failed to append session index entry")?;
-        self.maybe_compact_session_index()?;
-        Ok(())
+        }
+        let lock_path = self.session_index_path.with_extension("jsonl.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            // The file is only a lock handle; its contents are never read and
+            // truncating it would race other holders for no benefit.
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("failed to open session index lock {}", lock_path.display())
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            lock_file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!(
+                        "failed to secure session index lock {}",
+                        lock_path.display()
+                    )
+                })?;
+        }
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock
+            .write()
+            .with_context(|| format!("failed to lock session index {}", lock_path.display()))?;
+        operation()
     }
 
     /// Find the display name for a thread by its ID, using the session index.
@@ -1581,7 +1707,11 @@ impl StateStore {
         Ok(matched.and_then(|entry| entry.rollout_path.clone()))
     }
 
-    fn maybe_compact_session_index(&self) -> Result<()> {
+    /// Compact the session index. The caller must already hold the lock from
+    /// [`Self::with_session_index_lock`]: this reads a snapshot and renames a
+    /// rewritten file over the live one, and an append interleaved between
+    /// those two steps is lost.
+    fn compact_session_index_locked(&self) -> Result<()> {
         if !self.session_index_path.exists() {
             return Ok(());
         }
@@ -1628,6 +1758,11 @@ impl StateStore {
                     .context("failed to write compact session index entry")?;
             }
         }
+        // The snapshot is written but the live file is still the old one:
+        // this is the window an unsynchronized appender would write into and
+        // lose. Tests widen it deliberately to prove the lock closes it.
+        #[cfg(test)]
+        tests::compaction_midpoint(&self.session_index_path);
         fs::rename(&compact_path, &self.session_index_path).with_context(|| {
             format!(
                 "failed to replace session index {}",
@@ -1682,52 +1817,74 @@ impl StateStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let parsed: SessionIndexEntry =
-                serde_json::from_str(&line).context("failed to parse session index entry")?;
-            latest.insert(parsed.thread_id.clone(), parsed);
+            // Skip a line we can't parse instead of failing the whole read.
+            // An append that was interrupted mid-write leaves a torn final
+            // line; aborting here broke every thread-name lookup, and because
+            // compaction reads through this same function, the index could
+            // never repair itself either — the file stayed broken until
+            // someone deleted it by hand.
+            match serde_json::from_str::<SessionIndexEntry>(&line) {
+                Ok(parsed) => {
+                    latest.insert(parsed.thread_id.clone(), parsed);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "skipping unparseable session index entry in {}: {err}",
+                        self.session_index_path.display()
+                    );
+                }
+            }
         }
         Ok(latest)
     }
 }
 
-fn default_state_db_path() -> PathBuf {
+/// Resolve the default SQLite state path without opening or creating it.
+///
+/// An explicit `CODEWHALE_HOME` always yields `<override>/state.db` and blocks
+/// ambient legacy fallback. Without an override, an existing legacy database
+/// remains readable until it is migrated.
+#[must_use]
+pub fn default_state_db_path() -> PathBuf {
     // $CODEWHALE_HOME is a hard override of the base data directory
     // (docs/CONFIGURATION.md): when set, the state DB lives under it and we do
     // NOT fall back to the legacy ~/.deepseek path — silent fallback would
     // defeat the isolation the override promises (CI, containers, multi-project,
     // test harnesses). Legacy ~/.deepseek migration only applies to the default
     // home location.
-    if let Some(overridden) = codewhale_home_override() {
+    if let Some(overridden) = codewhale_home_override().ok().flatten() {
         return overridden.join("state.db");
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = codewhale_paths::user_home().unwrap_or_else(|| PathBuf::from("."));
     // Prefer the CodeWhale directory, falling back to legacy DeepSeek path
     // so existing installs don't lose their session history.
-    let primary = home.join(".codewhale").join("state.db");
-    if primary.exists() || !home.join(".deepseek").join("state.db").exists() {
+    let primary = home.join(CODEWHALE_APP_DIR).join("state.db");
+    if primary.exists() || !home.join(LEGACY_APP_DIR).join("state.db").exists() {
         primary
     } else {
-        home.join(".deepseek").join("state.db")
+        home.join(LEGACY_APP_DIR).join("state.db")
     }
-}
-
-/// Resolve `$CODEWHALE_HOME` as a hard override of the data directory root.
-///
-/// Returns the path verbatim (the env var IS the home dir, matching
-/// `codewhale_home()` in config — `$CODEWHALE_HOME=/data/cw` means the home is
-/// `/data/cw`, not `/data/cw/.codewhale`). Returns `None` when unset/empty so
-/// callers can branch on "explicit override" vs "default home + legacy
-/// fallback." Mirrors config's helper without taking a dependency on it (state
-/// is a low-level leaf crate; config cannot be a dependency here without
-/// inverting the layering).
-fn codewhale_home_override() -> Option<PathBuf> {
-    std::env::var_os("CODEWHALE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+/// Whether `table` currently has a column named `column`.
+///
+/// Used to guard `ALTER TABLE ... ADD COLUMN` migrations so they are
+/// idempotent. Both identifiers are compile-time literals at every call
+/// site, never user input. A missing table reports `false`, matching the
+/// fresh-database case where the migration must still run.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn i64_to_bool(value: i64) -> bool {
@@ -1827,7 +1984,10 @@ fn thread_goal_status_from_str(value: &str) -> ThreadGoalStatus {
         "usage_limited" => ThreadGoalStatus::UsageLimited,
         "budget_limited" => ThreadGoalStatus::BudgetLimited,
         "complete" => ThreadGoalStatus::Complete,
-        _ => ThreadGoalStatus::Active,
+        // Fail closed: an unknown or corrupted persisted value must never
+        // resurrect a self-driving goal. The user can inspect and explicitly
+        // resume a paused goal after repairing or replacing the record.
+        _ => ThreadGoalStatus::Paused,
     }
 }
 
@@ -1882,9 +2042,11 @@ fn row_to_thread_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadGoalRec
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    fn temp_state_store(name: &str) -> StateStore {
+    fn temp_state_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
@@ -1894,6 +2056,11 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp state dir");
+        dir
+    }
+
+    fn temp_state_store(name: &str) -> StateStore {
+        let dir = temp_state_dir(name);
         StateStore::open(Some(dir.join("state.db"))).expect("open state store")
     }
 
@@ -1937,6 +2104,14 @@ mod tests {
             created_at: 100,
             updated_at: 101,
         }
+    }
+
+    #[test]
+    fn unknown_persisted_goal_status_fails_closed() {
+        assert_eq!(
+            thread_goal_status_from_str("future_or_corrupt_status"),
+            ThreadGoalStatus::Paused
+        );
     }
 
     #[test]
@@ -2065,6 +2240,152 @@ mod tests {
             .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
             .expect("read foreign_keys pragma");
         assert_eq!(foreign_keys, 1);
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .expect("read journal_mode pragma");
+        assert_eq!(
+            journal_mode.to_ascii_lowercase(),
+            "wal",
+            "open should enable WAL for multi-process readers/writers"
+        );
+    }
+
+    #[test]
+    fn connection_setup_waits_for_database_lock_before_enabling_wal() {
+        let dir = temp_state_dir("locked-open");
+        let db_path = dir.join("state.db");
+
+        let candidate = Connection::open(&db_path).expect("open candidate connection");
+        // Do not let rusqlite's current default mask StateStore's own setup
+        // contract: configure_connection must install the wait policy before
+        // it performs any operation that can need a database lock.
+        candidate
+            .busy_timeout(Duration::ZERO)
+            .expect("disable dependency default timeout");
+        let blocker = Connection::open(&db_path).expect("open blocking connection");
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let blocker_thread = thread::spawn(move || {
+            blocker
+                .execute_batch("BEGIN EXCLUSIVE;")
+                .expect("acquire exclusive database lock");
+            locked_tx.send(()).expect("announce database lock");
+            thread::sleep(Duration::from_millis(200));
+            blocker
+                .execute_batch("COMMIT;")
+                .expect("release exclusive database lock");
+        });
+
+        locked_rx.recv().expect("wait for database lock");
+        StateStore::configure_connection(&candidate, &db_path)
+            .expect("connection setup should wait for the brief database lock");
+        blocker_thread.join().expect("blocking thread panicked");
+
+        let journal_mode: String = candidate
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .expect("read journal_mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        drop(candidate);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A second process must wait for a brief active writer instead of
+    /// surfacing SQLITE_BUSY (#4734).
+    ///
+    /// The lock handoff is explicit: unlike a race between many autocommit
+    /// writes, this proves the busy timeout while keeping the contention
+    /// duration below its documented five-second bound on every platform.
+    #[test]
+    fn second_connection_waits_for_active_writer() {
+        let dir = temp_state_dir("concurrent-write");
+        let db_path = dir.join("state.db");
+
+        let store_a = StateStore::open(Some(db_path.clone())).expect("open store a");
+        let store_b = StateStore::open(Some(db_path.clone())).expect("open store b");
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+
+        let writer_a = thread::spawn(move || {
+            let conn = store_a.conn().expect("connection a");
+            conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                INSERT INTO jobs(id, name, status, created_at, updated_at)
+                VALUES ('job-a', 'writer-a', 'running', 0, 0);
+                "#,
+            )
+            .expect("writer a should acquire the database write lock");
+            locked_tx.send(()).expect("announce active writer");
+            release_rx.recv().expect("wait to release active writer");
+            conn.execute_batch("COMMIT;")
+                .expect("writer a should commit");
+        });
+
+        locked_rx.recv().expect("wait for active writer");
+        let (attempting_tx, attempting_rx) = mpsc::sync_channel(0);
+        let writer_b = thread::spawn(move || {
+            attempting_tx.send(()).expect("announce second write");
+            store_b.upsert_job(&JobStateRecord {
+                id: "job-b".to_string(),
+                name: "writer-b".to_string(),
+                status: JobStateStatus::Running,
+                progress: None,
+                detail: Some("waited for writer a".to_string()),
+                created_at: 1,
+                updated_at: 1,
+            })
+        });
+
+        attempting_rx.recv().expect("wait for second write attempt");
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !writer_b.is_finished(),
+            "second writer should still be waiting while the first holds the lock"
+        );
+        release_tx.send(()).expect("release active writer");
+        writer_a.join().expect("writer a panicked");
+        writer_b
+            .join()
+            .expect("writer b panicked")
+            .expect("writer b should succeed after the lock is released");
+
+        let store = StateStore::open(Some(db_path)).expect("reopen for verify");
+        let listed = store.list_jobs(Some(2)).expect("list jobs");
+        assert_eq!(listed.len(), 2, "both writers should persist their jobs");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_runs_cleanly_when_schema_predates_user_version_header() {
+        // Simulate a restore (or a racing process that crashed before
+        // stamping user_version): the on-disk schema is fully migrated but
+        // the header still says 0. The v0 block used to re-run unconditional
+        // ADD COLUMN statements and abort the open with
+        // "duplicate column name".
+        let dir = temp_state_dir("migration-v0-idempotent");
+        let db_path = dir.join("state.db");
+        drop(StateStore::open(Some(db_path.clone())).expect("initial open"));
+        {
+            let conn = Connection::open(&db_path).expect("raw connection");
+            conn.pragma_update(None, "user_version", 0)
+                .expect("reset user_version");
+        }
+
+        let store = StateStore::open(Some(db_path.clone())).expect("reopen with v0 header");
+        store
+            .upsert_thread(&test_thread("thread-migrated"))
+            .expect("write after guarded migration");
+
+        // Reopening again (now stamped at the current version) still works.
+        drop(store);
+        let store = StateStore::open(Some(db_path)).expect("third open");
+        let persisted = store
+            .get_thread("thread-migrated")
+            .expect("read after reopen");
+        assert!(persisted.is_some());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2218,12 +2539,13 @@ mod tests {
     #[test]
     fn codewhale_home_override_returns_the_env_value_verbatim() {
         let _lock = CODEWHALE_HOME_TEST_LOCK.lock().unwrap();
-        let _g = CodeWhaleHomeGuard::set("/tmp/cw-isolated-state");
+        let override_path = std::env::temp_dir().join("cw-isolated-state");
+        let _g = CodeWhaleHomeGuard::set(override_path.to_str().unwrap());
         // The env var IS the home dir — no ".codewhale" appended. This matches
         // codewhale_home() in config ($CODEWHALE_HOME=/x means home is /x).
         assert_eq!(
-            codewhale_home_override().as_deref(),
-            Some(std::path::Path::new("/tmp/cw-isolated-state"))
+            codewhale_home_override().unwrap().as_deref(),
+            Some(override_path.as_path())
         );
     }
 
@@ -2231,21 +2553,16 @@ mod tests {
     fn codewhale_home_override_none_when_unset() {
         let _lock = CODEWHALE_HOME_TEST_LOCK.lock().unwrap();
         let _g = CodeWhaleHomeGuard::remove();
-        assert!(codewhale_home_override().is_none());
+        assert!(codewhale_home_override().unwrap().is_none());
     }
 
     #[test]
-    fn codewhale_home_override_none_when_empty() {
+    fn codewhale_home_override_none_when_whitespace_only() {
         let _lock = CODEWHALE_HOME_TEST_LOCK.lock().unwrap();
         let _g = CodeWhaleHomeGuard::set("   ");
-        // The helper filters empty values (after the OsString check). Note:
-        // var_os returns the raw "   ", and our filter only catches truly-empty,
-        // so this documents that whitespace-only is NOT treated as unset at the
-        // override layer (config's codewhale_home trims; we don't here — the
-        // branch is "was it set at all").
         assert!(
-            codewhale_home_override().is_some(),
-            "non-empty (even whitespace) counts as set; trimming is the caller's job"
+            codewhale_home_override().unwrap().is_none(),
+            "whitespace-only CODEWHALE_HOME must not establish isolation"
         );
     }
 
@@ -2313,5 +2630,142 @@ mod tests {
             .find_thread_name_by_id("thread-1")
             .expect("lookup thread name");
         assert_eq!(name.as_deref(), Some("name-5"));
+    }
+
+    #[test]
+    fn session_index_read_skips_a_torn_line() {
+        // #4735: a crash mid-append leaves a truncated final line. Failing the
+        // whole read broke every thread-name lookup at once, and compaction
+        // reads through the same path, so the index could not repair itself.
+        let store = temp_state_store("session-index-torn");
+        store
+            .append_thread_name("thread-1", Some("first".to_string()), 1, None)
+            .expect("append first entry");
+
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&store.session_index_path)
+                .expect("open session index");
+            // A write cut off mid-JSON, exactly as a crash would leave it.
+            writeln!(file, "{{\"thread_id\":\"thread-2\",\"thread_na").expect("write torn line");
+        }
+
+        store
+            .append_thread_name("thread-3", Some("third".to_string()), 3, None)
+            .expect("append third entry");
+
+        assert_eq!(
+            store
+                .find_thread_name_by_id("thread-1")
+                .expect("lookup thread-1")
+                .as_deref(),
+            Some("first"),
+        );
+        assert_eq!(
+            store
+                .find_thread_name_by_id("thread-3")
+                .expect("lookup thread-3")
+                .as_deref(),
+            Some("third"),
+        );
+    }
+
+    /// Hook fired by compaction between writing the snapshot and renaming it
+    /// over the live index — the window a concurrent append can be lost in.
+    /// Only the store whose path a test registered is affected, so tests
+    /// running in parallel don't disturb each other.
+    type MidpointHook = Box<dyn Fn() + Send + Sync>;
+    static COMPACTION_MIDPOINT: Mutex<Option<(PathBuf, MidpointHook)>> = Mutex::new(None);
+
+    /// Fires at most once: the racing append compacts too, and a hook that
+    /// fired twice would re-enter the test's one-shot handshake.
+    pub(super) fn compaction_midpoint(index_path: &Path) {
+        let mut hook = COMPACTION_MIDPOINT.lock().expect("midpoint hook lock");
+        let registered_for_this_store = match hook.as_ref() {
+            Some((registered, _)) => registered == index_path,
+            None => return,
+        };
+        if !registered_for_this_store {
+            return;
+        }
+        let (_, callback) = hook.take().expect("presence checked above");
+        drop(hook);
+        callback();
+    }
+
+    #[test]
+    fn session_index_compaction_does_not_drop_a_concurrent_append() {
+        // #4736: compaction snapshots the file, rewrites it, and renames over
+        // the live one. An append landing between those two steps used to
+        // vanish — silently, since it had already returned success to its
+        // caller. The shared lock serializes the two.
+        //
+        // The race is real but narrow, so the test drives it deterministically:
+        // a hook at the compaction midpoint releases the appender and then
+        // waits. Without the lock the appender writes into the doomed file and
+        // the rename discards it; with the lock it blocks until compaction
+        // finishes, and its entry survives.
+        let store = Arc::new(temp_state_store("session-index-race"));
+        let threshold = session_index_compact_line_threshold();
+
+        // One line short of the threshold, so the next append compacts.
+        for idx in 0..threshold {
+            store
+                .append_thread_name(
+                    &format!("thread-{idx}"),
+                    Some(format!("name-{idx}")),
+                    1,
+                    None,
+                )
+                .expect("append filler entry");
+        }
+
+        let appender_released = Arc::new(Barrier::new(2));
+        {
+            let released = Arc::clone(&appender_released);
+            *COMPACTION_MIDPOINT.lock().expect("midpoint hook lock") = Some((
+                store.session_index_path.clone(),
+                Box::new(move || {
+                    released.wait();
+                    // Give the appender time to complete its write into the
+                    // window. Under the fix it is blocked on the lock instead.
+                    thread::sleep(Duration::from_millis(300));
+                }),
+            ));
+        }
+
+        let appender = {
+            let store = Arc::clone(&store);
+            let released = Arc::clone(&appender_released);
+            thread::spawn(move || {
+                released.wait();
+                store
+                    .append_thread_name("racer", Some("racer-name".to_string()), 2, None)
+                    .expect("append racing entry");
+            })
+        };
+
+        store
+            .append_thread_name("trigger", Some("trigger-name".to_string()), 1, None)
+            .expect("append entry that triggers compaction");
+        appender.join().expect("appender thread");
+        *COMPACTION_MIDPOINT.lock().expect("midpoint hook lock") = None;
+
+        assert_eq!(
+            store
+                .find_thread_name_by_id("racer")
+                .expect("lookup racer")
+                .as_deref(),
+            Some("racer-name"),
+            "append was dropped by a concurrent compaction",
+        );
+        assert_eq!(
+            store
+                .find_thread_name_by_id("trigger")
+                .expect("lookup trigger")
+                .as_deref(),
+            Some("trigger-name"),
+        );
     }
 }

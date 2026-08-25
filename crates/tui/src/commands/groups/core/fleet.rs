@@ -1,6 +1,24 @@
 //! `/fleet` command.
+//!
+//! Fleet = who. Bare `/fleet` (and `/fleet roster`) opens the familiar roster
+//! surface for the selected Fleet; `/fleet setup` opens the authoring wizard.
+//! `/fleet fleets` (aliases: `saved`, `manage`) opens the named-Fleet picker
+//! for switching between saved configurations — never the primary face.
+//! `/fleet list|status|interrupt|resume` are control-plane verbs that run
+//! against the **durable** workspace ledger through the shared contract in
+//! `codewhale-lane`, exactly as `codewhale fleet …` does (#1888, #4022).
+//!
+//! `/fleet status` used to show the current TUI session's sub-agents. That was
+//! a different thing wearing the same name: session sub-agents are not the
+//! durable Fleet ledger, and a run started by `codewhale fleet run` never
+//! appeared. The session view is still reachable as `/fleet workers` (and
+//! `/subagents`), now labelled as what it is.
+
+use codewhale_lane::control::operations_for_domain;
+use codewhale_lane::{ControlDomain, ControlOperation, ControlSurface};
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::fleet::control::execute_fleet_control;
 use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
@@ -9,11 +27,53 @@ use super::CommandResult;
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "fleet",
     aliases: &["loadout", "party"],
-    usage: "/fleet [roster|setup|status]",
+    usage: "/fleet [members|setup|fleets|list|status|runs|interrupt <worker-id>|resume <run-id>]",
     description_id: MessageId::CmdFleetDescription,
 };
 
 pub(in crate::commands) struct FleetCmd;
+
+fn help_text() -> String {
+    let mut out = String::from(
+        "Usage: /fleet [members|setup|fleets|list|status|runs|interrupt <worker-id>|resume <run-id>]\n\n\
+         Fleet is who. /fleet (or /fleet members) opens the Fleet member list and orchestration state — \
+         each member's role, model, and access. /fleet setup opens the authoring wizard. \
+         /fleet fleets (or saved/manage) switches between named saved Fleets.\n\n\
+         /fleet list, status, interrupt, and resume act on the durable .codewhale/fleet.jsonl \
+         ledger for this workspace — the same records `codewhale fleet` reads and writes. \
+         /fleet workers (and /subagents) shows sub-agents in the current TUI session only, which \
+         is a different set: it does not include durable Fleet runs.\n",
+    );
+    for descriptor in operations_for_domain(ControlDomain::Fleet) {
+        out.push_str(&format!(
+            "\n  {:<30} {:<6} {}\n      CLI: {}\n",
+            descriptor.slash_invocation(),
+            descriptor.authority.as_str(),
+            descriptor.summary,
+            descriptor.cli_invocation
+        ));
+    }
+    out
+}
+
+/// Split `"<verb> <rest>"` into the verb and its raw target tail.
+fn split_verb(arg: Option<&str>) -> Option<(&str, Option<&str>)> {
+    let rest = arg.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(match rest.split_once(char::is_whitespace) {
+        Some((verb, tail)) => (verb, Some(tail.trim())),
+        None => (rest, None),
+    })
+}
+
+fn run_control(app: &App, operation: ControlOperation, target: Option<&str>) -> CommandResult {
+    let receipt = execute_fleet_control(ControlSurface::Slash, &app.workspace, operation, target);
+    let rendered = receipt.render();
+    if receipt.is_error() {
+        CommandResult::error(rendered)
+    } else {
+        CommandResult::message(rendered)
+    }
+}
 
 impl RegisterCommand for FleetCmd {
     fn info() -> &'static CommandInfo {
@@ -21,21 +81,48 @@ impl RegisterCommand for FleetCmd {
     }
 
     fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
-            None
-            | Some("roster" | "party" | "loadout" | "roles" | "role" | "profiles" | "profile") => {
+        let Some((verb, target)) = split_verb(arg) else {
+            // Primary face: the familiar roster for the selected Fleet.
+            // Named-Fleet switching lives under /fleet fleets — never between
+            // the operator and their fleet.
+            return CommandResult::action(AppAction::OpenFleetRoster);
+        };
+        match verb {
+            "save" | "update" => {
+                // Explicit persistence of the pending session route into the
+                // selected Fleet's operator. Only an explicit command can
+                // write a saved Fleet after an in-session route change.
+                let message = app.apply_route_save_choice(
+                    crate::tui::views::route_save_prompt::RouteSaveChoice::UpdateFleet,
+                );
+                return CommandResult::message(message);
+            }
+            "save-as" | "saveas" => {
+                let message = app.apply_route_save_choice(
+                    crate::tui::views::route_save_prompt::RouteSaveChoice::SaveAsNewFleet,
+                );
+                return CommandResult::message(message);
+            }
+            _ => {}
+        }
+        match verb {
+            "roster" | "party" | "loadout" | "roles" | "role" | "profiles" | "profile" => {
                 CommandResult::action(AppAction::OpenFleetRoster)
             }
-            Some("setup" | "edit" | "new") => CommandResult::action(AppAction::OpenFleetSetup),
-            Some("status" | "workers" | "worker" | "agents" | "subagents" | "list") => {
-                super::core::subagents(app)
-            }
-            Some("help" | "?") => CommandResult::message(
-                "Usage: /fleet [roster|setup|status]\n\n/fleet (or /fleet roster) opens Fleet workers and orchestration state — each member's posture, routing, and origin. Use Operate mode when managing delegated work. /fleet setup opens the authoring wizard for a new or overriding profile. /fleet status shows live Fleet worker status; /subagents is a compatibility shortcut for the same status view.",
-            ),
-            Some(other) => CommandResult::error(format!(
-                "Unknown /fleet target '{other}'. Use `/fleet roster`, `/fleet setup`, or `/fleet status`."
-            )),
+            "setup" | "edit" | "new" => CommandResult::action(AppAction::OpenFleetSetup),
+            // Named saved Fleets — secondary surface for multi-Fleet pick/switch.
+            // Deliberately not "list": that verb is the durable ledger (#4022).
+            "fleets" | "saved" | "manage" => CommandResult::action(AppAction::OpenFleetList),
+            // The current-session sub-agent projection, named for what it is.
+            "workers" | "worker" | "agents" | "subagents" => super::core::subagents(app),
+            "help" | "?" => CommandResult::message(help_text()),
+            other => match ControlOperation::parse_verb(ControlDomain::Fleet, other) {
+                Some(operation) => run_control(app, operation, target),
+                None => CommandResult::error(format!(
+                    "Unknown /fleet target '{other}'. Use roster, setup, fleets, list, status, \
+                     workers, interrupt <worker-id>, or resume <run-id>."
+                )),
+            },
         }
     }
 }
@@ -49,27 +136,18 @@ mod tests {
 
     fn test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
+    }
+
+    fn app_in(workspace: PathBuf) -> App {
+        let options = TuiOptions {
+            ..crate::test_support::test_tui_options(workspace.clone())
+        };
+        let mut app = App::new(options, &Config::default());
+        app.workspace = workspace;
+        app
     }
 
     #[test]
@@ -80,6 +158,18 @@ mod tests {
 
         assert_eq!(result.action, Some(AppAction::OpenFleetRoster));
         assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn fleet_fleets_args_open_named_fleet_picker() {
+        for arg in ["fleets", "saved", "manage"] {
+            let mut app = test_app();
+
+            let result = FleetCmd::execute(&mut app, Some(arg));
+
+            assert_eq!(result.action, Some(AppAction::OpenFleetList), "{arg}");
+            assert!(result.message.is_none(), "{arg}");
+        }
     }
 
     #[test]
@@ -108,9 +198,11 @@ mod tests {
         }
     }
 
+    /// #4022: the session sub-agent projection keeps its own name. It is no
+    /// longer allowed to answer for the durable Fleet ledger.
     #[test]
-    fn fleet_status_arg_opens_worker_status_view() {
-        for arg in ["status", "workers", "worker", "agents", "subagents", "list"] {
+    fn fleet_workers_arg_opens_the_session_subagent_view() {
+        for arg in ["workers", "worker", "agents", "subagents"] {
             let mut app = test_app();
 
             let result = FleetCmd::execute(&mut app, Some(arg));
@@ -120,8 +212,57 @@ mod tests {
         }
     }
 
+    /// #4022: `/fleet status` must read the durable ledger, not substitute the
+    /// current session's sub-agents for it.
     #[test]
-    fn fleet_help_arg_returns_usage() {
+    fn fleet_status_reads_the_durable_ledger_not_session_subagents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut app = app_in(workspace.path().to_path_buf());
+
+        let result = FleetCmd::execute(&mut app, Some("status"));
+
+        assert_eq!(
+            result.action, None,
+            "/fleet status must not open the session sub-agent view"
+        );
+        let message = result.message.as_deref().unwrap_or_default();
+        assert!(message.contains("fleet.status"), "got: {message}");
+        // This workspace has no ledger, so the truthful answer is a typed
+        // unavailability — never an empty-looking "all clear".
+        assert!(message.contains("no_fleet_ledger"), "got: {message}");
+        assert!(
+            !workspace
+                .path()
+                .join(".codewhale")
+                .join("fleet.jsonl")
+                .exists(),
+            "a read verb must not create the durable ledger"
+        );
+    }
+
+    #[test]
+    fn fleet_control_verbs_route_through_the_shared_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (arg, expected_id) in [
+            ("list", "fleet.list"),
+            ("status", "fleet.status"),
+            ("interrupt worker-1", "fleet.interrupt"),
+            ("resume run-1", "fleet.resume"),
+            ("restart worker-1", "fleet.restart"),
+        ] {
+            let mut app = app_in(workspace.path().to_path_buf());
+            let result = FleetCmd::execute(&mut app, Some(arg));
+            let message = result.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains(expected_id),
+                "/fleet {arg} must report {expected_id}, got: {message}"
+            );
+            assert_eq!(result.action, None, "/fleet {arg}");
+        }
+    }
+
+    #[test]
+    fn fleet_help_arg_distinguishes_durable_from_session_state() {
         let mut app = test_app();
 
         let result = FleetCmd::execute(&mut app, Some("help"));
@@ -129,8 +270,27 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.action.is_none());
         let message = result.message.as_deref().unwrap_or_default();
-        for surface in ["/fleet roster", "/fleet setup", "/fleet status"] {
+        for surface in [
+            "/fleet members",
+            "/fleet setup",
+            "/fleet fleets",
+            "/fleet status",
+        ] {
             assert!(message.contains(surface), "help must describe {surface}");
+        }
+        for truth in [
+            "current TUI session",
+            "codewhale fleet status",
+            ".codewhale/fleet.jsonl",
+        ] {
+            assert!(message.contains(truth), "help must distinguish {truth}");
+        }
+        for descriptor in operations_for_domain(ControlDomain::Fleet) {
+            assert!(
+                message.contains(descriptor.cli_invocation),
+                "help must name the CLI twin of {}",
+                descriptor.id
+            );
         }
     }
 
@@ -153,5 +313,23 @@ mod tests {
     #[test]
     fn fleet_aliases_are_registered_on_command_info() {
         assert!(FleetCmd::info().aliases.contains(&"loadout"));
+    }
+
+    #[test]
+    fn slash_command_and_cli_agree_on_fleet_verb_ids() {
+        for descriptor in operations_for_domain(ControlDomain::Fleet) {
+            assert_eq!(descriptor.slash_command, COMMAND_INFO.name);
+            assert_eq!(descriptor.hotbar_action_id(), "slash.fleet");
+            assert!(
+                COMMAND_INFO.usage.contains(descriptor.verb) || descriptor.verb == "restart",
+                "/fleet usage must document {} or declare it CLI-only",
+                descriptor.verb
+            );
+            assert!(descriptor.offers(ControlSurface::Cli));
+        }
+        assert!(
+            !COMMAND_INFO.requires_required_argument(),
+            "/fleet must stay directly runnable from the palette and hotbar"
+        );
     }
 }

@@ -1,14 +1,18 @@
 //! `/fleet` roster — the barracks view of the saved agent party.
 //!
-//! The roster view is the read side of the Fleet profile surface. The first
-//! row is the **operator** — the live session route (your main model): when a
-//! user picks a session model they are picking the operator, and the roster
-//! is that operator's team. Below it the merged [`FleetRoster`] (built-in <
-//! `[fleet.profiles]` config < `.codewhale/agents/*.toml` project members)
-//! renders as a scrollable list with a detail pane for the selected row. The
-//! view never writes anything; `s` / Enter on a member hands off to the
-//! `/fleet setup` wizard for authoring and overrides (the operator row is
-//! display-only — its route changes via `/model` or `/provider`).
+//! The roster view is the primary `/fleet` face. The first row is the
+//! **operator** — the Fleet leader (your live session model). When a user
+//! picks a session model they are picking the operator, and every member
+//! below is that leader's team. The header names the selected saved Fleet and
+//! whether it is user-global or folder-scoped, so scope is never ambiguous.
+//! Below the operator sits the merged [`FleetRoster`] (built-in <
+//! `[fleet.profiles]` config < `$CODEWHALE_HOME/agents/*.toml` personal <
+//! `.codewhale/agents/*.toml` project members)
+//! as a scrollable list with a detail pane for the selected row. The view
+//! never writes anything; `s` / Enter on a selected-v2 member opens that
+//! Fleet's exact editor, while the legacy profile wizard is used only when no
+//! named Fleet is selected (the operator row is display-only). Switch named
+//! Fleets with `/fleet fleets`.
 //!
 //! NOTE: like `fleet_setup.rs`, the copy below is intentionally English for
 //! now (#3167 reworks Fleet UI localization); the command entry
@@ -25,15 +29,17 @@ use ratatui::{
 
 use crate::config::Config;
 use crate::fleet::profile::AgentProfile;
-use crate::fleet::roster::{FleetRoster, ProfileOrigin};
+use crate::fleet::roster::{FleetRoster, ProfileLayer, ProfileOrigin, layers_from_parts};
 use crate::fleet::worker_runtime::roster_member_agent_type;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::app::App;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     truncate_view_text,
 };
+use crate::tui::whales;
 use crate::worker_profile::{ShellPolicy, WorkerRuntimeProfile};
 
 /// The live session route — the operator the roster works for. Read once at
@@ -41,6 +47,9 @@ use crate::worker_profile::{ShellPolicy, WorkerRuntimeProfile};
 #[derive(Debug, Clone)]
 struct OperatorInfo {
     provider: String,
+    /// Exact canonical route key, kept separate from the display label so
+    /// capability lookup can use provider-scoped catalog facts.
+    provider_id: String,
     model: String,
     reasoning: String,
 }
@@ -55,17 +64,56 @@ impl OperatorInfo {
         } else {
             app.model.clone()
         };
+        let route_provider = if app.auto_model {
+            app.last_effective_provider.unwrap_or(app.api_provider)
+        } else {
+            app.api_provider
+        };
+        let provider_id = if app.auto_model {
+            app.last_effective_provider_identity
+                .clone()
+                .unwrap_or_else(|| {
+                    if route_provider == crate::config::ApiProvider::Custom {
+                        app.provider_identity_for_persistence().to_string()
+                    } else {
+                        route_provider.as_str().to_string()
+                    }
+                })
+        } else {
+            app.provider_identity_for_persistence().to_string()
+        };
+        let provider = if route_provider == crate::config::ApiProvider::Custom {
+            provider_id.clone()
+        } else {
+            route_provider.display_name().to_string()
+        };
         Self {
-            provider: app.api_provider.display_name().to_string(),
+            provider,
+            provider_id,
             model,
             reasoning: app.reasoning_effort_display_label(),
         }
     }
 }
 
+/// Which named Fleet (if any) this session is using, and where that selection
+/// is pinned — user-global vs this folder only.
+#[derive(Debug, Clone)]
+struct SelectedFleetSummary {
+    name: String,
+    scope: crate::fleet::store::FleetScope,
+}
+
 pub struct FleetRosterView {
     operator: OperatorInfo,
     members: Vec<AgentProfile>,
+    /// Shadow records from the roster load (#5098): which lower-precedence
+    /// files the displayed members are ignoring.
+    shadowed: Vec<crate::fleet::roster::ShadowedProfile>,
+    /// Selected named Fleet + scope, when one is active for this session.
+    selected_fleet: Option<SelectedFleetSummary>,
+    /// A selected Fleet existed but could not become the runtime roster.
+    load_error: Option<String>,
     /// Selected row: 0 is the pinned operator row, members follow at 1..
     selected: usize,
     detail_scroll: usize,
@@ -76,15 +124,30 @@ pub struct FleetRosterView {
 impl FleetRosterView {
     #[must_use]
     pub fn new(app: &App, config: &Config) -> Self {
+        let selected_fleet =
+            crate::fleet::store::selected_fleet(&app.workspace).map(|sel| SelectedFleetSummary {
+                name: sel.name,
+                scope: sel.scope,
+            });
         let mut view = Self::from_parts(
             OperatorInfo::from_app(app),
-            FleetRoster::load(&config.fleet_config(), &app.workspace),
+            crate::fleet::identity::load_effective_roster(
+                &config.fleet_config(),
+                &app.workspace,
+                Some(app.plugin_registry.as_ref()),
+            ),
+            selected_fleet,
         );
         view.locale = app.ui_locale;
         view
     }
 
-    fn from_parts(operator: OperatorInfo, roster: FleetRoster) -> Self {
+    fn from_parts(
+        operator: OperatorInfo,
+        roster: FleetRoster,
+        selected_fleet: Option<SelectedFleetSummary>,
+    ) -> Self {
+        let load_error = roster.load_error().map(str::to_string);
         Self {
             operator,
             // The operator is pinned as its own row 0 (the live session route),
@@ -98,6 +161,9 @@ impl FleetRosterView {
                 .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
                 .cloned()
                 .collect(),
+            shadowed: roster.shadowed().to_vec(),
+            selected_fleet,
+            load_error,
             selected: 0,
             detail_scroll: 0,
             locale: Locale::En,
@@ -121,23 +187,33 @@ impl FleetRosterView {
     }
 
     fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.row_count(), -1);
         self.detail_scroll = 0;
     }
 
     fn move_down(&mut self) {
-        self.selected = (self.selected + 1).min(self.row_count().saturating_sub(1));
+        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.row_count(), 1);
         self.detail_scroll = 0;
     }
 
     fn footer_hints(&self) -> Vec<ActionHint> {
-        vec![
-            ActionHint::new("↑/↓", "select"),
-            ActionHint::new("s/Enter", "setup"),
+        let edit_label = if self.selected_fleet.is_some() {
+            "edit Fleet"
+        } else {
+            "setup profile"
+        };
+        let mut hints = vec![
+            ActionHint::new("↑/↓", "move"),
+            ActionHint::new("s/Enter", edit_label),
+            ActionHint::new("f", "saved Fleets"),
             ActionHint::new("w", tr(self.locale, MessageId::FleetRosterWorkers)),
             ActionHint::new("PgUp/PgDn", "scroll detail"),
             ActionHint::new("Esc", "close"),
-        ]
+        ];
+        if self.selected_fleet.is_some() && !self.operator_selected() {
+            hints.insert(2, ActionHint::new("m", "model"));
+        }
+        hints
     }
 }
 
@@ -162,19 +238,32 @@ impl ModalView for FleetRosterView {
                 ViewAction::None
             }
             KeyCode::Enter | KeyCode::Char('s') => {
-                if self.operator_selected() {
+                if let Some(member) = self.selected_member() {
+                    let member_id = member.id.clone();
+                    // Carry the exact member the operator already chose. The host
+                    // focuses it in the selected v2 Fleet editor, or starts
+                    // legacy setup from its member id when no Fleet is selected.
+                    ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id })
+                } else {
                     // The operator is not a wizard-authored profile; its
                     // route changes via /model or /provider (the detail pane
                     // says so).
                     ViewAction::None
-                } else {
-                    // Hand off to the authoring wizard; the roster itself
-                    // never writes anything.
-                    ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested)
                 }
+            }
+            KeyCode::Char('m') if self.selected_fleet.is_some() => {
+                let Some(member) = self.selected_member() else {
+                    return ViewAction::None;
+                };
+                ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenModelRequested {
+                    member_id: member.id.clone(),
+                })
             }
             KeyCode::Char('w') => {
                 ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenWorkersRequested)
+            }
+            KeyCode::Char('f') => {
+                ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenFleetsRequested)
             }
             KeyCode::Home => {
                 self.detail_scroll = 0;
@@ -212,7 +301,7 @@ impl ModalView for FleetRosterView {
             Line::from(vec![
                 Span::styled(
                     format!("─ {} ", tr(self.locale, MessageId::FleetRosterHeaderLabel)),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    Style::default().fg(palette::WHALE_ACTION).bold(),
                 ),
                 Span::styled(
                     "──────────────────────── ",
@@ -235,12 +324,16 @@ impl ModalView for FleetRosterView {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
+                    format!("  {}", self.selected_fleet_line()),
+                    Style::default().fg(palette::TEXT_SECONDARY),
+                ),
+                Span::styled(
                     format!(
-                        "  {}",
+                        " · {}",
                         tr(self.locale, MessageId::FleetRosterMembersCount)
                             .replace("{count}", &(self.members.len() + 1).to_string())
                     ),
-                    Style::default().fg(palette::TEXT_SECONDARY),
+                    Style::default().fg(palette::TEXT_MUTED),
                 ),
                 Span::styled(
                     format!(
@@ -260,6 +353,17 @@ impl ModalView for FleetRosterView {
 }
 
 impl FleetRosterView {
+    /// Scope-explicit selected Fleet line. Paths stay out — receipts name them.
+    fn selected_fleet_line(&self) -> String {
+        if let Some(error) = &self.load_error {
+            return format!("Fleet selection error — {error}");
+        }
+        match &self.selected_fleet {
+            Some(sel) => format!("Fleet `{}` · {}", sel.name, sel.scope.long_label()),
+            None => "No Fleet selected — built-in team".to_string(),
+        }
+    }
+
     fn render_body(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -303,7 +407,7 @@ impl FleetRosterView {
         let mut list_lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for idx in first..(first + visible_rows).min(self.row_count()) {
             let is_selected = idx == self.selected;
-            let pointer = if is_selected { "▸ " } else { "  " };
+            let pointer = format!("{} ", crate::tui::glyphs::selection_marker(is_selected));
             let (text, base_style) = if idx == 0 {
                 (
                     format!(
@@ -312,22 +416,71 @@ impl FleetRosterView {
                         self.operator.model
                     ),
                     Style::default()
-                        .fg(palette::WHALE_ACCENT_PRIMARY)
+                        .fg(palette::WHALE_ACTION)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
                 let member = &self.members[idx - 1];
                 let mark = member_role_mark(member);
-                (
-                    format!("{pointer}{mark} {}  {}", member.id, member_routing(member)),
-                    Style::default().fg(palette::TEXT_PRIMARY),
-                )
+                // #5098: badge rows whose id exists in more than one layer
+                // so a higher-layer win is visible from the list.
+                let shadow_badge = member_shadow_badge(self.locale, member, &self.shadowed);
+                // Whale Teams: the species badge sits between the charter role
+                // mark and the id, so a Scout, Patch, or Lantern reads at a
+                // glance even before the detail pane opens.
+                let species = member_species(member);
+                let badge_cells = whales::BADGE_WIDTH + 1;
+                let edit_marker = if is_selected && self.selected_fleet.is_some() {
+                    "[edit] "
+                } else {
+                    ""
+                };
+                let member_name = member
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&member.id))
+                    .map_or_else(
+                        || member.id.clone(),
+                        |name| format!("{name} ({})", member.id),
+                    );
+                let text = format!(
+                    "{pointer}{edit_marker}{mark} {}{}  {}",
+                    member_name,
+                    shadow_badge.as_deref().unwrap_or(""),
+                    member_routing(member)
+                );
+                let text = truncate_view_text(&text, list_width.saturating_sub(badge_cells));
+                let base_style = if is_selected {
+                    menu_style::selected_row_style()
+                } else {
+                    Style::default().fg(palette::TEXT_PRIMARY)
+                };
+                let split = pointer.len() + edit_marker.len() + mark.len() + 1;
+                let (head, tail) = if text.len() >= split && text.is_char_boundary(split) {
+                    text.split_at(split)
+                } else {
+                    (text.as_str(), "")
+                };
+                let mut spans = vec![Span::styled(head.to_string(), base_style)];
+                for span in whales::badge(species, &palette::UI_THEME) {
+                    spans.push(if is_selected {
+                        Span::styled(
+                            span.content,
+                            span.style
+                                .bg(palette::SELECTION_BG)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        span
+                    });
+                }
+                spans.push(Span::styled(format!(" {tail}"), base_style));
+                list_lines.push(Line::from(spans));
+                continue;
             };
             let style = if is_selected {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-                    .add_modifier(Modifier::BOLD)
+                menu_style::selected_row_style()
             } else {
                 base_style
             };
@@ -342,7 +495,20 @@ impl FleetRosterView {
         let lines = if self.operator_selected() {
             operator_detail_lines(&self.operator)
         } else if let Some(member) = self.selected_member() {
-            member_detail_lines(member)
+            // Whale Teams identity first: the portrait (or, in the Compact
+            // tier, only the badge) plus species and job. Rendered without a
+            // state — a roster member is a profile, not a runtime, so this
+            // claims nothing about whether anyone is working.
+            let mut lines = whale_identity_lines(member, self.locale, area.width);
+            // Session model is the operator route so "fast" loadouts resolve
+            // to the fast sibling the runtime will actually launch.
+            lines.extend(member_detail_lines_with_session(
+                member,
+                Some(self.operator.model.as_str()),
+                &self.shadowed,
+                self.locale,
+            ));
+            lines
         } else {
             vec![Line::from(Span::styled(
                 "Roster is empty.",
@@ -366,20 +532,60 @@ impl FleetRosterView {
     }
 }
 
+/// Species for a roster member: the profile id first (built-in ids are role
+/// names), then the resolved worker agent type. Unknown → the plain whale.
+fn member_species(member: &AgentProfile) -> whales::WhaleSpecies {
+    match whales::WhaleSpecies::for_role_id(&member.id) {
+        whales::WhaleSpecies::Plain => {
+            whales::WhaleSpecies::for_fleet_role(&roster_member_agent_type(member))
+        }
+        species => species,
+    }
+}
+
+/// Identity block for the detail pane: portrait when the view is at least
+/// the Compact tier width, badge otherwise; then `Name · species · job`. No
+/// state is drawn or claimed — a roster member is a profile, not a runtime.
+fn whale_identity_lines(
+    member: &AgentProfile,
+    locale: Locale,
+    view_width: u16,
+) -> Vec<Line<'static>> {
+    let species = member_species(member);
+    let theme = &palette::UI_THEME;
+    let mut lines: Vec<Line> = Vec::new();
+    if whales::portrait_fits(view_width) {
+        lines.extend(whales::portrait(species, None, 0, theme));
+    }
+    let mut caption = whales::badge(species, theme);
+    caption.push(Span::styled(
+        format!(
+            " {} · {} · {}",
+            species.name(),
+            species.animal(locale),
+            species.job(locale)
+        ),
+        Style::default().fg(palette::TEXT_PRIMARY),
+    ));
+    lines.push(Line::from(caption));
+    lines.push(Line::from(""));
+    lines
+}
+
 fn member_role_mark(member: &AgentProfile) -> &'static str {
     match member.id.as_str() {
-        "manager" | "scout" => "◆",
-        "builder" => "■",
-        "reviewer" => "◇",
-        "verifier" => "●",
-        "synthesizer" => "▲",
+        "manager" | "scout" => crate::tui::glyphs::ROLE_MANAGER,
+        "builder" => crate::tui::glyphs::ROLE_BUILDER,
+        "reviewer" => crate::tui::glyphs::ROLE_REVIEWER,
+        "verifier" => crate::tui::glyphs::ROLE_VERIFIER,
+        "synthesizer" => crate::tui::glyphs::ROLE_SYNTHESIZER,
         _ => match roster_member_agent_type(member).as_str() {
-            "scout" | "manager" => "◆",
-            "builder" => "■",
-            "reviewer" => "◇",
-            "verifier" => "●",
-            "synthesizer" => "▲",
-            _ => "·",
+            "scout" | "manager" => crate::tui::glyphs::ROLE_MANAGER,
+            "builder" => crate::tui::glyphs::ROLE_BUILDER,
+            "reviewer" => crate::tui::glyphs::ROLE_REVIEWER,
+            "verifier" => crate::tui::glyphs::ROLE_VERIFIER,
+            "synthesizer" => crate::tui::glyphs::ROLE_SYNTHESIZER,
+            _ => crate::tui::glyphs::NEUTRAL,
         },
     }
 }
@@ -398,21 +604,34 @@ fn detail_field(lines: &mut Vec<Line<'static>>, label: &str, body: String) {
 }
 
 /// Detail pane for the pinned operator row: the live session route, plus the
-/// product truth that the roster is this operator's team.
+/// product truth that the operator is this Fleet's leader.
 fn operator_detail_lines(operator: &OperatorInfo) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    detail_field(&mut lines, "Member", "operator (session route)".to_string());
-    detail_field(&mut lines, "Origin", "session".to_string());
-    detail_field(&mut lines, "Posture", "full session authority".to_string());
+    detail_field(
+        &mut lines,
+        "Role",
+        "Coordinator — this session's model leads the Fleet".to_string(),
+    );
+    detail_field(&mut lines, "Saved for", "this session only".to_string());
+    detail_field(&mut lines, "Access", "full session access".to_string());
     detail_field(&mut lines, "Provider", operator.provider.clone());
     detail_field(&mut lines, "Model", operator.model.clone());
+    // Session-route capability badges (#5038). Use the exact route key rather
+    // than the display label so built-in routes get provider-scoped catalog
+    // facts; custom routes still fall back conservatively to registry facts.
+    if let Some(badges) = crate::fleet::capability_badges::resolve_route_capability_badges(
+        Some(&operator.provider_id),
+        &operator.model,
+    ) {
+        detail_field(&mut lines, "Capabilities", badges.summary());
+    }
     detail_field(&mut lines, "Reasoning", operator.reasoning.clone());
     detail_field(
         &mut lines,
         "Description",
-        "Your main session model is the operator. Fleet members are the workers it dispatches \
-         — via `agent` profile spawns and Workflow task({profile}). Change the operator's \
-         route via /model or /provider."
+        "The Coordinator is this Fleet's leader — your main session model. Every \
+         member below works for it. Change the model with /model or /provider; \
+         persist with /fleet save."
             .to_string(),
     );
     lines
@@ -421,25 +640,40 @@ fn operator_detail_lines(operator: &OperatorInfo) -> Vec<Line<'static>> {
 /// The resolved worker posture for a roster member: what the runtime would
 /// actually grant when this member is dispatched (role posture, not the
 /// profile's requested permissions).
-fn member_posture(member: &AgentProfile) -> String {
+/// Plain-Access summary for a roster member: what it may do, derived from the
+/// same runtime profile dispatch would grant. No internal role/posture words.
+fn member_access_summary(member: &AgentProfile) -> String {
     let agent_type = roster_member_agent_type(member);
     let runtime = WorkerRuntimeProfile::for_role(agent_type.clone());
     let write = if runtime.permissions.write {
-        "write"
+        "can edit files"
     } else {
-        "read-only"
+        "read-only files"
     };
     let shell = match runtime.shell {
-        ShellPolicy::None => "shell none",
-        ShellPolicy::ReadOnly => "shell read-only",
-        ShellPolicy::Full => "shell full",
+        ShellPolicy::None => "cannot run commands",
+        ShellPolicy::ReadOnly => "read-only commands",
+        ShellPolicy::Full => "can run commands",
     };
-    format!("{} worker · {write} · {shell}", agent_type.as_str())
+    let network = if runtime.permissions.network {
+        "network"
+    } else {
+        "no network"
+    };
+    format!("{write} · {shell} · {network}")
 }
 
-/// The routing truth for a member: explicit model pin, else route preset, else
-/// same-route inheritance. `[subagents]` overrides still win at dispatch.
+/// The model truth for a member: explicit model choice, else saved model set,
+/// else the session's model. `[subagents]` overrides still win at dispatch.
+///
+/// When the loadout is `fast`, show that the runtime picks the **fast sibling
+/// of the active session model** — not a stale on-disk profile name — so the
+/// roster matches what Fleet will actually launch.
 fn member_routing(member: &AgentProfile) -> String {
+    member_routing_with_session(member, None)
+}
+
+fn member_routing_with_session(member: &AgentProfile, session_model: Option<&str>) -> String {
     if let Some(model) = member
         .profile
         .model
@@ -447,15 +681,67 @@ fn member_routing(member: &AgentProfile) -> String {
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        return format!("model {model} (pinned)");
+        if let Some(provider) = member
+            .profile
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+        {
+            return format!("model {provider}/{model}");
+        }
+        return format!("model {model}");
     }
     match member.profile.loadout.as_str() {
-        "inherit" => "inherit session route".to_string(),
-        loadout => format!("route preset {loadout}"),
+        "inherit" => "same model as this session".to_string(),
+        "fast" => match session_model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(session) => format!("fast model for {session}"),
+            None => "fast model, picked at launch".to_string(),
+        },
+        loadout => format!("saved model set {loadout}"),
     }
 }
 
-fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
+fn member_shadow_badge(
+    locale: Locale,
+    member: &AgentProfile,
+    shadowed: &[crate::fleet::roster::ShadowedProfile],
+) -> Option<String> {
+    let layers = layers_from_parts(member, shadowed);
+    if layers.len() < 2 {
+        return None;
+    }
+    let personal_ignored = layers
+        .iter()
+        .any(|layer| !layer.wins && layer.origin == ProfileOrigin::Personal);
+    let id = if personal_ignored {
+        MessageId::FleetRosterShadowBadgePersonalIgnored
+    } else {
+        match member.origin {
+            ProfileOrigin::Workspace => MessageId::FleetRosterShadowBadgeProjectOverride,
+            ProfileOrigin::Personal => MessageId::FleetRosterShadowBadgePersonalOverride,
+            ProfileOrigin::Config => MessageId::FleetRosterShadowBadgeConfigOverride,
+            ProfileOrigin::Plugin | ProfileOrigin::BuiltIn => return None,
+        }
+    };
+    Some(format!("  {}", tr(locale, id)))
+}
+
+fn format_profile_layer(layer: &ProfileLayer, locale: Locale) -> String {
+    let mark = if layer.wins {
+        tr(locale, MessageId::FleetRosterLayerWins)
+    } else {
+        tr(locale, MessageId::FleetRosterLayerIgnored)
+    };
+    format!("{} · {} ({mark})", layer.origin, layer.source.display())
+}
+
+fn member_detail_lines_with_session(
+    member: &AgentProfile,
+    session_model: Option<&str>,
+    shadowed: &[crate::fleet::roster::ShadowedProfile],
+    locale: Locale,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let name = match member.display_name.as_deref().map(str::trim) {
@@ -467,15 +753,74 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
     detail_field(&mut lines, "Member", name);
     detail_field(
         &mut lines,
-        "Origin",
+        "Role",
+        member.profile.role.name.trim().to_string(),
+    );
+    detail_field(
+        &mut lines,
+        "Saved for",
         match member.origin {
-            ProfileOrigin::BuiltIn => "built-in (default party)".to_string(),
+            ProfileOrigin::BuiltIn => "all projects (built-in team)".to_string(),
+            ProfileOrigin::Workspace => "this project".to_string(),
             _ => format!("{} · {}", member.origin, member.source.display()),
         },
     );
-    detail_field(&mut lines, "Slot", member.profile.slot.as_str().to_string());
-    detail_field(&mut lines, "Posture", member_posture(member));
-    detail_field(&mut lines, "Routing", member_routing(member));
+    // #5098: every layer found for this id, with the winner named. The
+    // Origin field still shows the effective copy; this list is the full
+    // stack so a personal/config edit is visible when project wins.
+    let layers = layers_from_parts(member, shadowed);
+    if layers.len() > 1 {
+        let body = layers
+            .iter()
+            .map(|layer| format_profile_layer(layer, locale))
+            .collect::<Vec<_>>()
+            .join("\n");
+        detail_field(
+            &mut lines,
+            &tr(locale, MessageId::FleetRosterLayersLabel),
+            body,
+        );
+    }
+    // Slot is internal dispatch vocabulary and duplicates Role — never shown.
+    detail_field(&mut lines, "Access", member_access_summary(member));
+    if let Some(provider) = member
+        .profile
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+    {
+        detail_field(&mut lines, "Provider", provider.to_string());
+    }
+    detail_field(
+        &mut lines,
+        "Model",
+        match (
+            member.profile.model.as_deref(),
+            crate::fleet::identity::friendly_model_name(member),
+        ) {
+            (Some(model), Some(name)) if !name.eq_ignore_ascii_case(model.trim()) => {
+                format!("{name} ({})", model.trim())
+            }
+            _ => member_routing_with_session(member, session_model),
+        },
+    );
+
+    // Capability badges for a pinned model, from the shared Fleet resolver
+    // (#5038). Unknown models omit the field rather than fabricating facts.
+    if let Some(model) = member
+        .profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        && let Some(badges) = crate::fleet::capability_badges::resolve_route_capability_badges(
+            member.profile.provider.as_deref(),
+            model,
+        )
+    {
+        detail_field(&mut lines, "Capabilities", badges.summary());
+    }
 
     let delegation = &member.profile.delegation;
     if delegation.max_spawn_depth.is_some() || delegation.max_concurrency.is_some() {
@@ -497,6 +842,9 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
                 ProfileOrigin::Workspace => {
                     format!("custom overlay ({})", member.source.display())
                 }
+                ProfileOrigin::Personal => {
+                    format!("personal overlay ({})", member.source.display())
+                }
                 _ => "custom overlay".to_string(),
             }
         } else {
@@ -517,361 +865,4 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::views::ViewStack;
-    use crossterm::event::KeyModifiers;
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-    use unicode_width::UnicodeWidthStr;
-
-    const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn operator() -> OperatorInfo {
-        OperatorInfo {
-            provider: "DeepSeek".to_string(),
-            model: "deepseek-v4-pro".to_string(),
-            reasoning: "Auto".to_string(),
-        }
-    }
-
-    fn built_in_view() -> FleetRosterView {
-        FleetRosterView::from_parts(operator(), FleetRoster::built_ins_only())
-    }
-
-    fn view_with_overrides() -> FleetRosterView {
-        let mut members = FleetRoster::built_ins_only()
-            .members()
-            .iter()
-            .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
-            .cloned()
-            .collect::<Vec<_>>();
-        // A project override of the built-in reviewer with a pinned model and
-        // an instruction overlay.
-        if let Some(reviewer) = members.iter_mut().find(|m| m.id == "reviewer") {
-            reviewer.origin = ProfileOrigin::Workspace;
-            reviewer.source = PathBuf::from(".codewhale/agents/reviewer.toml");
-            reviewer.profile.model = Some("glm-5.2".to_string());
-            reviewer.profile.role.instructions = Some("Review hard.".to_string());
-            reviewer.profile.delegation.max_spawn_depth = Some(1);
-        }
-        FleetRosterView {
-            operator: operator(),
-            members,
-            selected: 0,
-            detail_scroll: 0,
-            locale: Locale::En,
-        }
-    }
-
-    fn render_through_stack(make: impl Fn() -> FleetRosterView, w: u16, h: u16) -> Vec<String> {
-        let area = Rect::new(0, 0, w, h);
-        let mut buf = Buffer::empty(area);
-        for y in 0..h {
-            for x in 0..w {
-                buf[(x, y)].set_symbol("X");
-            }
-        }
-        let mut stack = ViewStack::new();
-        stack.push(make());
-        stack.render(area, &mut buf);
-        (0..h)
-            .map(|y| {
-                (0..w)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect()
-    }
-
-    /// #4208: every role mark and control glyph on the roster — operator,
-    /// role shapes, selection arrows, scroll rails — must narrow to an
-    /// ASCII-safe alternative.
-    #[test]
-    fn fleet_roster_glyphs_all_have_ascii_alternatives() {
-        let rows = render_through_stack(view_with_overrides, 100, 30);
-        for ch in rows.join("\n").chars().filter(|ch| !ch.is_ascii()) {
-            let mut cell = ratatui::buffer::Cell::default();
-            cell.set_symbol(&ch.to_string());
-            crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
-            assert!(
-                cell.symbol().is_ascii(),
-                "fleet glyph {ch:?} (U+{:04X}) lacks an ASCII-safe alternative",
-                ch as u32
-            );
-        }
-    }
-
-    #[test]
-    fn operator_row_is_pinned_first_with_the_session_model() {
-        let rows = render_through_stack(built_in_view, 100, 30);
-        let text = rows.join("\n");
-        // The operator row leads the list and the detail pane (row 0 is
-        // selected on open) shows the live session route.
-        let operator_row = rows
-            .iter()
-            .position(|row| row.contains("operator"))
-            .expect("operator row rendered");
-        let first_member_row = rows
-            .iter()
-            .position(|row| row.contains("manager"))
-            .expect("first member rendered");
-        assert!(
-            operator_row < first_member_row,
-            "operator must render above the first member"
-        );
-        assert!(text.contains("▸ @ operator"), "operator selected on open");
-        assert!(text.contains("deepseek-v4-pro"), "session model shown");
-        assert!(text.contains("full session authority"), "{text}");
-    }
-
-    #[test]
-    fn arrows_move_selection_and_clamp() {
-        let mut view = built_in_view();
-        assert_eq!(view.selected, 0);
-        view.handle_key(key(KeyCode::Up));
-        assert_eq!(view.selected, 0, "clamps at the operator row");
-
-        view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.selected, 1, "first member follows the operator");
-        for _ in 0..50 {
-            view.handle_key(key(KeyCode::Down));
-        }
-        assert_eq!(
-            view.selected,
-            view.members.len(),
-            "clamps at the last member"
-        );
-    }
-
-    #[test]
-    fn selection_change_resets_detail_scroll() {
-        let mut view = built_in_view();
-        view.handle_key(key(KeyCode::PageDown));
-        assert_eq!(view.detail_scroll, 8);
-        view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.detail_scroll, 0);
-    }
-
-    #[test]
-    fn enter_and_s_open_the_setup_wizard_for_members_only() {
-        for code in [KeyCode::Enter, KeyCode::Char('s')] {
-            // Operator row: display-only, no wizard hand-off.
-            let mut view = built_in_view();
-            assert!(view.operator_selected());
-            assert!(
-                matches!(view.handle_key(key(code)), ViewAction::None),
-                "{code:?} must be inert on the operator row"
-            );
-
-            // Member row: hands off to the setup wizard.
-            view.handle_key(key(KeyCode::Down));
-            let action = view.handle_key(key(code));
-            assert!(
-                matches!(
-                    action,
-                    ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested)
-                ),
-                "{code:?} should hand off to the setup wizard"
-            );
-        }
-    }
-
-    #[test]
-    fn w_opens_the_live_workers_tab() {
-        let mut view = built_in_view();
-        assert!(matches!(
-            view.handle_key(key(KeyCode::Char('w'))),
-            ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenWorkersRequested)
-        ));
-    }
-
-    #[test]
-    fn esc_closes() {
-        let mut view = built_in_view();
-        assert!(matches!(
-            view.handle_key(key(KeyCode::Esc)),
-            ViewAction::Close
-        ));
-    }
-
-    #[test]
-    fn built_in_party_lists_all_members_in_canonical_order() {
-        let view = built_in_view();
-        let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
-        // The operator is rendered as the pinned session row, not a member
-        // (#dogfood 0.8.67), so it is intentionally absent from this list.
-        assert_eq!(
-            ids,
-            [
-                "manager",
-                "scout",
-                "builder",
-                "reviewer",
-                "verifier",
-                "synthesizer",
-                "general"
-            ]
-        );
-    }
-
-    #[test]
-    fn detail_shows_posture_routing_and_origin() {
-        // Built-in reviewer: read-only review worker, shell read-only,
-        // inherits the session route.
-        let reviewer = FleetRoster::built_ins_only()
-            .get("reviewer")
-            .unwrap()
-            .clone();
-        assert_eq!(
-            member_posture(&reviewer),
-            "review worker · read-only · shell read-only"
-        );
-        assert_eq!(member_routing(&reviewer), "inherit session route");
-
-        // Built-in scout: no setup means the session route, just like every
-        // other built-in role.
-        let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
-        assert_eq!(
-            member_posture(&scout),
-            "explore worker · read-only · shell read-only"
-        );
-        assert_eq!(member_routing(&scout), "inherit session route");
-
-        // Builder writes with full shell.
-        let builder = FleetRoster::built_ins_only()
-            .get("builder")
-            .unwrap()
-            .clone();
-        assert_eq!(
-            member_posture(&builder),
-            "implementer worker · write · shell full"
-        );
-
-        // A pinned model beats the route preset label.
-        let mut pinned = reviewer.clone();
-        pinned.profile.model = Some("glm-5.2".to_string());
-        assert_eq!(member_routing(&pinned), "model glm-5.2 (pinned)");
-    }
-
-    #[test]
-    fn detail_lines_carry_overlay_source_for_project_members() {
-        let view = view_with_overrides();
-        let reviewer = view.members.iter().find(|m| m.id == "reviewer").unwrap();
-        let text = member_detail_lines(reviewer)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.clone().into_owned())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("project"), "{text}");
-        assert!(
-            text.contains("custom overlay (.codewhale/agents/reviewer.toml)"),
-            "{text}"
-        );
-        assert!(text.contains("model glm-5.2 (pinned)"), "{text}");
-        assert!(text.contains("spawn depth 1"), "{text}");
-    }
-
-    #[test]
-    fn roster_loads_config_members_through_the_shared_merge() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "docs-writer".to_string(),
-            codewhale_config::FleetProfile {
-                slot: codewhale_config::FleetSlot::from_name("scout"),
-                role: codewhale_config::FleetRole {
-                    name: "scout".to_string(),
-                    description: Some("Writes docs.".to_string()),
-                    instructions: None,
-                },
-                loadout: codewhale_config::FleetLoadout::Fast,
-                model: None,
-                provider: None,
-                reasoning_effort: None,
-                permissions: codewhale_config::FleetProfilePermissions::default(),
-                delegation: codewhale_config::FleetDelegationHints::default(),
-            },
-        );
-        let config = codewhale_config::FleetConfigToml {
-            profiles,
-            ..codewhale_config::FleetConfigToml::default()
-        };
-        let view = FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()));
-        let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
-        assert_eq!(extra.origin, ProfileOrigin::Config);
-        assert_eq!(member_routing(extra), "route preset fast");
-    }
-
-    #[test]
-    fn fleet_roster_is_usable_and_opaque_at_blocker_sizes() {
-        type Builder = (&'static str, fn() -> FleetRosterView);
-        let builders: [Builder; 3] = [
-            ("built-ins", built_in_view),
-            ("overrides", view_with_overrides),
-            ("last-selected", || {
-                let mut v = built_in_view();
-                v.selected = v.row_count() - 1;
-                v
-            }),
-        ];
-
-        for (label, make) in builders {
-            for (w, h) in BLOCKER_SIZES {
-                let rows = render_through_stack(make, w, h);
-                let text = rows.join("\n");
-
-                // No bleed-through anywhere in the composited frame.
-                assert!(
-                    !text.contains('X'),
-                    "{label} {w}x{h}: background bleed-through"
-                );
-                // Some action label is always visible.
-                assert!(text.contains("close"), "{label} {w}x{h}: missing footer");
-                // The first impression names Fleet as the worker/orchestration surface.
-                assert!(
-                    text.contains("fleet") && text.contains("workers"),
-                    "{label} {w}x{h}: missing framing"
-                );
-                // The selected row's detail is on screen.
-                assert!(
-                    text.contains("Posture"),
-                    "{label} {w}x{h}: missing detail pane"
-                );
-                // No row overflows the frame width.
-                for (y, row) in rows.iter().enumerate() {
-                    assert!(
-                        UnicodeWidthStr::width(row.trim_end()) <= w as usize,
-                        "{label} {w}x{h}: row {y} overflows: {row:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn selection_stays_visible_when_list_scrolls() {
-        // Select the last member and render short: the pointer row must be
-        // in the frame.
-        let rows = render_through_stack(
-            || {
-                let mut v = built_in_view();
-                v.selected = v.row_count() - 1;
-                v
-            },
-            80,
-            24,
-        );
-        let text = rows.join("\n");
-        assert!(text.contains("▸ · general"), "{text}");
-    }
-}
+mod tests;

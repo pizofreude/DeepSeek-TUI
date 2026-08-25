@@ -37,6 +37,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::command_safety::classify_command;
+use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 
 /// The fingerprint of a tool call — stable enough to match repeated
 /// calls but specific enough to avoid privilege confusion.
@@ -50,6 +51,7 @@ pub struct ApprovalKey(pub String);
 /// invocations of the same tool with different parameters.
 #[must_use]
 pub fn build_approval_key(tool_name: &str, input: &serde_json::Value) -> ApprovalKey {
+    let tool_name = crate::tools::canonical_action::canonical_action_alias(tool_name, input);
     let fingerprint = match tool_name {
         "apply_patch" | "write_file" | "edit_file" | "fim_edit" => {
             format!("file:{tool_name}:{}", hash_json_value(input))
@@ -79,6 +81,7 @@ pub fn build_approval_key(tool_name: &str, input: &serde_json::Value) -> Approva
 /// by flags. Denials must keep using the exact [`build_approval_key`].
 #[must_use]
 pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -> ApprovalKey {
+    let tool_name = crate::tools::canonical_action::canonical_action_alias(tool_name, input);
     let fingerprint = match tool_name {
         "apply_patch" => {
             let paths_hash = hash_patch_paths(input);
@@ -97,6 +100,15 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
             let host = parse_host(input);
             format!("net:{host}")
         }
+        // MCP tools are reviewed as kinds: a trusted plugin bundle's MCP
+        // tools were human-reviewed at trust time, so the session grant the
+        // approval card offers (`2` — "approves for the session") is the
+        // reviewed kind, `mcp:<tool>`. Hashing the full params here would
+        // make every exact-argument variant its own family and silently
+        // narrow the granted kind into a one-call grant (the regression the
+        // plugin e2e acceptance catches). Shell keeps its command-family
+        // key (R2); this arm never widens shell or file tools.
+        name if crate::mcp::McpPool::is_mcp_tool(name) => format!("mcp:{name}"),
         _ => format!("tool:{tool_name}:{}", hash_json_value(input)),
     };
     ApprovalKey(fingerprint)
@@ -123,18 +135,22 @@ fn hash_patch_paths(input: &serde_json::Value) -> String {
 
     let mut paths: Vec<&str> = Vec::new();
 
-    if let Some(changes) = input.get("changes").and_then(|v| v.as_array()) {
-        for change in changes {
-            if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
-                paths.push(path);
+    match normalize_apply_patch_input(input) {
+        Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
+            for change in entries {
+                if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
+                    paths.push(path);
+                }
             }
         }
-    } else if let Some(patch_text) = input.get("patch").and_then(|v| v.as_str()) {
-        for line in patch_text.lines() {
-            if let Some(rest) = line.strip_prefix("+++ b/") {
-                paths.push(rest.trim());
+        Ok(NormalizedApplyPatchInput::Patch(patch_text)) => {
+            for line in patch_text.lines() {
+                if let Some(rest) = line.strip_prefix("+++ b/") {
+                    paths.push(rest.trim());
+                }
             }
         }
+        Err(_) => {}
     }
 
     paths.sort();
@@ -281,6 +297,40 @@ mod tests {
     }
 
     #[test]
+    fn grouping_key_grants_mcp_tools_as_reviewed_kinds() {
+        // A session grant for a reviewed plugin MCP tool is the kind
+        // (`mcp:<tool>`), not the exact arguments: the plugin e2e acceptance
+        // approves the echo kind once and later variants of the same reviewed
+        // tool must not re-prompt. R2's shell command-family scoping is
+        // untouched — this is the MCP arm only.
+        let key_a = build_approval_grouping_key(
+            "mcp_plugin-4-demo-local_echo",
+            &json!({"text": "acceptance", "hang": false}),
+        );
+        let key_b = build_approval_grouping_key(
+            "mcp_plugin-4-demo-local_echo",
+            &json!({"text": "acceptance", "hang": true}),
+        );
+        assert_eq!(
+            key_a, key_b,
+            "a reviewed MCP kind grant covers argument variants of that tool"
+        );
+        let key_c = build_approval_grouping_key("mcp_plugin-4-demo-local_kick", &json!({"x": 1}));
+        assert_ne!(key_a, key_c, "a different MCP tool is a different kind");
+        // The exact-call key stays per-arguments so denials still suppress
+        // only exact retries.
+        let exact_a = build_approval_key(
+            "mcp_plugin-4-demo-local_echo",
+            &json!({"text": "acceptance", "hang": false}),
+        );
+        let exact_b = build_approval_key(
+            "mcp_plugin-4-demo-local_echo",
+            &json!({"text": "acceptance", "hang": true}),
+        );
+        assert_ne!(exact_a, exact_b, "denial keys remain argument-exact");
+    }
+
+    #[test]
     fn grouping_key_still_separates_distinct_commands() {
         let key_a = build_approval_grouping_key("exec_shell", &json!({"command": "git status"}));
         let key_b = build_approval_grouping_key("exec_shell", &json!({"command": "git push"}));
@@ -291,16 +341,30 @@ mod tests {
     fn grouping_key_collapses_patch_body_for_same_path() {
         let key_a = build_approval_grouping_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_grouping_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "y"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "y"}]}),
         );
         assert_eq!(
             key_a, key_b,
             "approving a patch family must cover later edits to the same path"
         );
+    }
+
+    #[test]
+    fn grouping_key_treats_replace_and_legacy_changes_as_the_same_path_set() {
+        let canonical = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"replace": [{"path": "a.rs", "content": "new"}]}),
+        );
+        let legacy = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"changes": [{"path": "a.rs", "content": "new"}]}),
+        );
+
+        assert_eq!(canonical, legacy);
     }
 
     #[test]
@@ -320,11 +384,11 @@ mod tests {
     fn patch_keys_differ_by_path() {
         let key_a = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "b.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "b.rs", "content": "x"}]}),
         );
         assert_ne!(key_a, key_b);
     }
@@ -333,11 +397,11 @@ mod tests {
     fn patch_keys_differ_by_body_for_same_path() {
         let key_a = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "x"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "x"}]}),
         );
         let key_b = build_approval_key(
             "apply_patch",
-            &json!({"changes": [{"path": "a.rs", "content": "y"}]}),
+            &json!({"replace": [{"path": "a.rs", "content": "y"}]}),
         );
         assert_ne!(key_a, key_b);
     }
@@ -370,6 +434,28 @@ mod tests {
         let key_a = build_approval_key("write_file", &json!({"path": "a.txt", "content": "x"}));
         let key_b = build_approval_key("write_file", &json!({"content": "x", "path": "a.txt"}));
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn lowercase_primitives_share_legacy_approval_keys() {
+        let shell = json!({"command": "cargo test"});
+        assert_eq!(
+            build_approval_key("bash", &shell),
+            build_approval_key("exec_shell", &shell)
+        );
+        let write = json!({"path": "a.txt", "content": "x"});
+        assert_eq!(
+            build_approval_key("write", &write),
+            build_approval_key("write_file", &write)
+        );
+        let edit = json!({
+            "path": "a.txt",
+            "edits": [{"oldText": "x", "newText": "y"}]
+        });
+        assert_eq!(
+            build_approval_key("edit", &edit),
+            build_approval_key("edit_file", &edit)
+        );
     }
 
     #[test]

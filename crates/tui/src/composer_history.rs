@@ -37,7 +37,7 @@ pub const MAX_HISTORY_ENTRIES: usize = 1000;
 const HISTORY_FILE_NAME: &str = "composer_history.txt";
 
 fn default_history_path() -> Option<PathBuf> {
-    history_path_with_home(dirs::home_dir())
+    history_path_with_home(crate::config::effective_home_dir())
 }
 
 /// Resolve the composer-history file under `home`, preferring the CodeWhale
@@ -290,7 +290,7 @@ mod tests {
 
     /// Tests use the path-injecting `*_from` / `*_to` helpers so they
     /// don't have to mutate `HOME` (which is not honored by
-    /// `dirs::home_dir()` on Windows — it reads `USERPROFILE` /
+    /// `crate::config::effective_home_dir()` on Windows — it reads `USERPROFILE` /
     /// `SHGetKnownFolderPath` instead). This makes the suite portable
     /// across all three CI runners without per-platform env juggling.
     fn temp_history_path() -> (tempfile::TempDir, PathBuf) {
@@ -390,9 +390,11 @@ mod tests {
     #[test]
     fn pruned_to_cap_at_append_time() {
         let (_tmp, path) = temp_history_path();
-        for i in 0..(MAX_HISTORY_ENTRIES + 50) {
-            append_history_to(&path, &format!("entry {i}"));
-        }
+        // One batched rewrite — a per-entry loop would fsync 1000+ times.
+        let entries: Vec<String> = (0..(MAX_HISTORY_ENTRIES + 50))
+            .map(|i| format!("entry {i}"))
+            .collect();
+        append_history_entries_to(&path, entries.iter().map(String::as_str));
         let history = load_history_from(&path);
         assert_eq!(history.len(), MAX_HISTORY_ENTRIES);
         // Newest entries survive; oldest 50 were pruned.
@@ -400,6 +402,28 @@ mod tests {
         assert_eq!(
             history.last().map(String::as_str),
             Some(format!("entry {}", MAX_HISTORY_ENTRIES + 49)).as_deref()
+        );
+
+        // Keep a cheap boundary check on the singleton production wrapper:
+        // seed to one below the cap in one write, then cross it with only two
+        // fsyncing appends. The second append must prune exactly the oldest
+        // entry rather than only enforcing the cap for batched callers.
+        let (_boundary_tmp, boundary_path) = temp_history_path();
+        let seeded: Vec<String> = (0..(MAX_HISTORY_ENTRIES - 1))
+            .map(|i| format!("entry {i}"))
+            .collect();
+        append_history_entries_to(&boundary_path, seeded.iter().map(String::as_str));
+        append_history_to(
+            &boundary_path,
+            &format!("entry {}", MAX_HISTORY_ENTRIES - 1),
+        );
+        append_history_to(&boundary_path, &format!("entry {MAX_HISTORY_ENTRIES}"));
+        let boundary = load_history_from(&boundary_path);
+        assert_eq!(boundary.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(boundary.first().map(String::as_str), Some("entry 1"));
+        assert_eq!(
+            boundary.last().map(String::as_str),
+            Some(format!("entry {MAX_HISTORY_ENTRIES}")).as_deref()
         );
     }
 

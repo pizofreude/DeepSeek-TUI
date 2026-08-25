@@ -26,49 +26,125 @@
 //! Pressing Esc backs out one stage at a time; from the list it closes the
 //! modal without changes.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
-use crate::config::{
-    ApiProvider, Config, base_url_uses_local_host, has_api_key_for, provider_is_configured,
-};
+use crate::config::{ApiProvider, Config, base_url_uses_local_host, provider_is_configured};
 use crate::core::ops::ProviderRuntimeStatus;
-use crate::model_profile::{SupportState, resolved_capability_profile};
+use crate::localization::{Locale, MessageId, tr};
+use crate::model_profile::{
+    SupportState, resolved_capability_profile, resolved_capability_profile_for_route,
+};
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
-use crate::provider_lake::catalog_model_count_for_provider;
+use crate::provider_lake::{catalog_model_count_for_provider, catalog_offering_for_model};
 use crate::provider_readiness::{
     CredentialState, ProviderReadinessSnapshot, ProviderRouteIdentity, ResolvedProviderReadiness,
     credential_state_for_provider, route_identity_for_model,
 };
 use crate::tui::app::ReasoningEffort;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
-use codewhale_config::provider::WireFormat;
-use codewhale_config::route::{
-    LogicalModelRef, PricingSku, RequestProtocol, RouteRequest, RouteResolver,
+use codewhale_config::provider::{CredentialAcquisition, WireFormat};
+use codewhale_config::route::{PricingSku, RequestProtocol};
+use codewhale_config::{
+    AGNES_TEMPLATE_ID, ProviderSetupApply, ProviderSetupTemplate, SENSENOVA_TEMPLATE_ID,
+    provider_setup_template, provider_setup_templates,
 };
 use serde_json::Value;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::sync::OnceLock;
+
+const DS4_PROVIDER_ID: &str = "ds4";
+const DS4_BASE_URL: &str = "http://127.0.0.1:8000/v1";
+const DS4_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const LM_STUDIO_PROVIDER_ID: &str = "lm_studio";
+const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     List,
+    /// Explicit xAI acquisition choice. xAI supports both an API key and the
+    /// Codewhale-owned device OAuth flow; neither path may impersonate the other.
+    XaiAuthChoice,
     KeyEntry,
+    /// Explicit disabled/read-only/managed external-credential policy choice.
+    ExternalConsentChoice,
+    /// Full owner/path/side-effect disclosure before a read grant is saved.
+    ExternalConsentConfirm,
     /// Default model pick after a key has been live-validated (#3875).
     ModelPick,
+    /// Kimi Code membership plan selection for the exact `api.kimi.com` route.
+    PlanTier,
+    /// StepFun pay-as-you-go vs Step Plan endpoint choice, asked before key
+    /// entry so the selected route is the one that gets live-validated (#4526).
+    StepfunBillingRoute,
     /// Confirmation summary before any secret or model is persisted (#3875).
     Confirm,
     CustomForm,
+    /// Beginner template catalog (#5350).
+    TemplateList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalConsentChoice {
+    Disabled,
+    ReadOnly,
+    ManagedUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XaiAuthChoice {
+    ApiKey,
+    DeviceOAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiCodePlanTier {
+    Safe262k,
+    OneMillion,
+}
+
+/// StepFun's two billing tracks. They are separate endpoints, not separate
+/// keys, so the setup wizard has to pick one before a key can be validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepfunBillingRoute {
+    PayAsYouGo,
+    StepPlan,
+}
+
+impl StepfunBillingRoute {
+    fn base_url(self) -> &'static str {
+        match self {
+            Self::PayAsYouGo => crate::config::DEFAULT_STEPFUN_BASE_URL,
+            Self::StepPlan => crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL,
+        }
+    }
+}
+
+/// Whether the StepFun billing-route choice applies to `base_url`.
+///
+/// Only the two endpoints Codewhale can classify are offered. A hand-edited
+/// endpoint (regional proxy, gateway, anything unrecognized) is a deliberate
+/// user choice, so the stage is skipped rather than silently rewriting it.
+fn stepfun_route_is_selectable(provider: ApiProvider, base_url: &str) -> bool {
+    provider == ApiProvider::Stepfun
+        && matches!(
+            crate::pricing::billing_surface_for_route(provider, Some(base_url)),
+            Some(crate::pricing::STEPFUN_PAYG_BILLING_SURFACE)
+                | Some(crate::pricing::STEPFUN_PLAN_BILLING_SURFACE)
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +156,14 @@ enum CustomProviderField {
 }
 
 /// Which subset of `rows` the list stage shows (#3830). `Configured` is the
-/// default; `A` toggles to `Catalog` to add a new provider or look at one
-/// that hasn't been set up yet.
+/// normal `/provider` default; first-run onboarding opens `Local` so a user
+/// can start with Ollama, SGLang, or vLLM without walking through cloud-key
+/// setup. `A` still exposes the full catalog and `L` returns to local routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderListView {
     Configured,
     Catalog,
+    Local,
 }
 
 pub struct ProviderPickerView {
@@ -94,11 +172,18 @@ pub struct ProviderPickerView {
     stage: Stage,
     view: ProviderListView,
     setup_mode: bool,
+    /// First-run/recovery keeps the canonical provider engine but removes
+    /// the advanced management hotkeys from the decision surface. They remain
+    /// available from `/provider` after onboarding.
+    onboarding_mode: bool,
     query: String,
     api_key_input: String,
     /// An error surfaced after a failed key verification, shown inline
     /// in the key-entry stage. Cleared when the user edits the input.
     key_entry_error: Option<String>,
+    locale: Locale,
+    xai_auth_choice: XaiAuthChoice,
+    external_consent_choice: ExternalConsentChoice,
     /// Validated key held only in memory until the confirm stage persists it.
     pending_api_key: Option<String>,
     /// Catalog models offered during the model-pick stage.
@@ -106,11 +191,20 @@ pub struct ProviderPickerView {
     model_selected_idx: usize,
     /// Model chosen on the model-pick stage (and shown on confirm).
     selected_model: Option<String>,
+    selected_context_window: Option<u32>,
+    kimi_code_plan_tier: KimiCodePlanTier,
+    stepfun_billing_route: StepfunBillingRoute,
+    /// Endpoint chosen in the setup wizard, carried unpersisted through key
+    /// validation and only written on confirm (#4526).
+    pending_base_url: Option<String>,
     custom_provider_field: CustomProviderField,
     custom_provider_id: String,
     custom_provider_base_url: String,
     custom_provider_model: String,
     custom_provider_api_key_env: String,
+    template_selected_idx: usize,
+    template_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
+    last_template_mouse_selected: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,8 +227,13 @@ pub struct ProviderDashboardRow {
     pub(crate) readiness: ResolvedProviderReadiness,
     pub maturity: ProviderMaturity,
     pub messages: Vec<String>,
+    external_credential_status: Option<codewhale_config::ExternalCredentialConsentStatus>,
     pub is_active: bool,
     has_key: bool,
+    /// Human-readable name of the place this row's credential resolved from,
+    /// or "not found". Ported from pi-mono's `AuthResult.source`; a label
+    /// only, never secret material.
+    pub(crate) credential_source: String,
     credential_state: CredentialState,
     route_identity: ProviderRouteIdentity,
     route_ok: bool,
@@ -153,9 +252,12 @@ pub struct ProviderDashboardRow {
 pub enum ProviderAuthStatus {
     Configured,
     Missing,
+    NoAuth,
     Optional,
     OAuthReady,
+    OAuthConsented,
     OAuthMissing,
+    ImportedTokenUnavailable,
     Local,
     Legacy,
 }
@@ -247,34 +349,52 @@ impl ProviderModelOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCapabilityBadges {
     pub context_window: Option<u32>,
+    /// Source receipt for the route-effective context-window badge.
+    pub context_window_source: Option<String>,
     pub max_output: Option<u32>,
     pub tools: SupportState,
     pub structured: SupportState,
     pub streaming: SupportState,
     pub cache: SupportState,
+    pub vision: SupportState,
 }
 
 impl ProviderCapabilityBadges {
     fn for_route(provider: ApiProvider, wire_model: &str) -> Self {
-        let cap = resolved_capability_profile(provider, wire_model);
+        let cap = catalog_offering_for_model(provider, wire_model).map_or_else(
+            || resolved_capability_profile(provider, wire_model),
+            |offering| {
+                let route_offering = offering.to_offering();
+                resolved_capability_profile_for_route(
+                    provider,
+                    wire_model,
+                    route_offering.capabilities,
+                    route_offering.limits,
+                )
+            },
+        );
         Self {
             context_window: cap.context_window,
+            context_window_source: None,
             max_output: cap.max_output,
             tools: cap.native_tool_calls,
             structured: cap.structured_output,
             streaming: cap.streaming,
             cache: cap.prompt_caching,
+            vision: cap.image_input,
         }
     }
 
     fn unknown() -> Self {
         Self {
             context_window: None,
+            context_window_source: None,
             max_output: None,
             tools: SupportState::Unknown,
             structured: SupportState::Unknown,
             streaming: SupportState::Unknown,
             cache: SupportState::Unknown,
+            vision: SupportState::Unknown,
         }
     }
 
@@ -282,13 +402,15 @@ impl ProviderCapabilityBadges {
     /// render `?` when unknown rather than being silently dropped.
     fn label(&self) -> String {
         format!(
-            "ctx:{} out:{} tools:{} json:{} stream:{} cache:{}",
+            "ctx:{}({}) out:{} tools:{} json:{} stream:{} cache:{} vision:{}",
             humanize_token_count(self.context_window),
+            self.context_window_source.as_deref().unwrap_or("?"),
             humanize_token_count(self.max_output),
             support_glyph(self.tools),
             support_glyph(self.structured),
             support_glyph(self.streaming),
             support_glyph(self.cache),
+            support_glyph(self.vision),
         )
     }
 }
@@ -347,7 +469,14 @@ impl ProviderDashboardRow {
         config: &Config,
         runtime_status: Option<&ProviderRuntimeStatus>,
     ) -> Self {
-        Self::from_config_with_provider_id(provider, active, config, None, runtime_status)
+        Self::from_config_with_provider_id(
+            provider,
+            active,
+            config,
+            None,
+            config.provider.as_deref(),
+            runtime_status,
+        )
     }
 
     fn from_custom_config_with_runtime_status(
@@ -363,6 +492,7 @@ impl ProviderDashboardRow {
             active,
             &scoped,
             Some(provider_id),
+            config.provider.as_deref(),
             runtime_status,
         )
     }
@@ -372,6 +502,7 @@ impl ProviderDashboardRow {
         active: ApiProvider,
         config: &Config,
         provider_id_override: Option<&str>,
+        active_provider_id: Option<&str>,
         runtime_status: Option<&ProviderRuntimeStatus>,
     ) -> Self {
         let configured = config.provider_config_for(provider);
@@ -380,20 +511,59 @@ impl ProviderDashboardRow {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let configured_model = configured
+        let uses_kimi_imported_token = provider == ApiProvider::Moonshot
+            && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token);
+        let configured_base_url = configured_base_url.or_else(|| {
+            uses_kimi_imported_token.then(|| crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string())
+        });
+        let explicitly_configured_model = configured
             .and_then(|entry| entry.model.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let has_configured_model = configured_model.is_some();
+        let has_configured_model = explicitly_configured_model.is_some();
+        let configured_model = explicitly_configured_model.or_else(|| {
+            uses_kimi_imported_token.then(|| crate::config::DEFAULT_KIMI_CODE_MODEL.to_string())
+        });
         let model_origin = ProviderModelOrigin::for_provider(provider, has_configured_model);
+        // One sourced resolution per row: the picker must be able to say WHERE
+        // it looked, not just that it found nothing (pi-mono's `AuthResult`
+        // source, ported in `crate::credentials`).
+        let credential_resolution = crate::config::resolve_credential_source(config, provider);
         let has_key = if provider == ApiProvider::Custom {
             custom_provider_has_auth(configured)
         } else {
-            has_api_key_for(config, provider)
+            credential_resolution.is_present()
         };
-        let auth_status = auth_status_for(provider, has_key, configured);
-        let usage_meter = usage_meter_for(provider);
+        let credential_source = credential_resolution.source.label().into_owned();
+        let credential_state = credential_state_for_provider(config, provider);
+        let auth_mode = config.auth_mode_for_provider(provider);
+        let no_auth = crate::config::auth_mode_disables_api_key(auth_mode.as_deref());
+        let api_key_required = crate::config::auth_mode_requires_api_key(auth_mode.as_deref());
+        let official_endpoint = !config.provider_uses_custom_endpoint(provider);
+        let auth_base_url = config.base_url_for_route(provider);
+        let xai_oauth_ready = provider == ApiProvider::Xai
+            && official_endpoint
+            && crate::xai_oauth::credentials_valid(config);
+        let auth_status = if credential_state == CredentialState::ExternalConsent {
+            ProviderAuthStatus::OAuthConsented
+        } else {
+            auth_status_for(
+                provider,
+                &auth_base_url,
+                has_key,
+                configured,
+                no_auth,
+                api_key_required,
+                official_endpoint,
+                xai_oauth_ready,
+            )
+        };
+        let usage_meter = if matches!(auth_status, ProviderAuthStatus::ImportedTokenUnavailable) {
+            "usage: Kimi API key required".to_string()
+        } else {
+            usage_meter_for(provider)
+        };
         let provider_id = provider_id_override
             .map(str::to_string)
             .unwrap_or_else(|| provider.as_str().to_string());
@@ -403,7 +573,7 @@ impl ProviderDashboardRow {
         let is_active = if provider == ApiProvider::Custom {
             active == ApiProvider::Custom
                 && match provider_id_override {
-                    Some(id) => config.provider.as_deref() == Some(id),
+                    Some(id) => active_provider_id == Some(id),
                     None => true,
                 }
         } else {
@@ -443,8 +613,10 @@ impl ProviderDashboardRow {
                     "legacy DeepSeek China alias; routing maps through DeepSeek compatibility"
                         .to_string(),
                 ],
+                external_credential_status: None,
                 is_active,
                 has_key,
+                credential_source,
                 credential_state: CredentialState::Legacy,
                 route_identity: route_identity_for_model(
                     config,
@@ -468,25 +640,37 @@ impl ProviderDashboardRow {
         } else {
             ProviderCatalogStatus::Bundled
         };
-        let route_request = RouteRequest {
-            explicit_provider: Some(kind),
-            model_selector: configured_model.clone().map(LogicalModelRef::from),
-            saved_provider_model: None,
+        let mut messages = Vec::new();
+        // Use the same route-effective resolver as the active runtime. In
+        // particular, Kimi Code's bare K3 model has a conservative 262K
+        // membership-plan baseline (or an explicit configured override), not
+        // the generic catalog's unknown-model fallback.
+        let route = crate::route_runtime::resolve_route_candidate_with_context_metadata(
+            provider,
+            configured_model.as_deref(),
+            None,
             // The legacy CN alias shares DeepSeek's strict model contract.
             // Passing its endpoint as a generic override would classify the
             // route as custom and accidentally accept foreign model ids.
-            base_url_override: (provider != ApiProvider::DeepseekCN)
+            (provider != ApiProvider::DeepseekCN)
                 .then(|| configured_base_url.clone())
                 .flatten(),
-        };
-
-        let mut messages = Vec::new();
-        let route = RouteResolver::new().resolve(&route_request);
-        let (base_url, supported_protocols, default_route, resolved_pricing, route_ok) = match route
-        {
-            Ok(candidate) => {
-                if !candidate.validation.messages.is_empty() {
-                    messages.extend(candidate.validation.messages.clone());
+            config.context_window_for_provider_config(provider),
+            None,
+        );
+        let (
+            base_url,
+            supported_protocols,
+            default_route,
+            resolved_pricing,
+            route_ok,
+            route_context_window,
+            route_context_window_source,
+        ) = match route {
+            Ok(resolution) => {
+                let candidate = resolution.candidate;
+                if !candidate.validation().messages.is_empty() {
+                    messages.extend(candidate.validation().messages.clone());
                 }
                 (
                     if provider == ApiProvider::DeepseekCN {
@@ -494,15 +678,17 @@ impl ProviderDashboardRow {
                             .clone()
                             .unwrap_or_else(|| provider.default_base_url().to_string())
                     } else {
-                        candidate.endpoint.base_url
+                        candidate.endpoint().base_url.clone()
                     },
-                    vec![protocol_label(candidate.protocol).to_string()],
+                    vec![protocol_label(candidate.protocol()).to_string()],
                     ProviderDefaultRoute {
-                        logical_model: candidate.logical_model.raw().to_string(),
-                        wire_model: candidate.wire_model_id.as_str().to_string(),
+                        logical_model: candidate.logical_model().raw().to_string(),
+                        wire_model: candidate.wire_model_id().as_str().to_string(),
                     },
-                    pricing_label(provider, candidate.pricing.as_ref()),
-                    candidate.validation.ok,
+                    pricing_label(provider, candidate.pricing()),
+                    candidate.validation().ok,
+                    Some(resolution.context_window.tokens),
+                    Some(resolution.context_window.source.label().to_string()),
                 )
             }
             Err(error) => {
@@ -512,10 +698,9 @@ impl ProviderDashboardRow {
                     vec![
                         provider
                             .metadata()
-                            .map(|metadata| protocol_label(metadata.wire()).to_string())
-                            .unwrap_or_else(|| {
-                                protocol_label(WireFormat::ChatCompletions).to_string()
-                            }),
+                            .and_then(|metadata| metadata.wire_policy().fixed())
+                            .map(|protocol| protocol_label(protocol).to_string())
+                            .unwrap_or_else(|| "model-aware".to_string()),
                     ],
                     ProviderDefaultRoute {
                         logical_model: configured_model.unwrap_or_else(|| "invalid".to_string()),
@@ -523,25 +708,40 @@ impl ProviderDashboardRow {
                     },
                     usage_meter.clone(),
                     false,
+                    None,
+                    None,
                 )
             }
         };
+        let resolved_pricing =
+            if matches!(auth_status, ProviderAuthStatus::ImportedTokenUnavailable) {
+                usage_meter
+            } else if provider == ApiProvider::Ollama
+                && !crate::config::provider_route_is_keyless_self_hosted(provider, &base_url)
+                && resolved_pricing == "cost: local"
+            {
+                "cost: unknown".to_string()
+            } else {
+                resolved_pricing
+            };
 
         if matches!(
             auth_status,
-            ProviderAuthStatus::Missing | ProviderAuthStatus::OAuthMissing
+            ProviderAuthStatus::Missing
+                | ProviderAuthStatus::OAuthMissing
+                | ProviderAuthStatus::ImportedTokenUnavailable
         ) {
-            messages.push(missing_auth_message(provider, configured, &provider_id));
+            messages.push(missing_auth_message(
+                provider,
+                configured,
+                &provider_id,
+                &credential_resolution,
+            ));
         }
         if catalog_status == ProviderCatalogStatus::DefaultOnly {
             messages.push("catalog snapshot missing; using provider default".to_string());
         }
 
-        let credential_state = if provider == ApiProvider::Custom {
-            credential_state_from_auth(auth_status)
-        } else {
-            credential_state_for_provider(config, provider)
-        };
         let route_identity =
             route_identity_for_model(config, provider, &default_route.logical_model);
         let readiness = readiness_for(
@@ -550,8 +750,15 @@ impl ProviderDashboardRow {
             route_ok,
             &ProviderReadinessSnapshot::default(),
         );
-        let reasoning = ProviderReasoningSummary::for_route(provider, &default_route, config);
-        let capabilities = ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
+        let reasoning =
+            ProviderReasoningSummary::for_route(provider, &base_url, &default_route, config);
+        let mut capabilities =
+            ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
+        if let Some(context_window) = route_context_window {
+            capabilities.context_window = Some(context_window);
+        }
+        capabilities.context_window_source = route_context_window_source;
+        let external_credential_status = config.external_credential_consent_status(provider);
 
         Self {
             provider,
@@ -576,8 +783,10 @@ impl ProviderDashboardRow {
             readiness,
             maturity: ProviderMaturity::for_provider(provider),
             messages,
+            external_credential_status,
             is_active,
             has_key,
+            credential_source,
             credential_state,
             route_identity,
             route_ok,
@@ -597,20 +806,28 @@ impl ProviderDashboardRow {
                 format!("{} | {}", self.readiness.label(), self.auth_status.label())
             }
             ProviderListView::Catalog => self.compact_hint(),
+            ProviderListView::Local => format!(
+                "local · no cloud key · {} · {}",
+                compact_base_url(&self.base_url),
+                self.default_route.logical_model
+            ),
         }
     }
 
     fn compact_hint(&self) -> String {
         // Self-hosted providers carry a local/private posture; surface it next
         // to the base URL so the row reads correctly without a key (#3083).
-        let self_hosted = if matches!(
-            self.auth_status,
-            ProviderAuthStatus::Local | ProviderAuthStatus::Optional
-        ) {
-            " (self-hosted)"
-        } else {
-            ""
-        };
+        let self_hosted =
+            if crate::config::provider_route_is_keyless_self_hosted(self.provider, &self.base_url)
+                || matches!(
+                    self.auth_status,
+                    ProviderAuthStatus::Local | ProviderAuthStatus::Optional
+                )
+            {
+                " (self-hosted)"
+            } else {
+                ""
+            };
         let request_concurrency = self
             .request_concurrency
             .label()
@@ -709,12 +926,34 @@ impl ProviderRequestConcurrencySummary {
 }
 
 impl ProviderReasoningSummary {
-    fn for_route(provider: ApiProvider, route: &ProviderDefaultRoute, config: &Config) -> Self {
+    fn for_route(
+        provider: ApiProvider,
+        base_url: &str,
+        route: &ProviderDefaultRoute,
+        config: &Config,
+    ) -> Self {
         if provider == ApiProvider::OpenaiCodex {
             return Self {
                 support: ProviderReasoningSupport::Supported,
                 controls: codex_reasoning_controls(),
                 stream_visibility: ProviderReasoningStreamVisibility::StructuredThinking,
+                selected_control: selected_reasoning_control(provider, config),
+            };
+        }
+
+        // The bare `k3` ID is deliberately not listed as a generic Moonshot
+        // model. Kimi Code owns this reasoning contract only at its exact
+        // membership-plan endpoint, so surface the capability before key
+        // entry without attributing it to neighboring Moonshot routes.
+        if crate::config::is_exact_kimi_code_k3_route(provider, base_url, &route.wire_model) {
+            return Self {
+                support: ProviderReasoningSupport::Supported,
+                controls: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                stream_visibility: configured_or_default_stream_visibility(
+                    provider,
+                    config,
+                    ProviderReasoningSupport::Supported,
+                ),
                 selected_control: selected_reasoning_control(provider, config),
             };
         }
@@ -789,9 +1028,12 @@ impl ProviderAuthStatus {
         match self {
             Self::Configured => "key:configured",
             Self::Missing => "key:not-set",
+            Self::NoAuth => "auth:none",
             Self::Optional => "key:optional",
             Self::OAuthReady => "auth:oauth-ready",
+            Self::OAuthConsented => "auth:oauth-consented-select-to-check",
             Self::OAuthMissing => "auth:oauth-missing",
+            Self::ImportedTokenUnavailable => "auth:imported-token-unavailable",
             Self::Local => "local",
             Self::Legacy => "legacy",
         }
@@ -800,9 +1042,15 @@ impl ProviderAuthStatus {
 
 /// Compact Models.dev freshness chip for the provider picker chrome (#4139).
 fn catalog_freshness_title_suffix() -> &'static str {
-    match models_dev_live::status().freshness {
+    catalog_freshness_title_suffix_for(models_dev_live::status().freshness)
+}
+
+fn catalog_freshness_title_suffix_for(freshness: ModelsDevFreshness) -> &'static str {
+    match freshness {
         ModelsDevFreshness::Stale => " · stale",
-        ModelsDevFreshness::Failed => " · cache failed",
+        // A failed optional refresh keeps prior or bundled rows available.
+        // Say what the picker is using instead of implying the catalog broke.
+        ModelsDevFreshness::Failed => " · refresh failed; catalog available",
         ModelsDevFreshness::Bundled | ModelsDevFreshness::Live => "",
     }
 }
@@ -945,20 +1193,43 @@ fn default_reasoning_stream_visibility(provider: ApiProvider) -> ProviderReasoni
         | ApiProvider::Vllm
         | ApiProvider::Zai
         | ApiProvider::Xai
+        // Model Studio surfaces reasoning as structured Thinking on both
+        // dialects: `delta.reasoning_content` on the OpenAI-compatible
+        // routes, thinking blocks on the Anthropic-compatible routes.
+        | ApiProvider::ModelstudioTokenPlan
+        | ApiProvider::ModelstudioTokenPlanAnthropic
+        | ApiProvider::ModelstudioCodingPlan
+        | ApiProvider::ModelstudioCodingPlanAnthropic
         | ApiProvider::Moonshot => ProviderReasoningStreamVisibility::StructuredThinking,
         _ => ProviderReasoningStreamVisibility::Unknown,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auth_status_for(
     provider: ApiProvider,
+    base_url: &str,
     has_key: bool,
     configured: Option<&crate::config::ProviderConfig>,
+    no_auth: bool,
+    api_key_required: bool,
+    official_endpoint: bool,
+    xai_oauth_ready: bool,
 ) -> ProviderAuthStatus {
-    if matches!(provider, ApiProvider::Ollama) {
-        return ProviderAuthStatus::Local;
+    if no_auth {
+        return ProviderAuthStatus::NoAuth;
     }
-    if matches!(provider, ApiProvider::Sglang | ApiProvider::Vllm) {
+    if crate::config::provider_route_is_keyless_self_hosted(provider, base_url) {
+        if api_key_required {
+            return if has_key {
+                ProviderAuthStatus::Configured
+            } else {
+                ProviderAuthStatus::Missing
+            };
+        }
+        if provider == ApiProvider::Ollama {
+            return ProviderAuthStatus::Local;
+        }
         return if has_explicit_credential(provider, configured) {
             ProviderAuthStatus::Configured
         } else {
@@ -974,14 +1245,13 @@ fn auth_status_for(
             ProviderAuthStatus::Missing
         };
     }
-    if provider == ApiProvider::Moonshot && configured.is_some_and(config_uses_kimi_oauth) {
-        return if crate::config::kimi_cli_credentials_valid() {
-            ProviderAuthStatus::OAuthReady
-        } else {
-            ProviderAuthStatus::OAuthMissing
-        };
+    if provider == ApiProvider::Moonshot
+        && official_endpoint
+        && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
+    {
+        return ProviderAuthStatus::ImportedTokenUnavailable;
     }
-    if provider == ApiProvider::OpenaiCodex {
+    if provider == ApiProvider::OpenaiCodex && official_endpoint {
         return if has_key {
             ProviderAuthStatus::OAuthReady
         } else {
@@ -989,7 +1259,8 @@ fn auth_status_for(
         };
     }
     if provider == ApiProvider::Xai
-        && let Some(status) = xai_oauth_status(configured, crate::xai_oauth::credentials_valid())
+        && official_endpoint
+        && let Some(status) = xai_oauth_status(configured, xai_oauth_ready)
     {
         return status;
     }
@@ -1002,7 +1273,7 @@ fn auth_status_for(
 
 fn xai_oauth_status(
     configured: Option<&crate::config::ProviderConfig>,
-    credentials_present: bool,
+    oauth_credentials_present: bool,
 ) -> Option<ProviderAuthStatus> {
     let oauth_selected = configured
         .and_then(|entry| entry.auth_mode.as_deref())
@@ -1010,8 +1281,10 @@ fn xai_oauth_status(
     if !oauth_selected {
         return None;
     }
-    Some(if credentials_present {
+    Some(if oauth_credentials_present {
         ProviderAuthStatus::OAuthReady
+    } else if has_explicit_credential(ApiProvider::Xai, configured) {
+        ProviderAuthStatus::Configured
     } else {
         ProviderAuthStatus::OAuthMissing
     })
@@ -1026,14 +1299,10 @@ fn has_explicit_credential(
         .iter()
         .any(|var| std::env::var(var).is_ok_and(|value| !value.trim().is_empty()))
         || configured.is_some_and(|entry| {
-            entry
-                .api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || entry
-                    .auth
-                    .as_ref()
-                    .is_some_and(|auth| auth.validate().is_ok())
+            entry.api_key.as_deref().is_some_and(|value| {
+                crate::config::classify_config_api_key_value(value)
+                    == crate::config::ConfigApiKeyValueKind::Literal
+            })
         })
 }
 
@@ -1042,20 +1311,15 @@ fn custom_provider_has_auth(configured: Option<&crate::config::ProviderConfig>) 
         return true;
     }
     configured.is_some_and(|entry| {
-        entry
-            .api_key
+        entry.api_key.as_deref().is_some_and(|value| {
+            crate::config::classify_config_api_key_value(value)
+                == crate::config::ConfigApiKeyValueKind::Literal
+        }) || entry
+            .api_key_env
             .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-            || entry
-                .api_key_env
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-            || entry
-                .auth
-                .as_ref()
-                .is_some_and(|auth| auth.validate().is_ok())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_some_and(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
     })
 }
 
@@ -1064,7 +1328,7 @@ fn custom_provider_auth_is_optional(configured: Option<&crate::config::ProviderC
         entry
             .auth_mode
             .as_deref()
-            .is_some_and(auth_mode_disables_api_key)
+            .is_some_and(|mode| crate::config::auth_mode_disables_api_key(Some(mode)))
             || entry
                 .base_url
                 .as_deref()
@@ -1072,42 +1336,47 @@ fn custom_provider_auth_is_optional(configured: Option<&crate::config::ProviderC
     })
 }
 
-fn auth_mode_disables_api_key(mode: &str) -> bool {
-    matches!(
-        mode.trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_")
-            .as_str(),
-        "none" | "off" | "disabled" | "no_auth" | "noapi" | "no_api_key" | "anonymous"
-    )
-}
-
+/// The actionable half of a failed credential resolution.
+///
+/// "missing DEEPSEEK_API_KEY" told a user nothing about *where* the picker
+/// looked, which is why a key sitting in the secret store could read as
+/// "missing key" while the request path found it. Every message now carries
+/// the ordered places that were probed and the one command that fixes the
+/// first of them. Places and fixes are labels only — never secret material.
 fn missing_auth_message(
     provider: ApiProvider,
     configured: Option<&crate::config::ProviderConfig>,
     provider_id: &str,
+    resolution: &crate::credentials::CredentialResolution,
 ) -> String {
-    if provider == ApiProvider::Custom {
-        if let Some(env_name) = configured
+    if provider == ApiProvider::Moonshot
+        && configured.is_some_and(crate::config::provider_config_uses_kimi_imported_token)
+    {
+        return "Kimi OAuth is unavailable; configure a Kimi API key".to_string();
+    }
+    let headline = if provider == ApiProvider::Custom {
+        match configured
             .and_then(|entry| entry.api_key_env.as_deref())
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            return format!("missing {env_name} for custom provider {provider_id}");
+            Some(env_name) => format!("missing {env_name} for custom provider {provider_id}"),
+            None => format!("missing custom provider auth for {provider_id}"),
         }
-        return format!("missing custom provider auth for {provider_id}");
+    } else {
+        format!("missing {}", provider.env_vars_label())
+    };
+    let mut message = headline;
+    let checked = resolution.checked_places();
+    if !checked.is_empty() {
+        message.push_str(" · checked ");
+        message.push_str(&checked);
     }
-    format!("missing {}", provider.env_vars_label())
-}
-
-fn config_uses_kimi_oauth(config: &crate::config::ProviderConfig) -> bool {
-    config.auth_mode.as_deref().is_some_and(|mode| {
-        let normalized = mode.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-        matches!(
-            normalized.as_str(),
-            "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
-        )
-    })
+    if let Some(fix) = resolution.first_fix() {
+        message.push_str(" · fix: ");
+        message.push_str(fix);
+    }
+    message
 }
 
 fn readiness_for(
@@ -1119,29 +1388,25 @@ fn readiness_for(
     crate::provider_readiness::resolve_with_identity(identity, credential, route_ok, health)
 }
 
-fn credential_state_from_auth(auth_status: ProviderAuthStatus) -> CredentialState {
-    match auth_status {
-        ProviderAuthStatus::Local | ProviderAuthStatus::Optional => CredentialState::Local,
-        ProviderAuthStatus::Configured | ProviderAuthStatus::OAuthReady => CredentialState::Saved,
-        ProviderAuthStatus::Legacy => CredentialState::Legacy,
-        ProviderAuthStatus::Missing => CredentialState::MissingKey,
-        ProviderAuthStatus::OAuthMissing => CredentialState::MissingLogin,
-    }
-}
-
 fn usage_meter_for(provider: ApiProvider) -> String {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => "cost: local".to_string(),
         ApiProvider::OpenaiCodex => "usage: Codex OAuth quota".to_string(),
-        ApiProvider::Moonshot if crate::config::kimi_cli_credentials_valid() => {
-            "usage: Kimi OAuth quota".to_string()
-        }
         ApiProvider::XiaomiMimo => "cost: token-plan".to_string(),
+        // OpenCode ships two billing tracks off one account; the rows must not
+        // both read as generic metering (#4526).
+        ApiProvider::OpencodeGo => "usage: OpenCode Go subscription".to_string(),
+        ApiProvider::OpencodeZen => "cost: OpenCode Zen pay-as-you-go".to_string(),
         _ => "cost: unknown".to_string(),
     }
 }
 
 fn pricing_label(provider: ApiProvider, pricing: Option<&PricingSku>) -> String {
+    // OpenCode Go spends a subscription allowance, not per-token dollars, so a
+    // catalog token price would misreport it as metered spend.
+    if provider == ApiProvider::OpencodeGo {
+        return usage_meter_for(provider);
+    }
     match pricing {
         Some(PricingSku::Token {
             input_per_mtok,
@@ -1191,7 +1456,102 @@ fn compact_base_url(base_url: &str) -> String {
     crate::tui::ui_text::truncate_line_to_width(stripped, 24)
 }
 
+/// Resolve the external credential target for a provider that supports
+/// read-only external consent. This is the same lower-level fact the
+/// provider picker uses to build its consent flow; Fleet setup reuses it
+/// for route-scoped activation without switching the parent session.
+#[must_use]
+pub(crate) fn external_consent_target_for_provider(
+    provider: ApiProvider,
+) -> Option<(
+    codewhale_config::ProviderKind,
+    codewhale_config::ExternalCredentialSource,
+    std::path::PathBuf,
+)> {
+    let (consent_provider, source, path) = match provider {
+        ApiProvider::OpenaiCodex => (
+            codewhale_config::ProviderKind::OpenaiCodex,
+            codewhale_config::ExternalCredentialSource::CodexCli,
+            crate::oauth::auth_file_path(),
+        ),
+        ApiProvider::Xai => (
+            codewhale_config::ProviderKind::Xai,
+            codewhale_config::ExternalCredentialSource::GrokCli,
+            crate::xai_oauth::auth_file_path(),
+        ),
+        _ => return None,
+    };
+    let path = codewhale_config::resolve_external_credential_path(path).ok()?;
+    Some((consent_provider, source, path))
+}
+
+/// #5243: grant-time validation — does the external file that the user wants
+/// to read actually exist and hold a fresh, usable token? The old picker only
+/// lexically normalized the path (`resolve_external_credential_path`) and
+/// deferred the check to the first request, which produced
+/// `auth:oauth-consented-select-to-check` and required a second `e` trip after
+/// a just-minted OAuth. Validating here fails fast and, when the check passes,
+/// the token is adopted automatically as part of the same grant.
+pub(crate) fn external_consent_target_is_grantable(provider: ApiProvider) -> bool {
+    let Some((_, _, path)) = external_consent_target_for_provider(provider) else {
+        return false;
+    };
+    match provider {
+        ApiProvider::Xai => crate::xai_oauth::external_file_is_fresh(&path),
+        ApiProvider::OpenaiCodex => codex_external_file_is_fresh(&path),
+        _ => false,
+    }
+}
+
+fn codex_external_file_is_fresh(path: &std::path::Path) -> bool {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let token = value
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.trim().is_empty());
+    let Some(token) = token else {
+        return false;
+    };
+    // Reuse the same 60s skew the runtime uses: token with valid JWT exp is fresh.
+    if let Some(exp) = codex_jwt_expiry(token) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return now + 60 < exp;
+    }
+    // If we cannot parse expiry, fail closed — external Codex credentials are
+    // never refreshed by Codewhale, so an opaque token must be treated as stale.
+    false
+}
+
+fn codex_jwt_expiry(token: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("exp")?.as_u64()
+}
+
 impl ProviderPickerView {
+    /// OAuth-only providers never collect a typed credential: the key entry
+    /// stage for them is a routing step (device flow / external consent), so
+    /// typed input and pastes are accepted events but never stored.
+    fn key_entry_is_oauth_locked(&self) -> bool {
+        self.selected_provider().credential_help().acquisition == CredentialAcquisition::OAuth
+    }
     #[cfg(test)]
     #[must_use]
     pub fn new(active: ApiProvider, config: &Config) -> Self {
@@ -1214,18 +1574,25 @@ impl ProviderPickerView {
         runtime_status: Option<ProviderRuntimeStatus>,
         memory: Option<&crate::tui::app::ProviderPickerMemory>,
     ) -> Self {
-        // Present providers in the shared metadata display order (#3076). The
-        // active provider is highlighted via `selected_idx` below, so it is
-        // never lost in the list.
+        // Build the setup/catalog universe directly from ApiProvider::all so
+        // first-run and recovery use the same canonical provider surface as
+        // the runtime, not a historical onboarding shortlist. The active
+        // provider is highlighted via `selected_idx` below, so it is never
+        // lost in the list.
         let runtime_status = runtime_status.as_ref();
         let custom_rows = custom_provider_dashboard_rows(active, config, runtime_status);
-        let mut rows: Vec<ProviderDashboardRow> = ApiProvider::sorted_for_display()
-            .into_iter()
+        // Catalog surface = ProviderKind::ALL (one identity per vendor). Dual
+        // dialect / plan-variant kinds stay resolvable but are not separate
+        // rows; plan is mode/base_url and dialect is providers.<id>.wire.
+        let catalog_active = active.catalog_identity();
+        let mut rows: Vec<ProviderDashboardRow> = ApiProvider::catalog()
+            .iter()
+            .copied()
             .filter(|provider| *provider != ApiProvider::Custom || custom_rows.is_empty())
             .map(|p| {
                 ProviderDashboardRow::from_config_with_runtime_status(
                     p,
-                    active,
+                    catalog_active,
                     config,
                     runtime_status,
                 )
@@ -1257,21 +1624,42 @@ impl ProviderPickerView {
             stage: Stage::List,
             view,
             setup_mode: false,
+            onboarding_mode: false,
             query: String::new(),
             api_key_input: String::new(),
             key_entry_error: None,
+            locale: Locale::En,
+            xai_auth_choice: XaiAuthChoice::ApiKey,
+            external_consent_choice: ExternalConsentChoice::Disabled,
             pending_api_key: None,
             model_options: Vec::new(),
             model_selected_idx: 0,
             selected_model: None,
+            selected_context_window: None,
+            kimi_code_plan_tier: KimiCodePlanTier::Safe262k,
+            stepfun_billing_route: StepfunBillingRoute::PayAsYouGo,
+            pending_base_url: None,
             custom_provider_field: CustomProviderField::Name,
             custom_provider_id: String::new(),
             custom_provider_base_url: String::new(),
             custom_provider_model: String::new(),
             custom_provider_api_key_env: String::new(),
+            template_selected_idx: 0,
+            template_row_hitboxes: RefCell::new(Vec::new()),
+            last_template_mouse_selected: None,
         };
         picker.restore_memory(memory);
         picker
+    }
+
+    #[must_use]
+    pub(crate) fn with_locale(mut self, locale: Locale) -> Self {
+        self.locale = locale;
+        self
+    }
+
+    fn tr(&self, id: MessageId) -> Cow<'static, str> {
+        tr(self.locale, id)
     }
 
     /// Apply session-local request evidence after the static catalog rows are
@@ -1333,15 +1721,91 @@ impl ProviderPickerView {
         config: &Config,
         runtime_status: Option<ProviderRuntimeStatus>,
     ) -> Self {
+        Self::new_for_setup_inner(active, target, config, runtime_status, true)
+    }
+
+    /// Open the named OpenAI-compatible form with DS4's keyless local
+    /// defaults filled in. DS4 uses the existing transport, not a new adapter.
+    #[must_use]
+    pub fn new_for_ds4_setup(
+        active: ApiProvider,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Self {
         let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        picker.setup_mode = true;
+        picker.enter_ds4_form();
+        picker
+    }
+
+    /// Open the beginner template list (`/provider templates`, Settings).
+    #[must_use]
+    pub fn new_for_template_list(
+        active: ApiProvider,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Self {
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        picker.setup_mode = true;
+        picker.enter_template_list();
+        picker
+    }
+
+    /// Apply one catalog template: first-class key-only setup, compatible
+    /// custom form, or unpublished guidance.
+    #[must_use]
+    pub fn new_for_template_setup(
+        active: ApiProvider,
+        template_id: &str,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Option<Self> {
+        let template = provider_setup_template(template_id)?;
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        picker.setup_mode = true;
+        picker.apply_template(template);
+        Some(picker)
+    }
+
+    /// Open the setup catalog for first-run/recovery onboarding (#4763).
+    /// Identical to [`Self::new_for_setup`] except that a missing-auth
+    /// `target` is only *focused*: onboarding must show the navigable
+    /// provider list before it asks for a secret, so key/OAuth entry is
+    /// reached by picking a row, never by opening straight into it.
+    #[must_use]
+    pub fn new_for_onboarding(
+        active: ApiProvider,
+        target: Option<ApiProvider>,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+    ) -> Self {
+        let mut picker = Self::new_for_setup_inner(active, target, config, runtime_status, false);
+        picker.onboarding_mode = true;
+        picker
+    }
+
+    fn new_for_setup_inner(
+        active: ApiProvider,
+        target: Option<ApiProvider>,
+        config: &Config,
+        runtime_status: Option<ProviderRuntimeStatus>,
+        key_entry_for_missing_auth: bool,
+    ) -> Self {
+        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
+        // First-run setup shows the full provider catalog (hosted + local)
+        // so a user can pick DeepSeek or any other API immediately. Local-only
+        // is opt-in via "explore offline" and the L toggle. A local-first
+        // default (introduced 2026-08-15) hid hosted providers behind a
+        // keypress, which read as "only local models are supported."
+        let _ = key_entry_for_missing_auth;
         picker.view = ProviderListView::Catalog;
         picker.setup_mode = true;
         if let Some(target) = target
             && let Some(idx) = picker.rows.iter().position(|row| row.provider == target)
         {
             picker.selected_idx = idx;
-            if !picker.selected_has_key() {
-                picker.enter_key_entry();
+            if key_entry_for_missing_auth && !picker.selected_has_key() {
+                picker.begin_setup();
             }
         }
         picker
@@ -1368,7 +1832,7 @@ impl ProviderPickerView {
         // The target may be an unconfigured catalog row; show the catalog so
         // it is visible, then jump into key entry for it.
         picker.view = ProviderListView::Catalog;
-        picker.enter_key_entry();
+        picker.begin_setup();
         Some(picker)
     }
 
@@ -1380,6 +1844,7 @@ impl ProviderPickerView {
         match self.view {
             ProviderListView::Catalog => true,
             ProviderListView::Configured => self.rows[idx].is_configured,
+            ProviderListView::Local => self.rows[idx].provider.is_self_hosted(),
         }
     }
 
@@ -1398,10 +1863,27 @@ impl ProviderPickerView {
         self.view = match self.view {
             ProviderListView::Configured => ProviderListView::Catalog,
             ProviderListView::Catalog => ProviderListView::Configured,
+            ProviderListView::Local => ProviderListView::Catalog,
         };
         if !self.rows.is_empty() && !self.row_visible(self.selected_idx) {
             self.selected_idx = (0..self.rows.len())
                 .find(|idx| self.row_visible(*idx))
+                .unwrap_or(0);
+        }
+    }
+
+    /// Show only the built-in keyless/self-hosted routes. Kept separate from
+    /// `Configured`: merely supporting a local route does not mean the user
+    /// configured it, while first-run should still make those routes obvious.
+    fn show_local_routes(&mut self) {
+        self.view = ProviderListView::Local;
+        self.query.clear();
+        if !self.rows.is_empty() && !self.row_visible(self.selected_idx) {
+            self.selected_idx = self
+                .rows
+                .iter()
+                .position(|row| row.provider == ApiProvider::Ollama)
+                .or_else(|| (0..self.rows.len()).find(|idx| self.row_visible(*idx)))
                 .unwrap_or(0);
         }
     }
@@ -1452,7 +1934,12 @@ impl ProviderPickerView {
     fn selected_has_key(&self) -> bool {
         matches!(
             self.rows[self.selected_idx].credential_state,
-            CredentialState::Saved | CredentialState::Local | CredentialState::Legacy
+            CredentialState::Saved
+                | CredentialState::ExternalConsent
+                | CredentialState::ImportedToken
+                | CredentialState::NoAuth
+                | CredentialState::Local
+                | CredentialState::Legacy
         )
     }
 
@@ -1465,9 +1952,106 @@ impl ProviderPickerView {
         self.api_key_input.clear();
         self.key_entry_error = None;
         self.pending_api_key = None;
+        self.pending_base_url = None;
         self.model_options.clear();
         self.model_selected_idx = 0;
         self.selected_model = None;
+    }
+
+    /// Start guided setup for the selected row. Providers that bill on more
+    /// than one endpoint choose the route first so the key is validated
+    /// against the endpoint it will actually be saved for (#4526).
+    fn begin_setup(&mut self) {
+        if self.selected_provider() == ApiProvider::Xai {
+            self.enter_xai_auth_choice();
+        } else if self.stepfun_billing_route_applies() {
+            self.enter_stepfun_billing_route();
+        } else {
+            self.enter_key_entry();
+        }
+    }
+
+    fn enter_xai_auth_choice(&mut self) {
+        self.xai_auth_choice = XaiAuthChoice::ApiKey;
+        self.stage = Stage::XaiAuthChoice;
+        self.api_key_input.clear();
+        self.key_entry_error = None;
+        self.pending_api_key = None;
+    }
+
+    fn move_xai_auth_choice(&mut self) {
+        self.xai_auth_choice = match self.xai_auth_choice {
+            XaiAuthChoice::ApiKey => XaiAuthChoice::DeviceOAuth,
+            XaiAuthChoice::DeviceOAuth => XaiAuthChoice::ApiKey,
+        };
+    }
+
+    fn stepfun_billing_route_applies(&self) -> bool {
+        self.rows
+            .get(self.selected_idx)
+            .is_some_and(|row| stepfun_route_is_selectable(row.provider, &row.base_url))
+    }
+
+    fn enter_stepfun_billing_route(&mut self) {
+        // Preselect whatever the row already resolves to so re-running setup
+        // on a configured Step Plan route does not default back to PAYG.
+        self.stepfun_billing_route = if crate::pricing::billing_surface_for_route(
+            ApiProvider::Stepfun,
+            Some(&self.rows[self.selected_idx].base_url),
+        ) == Some(crate::pricing::STEPFUN_PLAN_BILLING_SURFACE)
+        {
+            StepfunBillingRoute::StepPlan
+        } else {
+            StepfunBillingRoute::PayAsYouGo
+        };
+        self.stage = Stage::StepfunBillingRoute;
+    }
+
+    fn apply_stepfun_billing_route(&mut self) {
+        let base_url = self.stepfun_billing_route.base_url().to_string();
+        self.enter_key_entry();
+        self.rows[self.selected_idx].base_url.clone_from(&base_url);
+        self.pending_base_url = Some(base_url);
+    }
+
+    fn selected_external_consent_target(
+        &self,
+    ) -> Option<(
+        codewhale_config::ProviderKind,
+        codewhale_config::ExternalCredentialSource,
+        std::path::PathBuf,
+    )> {
+        external_consent_target_for_provider(self.selected_provider())
+    }
+
+    fn enter_external_consent_choice(&mut self) {
+        if self.selected_external_consent_target().is_some() {
+            self.external_consent_choice = ExternalConsentChoice::Disabled;
+            self.stage = Stage::ExternalConsentChoice;
+        }
+    }
+
+    fn move_external_consent_choice(&mut self, delta: isize) {
+        let index = match self.external_consent_choice {
+            ExternalConsentChoice::Disabled => 0,
+            ExternalConsentChoice::ReadOnly => 1,
+            ExternalConsentChoice::ManagedUnavailable => 2,
+        };
+        self.external_consent_choice = match (index as isize + delta).rem_euclid(3) {
+            0 => ExternalConsentChoice::Disabled,
+            1 => ExternalConsentChoice::ReadOnly,
+            _ => ExternalConsentChoice::ManagedUnavailable,
+        };
+    }
+
+    fn build_external_consent_event(&self) -> Option<ViewEvent> {
+        let (provider, source, path) = self.selected_external_consent_target()?;
+        Some(ViewEvent::ProviderPickerExternalConsentConfirmed {
+            provider: self.selected_provider(),
+            consent_provider: provider,
+            source,
+            path,
+        })
     }
 
     /// Open the picker already focused on `target` in its key-entry stage
@@ -1501,12 +2085,19 @@ impl ProviderPickerView {
         config: &Config,
         runtime_status: Option<ProviderRuntimeStatus>,
         api_key: String,
+        base_url: Option<String>,
     ) -> Option<Self> {
         let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
         let idx = picker.rows.iter().position(|row| row.provider == target)?;
         picker.selected_idx = idx;
         picker.view = ProviderListView::Catalog;
         picker.pending_api_key = Some(api_key);
+        // The wizard's endpoint choice survives the validation round-trip so
+        // confirm persists exactly the route the key was verified against.
+        if let Some(base_url) = base_url {
+            picker.rows[idx].base_url.clone_from(&base_url);
+            picker.pending_base_url = Some(base_url);
+        }
         picker.api_key_input.clear();
         picker.key_entry_error = None;
         picker.enter_model_pick();
@@ -1515,12 +2106,32 @@ impl ProviderPickerView {
 
     fn enter_model_pick(&mut self) {
         self.stage = Stage::ModelPick;
+        self.selected_context_window = None;
         let provider = self.selected_provider();
-        let preferred = self.rows[self.selected_idx]
-            .default_route
-            .logical_model
-            .clone();
+        let route = &self.rows[self.selected_idx].default_route;
+        let kimi_code_k3 = crate::config::is_exact_kimi_code_k3_route(
+            provider,
+            &self.rows[self.selected_idx].base_url,
+            &route.wire_model,
+        );
+        // Recovery must restore the configured wire route, not replace bare
+        // K3 with whichever generic Moonshot catalog entry happens to sort
+        // first. Keep this route-local; `k3` is intentionally not added to
+        // the global Moonshot catalog.
+        let preferred = if kimi_code_k3 {
+            route.wire_model.clone()
+        } else {
+            route.logical_model.clone()
+        };
         let mut models = crate::provider_lake::all_catalog_models_for_provider(provider);
+        if kimi_code_k3
+            && !preferred.trim().is_empty()
+            && !models
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(preferred.trim()))
+        {
+            models.push(preferred.clone());
+        }
         if models.is_empty() && !preferred.trim().is_empty() {
             models.push(preferred.clone());
         }
@@ -1542,6 +2153,30 @@ impl ProviderPickerView {
             self.selected_model = self.model_options.get(self.model_selected_idx).cloned();
         }
         self.stage = Stage::Confirm;
+    }
+
+    fn selected_kimi_code_k3(&self) -> bool {
+        let Some(model) = self.selected_model.as_deref() else {
+            return false;
+        };
+        crate::config::is_exact_kimi_code_k3_route(
+            self.selected_provider(),
+            &self.rows[self.selected_idx].base_url,
+            model,
+        )
+    }
+
+    fn enter_plan_tier(&mut self) {
+        self.stage = Stage::PlanTier;
+        self.kimi_code_plan_tier = KimiCodePlanTier::Safe262k;
+    }
+
+    fn apply_plan_tier(&mut self) {
+        self.selected_context_window = Some(match self.kimi_code_plan_tier {
+            KimiCodePlanTier::Safe262k => crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
+            KimiCodePlanTier::OneMillion => 1_048_576,
+        });
+        self.enter_confirm();
     }
 
     fn move_model_selection(&mut self, delta: isize) {
@@ -1570,6 +2205,8 @@ impl ProviderPickerView {
             provider_id: self.selected_provider_id(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            context_window: self.selected_context_window,
+            base_url: self.pending_base_url.clone(),
         })
     }
 
@@ -1580,6 +2217,156 @@ impl ProviderPickerView {
         self.custom_provider_base_url.clear();
         self.custom_provider_model.clear();
         self.custom_provider_api_key_env.clear();
+    }
+
+    fn enter_ds4_form(&mut self) {
+        self.stage = Stage::CustomForm;
+        self.custom_provider_field = CustomProviderField::ApiKeyEnv;
+        self.custom_provider_id = DS4_PROVIDER_ID.to_string();
+        self.custom_provider_base_url = DS4_BASE_URL.to_string();
+        self.custom_provider_model = DS4_DEFAULT_MODEL.to_string();
+        self.custom_provider_api_key_env.clear();
+    }
+
+    fn enter_lm_studio_form(&mut self) {
+        self.stage = Stage::CustomForm;
+        self.custom_provider_field = CustomProviderField::Model;
+        self.custom_provider_id = LM_STUDIO_PROVIDER_ID.to_string();
+        self.custom_provider_base_url = LM_STUDIO_BASE_URL.to_string();
+        // LM Studio model identifiers depend on what the user has loaded, so
+        // leave the model editable instead of guessing a stale default.
+        self.custom_provider_model.clear();
+        self.custom_provider_api_key_env.clear();
+    }
+
+    fn enter_sensenova_form(&mut self) {
+        if let Some(template) = provider_setup_template(SENSENOVA_TEMPLATE_ID) {
+            self.apply_template(template);
+        }
+    }
+
+    fn enter_template_list(&mut self) {
+        self.stage = Stage::TemplateList;
+        self.template_selected_idx = self
+            .template_selected_idx
+            .min(provider_setup_templates().len().saturating_sub(1));
+        self.last_template_mouse_selected = None;
+        self.template_row_hitboxes.borrow_mut().clear();
+    }
+
+    fn selected_template(&self) -> Option<&'static ProviderSetupTemplate> {
+        provider_setup_templates().get(self.template_selected_idx)
+    }
+
+    fn move_template_selection(&mut self, delta: isize) {
+        let total = provider_setup_templates().len();
+        if total == 0 {
+            return;
+        }
+        self.template_selected_idx =
+            crate::tui::list_nav::wrap_index(self.template_selected_idx, total, delta);
+        self.last_template_mouse_selected = None;
+    }
+
+    fn template_kind_label(&self, template: &ProviderSetupTemplate) -> Cow<'static, str> {
+        self.tr(match template.apply {
+            ProviderSetupApply::FirstClass(_) => MessageId::ProviderTemplateKindKeyOnly,
+            ProviderSetupApply::Compatible => MessageId::ProviderTemplateKindCompatible,
+            ProviderSetupApply::Unpublished => MessageId::ProviderTemplateKindUnpublished,
+        })
+    }
+
+    fn template_guidance_text(&self, template: &ProviderSetupTemplate) -> Cow<'static, str> {
+        match template.id {
+            "opencode-zen" => self.tr(MessageId::ProviderTemplateGuidanceOpencodeZen),
+            "opencode-go" => self.tr(MessageId::ProviderTemplateGuidanceOpencodeGo),
+            id if id == SENSENOVA_TEMPLATE_ID => {
+                self.tr(MessageId::ProviderTemplateGuidanceSenseNova)
+            }
+            id if id == AGNES_TEMPLATE_ID => self.tr(MessageId::ProviderTemplateGuidanceAgnes),
+            _ => Cow::Borrowed(template.guidance()),
+        }
+    }
+
+    fn activate_selected_template(&mut self) -> ViewAction {
+        if let Some(template) = self.selected_template() {
+            if template.is_unpublished() {
+                ViewAction::Emit(ViewEvent::StatusMessage {
+                    message: self.tr(MessageId::ProviderTemplateUnpublished).into_owned(),
+                })
+            } else {
+                self.apply_template(template);
+                ViewAction::None
+            }
+        } else {
+            ViewAction::None
+        }
+    }
+
+    fn handle_template_list_click(&mut self, mouse: MouseEvent) -> ViewAction {
+        let clicked = self
+            .template_row_hitboxes
+            .borrow()
+            .iter()
+            .find_map(|(rect, idx)| {
+                rect.contains(Position::new(mouse.column, mouse.row))
+                    .then_some(*idx)
+            });
+        let Some(idx) = clicked else {
+            return ViewAction::None;
+        };
+        let activate =
+            self.last_template_mouse_selected == Some(idx) && self.template_selected_idx == idx;
+        self.template_selected_idx = idx;
+        self.last_template_mouse_selected = Some(idx);
+        if activate {
+            self.activate_selected_template()
+        } else {
+            ViewAction::None
+        }
+    }
+
+    fn apply_template(&mut self, template: &'static ProviderSetupTemplate) {
+        match template.apply {
+            ProviderSetupApply::FirstClass(kind) => {
+                let provider = ApiProvider::from_kind(kind);
+                if !self.rows.iter().any(|row| row.provider == provider)
+                    || (self
+                        .rows
+                        .iter()
+                        .position(|row| row.provider == provider)
+                        .is_some_and(|idx| !self.row_visible(idx)))
+                {
+                    self.view = ProviderListView::Catalog;
+                }
+                if let Some(idx) = self.rows.iter().position(|row| row.provider == provider) {
+                    self.selected_idx = idx;
+                    self.stage = Stage::List;
+                    if !self.selected_has_key() {
+                        self.begin_setup();
+                    }
+                }
+            }
+            ProviderSetupApply::Compatible => self.enter_compatible_form(template),
+            ProviderSetupApply::Unpublished => {
+                if let Some(idx) = provider_setup_templates()
+                    .iter()
+                    .position(|candidate| candidate.id == template.id)
+                {
+                    self.template_selected_idx = idx;
+                }
+                self.enter_template_list();
+            }
+        }
+    }
+
+    fn enter_compatible_form(&mut self, template: &'static ProviderSetupTemplate) {
+        self.stage = Stage::CustomForm;
+        self.custom_provider_field = CustomProviderField::ApiKeyEnv;
+        self.custom_provider_id = template.id.to_string();
+        self.custom_provider_base_url = template.base_url().unwrap_or("").to_string();
+        self.custom_provider_model = template.default_model().unwrap_or("").to_string();
+        self.custom_provider_api_key_env = template.api_key_env().unwrap_or("").to_string();
     }
 
     fn custom_form_field_mut(&mut self) -> &mut String {
@@ -1677,37 +2464,32 @@ impl ProviderPickerView {
             .min(max_start)
     }
 
-    fn selected_row_style(fg: Color) -> Style {
-        Style::default()
-            .fg(fg)
-            .bg(palette::SURFACE_ELEVATED)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    fn selected_row_bg_style() -> Style {
-        Style::default().bg(palette::SURFACE_ELEVATED)
-    }
-
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
         let enter_action = if !self.selected_route_is_valid() {
-            "unavailable"
+            self.tr(MessageId::PickerActionUnavailable)
         } else if self.selected_has_key() {
-            "apply"
+            self.tr(MessageId::PickerActionApply)
         } else {
-            "set key"
+            self.tr(MessageId::PickerActionSetKey)
         };
-        let title = match (self.setup_mode, self.view) {
-            (true, ProviderListView::Configured) => {
-                format!(" Provider setup{} ", catalog_freshness_title_suffix())
-            }
-            (true, ProviderListView::Catalog) => {
-                format!(" Provider setup · all{} ", catalog_freshness_title_suffix())
-            }
-            (false, ProviderListView::Configured) => {
-                format!(" Provider{} ", catalog_freshness_title_suffix())
-            }
-            (false, ProviderListView::Catalog) => {
-                format!(" Provider · all{} ", catalog_freshness_title_suffix())
+        let title = if self.onboarding_mode {
+            format!(" {} ", self.tr(MessageId::OnboardProviderTitle))
+        } else {
+            match (self.setup_mode, self.view) {
+                (true, ProviderListView::Configured) => {
+                    format!(" Provider setup{} ", catalog_freshness_title_suffix())
+                }
+                (true, ProviderListView::Catalog) => {
+                    format!(" Provider setup · all{} ", catalog_freshness_title_suffix())
+                }
+                (true, ProviderListView::Local) => " Local models · no cloud key ".to_string(),
+                (false, ProviderListView::Configured) => {
+                    format!(" Provider{} ", catalog_freshness_title_suffix())
+                }
+                (false, ProviderListView::Catalog) => {
+                    format!(" Provider · all{} ", catalog_freshness_title_suffix())
+                }
+                (false, ProviderListView::Local) => " Provider · local only ".to_string(),
             }
         };
         let outer = Block::default()
@@ -1724,23 +2506,52 @@ impl ProviderPickerView {
         outer.render(area, buf);
 
         let view_action = match self.view {
-            ProviderListView::Configured => "browse all",
-            ProviderListView::Catalog => "configured",
+            ProviderListView::Configured => self.tr(MessageId::PickerActionBrowseAll),
+            ProviderListView::Catalog => self.tr(MessageId::PickerActionConfigured),
+            ProviderListView::Local => self.tr(MessageId::PickerActionBrowseAll),
         };
         let search_active = !self.query.trim().is_empty();
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the provider list renders above it.
-        let content = if search_active {
+        let content = if self.onboarding_mode {
+            let mut hints = vec![
+                ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
+                ActionHint::new("Enter", enter_action),
+            ];
+            if self.view == ProviderListView::Local {
+                hints.push(ActionHint::new(
+                    "A",
+                    self.tr(MessageId::PickerActionBrowseAll),
+                ));
+            }
+            hints.extend([
+                ActionHint::new("Ctrl+O", self.tr(MessageId::OnboardProviderOffline)),
+                ActionHint::new("Esc", self.tr(MessageId::OnboardActionBack)),
+            ]);
+            render_modal_footer(inner, buf, &hints)
+        } else if search_active {
             render_modal_footer(
                 inner,
                 buf,
                 &[
-                    ActionHint::new("Esc", "clear"),
-                    ActionHint::new("↑↓", "move"),
+                    // Two-stage Esc (clear the query, then cancel) reads as one
+                    // hint instead of a duplicated key.
+                    ActionHint::new(
+                        "Esc",
+                        format!(
+                            "{} / {}",
+                            self.tr(MessageId::PickerActionClear),
+                            self.tr(MessageId::PickerActionCancel)
+                        ),
+                    ),
+                    ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
                     ActionHint::new("Enter", enter_action),
-                    ActionHint::new("A", view_action),
-                    ActionHint::new("C", "custom"),
-                    ActionHint::new("Esc", "cancel"),
+                    ActionHint::new("A", view_action.clone()),
+                    ActionHint::new("L", "local only"),
+                    ActionHint::new("I", "LM Studio"),
+                    ActionHint::new("C", self.tr(MessageId::PickerActionCustom)),
+                    ActionHint::new("D", "DS4"),
+                    ActionHint::new("S", "SenseNova"),
                 ],
             )
         } else {
@@ -1748,14 +2559,21 @@ impl ProviderPickerView {
                 inner,
                 buf,
                 &[
-                    ActionHint::new("↑↓", "move"),
-                    ActionHint::new("a-z", "jump"),
+                    ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
+                    ActionHint::new("a-z", self.tr(MessageId::PickerActionJump)),
                     ActionHint::new("Enter", enter_action),
                     ActionHint::new("A", view_action),
-                    ActionHint::new("C", "custom"),
-                    ActionHint::new("R", "edit key"),
-                    ActionHint::new("M", "models"),
-                    ActionHint::new("Esc", "cancel"),
+                    ActionHint::new("L", "local only"),
+                    ActionHint::new("I", "LM Studio"),
+                    ActionHint::new("C", self.tr(MessageId::PickerActionCustom)),
+                    ActionHint::new("D", "DS4"),
+                    ActionHint::new("S", "SenseNova"),
+                    ActionHint::new("P", self.tr(MessageId::PickerActionTemplates)),
+                    ActionHint::new("C-t", self.tr(MessageId::PickerActionTestConnection)),
+                    ActionHint::new("R", self.tr(MessageId::PickerActionEditKey)),
+                    ActionHint::new("X", self.tr(MessageId::ProviderExternalActionRevoke)),
+                    ActionHint::new("M", self.tr(MessageId::PickerActionModels)),
+                    ActionHint::new("Esc", self.tr(MessageId::PickerActionCancel)),
                 ],
             )
         };
@@ -1764,24 +2582,35 @@ impl ProviderPickerView {
         if filtered.is_empty() {
             if search_active {
                 EmptyState::new(
-                    "No providers match",
-                    "Try a different search term or clear to browse.",
+                    self.tr(MessageId::ProviderNoMatchesTitle),
+                    self.tr(MessageId::ProviderNoMatchesHint),
                 )
-                .primary_action("Esc", "clear search")
+                .primary_action("Esc", self.tr(MessageId::PickerActionClearSearch))
                 .render(content, buf);
             } else {
                 EmptyState::new(
-                    "No providers configured yet",
-                    "Browse every supported provider or create a custom endpoint.",
+                    self.tr(MessageId::ProviderNoConfiguredTitle),
+                    self.tr(MessageId::ProviderNoConfiguredHint),
                 )
-                .primary_action("A", "browse all")
-                .secondary_action("C", "custom")
+                .primary_action("A", self.tr(MessageId::PickerActionBrowseAll))
+                .secondary_action("C", self.tr(MessageId::PickerActionCustom))
                 .render(content, buf);
             }
             return;
         }
 
-        let layout = ListDetailLayout::split(content, 34);
+        // Onboarding asks one question. The ordinary provider manager keeps
+        // its technical detail pane, but first-run gives the available rows
+        // the whole body so 40x12 still has room to choose and proceed.
+        let layout = if self.onboarding_mode {
+            ListDetailLayout {
+                list: content,
+                detail: Rect::new(content.x, content.y, 0, 0),
+                stacked: false,
+            }
+        } else {
+            ListDetailLayout::split(content, 34)
+        };
         let selected_pos = filtered
             .iter()
             .position(|(idx, _)| *idx == self.selected_idx)
@@ -1798,21 +2627,25 @@ impl ProviderPickerView {
             let is_selected = *idx == self.selected_idx;
             debug_assert_eq!(is_selected, pos == selected_pos);
             let is_active = row.is_active;
-            let arrow = if is_selected { "▸" } else { " " };
+            let arrow = crate::tui::glyphs::selection_marker(is_selected);
             let active_dot = if is_active { " *" } else { "  " };
             let spacer_style = if is_selected {
-                Self::selected_row_bg_style()
+                menu_style::selected_row_bg_style()
             } else {
                 Style::default()
             };
             let label_style = if is_selected {
-                Self::selected_row_style(palette::TEXT_PRIMARY)
+                menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
             let has_usable_auth = matches!(
                 row.credential_state,
-                CredentialState::Saved | CredentialState::Local | CredentialState::Legacy
+                CredentialState::Saved
+                    | CredentialState::ImportedToken
+                    | CredentialState::NoAuth
+                    | CredentialState::Local
+                    | CredentialState::Legacy
             );
             let hint_style = if is_selected {
                 let hint_fg = if has_usable_auth {
@@ -1820,7 +2653,7 @@ impl ProviderPickerView {
                 } else {
                     palette::STATUS_WARNING
                 };
-                Self::selected_row_style(hint_fg)
+                menu_style::selected_row_style_with_fg(hint_fg)
             } else if has_usable_auth {
                 Style::default().fg(palette::TEXT_MUTED)
             } else {
@@ -1843,20 +2676,22 @@ impl ProviderPickerView {
                 Span::styled(hint, hint_style),
             ]);
             if is_selected {
-                line.style = Self::selected_row_bg_style();
+                line.style = menu_style::selected_row_bg_style();
                 let target_width = usize::from(layout.list.width);
                 let line_width = line.width();
                 if line_width < target_width {
                     line.spans.push(Span::styled(
                         " ".repeat(target_width - line_width),
-                        Self::selected_row_bg_style(),
+                        menu_style::selected_row_bg_style(),
                     ));
                 }
             }
             lines.push(line);
         }
         Paragraph::new(lines).render(layout.list, buf);
-        self.render_provider_detail(layout.detail, buf, &self.rows[self.selected_idx]);
+        if !self.onboarding_mode {
+            self.render_provider_detail(layout.detail, buf, &self.rows[self.selected_idx]);
+        }
     }
 
     fn render_provider_detail(&self, area: Rect, buf: &mut Buffer, row: &ProviderDashboardRow) {
@@ -1900,6 +2735,14 @@ impl ProviderPickerView {
                 ),
                 Style::default().fg(palette::TEXT_MUTED),
             )),
+            // Which place the credential actually came from. A row can read
+            // "key:configured" for four different reasons; naming the one that
+            // won is what lets a user reconcile the picker with a request that
+            // succeeded (or didn't).
+            Line::from(Span::styled(
+                format!("Credential: {}", row.credential_source),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
             Line::from(Span::styled(
                 format!("Route: {route}"),
                 Style::default().fg(palette::TEXT_PRIMARY),
@@ -1937,16 +2780,121 @@ impl ProviderPickerView {
                 Style::default().fg(palette::STATUS_WARNING),
             )));
         }
+        if let Some(status) = row.external_credential_status.as_ref() {
+            let state = if status.route_state == "active" {
+                self.tr(MessageId::CtxInspActive)
+            } else {
+                self.tr(MessageId::ProviderExternalDormant)
+            };
+            let scope = self
+                .tr(MessageId::ProviderExternalDetailScope)
+                .replace("{access}", status.access.as_str())
+                .replace("{provider}", &status.provider)
+                .replace("{source}", status.source.as_str())
+                .replace("{version}", &status.consent_version.to_string())
+                .replace("{state}", &state);
+            lines.push(Line::from(Span::styled(
+                scope,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+            let owner_path = self
+                .tr(MessageId::ProviderExternalOwnerPath)
+                .replace("{owner}", status.owner)
+                .replace("{path}", &codewhale_config::quote_os_path(&status.path));
+            let mut owner_path_spans = vec![Span::styled(
+                owner_path,
+                Style::default().fg(palette::TEXT_MUTED),
+            )];
+            if status.ambient_path_changed {
+                let warning = self
+                    .tr(MessageId::ProviderExternalPinnedPathWarning)
+                    .replace("{owner}", status.owner)
+                    .replace("{path}", &codewhale_config::quote_os_path(&status.path));
+                owner_path_spans.push(Span::styled(
+                    " | ",
+                    Style::default().fg(palette::TEXT_MUTED),
+                ));
+                owner_path_spans.push(Span::styled(
+                    warning,
+                    Style::default().fg(palette::STATUS_WARNING),
+                ));
+            }
+            lines.push(Line::from(owner_path_spans));
+            let semantics = match status.access {
+                codewhale_config::ExternalCredentialAccess::Disabled => {
+                    self.tr(MessageId::ProviderExternalDisabledDetail)
+                }
+                codewhale_config::ExternalCredentialAccess::ReadOnly => {
+                    self.tr(MessageId::ProviderExternalReadOnlySemantics)
+                }
+                codewhale_config::ExternalCredentialAccess::Managed => {
+                    self.tr(MessageId::ProviderExternalManagedDetail)
+                }
+            };
+            lines.push(Line::from(Span::styled(
+                semantics,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+            let revoke = self
+                .tr(MessageId::ProviderExternalRevoke)
+                .replace("{revoke}", &status.revoke_command);
+            lines.push(Line::from(Span::styled(
+                revoke,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
             .render(inner, buf);
     }
 
+    fn render_xai_auth_choice(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::XaiAuthChoiceTitle),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓/1-2", self.tr(MessageId::ProviderExternalActionChoose)),
+                ActionHint::new("Enter", self.tr(MessageId::SetupActionContinue)),
+                ActionHint::new("E", self.tr(MessageId::ProviderExternalActionReuseGrok)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+            ],
+        );
+        let marker = |choice| crate::tui::glyphs::selection_marker(self.xai_auth_choice == choice);
+        Paragraph::new(vec![
+            Line::from(self.tr(MessageId::XaiAuthChoiceIntro)),
+            Line::from(""),
+            Line::from(format!(
+                "{} 1. {}",
+                marker(XaiAuthChoice::ApiKey),
+                self.tr(MessageId::XaiAuthChoiceApiKeyOption),
+            )),
+            Line::from(format!(
+                "{} 2. {}",
+                marker(XaiAuthChoice::DeviceOAuth),
+                self.tr(MessageId::XaiAuthChoiceDeviceOAuthOption),
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
+    }
+
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
         let row = &self.rows[self.selected_idx];
         let codex_oauth = row.provider == ApiProvider::OpenaiCodex;
-        let xai_oauth = row.provider == ApiProvider::Xai;
-        let oauth_provider = codex_oauth || xai_oauth;
+        let oauth_provider = codex_oauth;
+        let saved_credential = !oauth_provider && row.has_key;
         let outer = Block::default()
             .title(Line::from(Span::styled(
                 if oauth_provider {
@@ -1967,14 +2915,21 @@ impl ProviderPickerView {
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the key-entry fields render above it.
         let content = if codex_oauth {
-            render_modal_footer(inner, buf, &[ActionHint::new("Esc", "back")])
-        } else if xai_oauth {
             render_modal_footer(
                 inner,
                 buf,
                 &[
-                    ActionHint::new("Enter", "device login"),
-                    ActionHint::new("Esc", "back"),
+                    ActionHint::new("Enter", self.tr(MessageId::ProviderExternalActionChoices)),
+                    ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+                ],
+            )
+        } else if saved_credential && self.api_key_input.trim().is_empty() {
+            render_modal_footer(
+                inner,
+                buf,
+                &[
+                    ActionHint::new("Type/paste", "replace saved key"),
+                    ActionHint::new("Esc", "keep current key"),
                 ],
             )
         } else {
@@ -1990,9 +2945,9 @@ impl ProviderPickerView {
 
         let masked = mask_key(&self.api_key_input);
         let display = if codex_oauth {
-            "(run codex login; no token is stored here)".to_string()
-        } else if xai_oauth {
-            "(browser/device-code sign-in; tokens stay in ~/.grok/auth.json)".to_string()
+            "(run codex login; then explicitly grant read-only access)".to_string()
+        } else if masked.is_empty() && saved_credential {
+            "Saved credential configured".to_string()
         } else if masked.is_empty() {
             "(paste key here)".to_string()
         } else {
@@ -2016,16 +2971,32 @@ impl ProviderPickerView {
             "/provider"
         };
         let mut hint_lines = if codex_oauth {
+            vec![
+                Line::from(Span::styled(
+                    self.tr(MessageId::ProviderExternalHintCodexReview)
+                        .replace("{login}", "codex login"),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "Or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
+                        self.env_var_for_selected_row(),
+                    ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+                Line::from(Span::styled(
+                    "CLI: codewhale auth external-consent --provider openai-codex; no token is stored here.",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            ]
+        } else if saved_credential && self.api_key_input.trim().is_empty() {
             vec![Line::from(Span::styled(
-                format!(
-                    "Run `codex login`, or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
-                    self.env_var_for_selected_row(),
-                ),
+                "This terminal can use the stored credential. Type or paste only to replace it; Esc keeps it unchanged.",
                 Style::default().fg(palette::TEXT_MUTED),
             ))]
-        } else if xai_oauth {
+        } else if saved_credential {
             vec![Line::from(Span::styled(
-                "Press Enter for xAI device login, or use XAI_API_KEY and re-open this picker.",
+                "The replacement is validated before it replaces the stored credential.",
                 Style::default().fg(palette::TEXT_MUTED),
             ))]
         } else {
@@ -2037,11 +3008,45 @@ impl ProviderPickerView {
                 Style::default().fg(palette::TEXT_MUTED),
             ))]
         };
-        if !oauth_provider && let Some(url) = row.provider.credential_url() {
-            hint_lines.push(Line::from(Span::styled(
-                format!("Credentials: {url}"),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
+        if !oauth_provider {
+            if row.provider == ApiProvider::Moonshot
+                && crate::config::moonshot_base_url_is_exact_kimi_code(&row.base_url)
+            {
+                hint_lines.extend([
+                    Line::from(Span::styled(
+                        self.tr(MessageId::KimiCodePlanApiKeyHint).replace(
+                            "{console}",
+                            crate::config::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+                        ),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        self.tr(MessageId::KimiCodePlanRouteHint)
+                            .replace("{route}", crate::config::DEFAULT_KIMI_CODE_BASE_URL),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        self.tr(MessageId::KimiCodePlanNoImportHint),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )),
+                ]);
+            } else {
+                let help = row.provider.credential_help();
+                hint_lines.push(Line::from(Span::styled(
+                    help.credential_url.map_or_else(
+                        || format!("Credentials: {}", help.guidance),
+                        |url| format!("Credentials: {url}"),
+                    ),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+                if let Some(url) = help.docs_url {
+                    hint_lines.push(Line::from(Span::styled(
+                        self.tr(MessageId::ProviderTemplateDocs)
+                            .replace("{url}", url),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )));
+                }
+            }
         };
 
         if let Some(ref error) = self.key_entry_error {
@@ -2051,7 +3056,13 @@ impl ProviderPickerView {
             )));
         }
 
-        let hint_height = hint_lines.len().clamp(1, 3) as u16;
+        // `Line` count is not rendered row count: long environment-variable
+        // guidance can wrap to two or three terminal rows. Ask ratatui for the
+        // exact wrapped height instead of duplicating its layout arithmetic.
+        let hint = Paragraph::new(hint_lines).wrap(Wrap { trim: true });
+        let hint_height = u16::try_from(hint.line_count(content.width.max(1)))
+            .unwrap_or(u16::MAX)
+            .clamp(1, 6);
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2062,7 +3073,127 @@ impl ProviderPickerView {
             .split(content);
 
         Paragraph::new(key_lines).render(layout[0], buf);
-        Paragraph::new(hint_lines).render(layout[1], buf);
+        hint.render(layout[1], buf);
+    }
+
+    fn render_external_consent_choice(&self, area: Rect, buf: &mut Buffer) {
+        let provider_name = self.rows[self.selected_idx].display_name.clone();
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::ProviderExternalChoiceTitle)
+                    .replace("{provider}", &provider_name),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", self.tr(MessageId::ProviderExternalActionChoose)),
+                ActionHint::new("Enter", self.tr(MessageId::SetupActionContinue)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
+            ],
+        );
+        let selected = self.external_consent_choice;
+        let row = |choice, label: Cow<'static, str>, detail: Cow<'static, str>| {
+            let marker = crate::tui::glyphs::selection_marker(selected == choice);
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker} {label}"),
+                    Style::default().fg(if selected == choice {
+                        palette::WHALE_INFO
+                    } else {
+                        palette::TEXT_PRIMARY
+                    }),
+                ),
+                Span::styled(
+                    format!(" · {detail}"),
+                    Style::default().fg(palette::TEXT_MUTED),
+                ),
+            ])
+        };
+        Paragraph::new(vec![
+            Line::from(self.tr(MessageId::ProviderExternalChoiceIntro)),
+            Line::from(""),
+            row(
+                ExternalConsentChoice::Disabled,
+                self.tr(MessageId::ProviderExternalDisabledLabel),
+                self.tr(MessageId::ProviderExternalDisabledDetail),
+            ),
+            row(
+                ExternalConsentChoice::ReadOnly,
+                self.tr(MessageId::ProviderExternalReadOnlyLabel),
+                self.tr(MessageId::ProviderExternalReadOnlyDetail),
+            ),
+            row(
+                ExternalConsentChoice::ManagedUnavailable,
+                self.tr(MessageId::ProviderExternalManagedLabel),
+                self.tr(MessageId::ProviderExternalManagedDetail),
+            ),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
+    }
+
+    fn render_external_consent_confirm(&self, area: Rect, buf: &mut Buffer) {
+        let Some((provider, source, path)) = self.selected_external_consent_target() else {
+            return;
+        };
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                self.tr(MessageId::ProviderExternalConfirmTitle),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("Enter", self.tr(MessageId::ProviderExternalActionGrant)),
+                ActionHint::new("Esc", self.tr(MessageId::SetupActionCancel)),
+            ],
+        );
+        let provider_label = self.tr(MessageId::RouteProviderLabel);
+        let owner_label = self.tr(MessageId::ProviderExternalOwnerLabel);
+        let exact_path_label = self.tr(MessageId::ProviderExternalExactPathLabel);
+        let semantics_label = self.tr(MessageId::ProviderExternalSemanticsLabel);
+        let revoke_label = self.tr(MessageId::ProviderExternalRevokeLabel);
+        Paragraph::new(vec![
+            Line::from(format!("{provider_label}: {}", provider.as_str())),
+            Line::from(format!(
+                "{owner_label}: {} ({})",
+                source.owner_label(),
+                source.as_str()
+            )),
+            Line::from(format!(
+                "{exact_path_label}: {}",
+                codewhale_config::quote_os_path(&path)
+            )),
+            Line::from(""),
+            Line::from(format!(
+                "{semantics_label}: {}.",
+                self.tr(MessageId::ProviderExternalReadOnlySemantics)
+            )),
+            Line::from(self.tr(MessageId::ProviderExternalRejectUnsafe)),
+            Line::from(format!(
+                "{revoke_label}: codewhale auth external-revoke --provider {}",
+                provider.as_str()
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
     }
 
     fn render_model_pick(&self, area: Rect, buf: &mut Buffer) {
@@ -2091,7 +3222,7 @@ impl ProviderPickerView {
         );
 
         let header = Paragraph::new(Line::from(Span::styled(
-            "Key verified. Pick a default model for this provider.",
+            self.tr(MessageId::ProviderConnectionCheckedPickModel),
             Style::default().fg(palette::TEXT_MUTED),
         )));
         let layout = Layout::default()
@@ -2116,9 +3247,9 @@ impl ProviderPickerView {
             .take(visible_rows)
         {
             let is_selected = idx == self.model_selected_idx;
-            let arrow = if is_selected { "▸" } else { " " };
+            let arrow = crate::tui::glyphs::selection_marker(is_selected);
             let label_style = if is_selected {
-                Self::selected_row_style(palette::TEXT_PRIMARY)
+                menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
@@ -2139,7 +3270,7 @@ impl ProviderPickerView {
                     Span::styled(
                         format!("  ({default_tag})"),
                         if is_selected {
-                            Self::selected_row_style(palette::TEXT_MUTED)
+                            menu_style::selected_row_style_with_fg(palette::TEXT_MUTED)
                         } else {
                             Style::default().fg(palette::TEXT_MUTED)
                         },
@@ -2147,17 +3278,105 @@ impl ProviderPickerView {
                 },
             ]);
             if is_selected {
-                line.style = Self::selected_row_bg_style();
+                line.style = menu_style::selected_row_bg_style();
             }
             lines.push(line);
         }
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No catalog models available.",
+                self.tr(MessageId::ProviderNoCatalogModels),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
         Paragraph::new(lines).render(list_area, buf);
+    }
+
+    fn render_plan_tier(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                " Kimi Code plan tier ",
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", "choose"),
+                ActionHint::new("Enter", "continue"),
+                ActionHint::new("Esc", "back"),
+            ],
+        );
+        let selected = self.kimi_code_plan_tier;
+        let marker = |tier| crate::tui::glyphs::selection_marker(selected == tier);
+        Paragraph::new(vec![
+            Line::from("Kimi Code plan limits determine the context window used for k3."),
+            Line::from("Choose the tier you actually have; the safe floor is selected by default."),
+            Line::from(""),
+            Line::from(format!(
+                "{} 1. 262K context (safe default)",
+                marker(KimiCodePlanTier::Safe262k)
+            )),
+            Line::from(format!(
+                "{} 2. 1M context (only with an eligible plan)",
+                marker(KimiCodePlanTier::OneMillion)
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
+    }
+
+    fn render_stepfun_billing_route(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" {} ", self.tr(MessageId::StepfunBillingRouteTitle)),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", "choose"),
+                ActionHint::new("Enter", "continue"),
+                ActionHint::new("Esc", "back"),
+            ],
+        );
+        let selected = self.stepfun_billing_route;
+        let marker = |route| crate::tui::glyphs::selection_marker(selected == route);
+        // The endpoint is shown next to each choice: it is the whole
+        // difference between the two billing tracks, and it is what gets
+        // written to `[providers.stepfun] base_url` on confirm.
+        Paragraph::new(vec![
+            Line::from(self.tr(MessageId::StepfunBillingRouteIntro).to_string()),
+            Line::from(""),
+            Line::from(format!(
+                "{} 1. {} — {}",
+                marker(StepfunBillingRoute::PayAsYouGo),
+                self.tr(MessageId::StepfunBillingRoutePaygOption),
+                StepfunBillingRoute::PayAsYouGo.base_url(),
+            )),
+            Line::from(format!(
+                "{} 2. {} — {}",
+                marker(StepfunBillingRoute::StepPlan),
+                self.tr(MessageId::StepfunBillingRoutePlanOption),
+                StepfunBillingRoute::StepPlan.base_url(),
+            )),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(content, buf);
     }
 
     fn render_confirm(&self, area: Rect, buf: &mut Buffer) {
@@ -2222,14 +3441,23 @@ impl ProviderPickerView {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
+            if let Some(context_window) = self.selected_context_window {
+                Line::from(format!("Context:  {} tokens", context_window))
+            } else {
+                Line::from("")
+            },
         ];
         Paragraph::new(lines).render(content, buf);
     }
 
     fn render_custom_form(&self, area: Rect, buf: &mut Buffer) {
+        let title = provider_setup_template(&self.custom_provider_id)
+            .filter(|template| template.is_compatible())
+            .map(|template| format!(" {} ", template.display_name))
+            .unwrap_or_else(|| " Custom provider ".to_string());
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                " Custom provider ",
+                title,
                 Style::default()
                     .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
@@ -2261,10 +3489,24 @@ impl ProviderPickerView {
             ])
             .split(content);
 
+        let hint = provider_setup_template(&self.custom_provider_id)
+            .filter(|template| template.is_compatible())
+            .map(|template| {
+                let mut parts = vec![self.template_guidance_text(template).into_owned()];
+                if let Some(url) = template.docs_url() {
+                    parts.push(
+                        self.tr(MessageId::ProviderTemplateDocs)
+                            .replace("{url}", url),
+                    );
+                }
+                parts.join(" ")
+            })
+            .unwrap_or_else(|| self.tr(MessageId::ProviderCustomFormHint).into_owned());
         Paragraph::new(Line::from(Span::styled(
-            "OpenAI-compatible endpoint. Store an env var name here, not a raw key.",
+            hint,
             Style::default().fg(palette::TEXT_MUTED),
         )))
+        .wrap(Wrap { trim: true })
         .render(layout[0], buf);
 
         self.render_custom_form_field(layout[1], buf, CustomProviderField::Name, "Name", "acme_ai");
@@ -2272,14 +3514,14 @@ impl ProviderPickerView {
             layout[2],
             buf,
             CustomProviderField::BaseUrl,
-            "Base URL",
+            &self.tr(MessageId::ProviderCustomFormBaseUrl),
             "https://api.example.com/v1",
         );
         self.render_custom_form_field(
             layout[3],
             buf,
             CustomProviderField::Model,
-            "Default model",
+            &self.tr(MessageId::ProviderCustomFormModel),
             "optional",
         );
         self.render_custom_form_field(
@@ -2291,6 +3533,155 @@ impl ProviderPickerView {
         );
     }
 
+    fn render_template_list(&self, area: Rect, buf: &mut Buffer) {
+        self.template_row_hitboxes.borrow_mut().clear();
+        let outer = Block::default()
+            .title(Line::from(Span::styled(
+                format!(" {} ", self.tr(MessageId::ProviderTemplatesTitle)),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::WHALE_BG));
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
+                ActionHint::new("Enter", self.tr(MessageId::PickerActionApply)),
+                ActionHint::new("Esc", self.tr(MessageId::PickerActionCancel)),
+            ],
+        );
+        let templates = provider_setup_templates();
+        let intro_height = if content.height >= 12 { 2 } else { 0 };
+        let remaining = content.height.saturating_sub(intro_height);
+        let detail_reserve = if remaining >= 6 {
+            3
+        } else if remaining >= 4 {
+            2
+        } else if remaining >= 3 {
+            1
+        } else {
+            0
+        };
+        let list_budget = remaining.saturating_sub(detail_reserve).max(1);
+        let visible_count = templates
+            .len()
+            .min(usize::from(list_budget))
+            .max(usize::from(remaining > 0));
+        let list_height = u16::try_from(visible_count).unwrap_or(u16::MAX).max(1);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(intro_height),
+                Constraint::Length(list_height),
+                Constraint::Min(detail_reserve),
+            ])
+            .split(content);
+        if intro_height > 0 {
+            Paragraph::new(Line::from(Span::styled(
+                self.tr(MessageId::ProviderTemplatesIntro),
+                Style::default().fg(palette::TEXT_MUTED),
+            )))
+            .wrap(Wrap { trim: true })
+            .render(chunks[0], buf);
+        }
+        let selected = self
+            .template_selected_idx
+            .min(templates.len().saturating_sub(1));
+        let max_start = templates.len().saturating_sub(visible_count);
+        let start = selected
+            .saturating_sub(visible_count.saturating_sub(1))
+            .min(max_start);
+        let list_area = chunks[1];
+        for (offset, (idx, template)) in templates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+            .enumerate()
+        {
+            let row_y = list_area.y.saturating_add(offset as u16);
+            if row_y >= list_area.bottom() {
+                break;
+            }
+            let row = Rect::new(list_area.x, row_y, list_area.width, 1);
+            self.template_row_hitboxes.borrow_mut().push((row, idx));
+            let selected_row = idx == self.template_selected_idx;
+            let marker = crate::tui::glyphs::selection_marker(selected_row);
+            let kind = self.template_kind_label(template);
+            let style = if selected_row {
+                menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
+            } else {
+                Style::default().fg(palette::TEXT_PRIMARY)
+            };
+            let label = format!(
+                "{marker} {} ({}) · {kind}",
+                template.display_name, template.id
+            );
+            Paragraph::new(Line::from(Span::styled(
+                crate::tui::ui_text::truncate_line_to_width(&label, usize::from(row.width)),
+                style,
+            )))
+            .render(row, buf);
+        }
+
+        let mut detail = Vec::new();
+        if let Some(template) = self.selected_template() {
+            if template.is_unpublished() {
+                detail.push(Line::from(Span::styled(
+                    self.tr(MessageId::ProviderTemplateUnpublished),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            } else if let Some(url) = template.base_url() {
+                detail.push(Line::from(Span::styled(
+                    self.tr(MessageId::ProviderTemplateBaseUrl)
+                        .replace("{url}", url),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            if let Some(env) = template.api_key_env() {
+                detail.push(Line::from(Span::styled(
+                    env.to_string(),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            if let Some(model) = template.default_model() {
+                detail.push(Line::from(Span::styled(
+                    self.tr(MessageId::ProviderTemplateModel)
+                        .replace("{model}", model),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            if let Some(url) = template.docs_url() {
+                detail.push(Line::from(Span::styled(
+                    self.tr(MessageId::ProviderTemplateDocs)
+                        .replace("{url}", url),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            if let Some(url) = template.credential_url() {
+                detail.push(Line::from(Span::styled(
+                    self.tr(MessageId::ProviderTemplateCredentials)
+                        .replace("{url}", url),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+            }
+            detail.push(Line::from(Span::styled(
+                self.template_guidance_text(template),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: true })
+            .render(chunks[2], buf);
+    }
+
     fn render_custom_form_field(
         &self,
         area: Rect,
@@ -2300,18 +3691,18 @@ impl ProviderPickerView {
         placeholder: &str,
     ) {
         let selected = self.custom_provider_field == field;
-        let marker = if selected { "▸" } else { " " };
+        let marker = crate::tui::glyphs::selection_marker(selected);
         let value = self.custom_form_field_value(field);
         let display = if value.is_empty() { placeholder } else { value };
         let value_style = if selected {
-            Self::selected_row_style(palette::TEXT_PRIMARY)
+            menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
         } else if value.is_empty() {
             Style::default().fg(palette::TEXT_MUTED)
         } else {
             Style::default().fg(palette::TEXT_PRIMARY)
         };
         let label_style = if selected {
-            Self::selected_row_style(palette::WHALE_INFO)
+            menu_style::selected_row_style_with_fg(palette::WHALE_INFO)
         } else {
             Style::default().fg(palette::TEXT_MUTED)
         };
@@ -2328,7 +3719,7 @@ impl ProviderPickerView {
             ),
         ]);
         if selected {
-            line.style = Self::selected_row_bg_style();
+            line.style = menu_style::selected_row_bg_style();
         }
         Paragraph::new(line).render(area, buf);
     }
@@ -2366,10 +3757,7 @@ impl ModalView for ProviderPickerView {
     fn handle_paste(&mut self, text: &str) -> bool {
         match self.stage {
             Stage::KeyEntry => {
-                if matches!(
-                    self.selected_provider(),
-                    ApiProvider::OpenaiCodex | ApiProvider::Xai
-                ) {
+                if self.key_entry_is_oauth_locked() {
                     return true;
                 }
                 let sanitized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2384,7 +3772,15 @@ impl ModalView for ProviderPickerView {
                 self.custom_form_field_mut().push_str(sanitized.trim());
                 true
             }
-            Stage::List | Stage::ModelPick | Stage::Confirm => false,
+            Stage::List
+            | Stage::XaiAuthChoice
+            | Stage::ExternalConsentChoice
+            | Stage::ExternalConsentConfirm
+            | Stage::ModelPick
+            | Stage::PlanTier
+            | Stage::StepfunBillingRoute
+            | Stage::Confirm
+            | Stage::TemplateList => false,
         }
     }
 
@@ -2417,23 +3813,60 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Enter if self.row_visible(self.selected_idx) => {
                     let provider = self.selected_provider();
                     let provider_id = self.selected_provider_id();
-                    if !self.selected_route_is_valid() {
+                    if provider == ApiProvider::Custom
+                        && !self.rows[self.selected_idx].is_configured
+                    {
+                        self.enter_custom_form();
+                        ViewAction::None
+                    } else if !self.selected_route_is_valid() {
                         ViewAction::None
                     } else if self.selected_has_key() {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
                             provider,
                             provider_id,
                         })
-                    } else if provider == ApiProvider::Moonshot
-                        && crate::config::kimi_cli_credentials_valid()
-                    {
-                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerKimiOAuthEnabled {
-                            provider,
-                        })
+                    } else if external_consent_target_is_grantable(provider) {
+                        // #5243: token already stored externally and the user
+                        // pressed Enter on the provider (says they want it
+                        // read) — adopt it automatically in the same chord,
+                        // no second `e` trip. Validated at grant time.
+                        if let Some(event) = self.build_external_consent_event() {
+                            ViewAction::EmitAndClose(event)
+                        } else {
+                            self.begin_setup();
+                            ViewAction::None
+                        }
                     } else {
-                        self.enter_key_entry();
+                        self.begin_setup();
                         ViewAction::None
                     }
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'x')
+                        && self.row_visible(self.selected_idx)
+                        && self.rows[self.selected_idx].credential_state
+                            == CredentialState::ExternalConsent =>
+                {
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                        provider: self.selected_provider(),
+                    })
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && c.eq_ignore_ascii_case(&'e')
+                        && self.query.is_empty()
+                        && self.row_visible(self.selected_idx)
+                        && self.selected_external_consent_target().is_some() =>
+                {
+                    // #5243: one-chord external consent from the list — no
+                    // second trip through XaiAuthChoice/KeyEntry. The confirm
+                    // step validates at grant time and the token is adopted
+                    // automatically; a just-minted OAuth never requires a
+                    // follow-up `e`.
+                    self.enter_external_consent_choice();
+                    ViewAction::None
                 }
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
@@ -2441,7 +3874,7 @@ impl ModalView for ProviderPickerView {
                         && self.query.is_empty()
                         && self.row_visible(self.selected_idx) =>
                 {
-                    self.enter_key_entry();
+                    self.begin_setup();
                     ViewAction::None
                 }
                 // Toggle between the configured-only default view and the
@@ -2459,10 +3892,61 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
                         && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'l') =>
+                {
+                    self.show_local_routes();
+                    ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'i') =>
+                {
+                    self.enter_lm_studio_form();
+                    ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
                         && c.eq_ignore_ascii_case(&'c') =>
                 {
                     self.enter_custom_form();
                     ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'d') =>
+                {
+                    self.enter_ds4_form();
+                    ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'s') =>
+                {
+                    self.enter_sensenova_form();
+                    ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        && self.query.is_empty()
+                        && c.eq_ignore_ascii_case(&'p') =>
+                {
+                    self.enter_template_list();
+                    ViewAction::None
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && c.eq_ignore_ascii_case(&'t')
+                        && self.row_visible(self.selected_idx) =>
+                {
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerTestConnection {
+                        provider: self.selected_provider(),
+                        provider_id: self.selected_provider_id(),
+                        catalog_view: self.view == ProviderListView::Catalog,
+                    })
                 }
                 // Jump to the `/model` picker pre-filtered to this provider
                 // (#3083). Handled before the type-ahead arm so `m`/`M` opens
@@ -2499,9 +3983,49 @@ impl ModalView for ProviderPickerView {
                 }
                 _ => ViewAction::None,
             },
-            Stage::KeyEntry => match key.code {
+            Stage::XaiAuthChoice => match key.code {
                 KeyCode::Esc => {
                     self.stage = Stage::List;
+                    ViewAction::None
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.move_xai_auth_choice();
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.xai_auth_choice = XaiAuthChoice::ApiKey;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.xai_auth_choice = XaiAuthChoice::DeviceOAuth;
+                    ViewAction::None
+                }
+                KeyCode::Char(c) if key.modifiers.is_empty() && c.eq_ignore_ascii_case(&'e') => {
+                    self.enter_external_consent_choice();
+                    ViewAction::None
+                }
+                KeyCode::Enter => match self.xai_auth_choice {
+                    XaiAuthChoice::ApiKey => {
+                        self.enter_key_entry();
+                        ViewAction::None
+                    }
+                    XaiAuthChoice::DeviceOAuth => {
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
+                    }
+                },
+                _ => ViewAction::None,
+            },
+            Stage::KeyEntry => match key.code {
+                KeyCode::Esc => {
+                    // Back to the route choice when one was made, so Esc undoes
+                    // one wizard step instead of discarding the whole flow.
+                    self.stage = if self.selected_provider() == ApiProvider::Xai {
+                        Stage::XaiAuthChoice
+                    } else if self.pending_base_url.is_some() {
+                        Stage::StepfunBillingRoute
+                    } else {
+                        Stage::List
+                    };
                     self.api_key_input.clear();
                     self.key_entry_error = None;
                     self.pending_api_key = None;
@@ -2511,20 +4035,14 @@ impl ModalView for ProviderPickerView {
                     ViewAction::None
                 }
                 KeyCode::Backspace => {
-                    if !matches!(
-                        self.selected_provider(),
-                        ApiProvider::OpenaiCodex | ApiProvider::Xai
-                    ) {
+                    if !self.key_entry_is_oauth_locked() {
                         self.api_key_input.pop();
                         self.key_entry_error = None;
                     }
                     ViewAction::None
                 }
                 KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if !matches!(
-                        self.selected_provider(),
-                        ApiProvider::OpenaiCodex | ApiProvider::Xai
-                    ) {
+                    if !self.key_entry_is_oauth_locked() {
                         self.api_key_input.pop();
                         self.key_entry_error = None;
                     }
@@ -2532,12 +4050,8 @@ impl ModalView for ProviderPickerView {
                 }
                 KeyCode::Enter => {
                     if self.selected_provider() == ApiProvider::OpenaiCodex {
+                        self.enter_external_consent_choice();
                         return ViewAction::None;
-                    }
-                    if self.selected_provider() == ApiProvider::Xai {
-                        return ViewAction::EmitAndClose(
-                            ViewEvent::ProviderPickerXaiOAuthRequested,
-                        );
                     }
                     let key = self.api_key_input.trim().to_string();
                     if key.is_empty() {
@@ -2550,14 +4064,16 @@ impl ModalView for ProviderPickerView {
                             provider,
                             provider_id,
                             api_key: key,
+                            base_url: self.pending_base_url.clone(),
                         })
                     }
                 }
-                KeyCode::Char(c) => {
-                    if matches!(
-                        self.selected_provider(),
-                        ApiProvider::OpenaiCodex | ApiProvider::Xai
-                    ) {
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    if self.key_entry_is_oauth_locked() {
                         return ViewAction::None;
                     }
                     // Reject ASCII whitespace so a stray space/tab doesn't slip
@@ -2569,6 +4085,60 @@ impl ModalView for ProviderPickerView {
                     }
                     ViewAction::None
                 }
+                _ => ViewAction::None,
+            },
+            Stage::ExternalConsentChoice => match key.code {
+                KeyCode::Esc => {
+                    self.stage = if self.selected_provider() == ApiProvider::Xai {
+                        Stage::XaiAuthChoice
+                    } else {
+                        Stage::KeyEntry
+                    };
+                    ViewAction::None
+                }
+                KeyCode::Up => {
+                    self.move_external_consent_choice(-1);
+                    ViewAction::None
+                }
+                KeyCode::Down => {
+                    self.move_external_consent_choice(1);
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.external_consent_choice = ExternalConsentChoice::Disabled;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.external_consent_choice = ExternalConsentChoice::ReadOnly;
+                    ViewAction::None
+                }
+                KeyCode::Char('3') => {
+                    self.external_consent_choice = ExternalConsentChoice::ManagedUnavailable;
+                    ViewAction::None
+                }
+                KeyCode::Enter => match self.external_consent_choice {
+                    ExternalConsentChoice::Disabled => {
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                            provider: self.selected_provider(),
+                        })
+                    }
+                    ExternalConsentChoice::ReadOnly => {
+                        self.stage = Stage::ExternalConsentConfirm;
+                        ViewAction::None
+                    }
+                    ExternalConsentChoice::ManagedUnavailable => ViewAction::None,
+                },
+                _ => ViewAction::None,
+            },
+            Stage::ExternalConsentConfirm => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::ExternalConsentChoice;
+                    ViewAction::None
+                }
+                KeyCode::Enter => self
+                    .build_external_consent_event()
+                    .map(ViewAction::EmitAndClose)
+                    .unwrap_or(ViewAction::None),
                 _ => ViewAction::None,
             },
             Stage::ModelPick => match key.code {
@@ -2595,20 +4165,97 @@ impl ModalView for ProviderPickerView {
                         return ViewAction::None;
                     }
                     self.selected_model = self.model_options.get(self.model_selected_idx).cloned();
-                    self.enter_confirm();
+                    if self.selected_kimi_code_k3() {
+                        self.enter_plan_tier();
+                    } else {
+                        self.enter_confirm();
+                    }
+                    ViewAction::None
+                }
+                _ => ViewAction::None,
+            },
+            Stage::StepfunBillingRoute => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::List;
+                    self.pending_base_url = None;
+                    ViewAction::None
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.stepfun_billing_route = match self.stepfun_billing_route {
+                        StepfunBillingRoute::PayAsYouGo => StepfunBillingRoute::StepPlan,
+                        StepfunBillingRoute::StepPlan => StepfunBillingRoute::PayAsYouGo,
+                    };
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.stepfun_billing_route = StepfunBillingRoute::PayAsYouGo;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.stepfun_billing_route = StepfunBillingRoute::StepPlan;
+                    ViewAction::None
+                }
+                KeyCode::Enter => {
+                    self.apply_stepfun_billing_route();
+                    ViewAction::None
+                }
+                _ => ViewAction::None,
+            },
+            Stage::PlanTier => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::ModelPick;
+                    ViewAction::None
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.kimi_code_plan_tier = match self.kimi_code_plan_tier {
+                        KimiCodePlanTier::Safe262k => KimiCodePlanTier::OneMillion,
+                        KimiCodePlanTier::OneMillion => KimiCodePlanTier::Safe262k,
+                    };
+                    ViewAction::None
+                }
+                KeyCode::Char('1') => {
+                    self.kimi_code_plan_tier = KimiCodePlanTier::Safe262k;
+                    ViewAction::None
+                }
+                KeyCode::Char('2') => {
+                    self.kimi_code_plan_tier = KimiCodePlanTier::OneMillion;
+                    ViewAction::None
+                }
+                KeyCode::Enter => {
+                    self.apply_plan_tier();
                     ViewAction::None
                 }
                 _ => ViewAction::None,
             },
             Stage::Confirm => match key.code {
                 KeyCode::Esc => {
-                    self.stage = Stage::ModelPick;
+                    self.stage = if self.selected_kimi_code_k3() {
+                        Stage::PlanTier
+                    } else {
+                        Stage::ModelPick
+                    };
                     ViewAction::None
                 }
                 KeyCode::Enter => self
                     .build_setup_confirmed_event()
                     .map(ViewAction::EmitAndClose)
                     .unwrap_or(ViewAction::None),
+                _ => ViewAction::None,
+            },
+            Stage::TemplateList => match key.code {
+                KeyCode::Esc => {
+                    self.stage = Stage::List;
+                    ViewAction::None
+                }
+                KeyCode::Up => {
+                    self.move_template_selection(-1);
+                    ViewAction::None
+                }
+                KeyCode::Down => {
+                    self.move_template_selection(1);
+                    ViewAction::None
+                }
+                KeyCode::Enter => self.activate_selected_template(),
                 _ => ViewAction::None,
             },
             Stage::CustomForm => match key.code {
@@ -2665,7 +4312,30 @@ impl ModalView for ProviderPickerView {
                 MouseEventKind::ScrollDown => self.move_model_selection(1),
                 _ => {}
             },
-            Stage::KeyEntry | Stage::Confirm | Stage::CustomForm => {}
+            Stage::TemplateList => {
+                return match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.move_template_selection(-1);
+                        ViewAction::None
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.move_template_selection(1);
+                        ViewAction::None
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.handle_template_list_click(mouse)
+                    }
+                    _ => ViewAction::None,
+                };
+            }
+            Stage::PlanTier
+            | Stage::StepfunBillingRoute
+            | Stage::XaiAuthChoice
+            | Stage::KeyEntry
+            | Stage::ExternalConsentChoice
+            | Stage::ExternalConsentConfirm
+            | Stage::Confirm
+            | Stage::CustomForm => {}
         }
         ViewAction::None
     }
@@ -2673,10 +4343,19 @@ impl ModalView for ProviderPickerView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
-            Stage::KeyEntry => 10,
+            Stage::XaiAuthChoice => 12,
+            // Key/OAuth help is intentionally multi-line and wraps at narrow
+            // widths. One shared height keeps every provider's final guidance
+            // visible instead of special-casing whichever route clipped last.
+            Stage::KeyEntry => 14,
+            Stage::ExternalConsentChoice => 12,
+            Stage::ExternalConsentConfirm => 13,
             Stage::ModelPick => 12,
+            Stage::PlanTier => 10,
+            Stage::StepfunBillingRoute => 11,
             Stage::Confirm => 10,
             Stage::CustomForm => 12,
+            Stage::TemplateList => 16,
         };
         let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
 
@@ -2684,10 +4363,16 @@ impl ModalView for ProviderPickerView {
 
         match self.stage {
             Stage::List => self.render_list(popup_area, buf),
+            Stage::XaiAuthChoice => self.render_xai_auth_choice(popup_area, buf),
             Stage::KeyEntry => self.render_key_entry(popup_area, buf),
+            Stage::ExternalConsentChoice => self.render_external_consent_choice(popup_area, buf),
+            Stage::ExternalConsentConfirm => self.render_external_consent_confirm(popup_area, buf),
             Stage::ModelPick => self.render_model_pick(popup_area, buf),
+            Stage::PlanTier => self.render_plan_tier(popup_area, buf),
+            Stage::StepfunBillingRoute => self.render_stepfun_billing_route(popup_area, buf),
             Stage::Confirm => self.render_confirm(popup_area, buf),
             Stage::CustomForm => self.render_custom_form(popup_area, buf),
+            Stage::TemplateList => self.render_template_list(popup_area, buf),
         }
     }
 }
@@ -2727,57 +4412,23 @@ fn custom_provider_dashboard_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::has_api_key_for;
+    use crate::test_support::EnvVarGuard;
     use crossterm::event::{KeyEvent, KeyModifiers};
-    use std::env;
-    use std::ffi::OsString;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn remove(key: &'static str) -> Self {
-            let previous = env::var_os(key);
-            // SAFETY: provider-picker tests that mutate environment variables
-            // hold ENV_LOCK for the whole guard lifetime, so no sibling test in
-            // this module can concurrently mutate/read this provider key.
-            unsafe {
-                env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = env::var_os(key);
-            // SAFETY: provider-picker tests that mutate environment variables
-            // hold ENV_LOCK for the whole guard lifetime, so no sibling test in
-            // this module can concurrently mutate/read this provider key.
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: EnvVarGuard is used while ENV_LOCK is held; declaration
-            // order in the test drops the guard before releasing the lock.
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => env::set_var(self.key, value),
-                    None => env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    // Environment-mutating tests in this module hold the process-wide
+    // `lock_test_env()` (via `crate::test_support`), the same barrier every
+    // other module's env tests use. A module-private mutex cannot serialize
+    // against the rest of the suite, so sibling tests raced on shared
+    // provider env vars (EXAMPLE_API_KEY, OPENROUTER_API_KEY, ...) and a panic
+    // while holding it cascaded PoisonError failures into unrelated tests.
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn move_to_provider(picker: &mut ProviderPickerView, provider: ApiProvider) {
@@ -2807,6 +4458,14 @@ mod tests {
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn failed_live_catalog_refresh_names_the_working_fallback() {
+        assert_eq!(
+            catalog_freshness_title_suffix_for(ModelsDevFreshness::Failed),
+            " · refresh failed; catalog available"
+        );
     }
 
     #[test]
@@ -2902,10 +4561,20 @@ mod tests {
             .map(|row| row.display_name.as_str())
             .collect();
 
-        // Every built-in provider is present, none dropped (#3076 reorders, it
-        // does not filter).
-        assert_eq!(names.len(), ApiProvider::all().len());
+        // Catalog surface: one identity per vendor (not dual-wire / plan kinds).
+        assert_eq!(names.len(), ApiProvider::catalog().len());
         assert!(names.contains(&"DeepSeek"));
+        assert!(names.contains(&"Alibaba Cloud Model Studio"));
+        // Dialect is wire config — no second MiniMax / Model Studio rows.
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.contains("Alibaba Cloud Model Studio"))
+                .count(),
+            1
+        );
+        assert_eq!(names.iter().filter(|name| **name == "MiniMax").count(), 1);
+        assert_eq!(names.iter().filter(|name| **name == "DeepSeek").count(), 1);
 
         // Providers are presented in neutral case-insensitive alphabetical
         // order by display name (#3076), not `ApiProvider::all()` order.
@@ -3117,7 +4786,7 @@ mod tests {
     fn key_entry_hint_uses_metadata_env_vars() {
         assert_eq!(
             ProviderPickerView::env_var_for(ApiProvider::NvidiaNim),
-            "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY / DEEPSEEK_API_KEY"
+            "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY"
         );
     }
 
@@ -3130,8 +4799,167 @@ mod tests {
 
         let rendered = render_text(&picker, 120, 20);
 
-        assert!(rendered.contains("NVIDIA_API_KEY / NVIDIA_NIM_API_KEY / DEEPSEEK_API_KEY"));
+        assert!(rendered.contains("NVIDIA_API_KEY / NVIDIA_NIM_API_KEY"));
         assert!(rendered.contains("https://build.nvidia.com/settings/api-keys"));
+    }
+
+    #[test]
+    fn zai_key_entry_wraps_long_environment_guidance_without_hiding_credentials_url() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Zai);
+        picker.handle_key(key(KeyCode::Enter));
+
+        // Reproduce the width from the dogfood screenshot: the old renderer
+        // allocated one row per logical line, so the long env-var sentence
+        // clipped and displaced the credentials URL.
+        let rendered = render_text(&picker, 100, 20);
+
+        for name in [
+            "ZAI_API_KEY",
+            "Z_AI_API_KEY",
+            "ZHIPU_API_KEY",
+            "GLM_API_KEY",
+        ] {
+            assert!(rendered.contains(name), "missing {name}:\n{rendered}");
+        }
+        assert!(rendered.contains("re-open /provider."), "{rendered}");
+        assert!(
+            rendered.contains("Credentials: https://z.ai/model-api"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn kimi_key_entry_uses_the_direct_api_key_console_without_oauth_copy() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Moonshot);
+        picker.handle_key(key(KeyCode::Enter));
+
+        let rendered = render_text(&picker, 120, 20);
+
+        assert!(rendered.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(rendered.contains("paste key here"));
+        assert!(!rendered.contains("OAuth"));
+        assert!(!rendered.contains("device login"));
+    }
+
+    #[test]
+    fn kimi_code_plan_key_entry_uses_membership_route_guidance() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut picker = ProviderPickerView::new(ApiProvider::Moonshot, &config);
+        assert_eq!(picker.selected_provider(), ApiProvider::Moonshot);
+        picker.handle_key(key(KeyCode::Enter));
+
+        let rendered = render_text(&picker, 120, 24);
+
+        assert!(rendered.contains("https://www.kimi.com/code/console"));
+        assert!(rendered.contains("api.kimi.com/coding/v1"));
+        assert!(rendered.contains("does not import Kimi CLI credentials"));
+        assert!(!rendered.contains("https://platform.kimi.ai/console/api-keys"));
+        assert!(!rendered.contains("OAuth"));
+    }
+
+    #[test]
+    fn recovery_picker_keeps_active_route_and_esc_makes_no_change() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut picker = ProviderPickerView::new(ApiProvider::Moonshot, &config);
+
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.selected_provider(), ApiProvider::Moonshot);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Esc)),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerDismissed { .. })
+        ));
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(
+            config
+                .provider_config_for(ApiProvider::Moonshot)
+                .and_then(|entry| entry.base_url.as_deref()),
+            Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL)
+        );
+    }
+
+    #[test]
+    fn recovery_model_pick_restores_exact_kimi_code_k3_without_catalog_leakage() {
+        let mut config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let picker = ProviderPickerView::new_for_model_pick_after_validation(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &config,
+            None,
+            "validated-key".to_string(),
+            None,
+        )
+        .expect("Kimi route row");
+
+        assert_eq!(picker.selected_model.as_deref(), Some("k3"));
+        assert_eq!(
+            picker
+                .model_options
+                .iter()
+                .filter(|model| model.eq_ignore_ascii_case("k3"))
+                .count(),
+            1,
+            "the current wire model must be appended once, case-insensitively"
+        );
+
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .moonshot
+            .base_url = Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string());
+        let generic = ProviderPickerView::new_for_model_pick_after_validation(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &config,
+            None,
+            "validated-key".to_string(),
+            None,
+        )
+        .expect("generic Moonshot row");
+        assert!(
+            !generic
+                .model_options
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case("k3")),
+            "bare K3 stays route-local and must not be added to generic Moonshot"
+        );
     }
 
     #[test]
@@ -3179,6 +5007,7 @@ mod tests {
             codex_text.contains("OPENAI_CODEX_ACCESS_TOKEN"),
             "{codex_text}"
         );
+        assert!(codex_text.contains("external-consent"), "{codex_text}");
         assert!(!codex_text.contains("Credentials:"), "{codex_text}");
         assert!(!codex_text.contains("(paste key here)"), "{codex_text}");
 
@@ -3245,6 +5074,63 @@ mod tests {
         assert_eq!(row.usage_meter, "cost: local");
         assert!(row.base_url.contains("localhost:11434"));
         assert!(row.is_active);
+    }
+
+    #[test]
+    fn ollama_cloud_row_requires_credentials_and_is_not_labeled_local() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _ollama_cloud_key = EnvVarGuard::remove("OLLAMA_CLOUD_API_KEY");
+        let _ollama_key = EnvVarGuard::remove("OLLAMA_API_KEY");
+        let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+        let mut config = Config {
+            provider: Some("ollama".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                ollama: crate::config::ProviderConfig {
+                    base_url: Some(codewhale_config::provider::OLLAMA_CLOUD_BASE_URL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(config.api_provider(), ApiProvider::OllamaCloud);
+        let missing = ProviderDashboardRow::from_config(
+            ApiProvider::OllamaCloud,
+            ApiProvider::OllamaCloud,
+            &config,
+        );
+        assert_eq!(missing.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(missing.readiness, ResolvedProviderReadiness::MissingKey);
+        assert_eq!(missing.usage_meter, "cost: unknown");
+        assert!(!missing.compact_hint().contains("(self-hosted)"));
+        assert!(
+            missing
+                .messages
+                .iter()
+                .any(|message| message.contains("OLLAMA_API_KEY")),
+            "missing Cloud key guidance: {:?}",
+            missing.messages
+        );
+
+        config.providers.as_mut().expect("providers").ollama.api_key =
+            Some("ollama-cloud-key".to_string());
+        let configured = ProviderDashboardRow::from_config(
+            ApiProvider::OllamaCloud,
+            ApiProvider::OllamaCloud,
+            &config,
+        );
+        assert_eq!(configured.auth_status, ProviderAuthStatus::Configured);
+        assert_eq!(
+            configured.readiness,
+            ResolvedProviderReadiness::SavedUnchecked
+        );
+        assert!(!configured.compact_hint().contains("(self-hosted)"));
     }
 
     #[test]
@@ -3418,6 +5304,109 @@ mod tests {
         assert_eq!(row.reasoning.selected_control.as_deref(), Some("max"));
         assert!(row.compact_hint().contains("reasoning:high/max"));
         assert!(row.compact_hint().contains("stream:structured"));
+    }
+
+    #[test]
+    fn provider_dashboard_row_surfaces_modelstudio_structured_thinking() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                modelstudio_token_plan: crate::config::ProviderConfig {
+                    api_key: Some("modelstudio-key".to_string()),
+                    model: Some("qwen3.8-max".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::ModelstudioTokenPlan,
+            ApiProvider::ModelstudioTokenPlan,
+            &config,
+        );
+
+        assert_eq!(row.reasoning.support, ProviderReasoningSupport::Supported);
+        assert_eq!(
+            row.reasoning.stream_visibility,
+            ProviderReasoningStreamVisibility::StructuredThinking
+        );
+        assert!(row.compact_hint().contains("stream:structured"));
+    }
+
+    #[test]
+    fn provider_dashboard_row_surfaces_kimi_code_k3_reasoning_only_on_exact_route() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    api_key: Some("kimi-code-key".to_string()),
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &config,
+        );
+
+        assert_eq!(
+            row.default_route.wire_model,
+            crate::config::KIMI_CODE_K3_MODEL
+        );
+        assert_eq!(row.reasoning.support, ProviderReasoningSupport::Supported);
+        assert_eq!(
+            row.reasoning.stream_visibility,
+            ProviderReasoningStreamVisibility::StructuredThinking
+        );
+        assert_eq!(
+            row.reasoning.controls,
+            vec!["low".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert_eq!(
+            row.capabilities.context_window,
+            Some(262_144),
+            "the picker must show the route-effective K3 baseline, not the generic fallback"
+        );
+        assert_eq!(
+            row.capabilities.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor"),
+            "the picker must name the provenance instead of presenting a bare limit as provider fact"
+        );
+        assert!(
+            row.compact_hint()
+                .contains("ctx:262K(static Kimi Code safe floor)"),
+            "the compact picker receipt must retain context provenance"
+        );
+
+        let mut direct = config.clone();
+        direct
+            .providers
+            .as_mut()
+            .expect("providers")
+            .moonshot
+            .base_url = Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string());
+        let direct_row = ProviderDashboardRow::from_config(
+            ApiProvider::Moonshot,
+            ApiProvider::Moonshot,
+            &direct,
+        );
+        assert_ne!(
+            direct_row.reasoning.support,
+            ProviderReasoningSupport::Supported,
+            "generic Moonshot k3 must not inherit Kimi Code's route-owned capability"
+        );
+        // The generic model-facts table now carries the same conservative
+        // number for bare `k3`, so the route-ownership distinction lives in
+        // provenance: the direct Moonshot row must never claim the Kimi Code
+        // route-owned floor as its source.
+        assert_ne!(
+            direct_row.capabilities.context_window_source.as_deref(),
+            Some("static Kimi Code safe floor")
+        );
     }
 
     #[test]
@@ -3649,6 +5638,34 @@ mod tests {
     }
 
     #[test]
+    fn protected_self_hosted_row_requires_its_configured_auth_mode() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _vllm_key = crate::test_support::EnvVarGuard::remove("VLLM_API_KEY");
+        let _vllm_base_url = crate::test_support::EnvVarGuard::remove("VLLM_BASE_URL");
+        let config = Config {
+            provider: Some("vllm".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                vllm: crate::config::ProviderConfig {
+                    auth_mode: Some("api_key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let row = ProviderDashboardRow::from_config(ApiProvider::Vllm, ApiProvider::Vllm, &config);
+
+        assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
+        assert!(row.compact_hint().contains("(self-hosted)"));
+    }
+
+    #[test]
     fn self_hosted_reasoning_visibility_covers_vllm() {
         assert_eq!(
             default_reasoning_stream_visibility(ApiProvider::Sglang),
@@ -3696,8 +5713,113 @@ mod tests {
     }
 
     #[test]
+    fn custom_endpoint_cannot_claim_official_xai_oauth_readiness() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated oauth home");
+        let _xai_key = EnvVarGuard::remove("XAI_API_KEY");
+        let missing_grok_auth = temp.path().join("missing.json");
+        let _grok_auth = EnvVarGuard::set(
+            "GROK_AUTH_PATH",
+            missing_grok_auth.to_str().expect("utf8 test path"),
+        );
+        let config = Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    base_url: Some("https://gateway.example.test/v1".to_string()),
+                    model: Some("private-grok".to_string()),
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let row = ProviderDashboardRow::from_config(ApiProvider::Xai, ApiProvider::Xai, &config);
+
+        assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
+        assert!(!row.compact_hint().contains("oauth"));
+    }
+
+    #[test]
+    fn explicit_no_auth_custom_row_is_distinct_and_usable() {
+        let custom = std::collections::HashMap::from([(
+            "no-auth-gateway".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("https://gateway.example.test/v1".to_string()),
+                model: Some("private-model".to_string()),
+                auth_mode: Some("no-auth".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let config = Config {
+            provider: Some("no-auth-gateway".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let picker = ProviderPickerView::new(ApiProvider::Custom, &config);
+        let row = picker
+            .rows
+            .iter()
+            .find(|row| row.provider_id == "no-auth-gateway")
+            .expect("configured no-auth row");
+
+        assert_eq!(row.auth_status, ProviderAuthStatus::NoAuth);
+        assert_eq!(row.credential_state, CredentialState::NoAuth);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::NoAuthUnchecked);
+        assert!(picker.selected_has_key());
+        assert!(row.compact_hint().contains("auth:none"));
+    }
+
+    #[test]
+    fn unresolved_custom_auth_metadata_does_not_mark_picker_row_configured() {
+        let custom = std::collections::HashMap::from([(
+            "metadata-only".to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("https://gateway.example.test/v1".to_string()),
+                model: Some("private-model".to_string()),
+                auth: Some(codewhale_config::ProviderAuthSourceToml {
+                    source: codewhale_config::AuthSourceKind::Command,
+                    command: vec!["secret-tool".to_string(), "lookup".to_string()],
+                    timeout_ms: Some(2_000),
+                    secret_id: None,
+                }),
+                ..Default::default()
+            },
+        )]);
+        let config = Config {
+            provider: Some("metadata-only".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let picker = ProviderPickerView::new(ApiProvider::Custom, &config);
+        let row = picker
+            .rows
+            .iter()
+            .find(|row| row.provider_id == "metadata-only")
+            .expect("metadata-only row remains visible for repair");
+
+        assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
+    }
+
+    #[test]
     fn provider_picker_lists_configured_custom_provider_readiness() {
-        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _lock = crate::test_support::lock_test_env();
         let _example_key = EnvVarGuard::remove("EXAMPLE_API_KEY");
         let mut custom = std::collections::HashMap::new();
         custom.insert(
@@ -3706,6 +5828,7 @@ mod tests {
                 kind: Some("openai-compatible".to_string()),
                 base_url: Some("https://api.example.com/v1".to_string()),
                 model: Some("vendor/custom-model-v1".to_string()),
+                api_key: Some(crate::config::API_KEYRING_SENTINEL.to_string()),
                 api_key_env: Some("EXAMPLE_API_KEY".to_string()),
                 ..Default::default()
             },
@@ -3748,8 +5871,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_picker_marks_only_exact_active_custom_row() {
+        let custom = std::collections::HashMap::from([
+            (
+                "custom-a".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+                    model: Some("model-a".to_string()),
+                    api_key: Some("test-key-a".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom-b".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("http://127.0.0.1:18182/v1".to_string()),
+                    model: Some("model-b".to_string()),
+                    api_key: Some("test-key-b".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let config = Config {
+            provider: Some("custom-a".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        let rows = custom_provider_dashboard_rows(ApiProvider::Custom, &config, None);
+        let active_ids: Vec<_> = rows
+            .iter()
+            .filter(|row| row.is_active)
+            .map(|row| row.provider_id.as_str())
+            .collect();
+
+        assert_eq!(active_ids, vec!["custom-a"]);
+    }
+
+    #[test]
     fn provider_picker_marks_custom_provider_ready_when_env_auth_is_set() {
-        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _lock = crate::test_support::lock_test_env();
         let _example_key = EnvVarGuard::set("EXAMPLE_API_KEY", "sk-test");
         let mut custom = std::collections::HashMap::new();
         custom.insert(
@@ -3830,6 +5996,399 @@ mod tests {
                 assert_eq!(api_key_env.as_deref(), Some("ACME_API_KEY"));
             }
             other => panic!("expected custom provider submit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensenova_preset_fills_published_openai_host() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('s'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::CustomForm);
+        assert_eq!(picker.custom_provider_id, "sensenova");
+        assert_eq!(
+            picker.custom_provider_base_url,
+            codewhale_config::SENSENOVA_BASE_URL
+        );
+        assert_eq!(
+            picker.custom_provider_model,
+            codewhale_config::SENSENOVA_DEFAULT_MODEL
+        );
+        assert_eq!(
+            picker.custom_provider_api_key_env,
+            codewhale_config::SENSENOVA_API_KEY_ENV
+        );
+        let rendered = render_text(&picker, 100, 20);
+        assert!(rendered.contains("SenseNova"), "{rendered}");
+        assert!(
+            !rendered.contains("Custom provider"),
+            "built-in template must not look like a blank custom form: {rendered}"
+        );
+    }
+
+    #[test]
+    fn p_opens_template_list_with_catalog_rows() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('p'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::TemplateList);
+        let rendered = render_text(&picker, 100, 24);
+        assert!(rendered.contains("OpenCode Zen"), "{rendered}");
+        assert!(rendered.contains("OpenCode Go"), "{rendered}");
+        assert!(rendered.contains("SenseNova"), "{rendered}");
+        assert!(rendered.contains("Agnes"), "{rendered}");
+        assert!(
+            rendered.contains("no published") || rendered.contains("unpublished"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("https://opencode.ai/docs/zen/"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("minimax-m2.7"),
+            "template detail must not dump the Zen roster: {rendered}"
+        );
+    }
+
+    #[test]
+    fn template_list_enter_on_unpublished_agnes_does_not_invent_a_url() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_template_setup(
+            ApiProvider::Deepseek,
+            "agnes",
+            &config,
+            None,
+        )
+        .expect("agnes template");
+        assert_eq!(picker.stage, Stage::TemplateList);
+        let action = picker.handle_key(key(KeyCode::Enter));
+        match action {
+            ViewAction::Emit(ViewEvent::StatusMessage { message }) => {
+                assert!(
+                    message.to_ascii_lowercase().contains("no published"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected unpublished status, got {other:?}"),
+        }
+        assert!(picker.custom_provider_base_url.is_empty());
+    }
+
+    fn template_list_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn template_list_mouse_selects_row_and_second_click_activates() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('p'))),
+            ViewAction::None
+        ));
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let (rect, idx) = picker
+            .template_row_hitboxes
+            .borrow()
+            .iter()
+            .copied()
+            .find(|(_, row_idx)| *row_idx == 2)
+            .expect("SenseNova row hitbox");
+        assert_eq!(
+            provider_setup_templates()[idx].id,
+            codewhale_config::SENSENOVA_TEMPLATE_ID
+        );
+        let click = template_list_click(rect.x, rect.y);
+        assert!(matches!(picker.handle_mouse(click), ViewAction::None));
+        assert_eq!(picker.template_selected_idx, idx);
+        assert_eq!(picker.stage, Stage::TemplateList);
+        picker.handle_mouse(click);
+        assert_eq!(picker.stage, Stage::CustomForm);
+        assert_eq!(picker.custom_provider_id, "sensenova");
+        assert_eq!(
+            picker.custom_provider_base_url,
+            codewhale_config::SENSENOVA_BASE_URL
+        );
+    }
+
+    #[test]
+    fn template_list_mouse_second_click_on_unpublished_does_not_invent_a_url() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('p'))),
+            ViewAction::None
+        ));
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let (rect, idx) = picker
+            .template_row_hitboxes
+            .borrow()
+            .iter()
+            .copied()
+            .find(|(_, row_idx)| provider_setup_templates()[*row_idx].is_unpublished())
+            .expect("Agnes row hitbox");
+        let click = template_list_click(rect.x, rect.y);
+        assert!(matches!(picker.handle_mouse(click), ViewAction::None));
+        assert_eq!(picker.template_selected_idx, idx);
+        match picker.handle_mouse(click) {
+            ViewAction::Emit(ViewEvent::StatusMessage { message }) => {
+                assert!(
+                    message.to_ascii_lowercase().contains("no published"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected unpublished status, got {other:?}"),
+        }
+        assert!(picker.custom_provider_base_url.is_empty());
+        assert_eq!(picker.stage, Stage::TemplateList);
+    }
+
+    #[test]
+    fn template_list_compact_40x12_keeps_selection_without_clipping() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('p'))),
+            ViewAction::None
+        ));
+
+        for selected in [0usize, provider_setup_templates().len().saturating_sub(1)] {
+            picker.template_selected_idx = selected;
+            let area = Rect::new(0, 0, 40, 12);
+            let mut buf = Buffer::empty(area);
+            picker.render(area, &mut buf);
+            let rendered = render_text(&picker, 40, 12);
+            let selected_template = &provider_setup_templates()[selected];
+            assert!(
+                rendered.contains(selected_template.display_name),
+                "40x12 must keep selected {} visible:\n{rendered}",
+                selected_template.display_name
+            );
+            assert!(
+                rendered.contains(crate::tui::glyphs::SELECTION),
+                "40x12 must show the selection marker:\n{rendered}"
+            );
+            for (idx, line) in rendered.lines().enumerate() {
+                assert!(
+                    crate::tui::ui_text::text_display_width(line) <= 40,
+                    "40x12 line {idx} clips: {line:?}\n{rendered}"
+                );
+            }
+            let hitboxes = picker.template_row_hitboxes.borrow().clone();
+            assert!(
+                !hitboxes.is_empty(),
+                "40x12 must register template hitboxes:\n{rendered}"
+            );
+            assert!(
+                hitboxes.iter().any(|(_, idx)| *idx == selected),
+                "40x12 hitboxes must include selected {selected}: {hitboxes:?}\n{rendered}"
+            );
+            for (rect, idx) in &hitboxes {
+                assert!(
+                    rect.y < 12 && rect.x < 40,
+                    "hitbox for {idx} is outside 40x12: {rect:?}"
+                );
+                let row = (0..40)
+                    .map(|x| buf[(x, rect.y)].symbol())
+                    .collect::<String>();
+                assert!(
+                    row.contains(provider_setup_templates()[*idx].display_name)
+                        || row.contains(provider_setup_templates()[*idx].id),
+                    "40x12 hitbox y={} should map to {}: {row:?}",
+                    rect.y,
+                    provider_setup_templates()[*idx].display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_list_uses_locale_for_kinds_labels_and_guidance() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config)
+            .with_locale(crate::localization::Locale::ZhHans);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('p'))),
+            ViewAction::None
+        ));
+        let rendered = render_text(&picker, 100, 24);
+        // TestBackend stores the continuation cell of each wide CJK glyph
+        // as a space. Collapse whitespace for language-copy assertions
+        // while retaining the original cell dump for English-leak checks.
+        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(rendered.contains("OpenCode Zen"), "{rendered}");
+        assert!(rendered.contains("SenseNova"), "{rendered}");
+        assert!(rendered.contains("Agnes"), "{rendered}");
+        assert!(compact.contains("仅密钥"), "{rendered}");
+        assert!(compact.contains("兼容"), "{rendered}");
+        assert!(
+            compact.contains("基础URL"),
+            "localized Base URL label missing: {rendered}"
+        );
+        assert!(
+            compact.contains("模型：") || compact.contains("模型:"),
+            "localized Model label missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("key-only"),
+            "English kind leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Base URL:"),
+            "English Base URL leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Create or copy an OpenCode Zen API key"),
+            "English guidance leaked: {rendered}"
+        );
+        picker.template_selected_idx = provider_setup_templates()
+            .iter()
+            .position(|template| template.is_unpublished())
+            .expect("agnes");
+        let unpublished = render_text(&picker, 100, 24);
+        let unpublished_compact: String = unpublished
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            unpublished_compact.contains("未公布") || unpublished_compact.contains("没有"),
+            "{unpublished}"
+        );
+        assert!(
+            !unpublished.contains("unpublished"),
+            "English unpublished kind leaked: {unpublished}"
+        );
+    }
+
+    #[test]
+    fn t_emits_test_connection_for_the_selected_row() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let expected_catalog = picker.view == ProviderListView::Catalog;
+        let action = picker.handle_key(ctrl(KeyCode::Char('t')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerTestConnection {
+                provider,
+                provider_id,
+                catalog_view,
+            }) => {
+                assert_eq!(provider, picker.selected_provider());
+                assert_eq!(provider_id, picker.selected_provider_id());
+                assert_eq!(catalog_view, expected_catalog);
+            }
+            other => panic!("expected test-connection event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t_on_configured_view_does_not_force_the_full_catalog() {
+        let _lock = crate::test_support::lock_test_env();
+        let _key = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "sk-test");
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert_eq!(picker.view, ProviderListView::Configured);
+        match picker.handle_key(ctrl(KeyCode::Char('t'))) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerTestConnection {
+                catalog_view,
+                ..
+            }) => {
+                assert!(!catalog_view);
+            }
+            other => panic!("expected test-connection event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_t_stays_type_ahead_and_does_not_probe() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.toggle_view();
+        let action = picker.handle_key(key(KeyCode::Char('t')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(picker.query, "t");
+        assert_eq!(picker.stage, Stage::List);
+    }
+
+    #[test]
+    fn lm_studio_preset_is_loopback_keyless_and_requests_the_loaded_model() {
+        let config = Config::default();
+        let mut picker =
+            ProviderPickerView::new_for_setup(ApiProvider::Deepseek, None, &config, None);
+
+        let rendered = render_text(&picker, 100, 28);
+        assert!(rendered.contains("I LM Studio"), "{rendered}");
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('i'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::CustomForm);
+        assert_eq!(picker.custom_provider_field, CustomProviderField::Model);
+        assert_eq!(picker.custom_provider_id, "lm_studio");
+        assert_eq!(picker.custom_provider_base_url, "http://127.0.0.1:1234/v1");
+        assert!(picker.custom_provider_model.is_empty());
+        assert!(picker.custom_provider_api_key_env.is_empty());
+
+        for ch in "local-code-model".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        picker.handle_key(key(KeyCode::Enter));
+        let action = picker.handle_key(key(KeyCode::Enter));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerCustomProviderSubmitted {
+                provider_id,
+                base_url,
+                model,
+                api_key_env,
+            }) => {
+                assert_eq!(provider_id, "lm_studio");
+                assert_eq!(base_url, "http://127.0.0.1:1234/v1");
+                assert_eq!(model.as_deref(), Some("local-code-model"));
+                assert_eq!(api_key_env, None);
+            }
+            other => panic!("expected LM Studio custom-provider submit event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ds4_preset_is_keyless_and_ready_to_save() {
+        let mut picker =
+            ProviderPickerView::new_for_ds4_setup(ApiProvider::Deepseek, &Config::default(), None);
+
+        assert_eq!(picker.stage, Stage::CustomForm);
+        assert_eq!(picker.custom_provider_id, "ds4");
+        assert_eq!(picker.custom_provider_base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(picker.custom_provider_model, "deepseek-v4-flash");
+        assert!(picker.custom_provider_api_key_env.is_empty());
+
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerCustomProviderSubmitted {
+                provider_id,
+                base_url,
+                model,
+                api_key_env,
+            }) => {
+                assert_eq!(provider_id, "ds4");
+                assert_eq!(base_url, "http://127.0.0.1:8000/v1");
+                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(api_key_env, None);
+            }
+            other => panic!("expected DS4 custom-provider submit event, got {other:?}"),
         }
     }
 
@@ -3922,7 +6481,7 @@ mod tests {
 
     #[test]
     fn provider_dashboard_row_surfaces_openmodel_messages_route() {
-        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _lock = crate::test_support::lock_test_env();
         let _openmodel_key = EnvVarGuard::remove("OPENMODEL_API_KEY");
         let config = Config::default();
         let row = ProviderDashboardRow::from_config(
@@ -3948,7 +6507,7 @@ mod tests {
 
     #[test]
     fn provider_dashboard_row_marks_missing_api_key_as_needs_key() {
-        let _lock = ENV_LOCK.lock().expect("env lock poisoned");
+        let _lock = crate::test_support::lock_test_env();
         let _openrouter_key = EnvVarGuard::remove("OPENROUTER_API_KEY");
         let config = Config::default();
         let row = ProviderDashboardRow::from_config(
@@ -3969,6 +6528,117 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("missing OPENROUTER_API_KEY"))
         );
+    }
+
+    /// The visible payoff of the sourced resolver. Before this change the row
+    /// said "missing OPENROUTER_API_KEY" and nothing else, so a user could not
+    /// tell whether the durable slot had been read and found empty, skipped, or
+    /// never consulted. The note must now name the places that were probed and
+    /// the command that fixes the first of them.
+    #[test]
+    fn missing_key_note_names_the_places_that_were_checked() {
+        let _lock = crate::test_support::lock_test_env();
+        let _openrouter_key = EnvVarGuard::remove("OPENROUTER_API_KEY");
+        let config = Config::default();
+        let row = ProviderDashboardRow::from_config(
+            ApiProvider::Openrouter,
+            ApiProvider::Deepseek,
+            &config,
+        );
+
+        let note = row
+            .messages
+            .iter()
+            .find(|message| message.contains("missing OPENROUTER_API_KEY"))
+            .expect("missing-key note");
+        assert!(
+            note.contains("checked "),
+            "the note must say where it looked: {note}"
+        );
+        assert!(
+            note.contains("secret store \"openrouter\""),
+            "the durable slot must be named: {note}"
+        );
+        assert!(
+            note.contains("fix: "),
+            "the note must offer an action: {note}"
+        );
+        assert!(
+            !note.contains("sk-"),
+            "a credential note must never carry key material: {note}"
+        );
+    }
+
+    /// Every row states which place its credential came from, so a
+    /// "key:configured" row can be reconciled with a request that used a
+    /// different source.
+    #[test]
+    fn every_row_states_its_credential_source() {
+        let _lock = crate::test_support::lock_test_env();
+        let _openrouter_key = EnvVarGuard::remove("OPENROUTER_API_KEY");
+        let config = Config::default();
+        let missing = ProviderDashboardRow::from_config(
+            ApiProvider::Openrouter,
+            ApiProvider::Deepseek,
+            &config,
+        );
+        assert_eq!(missing.credential_source, "not found");
+
+        let _key = EnvVarGuard::set("OPENROUTER_API_KEY", "test-value");
+        let configured = ProviderDashboardRow::from_config(
+            ApiProvider::Openrouter,
+            ApiProvider::Deepseek,
+            &config,
+        );
+        assert_eq!(configured.credential_source, "OPENROUTER_API_KEY");
+        assert!(
+            !configured.credential_source.contains("test-value"),
+            "the source is a label, never the value"
+        );
+    }
+
+    #[test]
+    fn modelstudio_family_key_marks_all_variants_configured() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _ms_key = crate::test_support::EnvVarGuard::remove("MODELSTUDIO_API_KEY");
+        let _dashscope_key = crate::test_support::EnvVarGuard::remove("DASHSCOPE_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+        // One saved key on the Token Plan variant, marked by the save path.
+        codewhale_secrets::Secrets::auto_detect()
+            .set("modelstudio-token-plan", "ms-family-key")
+            .expect("seed family slot");
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                modelstudio_token_plan: crate::config::ProviderConfig {
+                    auth_mode: Some("api_key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        for variant in [
+            ApiProvider::ModelstudioTokenPlan,
+            ApiProvider::ModelstudioTokenPlanAnthropic,
+            ApiProvider::ModelstudioCodingPlan,
+            ApiProvider::ModelstudioCodingPlanAnthropic,
+        ] {
+            let row = ProviderDashboardRow::from_config(variant, ApiProvider::Deepseek, &config);
+            assert_eq!(
+                row.auth_status,
+                ProviderAuthStatus::Configured,
+                "{variant:?} must resolve the family's one saved key"
+            );
+        }
     }
 
     #[test]
@@ -4173,6 +6843,23 @@ mod tests {
         assert_eq!(picker.stage, Stage::List);
         assert_eq!(picker.view, ProviderListView::Catalog);
         assert_eq!(picker.visible_row_count(), picker.rows.len());
+        let mut listed = picker
+            .rows
+            .iter()
+            .map(|row| row.provider)
+            .collect::<Vec<_>>();
+        // With no configured custom providers, the catalog keeps the Custom
+        // entry so a custom endpoint can still be created from setup. The
+        // canonical universe is the user-facing catalog (one identity per
+        // vendor): dual-wire dialects are `wire` config and plan variants are
+        // `mode`/base_url, not picker rows.
+        let mut expected = ApiProvider::catalog().to_vec();
+        listed.sort_by_key(|provider| provider.as_str());
+        expected.sort_by_key(|provider| provider.as_str());
+        assert_eq!(
+            listed, expected,
+            "setup must use the canonical provider universe"
+        );
     }
 
     #[test]
@@ -4191,6 +6878,324 @@ mod tests {
         assert_eq!(picker.stage, Stage::KeyEntry);
         assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
         assert!(picker.api_key_input.is_empty());
+    }
+
+    /// #4763: onboarding focuses the persisted route but must still open on
+    /// the navigable list. Jumping straight into key/OAuth entry hid the
+    /// provider catalog from returning users with a missing key.
+    #[test]
+    fn onboarding_catalog_focuses_missing_provider_without_leaving_the_list() {
+        let _lock = crate::test_support::lock_test_env();
+        let _anthropic_key = crate::test_support::EnvVarGuard::remove("ANTHROPIC_API_KEY");
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_onboarding(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Anthropic),
+            &config,
+            None,
+        );
+
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+        assert_eq!(
+            picker.visible_row_count(),
+            picker.rows.len(),
+            "onboarding must show the whole provider catalog"
+        );
+    }
+
+    #[test]
+    fn first_run_onboarding_shows_all_providers_including_hosted() {
+        let _lock = crate::test_support::lock_test_env();
+        let config = Config::default();
+        let picker =
+            ProviderPickerView::new_for_onboarding(ApiProvider::Deepseek, None, &config, None);
+
+        // First-run setup opens on the full catalog with the active provider
+        // (DeepSeek) selected — hosted APIs are visible immediately, not
+        // hidden behind a keypress (#n3onr1ft feedback, 2026-08-23).
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.view, ProviderListView::Catalog);
+        assert_eq!(picker.selected_provider(), ApiProvider::Deepseek);
+
+        let visible = picker
+            .filtered_rows()
+            .into_iter()
+            .map(|(_, row)| row.provider)
+            .collect::<Vec<_>>();
+        assert!(!visible.is_empty());
+        // Hosted providers AND local runtimes are both present up front.
+        assert!(visible.contains(&ApiProvider::Deepseek));
+        assert!(visible.contains(&ApiProvider::Ollama));
+        assert!(
+            visible.iter().any(|provider| !provider.is_self_hosted()),
+            "hosted providers must be visible on first run: {visible:?}"
+        );
+
+        let rendered = render_text(&picker, 40, 12);
+        assert!(
+            rendered.contains(crate::tui::glyphs::SELECTION),
+            "{rendered}"
+        );
+        for (idx, line) in rendered.lines().enumerate() {
+            assert!(
+                crate::tui::ui_text::text_display_width(line) <= 40,
+                "40x12 line {idx} clips: {line:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_shortcut_filters_cloud_rows_from_the_catalog() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_onboarding(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Deepseek),
+            &config,
+            None,
+        );
+        assert_eq!(picker.view, ProviderListView::Catalog);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('l'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.view, ProviderListView::Local);
+        assert_eq!(picker.selected_provider(), ApiProvider::Ollama);
+        assert!(
+            picker
+                .filtered_rows()
+                .into_iter()
+                .all(|(_, row)| row.provider.is_self_hosted())
+        );
+    }
+
+    #[test]
+    fn onboarding_catalog_honors_typed_credentials_for_every_builtin_provider() {
+        use codewhale_config::provider::CredentialAcquisition;
+
+        let _global_env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("isolated provider catalog home");
+        let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().as_ref());
+        let _codewhale_home =
+            EnvVarGuard::set("CODEWHALE_HOME", home.path().to_string_lossy().as_ref());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", home.path().to_string_lossy().as_ref());
+        let _secret_backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let mut key_envs = ApiProvider::all()
+            .iter()
+            .flat_map(|provider| provider.env_vars().iter().copied())
+            .collect::<Vec<_>>();
+        key_envs.sort_unstable();
+        key_envs.dedup();
+        let _missing_keys = key_envs
+            .into_iter()
+            .map(EnvVarGuard::remove)
+            .collect::<Vec<_>>();
+        let config = Config::default();
+
+        // Every provider the catalog actually lists. Hidden dual-wire/plan
+        // variants share their vendor primary's row and credential metadata,
+        // so `ApiProvider::all()` cannot be driven through the visible list.
+        for provider in ApiProvider::catalog().iter().copied() {
+            let mut picker = ProviderPickerView::new_for_onboarding(
+                ApiProvider::Deepseek,
+                Some(provider),
+                &config,
+                None,
+            );
+            assert_eq!(picker.selected_provider(), provider, "{provider:?}");
+            assert_eq!(picker.stage, Stage::List, "{provider:?}");
+
+            let action = picker.handle_key(key(KeyCode::Enter));
+            match provider.credential_help().acquisition {
+                CredentialAcquisition::ApiKey => {
+                    assert!(matches!(action, ViewAction::None), "{provider:?}");
+                    assert!(
+                        matches!(picker.stage, Stage::KeyEntry | Stage::StepfunBillingRoute),
+                        "{provider:?} entered {:?}",
+                        picker.stage
+                    );
+                }
+                CredentialAcquisition::ApiKeyOrOAuth => {
+                    assert_eq!(provider, ApiProvider::Xai, "{provider:?}");
+                    assert!(matches!(action, ViewAction::None), "{provider:?}");
+                    let choices = render_text(&picker, 80, 24);
+                    assert!(choices.contains("API key"), "{choices}");
+                    assert!(choices.contains("device OAuth"), "{choices}");
+
+                    // Choice 1 is an ordinary API-key path. Text remains a key;
+                    // it is never reinterpreted as an OAuth bearer token.
+                    assert!(matches!(
+                        picker.handle_key(key(KeyCode::Char('1'))),
+                        ViewAction::None
+                    ));
+                    assert!(matches!(
+                        picker.handle_key(key(KeyCode::Enter)),
+                        ViewAction::None
+                    ));
+                    assert_eq!(picker.stage, Stage::KeyEntry);
+                    for ch in "violet-".chars() {
+                        picker.handle_key(key(KeyCode::Char(ch)));
+                    }
+                    assert!(picker.handle_paste("otter-key"));
+                    let key_text = "violet-otter-key";
+                    assert_eq!(picker.api_key_input, key_text);
+                    for (width, height) in [(80, 24), (120, 32)] {
+                        let rendered = render_text(&picker, width, height);
+                        assert!(!rendered.contains(key_text), "{width}x{height}: {rendered}");
+                        assert!(rendered.contains('*'), "{width}x{height}: {rendered}");
+                    }
+                    assert!(matches!(
+                        picker.handle_key(key(KeyCode::Enter)),
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
+                            provider: ApiProvider::Xai,
+                            provider_id: None,
+                            api_key,
+                            base_url: None,
+                        }) if api_key == key_text
+                    ));
+
+                    // Choice 2 is the provider-native device flow and emits only
+                    // the request event; the picker never manufactures a token.
+                    let mut oauth = ProviderPickerView::new_for_onboarding(
+                        ApiProvider::Deepseek,
+                        Some(ApiProvider::Xai),
+                        &config,
+                        None,
+                    );
+                    assert!(matches!(
+                        oauth.handle_key(key(KeyCode::Enter)),
+                        ViewAction::None
+                    ));
+                    assert!(matches!(
+                        oauth.handle_key(key(KeyCode::Char('2'))),
+                        ViewAction::None
+                    ));
+                    assert!(matches!(
+                        oauth.handle_key(key(KeyCode::Enter)),
+                        ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
+                    ));
+                }
+                CredentialAcquisition::LocalOptional => assert!(matches!(
+                    action,
+                    ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                        provider: applied,
+                        provider_id: None,
+                    }) if applied == provider
+                )),
+                CredentialAcquisition::OAuth => {
+                    assert!(matches!(action, ViewAction::None), "{provider:?}");
+                    assert_eq!(picker.stage, Stage::KeyEntry, "{provider:?}");
+                    assert!(picker.handle_paste("fixture-oauth-paste"));
+                    assert!(
+                        picker.api_key_input.is_empty(),
+                        "{provider:?} must reject key paste"
+                    );
+                }
+                CredentialAcquisition::Configuration => {
+                    assert_eq!(provider, ApiProvider::Custom);
+                    assert!(matches!(action, ViewAction::None));
+                    assert_eq!(picker.stage, Stage::CustomForm);
+                    assert!(picker.api_key_input.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn credential_draft_is_masked_and_escape_drops_it_without_persistence() {
+        let _global_env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("isolated credential draft home");
+        let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().as_ref());
+        let _codewhale_home =
+            EnvVarGuard::set("CODEWHALE_HOME", home.path().to_string_lossy().as_ref());
+        let _secret_backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _openrouter_key = EnvVarGuard::remove("OPENROUTER_API_KEY");
+        let config = Config::default();
+        let draft = ["violet", "otter", "draft", "7361"].join("-");
+        let mut picker = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::Openrouter,
+            &config,
+            None,
+        )
+        .expect("OpenRouter key editor");
+
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(matches!(picker.handle_key(ctrl_v), ViewAction::None));
+        assert!(
+            picker.api_key_input.is_empty(),
+            "shortcut must not type `v`"
+        );
+        let shifted_v = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        assert!(matches!(picker.handle_key(shifted_v), ViewAction::None));
+        assert_eq!(
+            picker.api_key_input, "V",
+            "shifted credential text is valid"
+        );
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Backspace)),
+            ViewAction::None
+        ));
+        assert!(picker.handle_paste(&draft));
+        assert_eq!(picker.api_key_input, draft);
+        for (width, height) in [(80, 24), (120, 32)] {
+            let rendered = render_text(&picker, width, height);
+            assert!(!rendered.contains(&draft), "{width}x{height}: {rendered}");
+            assert!(rendered.contains('*'), "{width}x{height}: {rendered}");
+        }
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Esc)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::List);
+        assert!(picker.api_key_input.is_empty());
+        assert_eq!(
+            std::fs::read_dir(home.path())
+                .expect("isolated home remains readable")
+                .count(),
+            0,
+            "Esc must not create config or credential-backend files"
+        );
+    }
+
+    /// #4763: Escape backs out one stage at a time — key entry returns to the
+    /// list, and only the list dismisses the picker.
+    #[test]
+    fn onboarding_escape_walks_key_entry_back_to_the_list_then_dismisses() {
+        let _lock = crate::test_support::lock_test_env();
+        let _anthropic_key = crate::test_support::EnvVarGuard::remove("ANTHROPIC_API_KEY");
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_onboarding(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Anthropic),
+            &config,
+            None,
+        );
+        assert_eq!(picker.stage, Stage::List);
+
+        picker.enter_key_entry();
+        assert_eq!(picker.stage, Stage::KeyEntry);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Esc)),
+            ViewAction::None
+        ));
+        assert_eq!(
+            picker.stage,
+            Stage::List,
+            "Escape from key entry returns to the provider list"
+        );
+
+        assert!(
+            matches!(
+                picker.handle_key(key(KeyCode::Esc)),
+                ViewAction::EmitAndClose(ViewEvent::ProviderPickerDismissed { .. })
+            ),
+            "Escape from the list dismisses the picker"
+        );
     }
 
     #[test]
@@ -4285,6 +7290,7 @@ mod tests {
             &config,
             None,
             "sk-validated".to_string(),
+            None,
         )
         .expect("OpenRouter has a picker row");
 
@@ -4304,6 +7310,7 @@ mod tests {
             &config,
             None,
             "sk-validated".to_string(),
+            None,
         )
         .expect("OpenRouter has a picker row");
 
@@ -4323,6 +7330,7 @@ mod tests {
                 provider_id,
                 api_key,
                 model,
+                ..
             }) => {
                 assert_eq!(provider, ApiProvider::Openrouter);
                 assert_eq!(provider_id, None);
@@ -4330,6 +7338,57 @@ mod tests {
                 assert_eq!(model, selected_model);
             }
             other => panic!("expected ProviderPickerSetupConfirmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_kimi_code_setup_asks_for_plan_and_emits_selected_context_window() {
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut picker = ProviderPickerView::new_for_model_pick_after_validation(
+            ApiProvider::Deepseek,
+            ApiProvider::Moonshot,
+            &config,
+            None,
+            "sk-kimi-plan".to_string(),
+            None,
+        )
+        .expect("Moonshot has a picker row");
+
+        assert_eq!(picker.stage, Stage::ModelPick);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::PlanTier);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('2'))),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::Confirm);
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerSetupConfirmed {
+                context_window,
+                model,
+                ..
+            }) => {
+                assert_eq!(model, crate::config::KIMI_CODE_K3_MODEL);
+                assert_eq!(context_window, Some(1_048_576));
+            }
+            other => panic!("expected Kimi Code setup confirmation, got {other:?}"),
         }
     }
 
@@ -4342,6 +7401,7 @@ mod tests {
             &config,
             None,
             "sk-validated".to_string(),
+            None,
         )
         .expect("OpenRouter has a picker row");
 
@@ -4362,6 +7422,203 @@ mod tests {
         assert!(picker.pending_api_key.is_some());
     }
 
+    fn stepfun_config(base_url: Option<&str>) -> Config {
+        Config {
+            providers: Some(crate::config::ProvidersConfig {
+                stepfun: crate::config::ProviderConfig {
+                    base_url: base_url.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// #4526: StepFun's two billing tracks are two endpoints. Setup asks which
+    /// one the key belongs to, and the choice reaches key entry as a pending —
+    /// not yet persisted — endpoint.
+    #[test]
+    fn stepfun_setup_asks_for_billing_route_before_key_entry() {
+        let config = stepfun_config(None);
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Stepfun);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('r'))),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::StepfunBillingRoute);
+        assert_eq!(
+            picker.stepfun_billing_route,
+            StepfunBillingRoute::PayAsYouGo
+        );
+
+        // The endpoints are the whole difference between the two tracks, so
+        // both have to be legible at the narrow terminal size too.
+        for (w, h) in [(80u16, 24u16), (120u16, 32u16)] {
+            let rendered = render_text(&picker, w, h);
+            assert!(
+                rendered.contains(crate::config::DEFAULT_STEPFUN_BASE_URL)
+                    && rendered.contains(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL),
+                "{w}x{h} must show both StepFun endpoints:\n{rendered}"
+            );
+            for (idx, line) in rendered.lines().enumerate() {
+                assert!(
+                    crate::tui::ui_text::text_display_width(line) <= w as usize,
+                    "{w}x{h} billing-route line {idx} overflows: {line:?}"
+                );
+            }
+        }
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('2'))),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(
+            picker.pending_base_url.as_deref(),
+            Some(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL)
+        );
+    }
+
+    /// The chosen endpoint rides on the key-submit event so the live check in
+    /// `ui.rs` probes the Step Plan route, not the pay-as-you-go default.
+    #[test]
+    fn stepfun_plan_choice_travels_with_the_key_for_validation() {
+        let config = stepfun_config(None);
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Stepfun);
+        picker.handle_key(key(KeyCode::Char('r')));
+        picker.handle_key(key(KeyCode::Char('2')));
+        picker.handle_key(key(KeyCode::Enter));
+        for c in "step-plan-key".chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
+                provider,
+                api_key,
+                base_url,
+                ..
+            }) => {
+                assert_eq!(provider, ApiProvider::Stepfun);
+                assert_eq!(api_key, "step-plan-key");
+                assert_eq!(
+                    base_url.as_deref(),
+                    Some(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL)
+                );
+            }
+            other => panic!("expected ProviderPickerApiKeySubmitted, got {other:?}"),
+        }
+    }
+
+    /// Confirm carries exactly the validated endpoint, and nothing else about
+    /// the route, so the handler writes only `[providers.stepfun] base_url`.
+    #[test]
+    fn stepfun_confirm_emits_only_the_validated_endpoint() {
+        let config = stepfun_config(None);
+        let mut picker = ProviderPickerView::new_for_model_pick_after_validation(
+            ApiProvider::Deepseek,
+            ApiProvider::Stepfun,
+            &config,
+            None,
+            "step-plan-key".to_string(),
+            Some(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL.to_string()),
+        )
+        .expect("StepFun has a picker row");
+
+        assert_eq!(picker.stage, Stage::ModelPick);
+        picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(picker.stage, Stage::Confirm);
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerSetupConfirmed {
+                provider,
+                base_url,
+                context_window,
+                ..
+            }) => {
+                assert_eq!(provider, ApiProvider::Stepfun);
+                assert_eq!(
+                    base_url.as_deref(),
+                    Some(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL)
+                );
+                assert_eq!(context_window, None);
+            }
+            other => panic!("expected ProviderPickerSetupConfirmed, got {other:?}"),
+        }
+    }
+
+    /// A hand-configured StepFun endpoint is a deliberate choice. The wizard
+    /// skips the billing-route stage entirely and emits no endpoint, so the
+    /// custom value is never silently rewritten (#4526).
+    #[test]
+    fn stepfun_custom_base_url_survives_the_wizard_untouched() {
+        let custom = "https://stepfun.internal.example/v1";
+        let config = stepfun_config(Some(custom));
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Stepfun);
+        assert_eq!(picker.rows[picker.selected_idx].base_url, custom);
+
+        picker.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(picker.pending_base_url, None);
+        assert_eq!(picker.rows[picker.selected_idx].base_url, custom);
+
+        for c in "custom-key".chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerApiKeySubmitted {
+                base_url, ..
+            }) => assert_eq!(base_url, None, "custom endpoint must not be rewritten"),
+            other => panic!("expected ProviderPickerApiKeySubmitted, got {other:?}"),
+        }
+    }
+
+    /// A StepFun route already on Step Plan re-opens preselected there rather
+    /// than defaulting the user back onto pay-as-you-go.
+    #[test]
+    fn stepfun_plan_route_reopens_preselected() {
+        let config = stepfun_config(Some(crate::config::DEFAULT_STEPFUN_PLAN_BASE_URL));
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Stepfun);
+        picker.handle_key(key(KeyCode::Char('r')));
+
+        assert_eq!(picker.stage, Stage::StepfunBillingRoute);
+        assert_eq!(picker.stepfun_billing_route, StepfunBillingRoute::StepPlan);
+    }
+
+    /// #4526: OpenCode Go (subscription allowance) and OpenCode Zen
+    /// (pay-as-you-go) are separate billing tracks and must not present as the
+    /// same generic meter.
+    #[test]
+    fn opencode_go_and_zen_read_as_distinct_billing_tracks() {
+        let go = usage_meter_for(ApiProvider::OpencodeGo);
+        let zen = usage_meter_for(ApiProvider::OpencodeZen);
+        assert_ne!(go, zen);
+        assert!(go.contains("subscription"), "Go label was {go:?}");
+        assert!(zen.contains("pay-as-you-go"), "Zen label was {zen:?}");
+        assert_ne!(go, usage_meter_for(ApiProvider::Openrouter));
+
+        // Go never reports catalog token prices: its allowance is not spend.
+        assert_eq!(
+            pricing_label(
+                ApiProvider::OpencodeGo,
+                Some(&PricingSku::Token {
+                    input_per_mtok: Some(1.0),
+                    output_per_mtok: Some(2.0),
+                }),
+            ),
+            go
+        );
+    }
+
     #[test]
     fn guided_flow_stages_render_at_80x24_and_120x32() {
         let config = Config::default();
@@ -4371,6 +7628,7 @@ mod tests {
             &config,
             None,
             "sk-validated-key".to_string(),
+            None,
         )
         .expect("OpenRouter has a picker row");
         let mut confirm = ProviderPickerView::new_for_model_pick_after_validation(
@@ -4379,6 +7637,7 @@ mod tests {
             &config,
             None,
             "sk-validated-key".to_string(),
+            None,
         )
         .expect("OpenRouter has a picker row");
         confirm.handle_key(key(KeyCode::Enter));
@@ -4451,6 +7710,56 @@ mod tests {
     }
 
     #[test]
+    fn configured_api_key_editors_acknowledge_saved_credentials_across_providers() {
+        for (provider, config, secret) in [
+            (
+                ApiProvider::Zai,
+                Config {
+                    providers: Some(crate::config::ProvidersConfig {
+                        zai: crate::config::ProviderConfig {
+                            api_key: Some("stored-zai-key".to_string()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Config::default()
+                },
+                "stored-zai-key",
+            ),
+            (
+                ApiProvider::Openrouter,
+                Config {
+                    providers: Some(crate::config::ProvidersConfig {
+                        openrouter: crate::config::ProviderConfig {
+                            api_key: Some("stored-openrouter-key".to_string()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Config::default()
+                },
+                "stored-openrouter-key",
+            ),
+        ] {
+            let mut picker = ProviderPickerView::new(provider, &config);
+            move_to_provider(&mut picker, provider);
+            picker.handle_key(key(KeyCode::Char('r')));
+
+            let rendered = render_text(&picker, 100, 20);
+
+            assert!(
+                rendered.contains("Saved credential configured"),
+                "{provider:?}:\n{rendered}"
+            );
+            assert!(rendered.contains("stored credential"), "{rendered}");
+            assert!(rendered.contains("replace saved key"), "{rendered}");
+            assert!(rendered.contains("keep current key"), "{rendered}");
+            assert!(!rendered.contains("paste key here"), "{rendered}");
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[test]
     fn ctrl_r_does_not_trigger_key_entry() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
@@ -4493,10 +7802,12 @@ mod tests {
                 provider,
                 provider_id,
                 api_key,
+                base_url,
             }) => {
                 assert_eq!(provider, ApiProvider::Novita);
                 assert_eq!(provider_id, None);
                 assert_eq!(api_key, "novita-key");
+                assert_eq!(base_url, None);
             }
             other => panic!("expected ProviderPickerApiKeySubmitted, got {other:?}"),
         }
@@ -4515,8 +7826,8 @@ mod tests {
         assert_eq!(picker.stage, Stage::KeyEntry);
 
         let rendered = render_text(&picker, 96, 20);
-        assert!(rendered.contains("OAuth login"));
-        assert!(rendered.contains("no token is stored here"));
+        assert!(rendered.contains("OAuth login"), "{rendered}");
+        assert!(rendered.contains("no token is stored here"), "{rendered}");
         assert!(!rendered.contains("save & switch"));
         assert!(!rendered.contains("(paste key here)"));
         assert!(!rendered.contains("Credentials:"));
@@ -4530,10 +7841,57 @@ mod tests {
             picker.handle_key(key(KeyCode::Enter)),
             ViewAction::None
         ));
+        assert_eq!(picker.stage, Stage::ExternalConsentChoice);
+        let choices = render_text(&picker, 100, 20);
+        assert!(choices.contains("Disabled (default)"), "{choices}");
+        assert!(choices.contains("Read-only"), "{choices}");
+        assert!(choices.contains("Managed (unavailable)"), "{choices}");
+
+        picker.handle_key(key(KeyCode::Char('2')));
+        picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(picker.stage, Stage::ExternalConsentConfirm);
+        let confirm = render_text(&picker, 120, 22);
+        assert!(confirm.contains("Owning CLI: Codex CLI"), "{confirm}");
+        assert!(confirm.contains("Exact resolved path:"), "{confirm}");
+        assert!(confirm.contains("no refresh, identity-provider or discovery requests"));
+        assert!(confirm.contains("normal requests to the selected provider"));
+        assert!(confirm.contains("external-revoke --provider openai-codex"));
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentConfirmed {
+                provider: ApiProvider::OpenaiCodex,
+                consent_provider: codewhale_config::ProviderKind::OpenaiCodex,
+                source: codewhale_config::ExternalCredentialSource::CodexCli,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn xai_key_entry_launches_device_oauth() {
+    fn external_consent_surface_uses_the_selected_locale() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::OpenaiCodex,
+            &config,
+            None,
+        )
+        .expect("OpenAI Codex has a picker row")
+        .with_locale(crate::localization::Locale::ZhHans);
+
+        picker.handle_key(key(KeyCode::Enter));
+        let choices = render_text(&picker, 100, 20);
+        let compact = choices
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains("外部凭据访问"), "{choices}");
+        assert!(compact.contains("禁用（默认）"), "{choices}");
+        assert!(compact.contains("托管（不可用）"), "{choices}");
+    }
+
+    #[test]
+    fn xai_auth_choice_keeps_api_key_device_oauth_and_external_reuse_distinct() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new_for_missing_auth(
             ApiProvider::Deepseek,
@@ -4542,20 +7900,61 @@ mod tests {
             None,
         )
         .expect("xAI has a picker row");
-        assert_eq!(picker.stage, Stage::KeyEntry);
+        assert_eq!(picker.stage, Stage::XaiAuthChoice);
 
         let rendered = render_text(&picker, 96, 20);
-        assert!(rendered.contains("OAuth login"));
-        assert!(rendered.contains("device login"));
-        assert!(rendered.contains("~/.grok/auth.json"));
-        assert!(!rendered.contains("(paste key here)"));
-
-        assert!(picker.handle_paste("xai-token"));
-        assert!(picker.api_key_input.is_empty());
+        assert!(rendered.contains("xAI API key"));
+        assert!(rendered.contains("Native device OAuth"));
+        assert!(rendered.contains("Codewhale-owned storage"));
+        picker.handle_key(key(KeyCode::Char('2')));
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             ViewAction::EmitAndClose(ViewEvent::ProviderPickerXaiOAuthRequested)
         ));
+
+        let mut external = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::Xai,
+            &config,
+            None,
+        )
+        .expect("xAI has a picker row");
+        assert!(matches!(
+            external.handle_key(key(KeyCode::Char('e'))),
+            ViewAction::None
+        ));
+        assert_eq!(external.stage, Stage::ExternalConsentChoice);
+        let rendered = render_text(&external, 100, 20);
+        assert!(rendered.contains("Managed (unavailable)"), "{rendered}");
+    }
+
+    #[test]
+    fn xai_auth_choice_uses_the_selected_locale() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_missing_auth(
+            ApiProvider::Deepseek,
+            ApiProvider::Xai,
+            &config,
+            None,
+        )
+        .expect("xAI has a picker row")
+        .with_locale(crate::localization::Locale::ZhHans);
+
+        let rendered = render_text(&picker, 100, 24);
+        let compact = rendered
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        for translated in [
+            "xAI身份验证",
+            "请选择一个明确的凭据来源",
+            "xAIAPI密钥",
+            "原生设备OAuth",
+        ] {
+            assert!(compact.contains(translated), "{translated}: {rendered}");
+        }
+        assert!(!rendered.contains("Choose one explicit credential source"));
+        assert!(!rendered.contains("Native device OAuth"));
     }
 
     #[test]
@@ -4574,6 +7973,265 @@ mod tests {
         );
         assert_eq!(xai_oauth_status(None, true), None);
         assert_eq!(xai_oauth_status(None, false), None);
+
+        let fallback_key = crate::config::ProviderConfig {
+            auth_mode: Some("oauth".to_string()),
+            api_key: Some("xai-api-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            xai_oauth_status(Some(&fallback_key), false),
+            Some(ProviderAuthStatus::Configured)
+        );
+        for sentinel in [crate::config::API_KEYRING_SENTINEL, "  __KEYRING__  "] {
+            let placeholder = crate::config::ProviderConfig {
+                auth_mode: Some("oauth".to_string()),
+                api_key: Some(sentinel.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                xai_oauth_status(Some(&placeholder), false),
+                Some(ProviderAuthStatus::OAuthMissing)
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_external_consents_are_visible_without_io_and_never_enter_routing_inventory() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("external consent fixtures");
+        let codex_path = temp.path().join("codex-auth.json");
+        let grok_path = temp.path().join("grok-auth.json");
+        let codex_raw = "codex-external-file-must-not-be-read";
+        let grok_raw = "grok-external-file-must-not-be-read";
+        std::fs::write(&codex_path, codex_raw).expect("write Codex trap");
+        std::fs::write(&grok_path, grok_raw).expect("write Grok trap");
+        let owned_home = temp.path().join("codewhale-owned");
+
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &owned_home);
+        let _codex_path =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &codex_path);
+        let _grok_path = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &grok_path);
+        let _codex_access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _legacy_codex_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let _xai_key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+
+        let config = Config {
+            provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::OpenaiCodex,
+                            codewhale_config::ExternalCredentialSource::CodexCli,
+                            codex_path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            grok_path.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        crate::external_credentials::reset_side_effect_trap();
+        assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+        assert!(!has_api_key_for(&config, ApiProvider::Xai));
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        for provider in [ApiProvider::OpenaiCodex, ApiProvider::Xai] {
+            let index = picker
+                .rows
+                .iter()
+                .position(|row| row.provider == provider)
+                .expect("consented provider row");
+            let row = &picker.rows[index];
+            assert_eq!(row.credential_state, CredentialState::ExternalConsent);
+            assert_eq!(row.auth_status, ProviderAuthStatus::OAuthConsented);
+            let structural = row
+                .external_credential_status
+                .as_ref()
+                .expect("external status");
+            assert_eq!(structural.access.as_str(), "read_only");
+            assert_eq!(structural.route_state, "dormant");
+            assert!(structural.revoke_command.contains(provider.as_str()));
+            assert_eq!(
+                row.readiness,
+                ResolvedProviderReadiness::ExternalConsentPendingSelection
+            );
+            assert!(!row.readiness.can_attempt());
+            picker.selected_idx = index;
+            let visible = render_text(&picker, 140, 32);
+            assert!(visible.contains("External: access=read_only"), "{visible}");
+            assert!(visible.contains("Owner/path:"), "{visible}");
+            assert!(
+                visible.contains("revoke: codewhale auth external-revoke"),
+                "{visible}"
+            );
+            assert!(
+                picker.selected_has_key(),
+                "selecting {provider:?} should activate the consented route before checking it"
+            );
+            assert!(matches!(
+                picker.handle_key(key(KeyCode::Enter)),
+                ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
+                    provider: selected,
+                    ..
+                }) if selected == provider
+            ));
+        }
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Char('x'))),
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerExternalConsentRevoked {
+                provider: ApiProvider::Xai
+            })
+        ));
+
+        let inventory = crate::model_inventory::ModelInventory::from_config(&config);
+        assert!(
+            inventory.candidates.iter().all(|candidate| !matches!(
+                candidate.provider,
+                ApiProvider::OpenaiCodex | ApiProvider::Xai
+            )),
+            "dormant external-only routes must not reach auto-routing inventory"
+        );
+        assert_eq!(
+            crate::route_billing::for_route(&config, ApiProvider::Xai),
+            crate::route_billing::BillingPresentation::Metered
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "picker, readiness, billing, and model inventory must not inspect inactive external files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&codex_path).expect("Codex trap unchanged"),
+            codex_raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(&grok_path).expect("Grok trap unchanged"),
+            grok_raw
+        );
+        assert!(!owned_home.join("credentials/xai-auth.json").exists());
+    }
+
+    #[test]
+    fn kimi_cli_token_is_never_auto_enabled_without_explicit_legacy_auth_mode() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials"))
+            .expect("Kimi import credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            serde_json::json!({
+                "access_token": "unexpired-user-owned-token",
+                "refresh_token": "must-not-be-used",
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        )
+        .expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let _moonshot_key = crate::test_support::EnvVarGuard::remove("MOONSHOT_API_KEY");
+        let _kimi_key = crate::test_support::EnvVarGuard::remove("KIMI_API_KEY");
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &Config::default());
+        move_to_provider(&mut picker, ApiProvider::Moonshot);
+        let row = &picker.rows[picker.selected_idx];
+        assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(
+            picker.stage,
+            Stage::KeyEntry,
+            "a stray Kimi CLI credential must lead to API-key setup, not import activation"
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_kimi_import_is_unavailable_and_routes_to_api_key_setup() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("Kimi import fixture root");
+        let kimi_home = temp.path().join("kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials"))
+            .expect("Kimi import credential directory");
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+            + 3600.0;
+        std::fs::write(
+            kimi_home.join("credentials/kimi-code.json"),
+            serde_json::json!({
+                "access_token": "unexpired-user-owned-token",
+                "refresh_token": "must-not-be-used",
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        )
+        .expect("write Kimi import fixture");
+        let _kimi_home = crate::test_support::EnvVarGuard::set(
+            "KIMI_CODE_HOME",
+            kimi_home.to_str().expect("utf8 path"),
+        );
+        let config = Config {
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    auth_mode: Some("kimi_oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Moonshot);
+        let row = &picker.rows[picker.selected_idx];
+        assert_eq!(
+            row.auth_status,
+            ProviderAuthStatus::ImportedTokenUnavailable
+        );
+        assert_eq!(row.credential_state, CredentialState::MissingKey);
+        assert_eq!(row.base_url, crate::config::DEFAULT_KIMI_CODE_BASE_URL);
+        assert_eq!(
+            row.default_route.logical_model,
+            crate::config::DEFAULT_KIMI_CODE_MODEL
+        );
+        assert_eq!(row.usage_meter, "usage: Kimi API key required");
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::KeyEntry);
     }
 
     #[test]
@@ -4733,13 +8391,36 @@ mod tests {
             .positions()
             .filter(|position| {
                 let cell = &buf[*position];
-                cell.bg == palette::SURFACE_ELEVATED
+                cell.bg == palette::SELECTION_BG
             })
             .count();
         assert!(
             highlighted_cells >= 32,
             "selected provider row should use a visible continuous highlight"
         );
+    }
+
+    #[test]
+    fn search_footer_shows_two_stage_esc_as_a_single_hint() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.query = "deep".to_string();
+        let area = Rect::new(0, 0, 100, 24);
+        let mut buf = Buffer::empty(area);
+
+        picker.render(area, &mut buf);
+
+        let text = area
+            .positions()
+            .map(|position| buf[position].symbol())
+            .collect::<String>();
+        // The key appears once, with both stages spelled out in its label.
+        assert_eq!(
+            text.matches(" Esc ").count(),
+            1,
+            "search footer must not duplicate the Esc key: {text}"
+        );
+        assert!(text.contains("clear / cancel"), "{text}");
     }
 
     #[test]

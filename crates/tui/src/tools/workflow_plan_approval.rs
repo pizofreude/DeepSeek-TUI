@@ -343,6 +343,22 @@ fn analyze_plan_object(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // Mirror structured-plan lowering's `plan_risk_to_mode` aliases exactly:
+    // child role identity never elevates an omitted/read-only plan mode.
+    let default_mode_is_write = matches!(
+        risk.as_deref(),
+        Some(
+            "writes"
+                | "write"
+                | "read_write"
+                | "readwrite"
+                | "medium"
+                | "elevated"
+                | "high"
+                | "shell"
+                | "network"
+        )
+    );
     let token_budget = token_budget_override.or_else(|| {
         plan.get("token_budget")
             .and_then(Value::as_u64)
@@ -374,6 +390,7 @@ fn analyze_plan_object(
                 &mut network,
                 &mut secrets,
                 &mut worktree,
+                default_mode_is_write,
             );
         }
     }
@@ -386,6 +403,7 @@ fn analyze_plan_object(
         &mut network,
         &mut secrets,
         &mut worktree,
+        default_mode_is_write,
     );
     // IR nodes escape hatch
     if let Some(nodes) = plan.get("nodes").and_then(Value::as_array) {
@@ -399,18 +417,12 @@ fn analyze_plan_object(
             &mut network,
             &mut secrets,
             &mut worktree,
+            default_mode_is_write,
         );
     }
 
-    if matches!(
-        risk.as_deref(),
-        Some("writes" | "write" | "read_write" | "elevated" | "high" | "shell" | "network")
-    ) {
-        writes = writes
-            || matches!(
-                risk.as_deref(),
-                Some("writes" | "write" | "read_write" | "elevated" | "high" | "shell")
-            );
+    if default_mode_is_write {
+        writes = true;
         shell = shell || matches!(risk.as_deref(), Some("elevated" | "high" | "shell"));
         network = network || matches!(risk.as_deref(), Some("elevated" | "high" | "network"));
     }
@@ -491,6 +503,7 @@ fn collect_children(
     network: &mut bool,
     secrets: &mut bool,
     worktree: &mut bool,
+    default_mode_is_write: bool,
 ) {
     let Some(children) = children else {
         return;
@@ -507,16 +520,30 @@ fn collect_children(
         let mode = child
             .get("mode")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
         let agent_type = child
             .get("type")
             .or_else(|| child.get("agent_type"))
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if mode.contains("write") || agent_type == "implementer" || agent_type == "builder" {
+            .unwrap_or("general")
+            .trim()
+            .to_ascii_lowercase();
+        let effective_read_write = match mode.as_str() {
+            "read_only" | "readonly" => false,
+            "read_write" | "readwrite" | "writes" | "write" => true,
+            "" => default_mode_is_write,
+            other => other.contains("write") && !other.contains("read_only"),
+        };
+        if effective_read_write {
             *writes = true;
-            // Write-capable implementers may run shell beyond read-only.
-            if agent_type == "implementer" || agent_type == "builder" || agent_type == "general" {
+            // Write-capable builders/workers may run shell beyond read-only.
+            // Keep the legacy runtime names for stored Workflow plans.
+            if matches!(
+                agent_type.as_str(),
+                "builder" | "implement" | "implementer" | "worker" | "general"
+            ) {
                 *shell = true;
             }
         }
@@ -561,7 +588,10 @@ fn collect_children(
                 {
                     *network = true;
                 }
-                if matches!(name, "write_file" | "edit_file" | "apply_patch") {
+                if matches!(
+                    name,
+                    "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
+                ) {
                     *writes = true;
                 }
             }
@@ -580,6 +610,7 @@ fn walk_nodes(
     network: &mut bool,
     secrets: &mut bool,
     worktree: &mut bool,
+    default_mode_is_write: bool,
 ) {
     for node in nodes {
         if let Some(agent) = node.get("agent") {
@@ -592,6 +623,7 @@ fn walk_nodes(
                 network,
                 secrets,
                 worktree,
+                default_mode_is_write,
             );
         }
         if let Some(branch) = node.get("branch") {
@@ -605,6 +637,7 @@ fn walk_nodes(
                 network,
                 secrets,
                 worktree,
+                default_mode_is_write,
             );
         }
         if let Some(seq) = node.get("sequence") {
@@ -620,6 +653,7 @@ fn walk_nodes(
                     network,
                     secrets,
                     worktree,
+                    default_mode_is_write,
                 );
             }
         }
@@ -636,6 +670,7 @@ fn walk_nodes(
                 network,
                 secrets,
                 worktree,
+                default_mode_is_write,
             );
         }
     }
@@ -647,12 +682,18 @@ fn script_suggests_writes(script: &str) -> bool {
         || lower.contains("read_write")
         || lower.contains("allow_write")
         || lower.contains("write_file")
+        || lower.contains("\"write\"")
+        || lower.contains("\"edit\"")
         || lower.contains("apply_patch")
 }
 
 fn script_suggests_shell(script: &str) -> bool {
     let lower = script.to_ascii_lowercase();
-    lower.contains("exec_shell") || (lower.contains("allowedtools") && lower.contains("shell"))
+    lower.contains("exec_shell")
+        || lower.contains("\"bash\"")
+        || lower.contains("bash(")
+        || ((lower.contains("allowedtools") || lower.contains("allowed_tools"))
+            && (lower.contains("shell") || lower.contains("bash")))
 }
 
 fn script_suggests_network(script: &str) -> bool {
@@ -790,6 +831,82 @@ mod tests {
     }
 
     #[test]
+    fn canonical_worker_role_flags_shell_for_write_plan() {
+        let input = json!({
+            "action": "start",
+            "plan": {
+                "goal": "land the fix",
+                "children": [{
+                    "prompt": "patch it",
+                    "type": "worker",
+                    "mode": "read_write"
+                }]
+            }
+        });
+
+        let summary = analyze_workflow_plan_approval(&input);
+        assert!(summary.writes);
+        assert!(summary.shell);
+    }
+
+    #[test]
+    fn lowercase_bash_is_classified_as_shell_authority() {
+        for script in [
+            r#"{"allowed_tools":["bash"]}"#,
+            r#"bash({"command":"pwd"})"#,
+        ] {
+            assert!(script_suggests_shell(script), "{script}");
+        }
+    }
+
+    #[test]
+    fn read_only_implementer_does_not_request_write_or_shell_authority() {
+        for child in [
+            json!({
+                "prompt": "review an implementation",
+                "type": "implementer",
+                "mode": "read_only"
+            }),
+            json!({
+                "prompt": "review under the plan envelope",
+                "type": "implementer"
+            }),
+        ] {
+            let summary = analyze_workflow_plan_approval(&json!({
+                "plan": {
+                    "goal": "read-only implementation review",
+                    "risk": "read_only",
+                    "children": [child]
+                }
+            }));
+            assert!(!summary.writes, "{summary:?}");
+            assert!(!summary.shell, "{summary:?}");
+            assert!(!summary.elevated, "{summary:?}");
+        }
+
+        let omitted_risk = analyze_workflow_plan_approval(&json!({
+            "plan": {
+                "goal": "default-safe implementation review",
+                "children": [{ "prompt": "inspect", "type": "implementer" }]
+            }
+        }));
+        assert!(!omitted_risk.writes, "{omitted_risk:?}");
+        assert!(!omitted_risk.shell, "{omitted_risk:?}");
+
+        for risk in ["medium", "readwrite"] {
+            let write_default = analyze_workflow_plan_approval(&json!({
+                "plan": {
+                    "goal": "default writer",
+                    "risk": risk,
+                    "children": [{ "prompt": "patch" }]
+                }
+            }));
+            assert!(write_default.writes, "{risk}: {write_default:?}");
+            assert!(write_default.shell, "{risk}: {write_default:?}");
+        }
+    }
+
+    #[test]
     fn elevated_risk_flags_shell_and_network() {
         let summary = analyze_workflow_plan_approval(&json!({
             "plan": {
@@ -861,6 +978,43 @@ mod tests {
                 &config()
             ),
             ApprovalRequirement::Required
+        );
+    }
+
+    #[test]
+    fn require_approval_for_writes_true_blocks_write_start_read_only_stays_auto() {
+        let mut cfg = config();
+        cfg.require_approval_for_writes = true;
+        cfg.auto_start_read_only = true;
+        let write_plan = json!({
+            "action": "start",
+            "plan": {
+                "goal": "land the fix",
+                "risk": "writes",
+                "children": [{
+                    "prompt": "patch it",
+                    "type": "implementer",
+                    "mode": "read_write"
+                }]
+            }
+        });
+        let read_only = json!({
+            "action": "start",
+            "plan": {
+                "goal": "scout crates",
+                "risk": "read_only",
+                "children": [{ "prompt": "look", "type": "explore" }]
+            }
+        });
+        assert_eq!(
+            workflow_approval_requirement_for(&write_plan, &cfg),
+            ApprovalRequirement::Required,
+            "require_approval_for_writes = true must require the card for a write start"
+        );
+        assert_eq!(
+            workflow_approval_requirement_for(&read_only, &cfg),
+            ApprovalRequirement::Auto,
+            "auto_start_read_only = true must still auto-start a read-only plan"
         );
     }
 

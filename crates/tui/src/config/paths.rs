@@ -1,8 +1,8 @@
 //! Filesystem path resolution helpers for config/cache/workspace locations.
 //!
 //! Pure path-building helpers extracted verbatim from `config.rs`. They depend
-//! only on `std`, `dirs`, and `shellexpand` plus one another, so they form a
-//! clean leaf. `config.rs` pulls them back in (`use paths::{...}`) for the
+//! only on `std`, `codewhale-paths`, and `shellexpand` plus one another, so they
+//! form a clean leaf. `config.rs` pulls them back in (`use paths::{...}`) for the
 //! workspace-trust and config-loading logic that stays there, and re-exports
 //! the two `pub(crate)` entry points (`effective_home_dir`, `expand_path`) so
 //! external `crate::config::` callers resolve unchanged (#3311).
@@ -13,51 +13,89 @@
 
 use std::path::{Path, PathBuf};
 
-pub(crate) fn default_config_path() -> Option<PathBuf> {
-    env_config_path().or_else(home_config_path)
+/// Re-exported so `config::effective_home_dir` and every `use paths::{...}`
+/// caller resolve unchanged. It lives in `home.rs` because this module is not
+/// includable from an integration test binary — see that file's header.
+pub(crate) use super::home::effective_home_dir;
+
+pub(crate) fn default_config_path() -> anyhow::Result<PathBuf> {
+    try_default_config_path()
 }
 
-pub(crate) fn codewhale_home_dir() -> Option<PathBuf> {
-    std::env::var_os("CODEWHALE_HOME").and_then(|path| {
-        let path = PathBuf::from(path);
-        (!path.as_os_str().is_empty()).then_some(path)
+pub(crate) fn try_default_config_path() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    {
+        with_test_state_path(try_default_config_path_from_environment, || {
+            Ok(crate::test_support::unsealed_test_state_root()
+                .join(codewhale_config::CONFIG_FILE_NAME))
+        })
+    }
+
+    #[cfg(not(test))]
+    try_default_config_path_from_environment()
+}
+
+fn try_default_config_path_from_environment() -> anyhow::Result<PathBuf> {
+    codewhale_config::resolve_config_path(None)
+}
+
+/// Holding [`lock_test_env`] is not enough to read the process environment:
+/// many tests take that lock only to serialize unrelated variables, and
+/// trusting it routed them at a populated `~/.codewhale/config.toml` (#5355,
+/// #5359). Settings already requires a sealed `EnvVarGuard`; config paths
+/// must use the same gate.
+#[cfg(test)]
+fn with_test_state_path<T>(
+    from_environment: impl FnOnce() -> T,
+    isolated: impl FnOnce() -> T,
+) -> T {
+    let honor_guarded_environment = crate::test_support::guarded_environment_provides_state_paths();
+    crate::test_support::with_test_env_lock(|| {
+        if honor_guarded_environment {
+            from_environment()
+        } else {
+            isolated()
+        }
     })
 }
 
-pub(crate) fn effective_home_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("HOME") {
-        let path = PathBuf::from(path);
-        if !path.as_os_str().is_empty() {
-            return Some(path);
-        }
-    }
-
-    if let Some(path) = std::env::var_os("USERPROFILE") {
-        let path = PathBuf::from(path);
-        if !path.as_os_str().is_empty() {
-            return Some(path);
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        if let (Some(drive), Some(homepath)) =
-            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
-        {
-            let mut path = PathBuf::from(drive);
-            path.push(homepath);
-            if !path.as_os_str().is_empty() {
-                return Some(path);
-            }
-        }
-    }
-
-    dirs::home_dir()
+pub(crate) fn codewhale_home_dir() -> Result<Option<PathBuf>, codewhale_paths::PathOverrideError> {
+    codewhale_paths::codewhale_home_override()
 }
 
+/// The user-global config document: `$CODEWHALE_HOME/config.toml` when an
+/// explicit home is set, otherwise `~/.codewhale/config.toml` (falling back to
+/// the legacy `~/.deepseek/config.toml` only when that file already exists).
+///
+/// Credential writes are rerouted here when the ambient config path resolves
+/// to a workspace-scoped document (#5045, #5193); non-credential settings keep
+/// the ambient scoping.
 pub(crate) fn home_config_path() -> Option<PathBuf> {
-    if let Some(home) = codewhale_home_dir() {
-        return Some(home.join("config.toml"));
+    #[cfg(test)]
+    {
+        with_test_state_path(home_config_path_from_environment, || {
+            Some(
+                crate::test_support::unsealed_test_state_root()
+                    .join(codewhale_config::CONFIG_FILE_NAME),
+            )
+        })
+    }
+
+    #[cfg(not(test))]
+    home_config_path_from_environment()
+}
+
+fn home_config_path_from_environment() -> Option<PathBuf> {
+    match codewhale_home_dir() {
+        Ok(Some(home)) => return Some(home.join(codewhale_config::CONFIG_FILE_NAME)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "invalid Codewhale home override; refusing to substitute a different config path"
+            );
+            return None;
+        }
     }
 
     effective_home_dir().map(|home| {
@@ -83,20 +121,19 @@ pub(crate) fn canonicalize_or_keep(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(crate) fn env_config_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(expand_path(trimmed));
-        }
+pub(crate) fn env_config_path() -> Result<Option<PathBuf>, codewhale_paths::PathOverrideError> {
+    #[cfg(test)]
+    {
+        with_test_state_path(env_config_path_unlocked, || Ok(None))
     }
-    if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(expand_path(trimmed));
-        }
+    #[cfg(not(test))]
+    {
+        env_config_path_unlocked()
     }
-    None
+}
+
+fn env_config_path_unlocked() -> Result<Option<PathBuf>, codewhale_paths::PathOverrideError> {
+    codewhale_paths::config_path_override()
 }
 
 pub(crate) fn expand_pathbuf(path: PathBuf) -> PathBuf {
@@ -157,44 +194,52 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
 }
 
 pub(crate) fn default_skills_dir() -> Option<PathBuf> {
-    effective_home_dir().map(|home| home.join(".codewhale").join("skills"))
+    default_user_state_path("skills")
 }
 
 pub(crate) fn default_mcp_config_path() -> Option<PathBuf> {
-    effective_home_dir().map(|home| {
-        let primary = home.join(".codewhale").join("mcp.json");
-        if primary.exists() {
-            return primary;
-        }
-        let legacy = home.join(".deepseek").join("mcp.json");
-        if legacy.exists() {
-            return legacy;
-        }
-        primary
-    })
+    default_user_state_path("mcp.json")
 }
 
 pub(crate) fn default_notes_path() -> Option<PathBuf> {
-    effective_home_dir().map(|home| {
-        let primary = home.join(".codewhale").join("notes.txt");
-        if primary.exists() {
-            return primary;
-        }
-        let legacy = home.join(".deepseek").join("notes.txt");
-        if legacy.exists() {
-            return legacy;
-        }
-        primary
-    })
+    default_user_state_path("notes.txt")
 }
 
 pub(crate) fn default_memory_path() -> Option<PathBuf> {
+    default_user_state_path("memory.md")
+}
+
+fn default_user_state_path(name: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        with_test_state_path(
+            || default_user_state_path_from_environment(name),
+            || Some(crate::test_support::unsealed_test_state_root().join(name)),
+        )
+    }
+
+    #[cfg(not(test))]
+    default_user_state_path_from_environment(name)
+}
+
+fn default_user_state_path_from_environment(name: &str) -> Option<PathBuf> {
+    match codewhale_home_dir() {
+        Ok(Some(home)) => return Some(home.join(name)),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "invalid Codewhale home override; refusing to substitute a different state root"
+            );
+            return None;
+        }
+    }
     effective_home_dir().map(|home| {
-        let primary = home.join(".codewhale").join("memory.md");
+        let primary = home.join(".codewhale").join(name);
         if primary.exists() {
             return primary;
         }
-        let legacy = home.join(".deepseek").join("memory.md");
+        let legacy = home.join(".deepseek").join(name);
         if legacy.exists() {
             return legacy;
         }

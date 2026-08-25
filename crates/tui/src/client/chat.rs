@@ -14,33 +14,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout as tokio_timeout;
 
-use crate::config::wire_model_for_provider;
+use crate::config::{
+    TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
+    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_tiered_effort_route,
+    minimax_m3_route_uses_max_completion_tokens, wire_model_for_provider_route,
+};
 
-/// Default timeout for the initial streaming response headers.
-///
-/// `doctor` uses a bounded non-streaming request, but normal TUI turns first
-/// wait for the SSE response to open. On some Windows/proxy paths that wait can
-/// hang before any stream chunk exists, leaving the UI stuck at "Working...".
-const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(45);
+// The bounded response-header wait (`stream_open_timeout`) and its env
+// override live in the shared stream-entry seam; every streaming adapter
+// (Chat Completions / Anthropic Messages / Responses) uses the same policy.
+use super::stream_entry::stream_open_timeout;
 
-/// Reads `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` as a bounded override for the
-/// response-header wait. This is intentionally shorter than the per-chunk idle
-/// timeout because it only covers connection setup and upstream header return,
-/// not model thinking time after streaming has started.
-fn stream_open_timeout() -> Duration {
-    stream_open_timeout_from_env(
-        std::env::var("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
-    let secs = value
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STREAM_OPEN_TIMEOUT.as_secs())
-        .clamp(5, 300);
-    Duration::from_secs(secs)
+fn stream_idle_timeout_message(
+    idle: Duration,
+    bytes_received: usize,
+    stream_age: Duration,
+    since_last_chunk: Duration,
+) -> String {
+    // Shared seam: Chat Completions / Anthropic / Responses keep one message shape.
+    super::stream_entry::idle_timeout_message(idle, bytes_received, stream_age, since_last_chunk)
 }
 
 use crate::config::ApiProvider;
@@ -53,21 +45,27 @@ use crate::models::{
     model_is_openai_reasoning_family, model_supports_reasoning,
 };
 
+use super::prepared::WireDialect;
+use super::role_placement::{RolePlacement, role_placement};
 use super::{
     DeepSeekClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
-    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url_with_suffix,
+    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
     apply_reasoning_effort, bounded_error_text, from_api_tool_name, parse_usage,
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
+use crate::models::Role;
 
 fn apply_provider_token_limit(
     body: &mut Value,
     provider: ApiProvider,
+    base_url: &str,
     model: &str,
     max_tokens: u32,
 ) {
     let use_max_completion_tokens = provider == ApiProvider::XiaomiMimo
-        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model));
+        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model))
+        || minimax_m3_route_uses_max_completion_tokens(provider, base_url, model)
+        || is_exact_direct_moonshot_k3_route(provider, base_url, model);
     if !use_max_completion_tokens {
         return;
     }
@@ -89,7 +87,11 @@ fn apply_openai_reasoning_effort(
         provider == ApiProvider::Openai && is_openai_gpt_56_api_model(model_lower.as_str());
     let is_openai_reasoning =
         provider == ApiProvider::Openai && model_is_openai_reasoning_family(model);
-    let is_muse_spark = provider == ApiProvider::Meta && model_lower == "muse-spark-1.1";
+    let is_muse_spark = provider == ApiProvider::Meta
+        && matches!(
+            model_lower.as_str(),
+            "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor"
+        );
     if !is_openai_reasoning && !is_muse_spark {
         return;
     }
@@ -99,6 +101,767 @@ fn apply_openai_reasoning_effort(
         return;
     };
     body["reasoning_effort"] = json!(effort);
+}
+
+fn apply_xai_grok_4_6_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !(is_exact_xai_grok_4_6_route(provider, base_url, model)
+        || (provider == ApiProvider::Xai
+            && codewhale_config::provider::is_exact_xai_platform_route(
+                codewhale_config::ProviderKind::Xai,
+                base_url,
+            )
+            && model
+                .trim()
+                .eq_ignore_ascii_case(crate::config::XAI_GROK_4_5_MODEL)))
+    {
+        return;
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let model = model.trim().to_ascii_lowercase();
+    let supports_xhigh = model == crate::config::XAI_GROK_4_6_MODEL;
+    let supports_effort = supports_xhigh || model == crate::config::XAI_GROK_4_5_MODEL;
+    if !supports_effort {
+        return;
+    }
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "auto" | "automatic" | "" => return,
+        "off" | "disabled" | "none" | "false" | "high" => "high",
+        "minimal" | "minimum" | "low" | "light" => "low",
+        "medium" | "mid" => "medium",
+        "xhigh" | "max" | "maximum" | "highest" | "ultra" | "ultracode" => {
+            if supports_xhigh {
+                "xhigh"
+            } else {
+                "high"
+            }
+        }
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
+}
+
+fn apply_inkling_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Together
+        || !model.trim().eq_ignore_ascii_case(TOGETHER_INKLING_MODEL)
+    {
+        return;
+    }
+
+    // Inkling's official chat template accepts OpenAI's top-level
+    // `reasoning_effort` field with this exact vocabulary. It does not use
+    // Together's generic `thinking` extension or the `xhigh` wire value.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" => "none",
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" | "mid" | "" => "medium",
+        "high" => "high",
+        "max" | "xhigh" | "highest" | "ultra" | "ultracode" => "max",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
+}
+
+/// Apply Kimi Code K3's route-specific nested thinking effort after the
+/// generic Moonshot shaping. Other Moonshot and Kimi-compatible routes accept
+/// only the generic enabled/disabled form, so the exact endpoint and bare
+/// model identifier are both part of this guard.
+fn apply_kimi_code_k3_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !is_exact_kimi_code_k3_route(provider, base_url, model) {
+        return;
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+
+    let thinking = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => {
+            json!({ "type": "enabled", "effort": "low" })
+        }
+        "medium" | "high" => json!({ "type": "enabled", "effort": "high" }),
+        "xhigh" | "ultra" | "max" => json!({ "type": "enabled", "effort": "max" }),
+        _ => return,
+    };
+
+    // K3 uses the nested `thinking.effort` dialect. Do not leave an
+    // OpenAI-style effort value behind if another shaping layer was added
+    // before this route-specific override.
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+    body["thinking"] = thinking;
+}
+
+/// Apply Moonshot's direct K3 reasoning dialect.
+///
+/// The pay-as-you-go K3 endpoint is always-thinking and accepts only the
+/// top-level `reasoning_effort` values low/high/max. In particular, a generic
+/// Moonshot `thinking: {type: disabled}` payload is not truthful for this
+/// route. Treat a legacy raw `off` as the lowest supported tier defensively;
+/// route-aware callers normalize it before it reaches this layer.
+fn apply_direct_moonshot_k3_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !is_exact_direct_moonshot_k3_route(provider, base_url, model) {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+        object.remove("reasoning_effort");
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => "low",
+        "medium" | "mid" | "high" | "" => "high",
+        "xhigh" | "ultra" | "max" | "highest" | "ultracode" => "max",
+        // `auto` and unknown legacy values leave the field omitted so the
+        // direct API owns its documented default (`max`).
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
+}
+
+/// Keep Z.ai controls on exact first-party routes only. The tiered-effort GLM
+/// models (5.2, and 5.3 which inherits its reasoning options) receive the
+/// documented top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic
+/// thinking toggle, and compatible gateways receive neither field because their
+/// request dialect is not known from provider/model selection alone.
+fn apply_zai_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Zai {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+        if !is_exact_zai_chat_route(provider, base_url) {
+            // A compatible gateway owns its own request dialect. Provider/model
+            // selection alone is not evidence that Z.ai's `thinking` object is
+            // supported there, so fail closed instead of leaking it.
+            object.remove("thinking");
+            return;
+        }
+    }
+    if !crate::config::is_exact_known_zai_reasoning_route(provider, base_url, model) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        return;
+    }
+    if !is_exact_zai_tiered_effort_route(provider, base_url, model) {
+        // Exact first-party GLM-5-Turbo and GLM-5.1 keep only the generic
+        // enabled/disabled thinking control.
+        return;
+    }
+    match effort
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("high") => body["reasoning_effort"] = json!("high"),
+        Some("xhigh") | Some("max") | Some("highest") | Some("ultra") | Some("ultracode") => {
+            body["reasoning_effort"] = json!("max");
+        }
+        // Off, lower tiers, omitted effort, and unknown legacy values retain
+        // only the generic Z.ai thinking control.
+        _ => {}
+    }
+}
+
+/// Add MiniMax's Chat-only reasoning controls only when endpoint and model
+/// prove the exact first-party M3 route. A provider label alone is not enough
+/// to send MiniMax-specific fields to a compatible gateway or unknown model.
+fn apply_minimax_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Minimax {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_split");
+        object.remove("thinking");
+    }
+    if !crate::config::is_exact_minimax_m3_route(provider, base_url, model) {
+        return;
+    }
+
+    body["reasoning_split"] = json!(true);
+    match effort
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("off" | "disabled" | "none" | "false") => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        Some(
+            "low" | "minimal" | "medium" | "mid" | "high" | "xhigh" | "max" | "highest" | "ultra"
+            | "ultracode" | "",
+        ) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+        }
+        _ => {}
+    }
+}
+
+/// Model Studio's OpenAI-compatible API uses its own top-level reasoning
+/// controls. Keep them on verified Alibaba Chat Completions routes: a custom
+/// `base_url` points the same provider identity at an arbitrary gateway, and
+/// that gateway must not be handed Alibaba's dialect.
+///
+/// This is the *sole* writer of Model Studio reasoning fields —
+/// `apply_reasoning_effort` deliberately writes nothing for the `Modelstudio*`
+/// identities — so the strip below runs for all four variants, including the
+/// two Anthropic-dialect ones. Those normally reach the Messages adapter
+/// instead, but `wire = "openai"` can route them here, and an unmatched
+/// `enable_thinking` left in the body would then go out unguarded.
+fn apply_modelstudio_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if !matches!(
+        provider,
+        ApiProvider::ModelstudioTokenPlan
+            | ApiProvider::ModelstudioTokenPlanAnthropic
+            | ApiProvider::ModelstudioCodingPlan
+            | ApiProvider::ModelstudioCodingPlanAnthropic
+    ) {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+        object.remove("enable_thinking");
+        object.remove("preserve_thinking");
+        object.remove("reasoning_effort");
+    }
+    if !is_exact_modelstudio_chat_route(provider, base_url) {
+        return;
+    }
+
+    let thinking_only = modelstudio_model_is_thinking_only(model);
+    if !thinking_only && !modelstudio_model_is_hybrid(model) {
+        return;
+    }
+
+    let thinking_enabled = !modelstudio_effort_disables_thinking(effort);
+    // Thinking-only models emit `reasoning_content` but reject an
+    // enable/disable control. Hybrid models use `enable_thinking`.
+    if !thinking_only {
+        body["enable_thinking"] = json!(thinking_enabled);
+    }
+    if modelstudio_model_supports_preserve_thinking(model) {
+        // Model Studio otherwise drops assistant `reasoning_content` from the
+        // next turn's context. This applies even when the provider default
+        // leaves thinking enabled and no explicit UI effort was selected.
+        body["preserve_thinking"] = json!(thinking_only || thinking_enabled);
+    }
+    if !thinking_only
+        && thinking_enabled
+        && let Some(effort) = effort.and_then(modelstudio_reasoning_effort_for_model)
+        && modelstudio_model_supports_reasoning_effort(model)
+    {
+        body["reasoning_effort"] = json!(effort);
+    }
+}
+
+/// Fail-closed host guard: only Alibaba's own OpenAI-compatible Chat
+/// Completions URL shapes count. Anything else (a proxy, a self-hosted
+/// gateway, a typo) gets the Model Studio fields stripped and nothing added.
+fn is_exact_modelstudio_chat_route(provider: ApiProvider, base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let Some((host, path)) = trimmed
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+
+    // Includes Token Plan's default and workspace-scoped
+    // `{workspace}.<region>.maas.aliyuncs.com/compatible-mode/v1` hosts.
+    let token_plan_chat = host.ends_with(".maas.aliyuncs.com") && path == "compatible-mode/v1";
+    let coding_plan_chat = host == "coding-intl.dashscope.aliyuncs.com" && path == "v1";
+    // Alibaba's classic pay-as-you-go DashScope endpoints serve the same
+    // models and the same dialect; leaving them off the allowlist silently
+    // stripped every reasoning control on a genuine Alibaba host
+    // (2026-08-04 review). The intl spelling matches the repo's own
+    // provider defaults.
+    let classic_dashscope_chat = matches!(
+        host,
+        "dashscope.aliyuncs.com" | "dashscope-intl.aliyuncs.com"
+    ) && path == "compatible-mode/v1";
+
+    match provider {
+        // The primary Model Studio provider selects Coding Plan through
+        // `mode = "coding-plan"`, which resolves this base URL without
+        // changing the provider enum. Legacy Coding Plan identities remain
+        // supported as well, so recognize either official Chat route for the
+        // complete Model Studio OpenAI family. The `*Anthropic` identities
+        // speak the Messages dialect and are never verified here.
+        ApiProvider::ModelstudioTokenPlan | ApiProvider::ModelstudioCodingPlan => {
+            token_plan_chat || coding_plan_chat || classic_dashscope_chat
+        }
+        _ => false,
+    }
+}
+
+fn is_exact_modelstudio_thinking_only_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    is_exact_modelstudio_chat_route(provider, base_url) && modelstudio_model_is_thinking_only(model)
+}
+
+fn modelstudio_effort_disables_thinking(effort: Option<&str>) -> bool {
+    effort.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "disabled" | "none" | "false"
+        )
+    })
+}
+
+/// Models with no enable/disable control at all. `models_dev.bundled.json`
+/// lists `qwen3.8-max` as `thinking: always_on` and gives `qwen3.8-max-preview`
+/// effort/budget options with no `toggle`, so sending `enable_thinking` to
+/// either is at best ignored and at worst a 400.
+fn modelstudio_model_is_thinking_only(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "qwen3.8-max"
+            | "qwen3.8-max-preview"
+            // Kimi K2.7 Code is always-thinking. Keep both Alibaba-hosted and
+            // Moonshot-supplied exact IDs separate from hybrid Kimi variants
+            // so we never send the unsupported enable_thinking switch.
+            | "kimi-k2.7-code"
+            | "kimi/kimi-k2.7-code"
+            | "kimi/kimi-k2.7-code-highspeed"
+    )
+}
+
+fn modelstudio_model_is_hybrid(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("qwen3.7-")
+        || model.starts_with("qwen3.6-")
+        || model.starts_with("qwen3.5-")
+        || model.starts_with("qwen3-")
+        || model.starts_with("deepseek-v4")
+        || model.starts_with("deepseek-v3.2")
+        || model.starts_with("deepseek-v3.1")
+        || model.starts_with("kimi-k2.6")
+        || matches!(model.as_str(), "kimi/kimi-k2.6")
+        || model.starts_with("kimi-k2.5")
+        || model.starts_with("glm-")
+}
+
+fn modelstudio_model_supports_preserve_thinking(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    matches!(
+        model.as_str(),
+        "qwen3.7-max"
+            | "qwen3.7-max-us"
+            | "qwen3.7-max-2026-05-17"
+            | "qwen3.7-max-2026-05-20"
+            | "qwen3.7-max-2026-06-08"
+            | "qwen3.7-max-preview"
+            | "qwen3.7-plus"
+            | "qwen3.7-plus-us"
+            | "qwen3.7-plus-2026-05-26"
+            | "qwen3.6-max-preview"
+            | "qwen3.6-plus"
+            | "qwen3.6-plus-2026-04-02"
+            | "qwen3.6-flash"
+            | "qwen3.6-flash-2026-04-16"
+            | "kimi-k2.6"
+            | "kimi-k2.7-code"
+            | "kimi/kimi-k2.6"
+            | "kimi/kimi-k2.7-code"
+            | "kimi/kimi-k2.7-code-highspeed"
+    )
+}
+
+fn modelstudio_model_supports_reasoning_effort(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("deepseek-v4") || matches!(model.as_str(), "glm-5.2" | "glm-5.1" | "glm-5")
+}
+
+fn modelstudio_reasoning_effort_for_model(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        // Model Studio documents low and medium as aliases for high.
+        "minimal" | "low" | "medium" | "mid" | "high" | "" => Some("high"),
+        "xhigh" | "max" | "highest" | "ultra" | "ultracode" => Some("max"),
+        _ => None,
+    }
+}
+
+/// Final reasoning-control pass shared by streaming and non-streaming Chat
+/// Completions requests. Route-specific shapers run after the generic provider
+/// layer so they can remove fields that are invalid for their exact endpoint.
+pub(super) fn apply_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    apply_reasoning_effort(body, effort, provider);
+    apply_modelstudio_route_reasoning_controls(body, provider, base_url, model, effort);
+    apply_minimax_route_reasoning_controls(body, provider, base_url, model, effort);
+    apply_inkling_reasoning_effort(body, provider, model, effort);
+    apply_openai_reasoning_effort(body, provider, model, effort);
+    apply_xai_grok_4_6_reasoning_effort(body, provider, base_url, model, effort);
+    apply_direct_moonshot_k3_reasoning_effort(body, provider, base_url, model, effort);
+    apply_kimi_code_k3_reasoning_effort(body, provider, base_url, model, effort);
+    apply_zai_route_reasoning_controls(body, provider, base_url, model, effort);
+    apply_mistral_route_reasoning_controls(body, provider, base_url, model, effort);
+    apply_google_thinking_level(body, provider, base_url, model, effort);
+}
+
+/// Mistral's polymorphic reasoning-content contract is only proven on its
+/// first-party Chat Completions endpoints. A configured `mistral` provider may
+/// point at an arbitrary OpenAI-compatible gateway, so provider identity alone
+/// is not enough to opt that route into Mistral's request or response dialect.
+fn is_exact_mistral_chat_route(provider: ApiProvider, base_url: &str) -> bool {
+    if provider != ApiProvider::Mistral {
+        return false;
+    }
+    let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let Some((host, path)) = trimmed
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    matches!(
+        host,
+        "api.mistral.ai" | "api.eu.mistral.ai" | "api.us.mistral.ai"
+    ) && path == "v1"
+}
+
+/// Google's OpenAI-compatibility route. Thought signatures are captured
+/// from tool-call `extra_content.google.thought_signature` and replayed on
+/// the assistant tool-call messages of later turns; thinking models fail
+/// closed when a replayed call has no signature.
+fn is_exact_google_chat_route(provider: ApiProvider, base_url: &str) -> bool {
+    if provider != ApiProvider::Google {
+        return false;
+    }
+    let trimmed = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let Some((host, path)) = trimmed
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    host == "generativelanguage.googleapis.com" && path == "v1beta/openai"
+}
+
+/// Gemini models whose thinking makes thought signatures load-bearing on
+/// the OpenAI-compat route. Gemini 2.5 Flash-Lite ships with thinking off
+/// by default, so a missing signature there degrades with a warning
+/// instead of failing the turn.
+fn google_model_requires_thought_signatures(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("gemini-3") {
+        return true;
+    }
+    if model.starts_with("gemini-2.5-pro") {
+        return true;
+    }
+    model.starts_with("gemini-2.5-flash") && !model.starts_with("gemini-2.5-flash-lite")
+}
+
+/// Thinking level for the OpenAI-compat route rides the documented
+/// `google.thinking_config.thinking_level` body field (low/high; Gemini 3
+/// cannot disable thinking).
+fn apply_google_thinking_level(
+    body: &mut serde_json::Value,
+    provider: ApiProvider,
+    base_url: &str,
+    _model: &str,
+    effort: Option<&str>,
+) {
+    if !is_exact_google_chat_route(provider, base_url) || effort.is_none() {
+        return;
+    }
+    let level = match effort
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "disabled" | "none" | "false" | "" | "low" | "minimal" | "medium" | "mid" => "low",
+        _ => "high",
+    };
+    body["google"]["thinking_config"]["thinking_level"] = json!(level);
+}
+
+/// Fail closed before transport when the exact Google route would replay
+/// tool calls without the thought signatures Google's thinking models
+/// require. The error names the model and tells the operator how to
+/// recover instead of letting Google reject or corrupt the tool loop.
+fn validate_google_thought_signature_replay(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    messages: &[Value],
+) -> Result<()> {
+    if !is_exact_google_chat_route(provider, base_url)
+        || !google_model_requires_thought_signatures(model)
+    {
+        return Ok(());
+    }
+    for message in messages {
+        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for call in tool_calls {
+            let missing = call
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str)
+                .is_none();
+            if missing {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or("?");
+                anyhow::bail!(
+                    "Gemini model `{model}` requires a thought signature to replay tool call \
+                     `{id}`, but none was captured (the turn predates signature capture, or \
+                     the provider omitted it). Start a new session before using tools on \
+                     this route."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Captured Google signatures ride on tool calls as
+/// `extra_content.google.thought_signature`. Only the exact Google route
+/// may carry them on the wire; every other provider gets them stripped so
+/// a route switch never leaks Google-only fields to a foreign gateway.
+fn strip_google_tool_call_extra_content(messages: &mut [Value]) {
+    for message in messages {
+        let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in tool_calls {
+            if let Some(extra) = call.get_mut("extra_content")
+                && let Some(obj) = extra.as_object_mut()
+            {
+                obj.remove("google");
+                if obj.is_empty() {
+                    call.as_object_mut().map(|c| c.remove("extra_content"));
+                }
+            }
+        }
+    }
+}
+
+fn mistral_model_has_adjustable_reasoning(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("mistral-medium") || model.starts_with("mistral-small")
+}
+
+fn mistral_model_has_native_reasoning(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("magistral")
+}
+
+fn mistral_model_supports_reasoning(model: &str) -> bool {
+    mistral_model_has_adjustable_reasoning(model) || mistral_model_has_native_reasoning(model)
+}
+
+fn mistral_reasoning_effort_wire_value(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" => Some("none"),
+        "high" | "xhigh" | "max" | "highest" | "ultra" | "ultracode" => Some("high"),
+        _ => None,
+    }
+}
+
+/// Rewrite assistant messages that carry `reasoning_content` back into the
+/// polymorphic `content: [{type: thinking, thinking: [{type: text, text: ...}],
+/// closed: bool}, {type: text, text: ...}]` shape that Mistral la Plateforme
+/// emits and accepts on replay. Mistral tolerates plain-string history in a
+/// thinking-capable conversation, but replaying the original thinking trace
+/// keeps multi-turn reasoning quality high per the official docs
+/// (docs.mistral.ai/capabilities/reasoning). Non-assistant messages and
+/// assistant messages without stored thinking are left untouched.
+fn reshape_mistral_messages_for_reasoning_replay(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(reasoning) = object.remove("reasoning_content") else {
+            continue;
+        };
+        let reasoning_text = reasoning
+            .as_str()
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        let Some(reasoning_text) = reasoning_text else {
+            continue;
+        };
+        let text_content = object
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut blocks = vec![json!({
+            "type": "thinking",
+            "thinking": [{"type": "text", "text": reasoning_text}],
+            "closed": true,
+        })];
+        if let Some(text) = text_content.filter(|s| !s.trim().is_empty()) {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        object.insert("content".to_string(), Value::Array(blocks));
+    }
+}
+
+/// Extract thinking and text content from a Mistral polymorphic `content`
+/// value. Mistral la Plateforme returns `content` as either a plain string
+/// (default) or an array of typed blocks (`{type: "thinking", thinking:
+/// [{type: "text", text: "..."}], closed: bool}` and `{type: "text", text:
+/// "..."}`). This helper flattens the thinking sub-array into a single
+/// string and returns any inline text separately. It ignores plain-string
+/// `content` (returns `(None, None)`) so the shared string fallback still
+/// runs for non-reasoning responses.
+fn extract_mistral_polymorphic_content(value: &Value) -> (Option<String>, Option<String>) {
+    let Some(array) = value.get("content").and_then(Value::as_array) else {
+        return (None, None);
+    };
+    let mut thinking = String::new();
+    let mut text = String::new();
+    for block in array {
+        let Some(kind) = block.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "thinking" => {
+                if let Some(inner) = block.get("thinking").and_then(Value::as_array) {
+                    for sub in inner {
+                        if let Some(sub_text) = sub
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            thinking.push_str(sub_text);
+                        }
+                    }
+                } else if let Some(inline) = block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    thinking.push_str(inline);
+                }
+            }
+            "text" => {
+                if let Some(sub_text) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    text.push_str(sub_text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let thinking = (!thinking.is_empty()).then_some(thinking);
+    let text = (!text.is_empty()).then_some(text);
+    (thinking, text)
+}
+
+fn apply_mistral_route_reasoning_controls(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Mistral {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+        object.remove("reasoning_effort");
+    }
+    if !is_exact_mistral_chat_route(provider, base_url)
+        || !mistral_model_has_adjustable_reasoning(model)
+    {
+        return;
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    if let Some(wire) = mistral_reasoning_effort_wire_value(effort) {
+        body["reasoning_effort"] = json!(wire);
+    }
+}
+
+/// The direct K3 Chat Completions schema exposes fixed sampling behavior and
+/// omits `temperature` and `top_p`. Strip legacy/generic values only from the
+/// exact first-party route so compatible gateways keep their own contract.
+/// Source: <https://platform.kimi.ai/docs/guide/kimi-k3-quickstart> (verified 2026-07-20).
+fn apply_direct_moonshot_k3_fixed_sampling(
+    body: &mut Value,
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) {
+    if !is_exact_direct_moonshot_k3_route(provider, base_url, model) {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("temperature");
+        object.remove("top_p");
+    }
 }
 
 fn openai_compatible_reasoning_effort(
@@ -114,8 +877,8 @@ fn openai_compatible_reasoning_effort(
         "medium" | "mid" | "" => Some("medium"),
         "high" => Some("high"),
         "xhigh" => Some("xhigh"),
-        "max" | "highest" | "ultracode" if supports_max => Some("max"),
-        "max" | "highest" | "ultracode" => Some("xhigh"),
+        "max" | "highest" | "ultra" | "ultracode" if supports_max => Some("max"),
+        "max" | "highest" | "ultra" | "ultracode" => Some("xhigh"),
         _ => None,
     }
 }
@@ -155,65 +918,195 @@ fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProv
     mirror_minimax_reasoning_details_for_messages(messages);
 }
 
-impl DeepSeekClient {
-    pub(super) async fn create_message_chat(
-        &self,
-        request: &MessageRequest,
-    ) -> Result<MessageResponse> {
-        let cacheable = crate::llm_response_cache::request_is_cacheable(request);
-        let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
-        let model = wire_model_for_provider(self.api_provider, &request.model);
-        let mut body = json!({
+fn sanitize_moonshot_chat_tools(chat_tools: &mut [Value]) -> Result<()> {
+    for tool in chat_tools {
+        let Some(function) = tool
+            .as_object_mut()
+            .and_then(|tool| tool.get_mut("function"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let Some(parameters) = function.get_mut("parameters") else {
+            continue;
+        };
+        let note = crate::tools::schema_sanitize::sanitize_for_kimi_parameters(parameters)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Moonshot function parameters failed safe compatibility validation: {error}"
+                )
+            })?;
+        if let Some(note) = note {
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let description = if description.is_empty() {
+                note
+            } else {
+                format!("{description} {note}")
+            };
+            function.insert("description".to_string(), json!(description));
+        }
+    }
+    Ok(())
+}
+
+/// The final Chat Completions wire payload for one request.
+///
+/// Produced by [`build_chat_wire_body`], the single place where a
+/// `MessageRequest` becomes Chat-shaped JSON. It is reached only through
+/// [`super::DeepSeekClient::prepare_outbound_request`], the shared outbound
+/// seam that the blocking transport, the streaming transport, and
+/// `/preview-request` all consume — so a preview cannot drift from what would
+/// be sent, and no other dialect is projected through this builder.
+///
+/// Seam concept harvested from PR #1099 (`build_sanitized_chat_completion_body`)
+/// by TaoMu (GTC2080); re-implemented against the current client shape.
+pub(crate) struct ChatWireBody {
+    /// Provider-shaped JSON body, post-sanitizers.
+    pub(crate) body: Value,
+    /// The model id actually placed on the wire (may differ from the
+    /// configured/display model for routed providers).
+    pub(crate) model: String,
+    /// Tokens re-sent because thinking-mode replay substituted
+    /// `reasoning_content`. Only computed on the streaming path, which is the
+    /// only path that runs the replay sanitizer today.
+    pub(crate) replay_input_tokens: Option<u32>,
+}
+
+/// Build the Chat Completions wire body for `request`.
+///
+/// `stream` selects the streaming shape (`stream` + `stream_options`) and, to
+/// preserve historical behavior exactly, also gates the thinking-mode replay
+/// sanitizer — the blocking path has never run it.
+pub(crate) fn build_chat_wire_body(
+    request: &MessageRequest,
+    provider: ApiProvider,
+    base_url: &str,
+    stream: bool,
+) -> Result<ChatWireBody> {
+    let messages =
+        build_chat_messages_for_request_and_provider_and_route(request, provider, base_url);
+    let model = {
+        let wire = wire_model_for_provider_route(provider, base_url, &request.model);
+        crate::models::effective_muse_wire_id(&wire).to_string()
+    };
+    validate_google_thought_signature_replay(provider, base_url, &model, &messages)?;
+    let mut body = if stream {
+        json!({
             "model": model.clone(),
             "messages": messages,
             "max_tokens": request.max_tokens,
-        });
-        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
+            "stream": true,
+            "stream_options": {
+                "include_usage": true
+            },
+        })
+    } else {
+        json!({
+            "model": model.clone(),
+            "messages": messages,
+            "max_tokens": request.max_tokens,
+        })
+    };
+    apply_provider_token_limit(&mut body, provider, base_url, &model, request.max_tokens);
 
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(tools) = request.tools.as_ref() {
+        let mut chat_tools: Vec<_> = tools
+            .iter()
+            .map(|tool| tool_to_chat_for_base_url(tool, base_url))
+            .collect();
+        // Moonshot function parameters must end at a plain object root.
+        // Flatten root composition, preserve valid nested anyOf, and fail
+        // closed before transport when an internal root ref is unsafe.
+        if matches!(provider, crate::config::ApiProvider::Moonshot) {
+            sanitize_moonshot_chat_tools(&mut chat_tools)?;
         }
-        if let Some(top_p) = request.top_p {
-            body["top_p"] = json!(top_p);
-        }
-        if let Some(tools) = request.tools.as_ref() {
-            let mut chat_tools: Vec<_> = tools
-                .iter()
-                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                .collect();
-            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
-            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
-            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
-                for t in &mut chat_tools {
-                    if let Some(fn_obj) = t
-                        .as_object_mut()
-                        .and_then(|t| t.get_mut("function"))
-                        .and_then(|f| f.get_mut("parameters"))
-                    {
-                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
-                    }
+        // xAI rejects a parameters root that is not a plain object schema
+        // (e.g. apply_patch's root `oneOf` required-groups) with a 400.
+        if matches!(provider, crate::config::ApiProvider::Xai) {
+            for t in &mut chat_tools {
+                let Some(function) = t
+                    .as_object_mut()
+                    .and_then(|t| t.get_mut("function"))
+                    .and_then(|f| f.as_object_mut())
+                else {
+                    continue;
+                };
+                let note = function.get_mut("parameters").and_then(|parameters| {
+                    crate::tools::schema_sanitize::sanitize_for_xai_parameters(parameters)
+                });
+                if let Some(note) = note
+                    && let Some(description) = function
+                        .get_mut("description")
+                        .and_then(|d| d.as_str().map(str::to_string))
+                {
+                    function.insert(
+                        "description".to_string(),
+                        json!(format!("{description} {note}")),
+                    );
                 }
             }
-            body["tools"] = json!(chat_tools);
         }
-        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
-            && let Some(choice) = request.tool_choice.as_ref()
-            && let Some(mapped) = map_tool_choice_for_chat(choice)
-        {
-            body["tool_choice"] = mapped;
-        }
-        apply_reasoning_effort(
+        body["tools"] = json!(chat_tools);
+    }
+    if should_send_tool_choice_for_chat(provider, request.reasoning_effort.as_deref())
+        && let Some(choice) = request.tool_choice.as_ref()
+        && let Some(mapped) = map_tool_choice_for_chat(choice)
+    {
+        body["tool_choice"] = mapped;
+    }
+    apply_route_reasoning_controls(
+        &mut body,
+        provider,
+        base_url,
+        &model,
+        request.reasoning_effort.as_deref(),
+    );
+    apply_direct_moonshot_k3_fixed_sampling(&mut body, provider, base_url, &model);
+
+    // Bulletproof final sanitizer: walk the wire payload and force
+    // `reasoning_content` onto any assistant message that has tool_calls
+    // but no reasoning_content. DeepSeek's thinking-mode API rejects
+    // such messages with a 400. This is the last line of defense after
+    // engine-side and build-side substitution; if either upstream path
+    // misses a case (e.g. a session restored from disk, a sub-agent
+    // adding messages directly, or a cached prefix mismatch), this pass
+    // still produces a valid request.
+    let replay_input_tokens = if stream {
+        sanitize_thinking_mode_messages_for_route(
             &mut body,
-            request.reasoning_effort.as_deref(),
-            self.api_provider,
-        );
-        apply_openai_reasoning_effort(
-            &mut body,
-            self.api_provider,
             &model,
             request.reasoning_effort.as_deref(),
-        );
-        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
+            provider,
+            base_url,
+        )
+    } else {
+        None
+    };
+    mirror_minimax_reasoning_details_for_body(&mut body, provider);
+
+    Ok(ChatWireBody {
+        body,
+        model,
+        replay_input_tokens,
+    })
+}
+
+impl DeepSeekClient {
+    pub(super) async fn create_message_chat(
+        &self,
+        prepared: &super::PreparedOutboundRequest,
+        cacheable: bool,
+    ) -> Result<MessageResponse> {
+        let body = &prepared.body;
 
         let response_cache_key = if cacheable {
             let wire_body =
@@ -233,27 +1126,14 @@ impl DeepSeekClient {
             None
         };
 
-        let url = api_url_with_suffix(
-            &self.base_url,
-            "chat/completions",
-            self.path_suffix.as_deref(),
-        );
-        let open_timeout = stream_open_timeout();
-        let response = match tokio_timeout(open_timeout, self.send_json_with_retry(&url, &body))
-            .await
-        {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                anyhow::bail!(
-                    "SSE stream request did not receive response headers after {}s. \
-                     `codewhale doctor` can still pass when non-streaming requests work; \
-                     on Windows or proxy networks, try `DEEPSEEK_FORCE_HTTP1=1` and rerun `codewhale`.",
-                    open_timeout.as_secs()
-                );
-            }
-        };
+        // The endpoint was resolved by the shared seam alongside the body, so
+        // a route-shape decision (e.g. DeepSeek's strict-tools `/beta` path)
+        // cannot be made twice with two different answers.
+        let url = prepared.endpoint.url.as_str();
+        let response = self.send_json_with_retry(url, body).await?;
 
         let status = response.status();
+        crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
             let error_text = sanitize_http_error_body(
@@ -261,7 +1141,10 @@ impl DeepSeekClient {
                 status.as_u16(),
                 &raw_error_text,
             );
-            anyhow::bail!("Failed to call DeepSeek Chat API: HTTP {status}: {error_text}");
+            anyhow::bail!(
+                "Failed to call {} Chat Completions API: HTTP {status}: {error_text}",
+                self.api_provider.display_name()
+            );
         }
 
         let response_text = response
@@ -270,7 +1153,7 @@ impl DeepSeekClient {
             .context("Failed to read Chat API response body")?;
         let value: Value =
             serde_json::from_str(&response_text).context("Failed to parse Chat API JSON")?;
-        let parsed = parse_chat_message(&value)?;
+        let parsed = parse_chat_message_for_route(&value, self.api_provider, &self.base_url)?;
         if let Some(key) = response_cache_key {
             crate::llm_response_cache::response_cache().put(key, parsed.clone());
         }
@@ -279,92 +1162,64 @@ impl DeepSeekClient {
 }
 
 impl DeepSeekClient {
-    pub(super) async fn handle_chat_completion_stream(
+    async fn open_chat_stream_response(
         &self,
-        request: MessageRequest,
-    ) -> Result<StreamEventBox> {
-        // Try true SSE streaming via chat completions (widely supported)
-        let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
-        let model = wire_model_for_provider(self.api_provider, &request.model);
-        let mut body = json!({
-            "model": model.clone(),
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "stream": true,
-            "stream_options": {
-                "include_usage": true
-            },
-        });
-        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
-
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(top_p) = request.top_p {
-            body["top_p"] = json!(top_p);
-        }
-        if let Some(tools) = request.tools.as_ref() {
-            let mut chat_tools: Vec<_> = tools
-                .iter()
-                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                .collect();
-            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
-            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
-            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
-                for t in &mut chat_tools {
-                    if let Some(fn_obj) = t
-                        .as_object_mut()
-                        .and_then(|t| t.get_mut("function"))
-                        .and_then(|f| f.get_mut("parameters"))
-                    {
-                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
-                    }
+        url: &str,
+        body: &Value,
+    ) -> Result<(reqwest::Response, Duration)> {
+        let open_req = super::stream_entry::StreamOpenRequest::new(
+            stream_open_timeout(),
+            self.stream_idle_timeout,
+        );
+        let idle_timeout = open_req.idle_timeout;
+        let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
+            match policy {
+                // The prebuilt HTTP/1.1 twin carries the same default
+                // headers/auth; send once, without the JSON retry loop
+                // (matching the pre-seam H1-pin behavior).
+                super::stream_entry::StreamHttpPolicy::Http1Only => {
+                    let client = super::stream_entry::client_for_policy(
+                        &self.http_client,
+                        self.http1_fallback_client(),
+                        policy,
+                    );
+                    Ok(client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .json(body)
+                        .send()
+                        .await?)
+                }
+                super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
+                    self.send_json_with_retry(url, body).await
                 }
             }
-            body["tools"] = json!(chat_tools);
-        }
-        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
-            && let Some(choice) = request.tool_choice.as_ref()
-            && let Some(mapped) = map_tool_choice_for_chat(choice)
-        {
-            body["tool_choice"] = mapped;
-        }
-        apply_reasoning_effort(
-            &mut body,
-            request.reasoning_effort.as_deref(),
-            self.api_provider,
-        );
-        apply_openai_reasoning_effort(
-            &mut body,
-            self.api_provider,
-            &model,
-            request.reasoning_effort.as_deref(),
-        );
+        })
+        .await?;
+        Ok((response, idle_timeout))
+    }
 
-        // Bulletproof final sanitizer: walk the wire payload and force
-        // `reasoning_content` onto any assistant message that has tool_calls
-        // but no reasoning_content. DeepSeek's thinking-mode API rejects
-        // such messages with a 400. This is the last line of defense after
-        // engine-side and build-side substitution; if either upstream path
-        // misses a case (e.g. a session restored from disk, a sub-agent
-        // adding messages directly, or a cached prefix mismatch), this pass
-        // still produces a valid request.
-        let replay_input_tokens = sanitize_thinking_mode_messages(
-            &mut body,
-            &model,
-            request.reasoning_effort.as_deref(),
-            self.api_provider,
-        );
-        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
+    pub(super) async fn handle_chat_completion_stream(
+        &self,
+        prepared: super::PreparedOutboundRequest,
+    ) -> Result<StreamEventBox> {
+        // Try true SSE streaming via chat completions (widely supported).
+        // Body and endpoint both come from the shared prepared-request seam,
+        // so a preview or a non-stream call can never diverge from the
+        // streamed request.
+        let super::PreparedOutboundRequest {
+            body,
+            wire_model: model,
+            replay_input_tokens,
+            endpoint,
+            ..
+        } = prepared;
+        let url = endpoint.url;
 
-        let url = api_url_with_suffix(
-            &self.base_url,
-            "chat/completions",
-            self.path_suffix.as_deref(),
-        );
-        let response = self.send_json_with_retry(&url, &body).await?;
+        let (response, stream_idle_timeout) = self.open_chat_stream_response(&url, &body).await?;
 
         let status = response.status();
+        crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
             let error_text = sanitize_http_error_body(
@@ -382,6 +1237,7 @@ impl DeepSeekClient {
         }
 
         let api_provider = self.api_provider;
+        let base_url = self.base_url.clone();
 
         // Capture transport-shape headers before we consume `response` into
         // `bytes_stream()`. They are surfaced in the decode-error log path so
@@ -389,7 +1245,6 @@ impl DeepSeekClient {
         // gzip-compressor failure when investigating #103.
         let response_headers = format_stream_headers(response.headers());
         let byte_stream = response.bytes_stream();
-        let stream_idle_timeout = self.stream_idle_timeout;
         let configured_reasoning_stream_style = self.reasoning_stream_style.clone();
 
         let stream = async_stream::stream! {
@@ -422,8 +1277,9 @@ impl DeepSeekClient {
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
             let mut reasoning_detail_buffers: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
             let mut inline_reasoning_tags = InlineReasoningTagState::default();
-            let reasoning_stream_style = reasoning_stream_style_for_stream(
+            let reasoning_stream_style = reasoning_stream_style_for_route(
                 api_provider,
+                &base_url,
                 &model,
                 configured_reasoning_stream_style.as_deref(),
             );
@@ -442,22 +1298,37 @@ impl DeepSeekClient {
             // Set when a `[DONE]` sentinel was seen, so the post-loop flush does
             // not re-process trailing post-DONE bytes.
             let mut saw_done = false;
+            // A number of OpenAI-compatible providers omit `[DONE]` but send a
+            // terminal `finish_reason`. Either is valid terminal proof. A raw
+            // HTTP EOF with neither is not: treating that as MessageStop turns
+            // a truncated provider response into a successful empty turn.
+            let mut saw_finish_reason = false;
+            // Once an error has been emitted, do not follow it with a synthetic
+            // MessageStop (or a second, less-specific premature-EOF error).
+            let mut stream_failed = false;
+            // Set when a complete line or unterminated flush failed UTF-8.
+            // Skip further data-frame parsing so U+FFFD cannot enter the transcript.
+            let mut decode_failed = false;
 
             'stream: loop {
                 let chunk_result = match tokio_timeout(idle, byte_stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
                     Err(_elapsed) => {
-                        yield Err(anyhow::anyhow!(
-                            "SSE stream idle timeout after {}s — no data received",
-                            idle.as_secs(),
-                        ));
+                        stream_failed = true;
+                        yield Err(anyhow::anyhow!(stream_idle_timeout_message(
+                            idle,
+                            bytes_received,
+                            stream_start.elapsed(),
+                            last_event_at.elapsed(),
+                        )));
                         break;
                     }
                 };
                 let chunk = match chunk_result {
                     Ok(bytes) => bytes,
                     Err(e) => {
+                        stream_failed = true;
                         // Walk the error source chain so reqwest's underlying
                         // hyper / h2 / io error is visible — without this the
                         // outer "error decoding response body" message tells
@@ -489,6 +1360,7 @@ impl DeepSeekClient {
                 // Guard against unbounded buffer growth (e.g., malformed stream without newlines)
                 const MAX_SSE_BUF: usize = 10 * 1024 * 1024; // 10 MB
                 if byte_buf.len() > MAX_SSE_BUF {
+                    stream_failed = true;
                     yield Err(anyhow::anyhow!("SSE buffer exceeded {MAX_SSE_BUF} bytes — aborting stream"));
                     break;
                 }
@@ -497,15 +1369,21 @@ impl DeepSeekClient {
                     tokio::time::sleep(Duration::from_millis(SSE_BACKPRESSURE_SLEEP_MS)).await;
                 }
 
-                // Process complete SSE lines from the buffer
+                // Process complete SSE lines from the buffer. Decode only after
+                // a `\n` so an HTTP/2 DATA split mid-character cannot become
+                // U+FFFD; genuine invalid bytes fail closed.
                 let mut lines_processed = 0usize;
-                while let Some(newline_pos) = byte_buf.iter().position(|&b| b == b'\n') {
-                    let mut end = newline_pos;
-                    if end > 0 && byte_buf[end - 1] == b'\r' {
-                        end -= 1;
-                    }
-                    let line = String::from_utf8_lossy(&byte_buf[..end]).into_owned();
-                    byte_buf.drain(..newline_pos + 1);
+                loop {
+                    let line = match super::take_sse_line(&mut byte_buf) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(err) => {
+                            decode_failed = true;
+                            stream_failed = true;
+                            yield Err(anyhow::anyhow!("{err}"));
+                            break 'stream;
+                        }
+                    };
 
                     if line.is_empty() {
                         // Empty line = event boundary, process accumulated data
@@ -527,6 +1405,11 @@ impl DeepSeekClient {
                                 }
                                 SseDataFrame::Events(events) => {
                                     for mut event in events {
+                                        saw_finish_reason |= matches!(
+                                            &event,
+                                            StreamEvent::MessageDelta { delta, .. }
+                                                if delta.stop_reason.as_deref().is_some_and(|reason| !reason.trim().is_empty())
+                                        );
                                         // Stamp the client-side replay-token estimate
                                         // onto the final usage so the UI can surface
                                         // it (#30). We compute it pre-request and
@@ -562,8 +1445,15 @@ impl DeepSeekClient {
 
                     lines_processed = lines_processed.saturating_add(1);
                     if lines_processed >= SSE_MAX_LINES_PER_CHUNK {
-                        // Yield backpressure relief to avoid starving downstream consumers.
-                        break;
+                        // Backpressure relief: hand the executor a turn so a
+                        // slow consumer is not starved. Keep draining after
+                        // that — leaving complete lines buffered would strand
+                        // them, because the outer loop only resumes draining
+                        // once ANOTHER chunk arrives and the end-of-stream
+                        // flush treats the whole remainder as a single
+                        // unterminated line.
+                        lines_processed = 0;
+                        tokio::task::yield_now().await;
                     }
                 }
             }
@@ -572,24 +1462,28 @@ impl DeepSeekClient {
             // line (the stream closed straight after the last `data:` line, or
             // that line lacked a trailing newline). Without this the final delta
             // — last tokens, finish_reason, and usage — is silently dropped.
-            // Skipped after `[DONE]`, whose frame was already processed.
-            if !saw_done {
-                if !byte_buf.is_empty() {
-                    let mut end = byte_buf.len();
-                    if end > 0 && byte_buf[end - 1] == b'\r' {
-                        end -= 1;
-                    }
-                    let line = String::from_utf8_lossy(&byte_buf[..end]).into_owned();
-                    if let Some(data) = super::extract_sse_data_value(&line) {
-                        if !line_buf.is_empty() {
-                            line_buf.push('\n');
+            // Skipped after `[DONE]`, whose frame was already processed, and
+            // after a fail-closed UTF-8 error.
+            if !saw_done && !decode_failed {
+                match super::flush_sse_line(&mut byte_buf) {
+                    Ok(Some(line)) => {
+                        if let Some(data) = super::extract_sse_data_value(&line) {
+                            if !line_buf.is_empty() {
+                                line_buf.push('\n');
+                            }
+                            line_buf.push_str(data);
                         }
-                        line_buf.push_str(data);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        decode_failed = true;
+                        stream_failed = true;
+                        yield Err(anyhow::anyhow!("{err}"));
                     }
                 }
-                if !line_buf.is_empty() {
+                if !decode_failed && !line_buf.is_empty() {
                     let data = std::mem::take(&mut line_buf);
-                    if let SseDataFrame::Events(events) = parse_sse_data_frame(
+                    match parse_sse_data_frame(
                         &data,
                         &mut content_index,
                         &mut text_started,
@@ -599,15 +1493,23 @@ impl DeepSeekClient {
                         &mut inline_reasoning_tags,
                         reasoning_stream_style,
                     ) {
-                        for mut event in events {
-                            if let Some(tokens) = replay_input_tokens
-                                && let StreamEvent::MessageDelta {
-                                    usage: Some(usage), ..
-                                } = &mut event
-                            {
-                                usage.reasoning_replay_tokens = Some(tokens);
+                        SseDataFrame::Done => saw_done = true,
+                        SseDataFrame::Events(events) => {
+                            for mut event in events {
+                                saw_finish_reason |= matches!(
+                                    &event,
+                                    StreamEvent::MessageDelta { delta, .. }
+                                        if delta.stop_reason.as_deref().is_some_and(|reason| !reason.trim().is_empty())
+                                );
+                                if let Some(tokens) = replay_input_tokens
+                                    && let StreamEvent::MessageDelta {
+                                        usage: Some(usage), ..
+                                    } = &mut event
+                                {
+                                    usage.reasoning_replay_tokens = Some(tokens);
+                                }
+                                yield Ok(event);
                             }
-                            yield Ok(event);
                         }
                     }
                 }
@@ -621,7 +1523,13 @@ impl DeepSeekClient {
             }
 
             release_stream_buffer(byte_buf);
-            yield Ok(StreamEvent::MessageStop);
+            if !stream_failed && (saw_done || saw_finish_reason) {
+                yield Ok(StreamEvent::MessageStop);
+            } else if !stream_failed {
+                yield Err(anyhow::anyhow!(
+                    "Chat Completions stream closed before [DONE] or finish_reason"
+                ));
+            }
         };
 
         Ok(Pin::from(Box::new(stream)
@@ -653,11 +1561,26 @@ pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<V
     PromptBuilder::for_request(request).build()
 }
 
+#[cfg(test)]
 pub(super) fn build_chat_messages_for_request_and_provider(
     request: &MessageRequest,
     provider: ApiProvider,
 ) -> Vec<Value> {
-    PromptBuilder::for_request(request).build_for_provider(provider)
+    build_chat_messages_for_request_and_provider_and_route(request, provider, "")
+}
+
+/// Build a wire prompt for one fully resolved provider route.
+///
+/// Most provider behavior is keyed only by the provider kind and model. Kimi
+/// Code K3 is deliberately narrower: the bare `k3` model owns reasoning
+/// replay only on its official membership-plan endpoint, so callers that have
+/// a concrete base URL must retain it through prompt construction.
+pub(super) fn build_chat_messages_for_request_and_provider_and_route(
+    request: &MessageRequest,
+    provider: ApiProvider,
+    base_url: &str,
+) -> Vec<Value> {
+    PromptBuilder::for_request(request).build_for_provider_and_route(provider, base_url)
 }
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
@@ -698,13 +1621,14 @@ impl<'a> PromptBuilder<'a> {
         )
     }
 
-    fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
+    fn build_for_provider_and_route(self, provider: ApiProvider, base_url: &str) -> Vec<Value> {
         let mut messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
             self.model,
-            should_replay_reasoning_content_for_provider(
+            should_replay_reasoning_content_for_provider_on_route(
                 provider,
+                base_url,
                 self.model,
                 self.reasoning_effort,
             ),
@@ -716,6 +1640,12 @@ impl<'a> PromptBuilder<'a> {
         }
         if provider == ApiProvider::Minimax {
             mirror_minimax_reasoning_details_for_messages(&mut messages);
+        }
+        if is_exact_mistral_chat_route(provider, base_url) {
+            reshape_mistral_messages_for_reasoning_replay(&mut messages);
+        }
+        if !is_exact_google_chat_route(provider, base_url) {
+            strip_google_tool_call_extra_content(&mut messages);
         }
         messages
     }
@@ -740,7 +1670,7 @@ impl<'a> PromptBuilder<'a> {
             .map(<[Tool]>::to_vec);
         let tool_choice = tools.as_ref().map(|_| json!("none"));
         messages.push(Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::Text {
                 text: CACHE_WARMUP_USER_TAIL.to_string(),
                 cache_control: None,
@@ -750,15 +1680,18 @@ impl<'a> PromptBuilder<'a> {
         MessageRequest {
             model: self.model.to_string(),
             messages,
-            max_tokens: 8,
+            max_tokens: CACHE_WARMUP_MAX_TOKENS,
             system,
             tools,
             tool_choice,
             metadata: None,
             thinking: None,
-            reasoning_effort: self.reasoning_effort.map(str::to_string),
+            // Warmup has an intentionally tiny answer contract ("OK"). Do not
+            // let hidden reasoning consume that allowance before the cacheable
+            // prefix is accepted by the provider.
+            reasoning_effort: Some("off".to_string()),
             stream: None,
-            temperature: Some(0.0),
+            temperature: None,
             top_p: None,
         }
     }
@@ -861,19 +1794,20 @@ fn push_text_part(parts: &mut Vec<Value>, text: &str) {
 }
 
 pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
+pub(crate) const CACHE_WARMUP_MAX_TOKENS: u32 = 8;
 const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
+
+fn tool_result_sent_char_budget() -> usize {
+    crate::tools::large_output_router::WorkshopConfig::active_tool_result_max_bytes()
+        .map(|bytes| bytes.clamp(TOOL_RESULT_SENT_CHAR_BUDGET, 2 * 1024 * 1024))
+        .unwrap_or(TOOL_RESULT_SENT_CHAR_BUDGET)
+}
 const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
 const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
 /// Tool results shorter than this stay inline even when repeated. The
-/// extra prompt bytes are cheaper than forcing the model through an
-/// unnecessary retrieval hop for tiny command outputs.
+/// extra prompt bytes are cheaper than adding an earlier-message reference
+/// for tiny command outputs.
 const TOOL_RESULT_DEDUP_MIN_CHARS: usize = 1_024;
-/// Tool results shorter than this are also exempt from disk persistence —
-/// no SHA file is written. The wire-dedup path won't fire for them
-/// anyway (see `TOOL_RESULT_DEDUP_MIN_CHARS`), so there's no retrieval
-/// burden to satisfy. Keeps `~/.deepseek/tool_outputs/` from filling
-/// up with tiny `gh auth status` and `cat package.json` files.
-const TOOL_RESULT_SHA_PERSIST_MIN_CHARS: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptInspection {
@@ -1274,34 +2208,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     crate::hashing::sha256_hex(bytes)
 }
 
-/// Persist a SHA-addressed copy of `content` to
-/// `~/.deepseek/tool_outputs/sha_<sha>.txt` so the model can retrieve
-/// the original bytes after the wire-dedup compactor has replaced
-/// later occurrences with a `<TOOL_RESULT_REF sha="..." />` block.
-///
-/// Returns `true` when the persist succeeded (or the content is
-/// below `TOOL_RESULT_SHA_PERSIST_MIN_CHARS` — there's no retrieval
-/// need to satisfy). Returns `false` when the write failed and the
-/// caller MUST skip dedup, because emitting a SHA ref the model
-/// can't retrieve is worse than inlining the content twice. The
-/// no-home-dir edge case (InvalidInput) is treated as a real
-/// failure: we can't promise retrieval works without a writable
-/// store.
-fn persist_tool_result_for_sha(sha: &str, content: &str) -> bool {
-    if content.chars().count() < TOOL_RESULT_SHA_PERSIST_MIN_CHARS {
-        return true;
-    }
-    match crate::tools::truncate::write_sha_spillover(sha, content) {
-        Ok(_) => true,
-        Err(err) => {
-            logging::warn(format!(
-                "tool-result SHA spillover write failed for sha={sha}: {err} — dedup skipped"
-            ));
-            false
-        }
-    }
-}
-
 #[derive(Clone)]
 struct PendingToolCallInfo {
     tool_name: String,
@@ -1389,10 +2295,15 @@ fn turn_meta_budget_json(turn_meta: &TurnMetaBudget) -> Value {
 /// their full confirmation inline: collapsing the later one to a
 /// `<TOOL_RESULT_REF sha="..." />` makes the model lose the write-success
 /// context and behave as if the file is missing (issue #1695). Read-style
-/// tools (`read_file`, `grep_files`, `exec_shell`, …) are unaffected and
-/// still dedup normally.
+/// tools (`read_file`, `grep_files`, `exec_shell`, …) may deduplicate medium
+/// outputs by pointing at an earlier full message in the same request. They
+/// never advertise a process-wide SHA as retrievable: that store cannot prove
+/// session ownership.
 fn is_mutation_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "write_file" | "edit_file" | "apply_patch")
+    matches!(
+        tool_name,
+        "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
+    )
 }
 
 fn compact_tool_result_for_wire(
@@ -1405,43 +2316,17 @@ fn compact_tool_result_for_wire(
     let original_chars = content.chars().count();
     let sha = sha256_hex(content.as_bytes());
 
-    // Two independent size-and-kind predicates, deliberately decoupled:
-    //
-    // * `persist_eligible` — size only. Any large result (including a
-    //   mutation tool's big diff) is written to the SHA-addressed store
-    //   so that, if it gets truncated below, the elided middle stays
-    //   retrievable via `retrieve_tool_result`. Mutation tools must NOT
-    //   be excluded here: a >12k-char `write_file` diff that we truncate
-    //   without persisting would leave the model unable to recover it.
-    // * `dedup_eligible` — size AND non-mutation. Only this predicate
-    //   gates collapsing a later identical result to a
-    //   `<TOOL_RESULT_REF>`. Mutation-tool results are write
-    //   *confirmations*, never dedup-eligible (#1695): two identical
-    //   large `write_file` calls must each keep their full confirmation
-    //   inline.
-    //
-    // Below the threshold, repeating the content is safer than asking
-    // the model to chase a reference, and there's no retrieval burden to
-    // satisfy, so both predicates are false.
-    let persist_eligible = original_chars >= TOOL_RESULT_DEDUP_MIN_CHARS;
-    let dedup_eligible = persist_eligible && !is_mutation_tool(tool_name);
+    // Only medium, non-mutation results can point back to a full earlier
+    // message in this one request. Oversized results are already excerpts, so
+    // a back-reference would falsely imply the exact bytes remain available.
+    let sent_budget = tool_result_sent_char_budget();
+    let dedup_eligible = (TOOL_RESULT_DEDUP_MIN_CHARS..=sent_budget).contains(&original_chars)
+        && !is_mutation_tool(tool_name);
 
     if dedup_eligible && let Some(previous) = seen_tool_results.get(&sha) {
-        // Re-check persistence before emitting a ref. If the file is
-        // already present this is a cheap no-op; if the write now fails,
-        // inline the content rather than producing an orphan reference.
-        if !persist_tool_result_for_sha(&sha, content) {
-            return WireToolResult {
-                content: content.to_string(),
-                original_chars,
-                sent_chars: original_chars,
-                truncated: false,
-                deduplicated: false,
-            };
-        }
         let content = format!(
             "<TOOL_RESULT_REF sha=\"{sha}\" original_message=\"{label}\" chars=\"{chars}\">\n\
-             retrieve: retrieve_tool_result ref=sha:{sha}\n\
+             source: full content appears in {label} earlier in this request\n\
              </TOOL_RESULT_REF>",
             label = previous.message_label,
             chars = previous.original_chars,
@@ -1455,28 +2340,32 @@ fn compact_tool_result_for_wire(
         };
     }
 
-    if persist_eligible {
-        // Persist any large result so a later truncation below stays
-        // retrievable by SHA — this includes mutation tools, whose big
-        // diffs are NOT dedup-eligible but still must be recoverable
-        // when elided. Only register the SHA as dedup-able (eligible to
-        // be replaced by a back-reference later) when `dedup_eligible`:
-        // if the write fails, skip registration so later occurrences
-        // stay inline instead of pointing at a file that was never
-        // created.
-        let persisted = persist_tool_result_for_sha(&sha, content);
-        if persisted && dedup_eligible {
-            seen_tool_results.insert(
-                sha.clone(),
-                SeenToolResult {
-                    message_label: message_label.to_string(),
-                    original_chars,
-                },
-            );
-        }
+    if dedup_eligible {
+        seen_tool_results.insert(
+            sha.clone(),
+            SeenToolResult {
+                message_label: message_label.to_string(),
+                original_chars,
+            },
+        );
     }
 
-    if original_chars <= TOOL_RESULT_SENT_CHAR_BUDGET {
+    if original_chars <= sent_budget {
+        return WireToolResult {
+            content: content.to_string(),
+            original_chars,
+            sent_chars: original_chars,
+            truncated: false,
+            deduplicated: false,
+        };
+    }
+
+    // Content already bounded by the adaptive evidence envelope carries its
+    // own honest footer: the omitted count, the on-disk artifact path, and a
+    // recovery instruction. Truncating it again here would destroy that
+    // recovery contract and falsely report that no session-owned artifact
+    // was recorded, so pass it through untouched.
+    if content.contains(crate::tools::truncate::SPILLOVER_RECOVERY_HINT) {
         return WireToolResult {
             content: content.to_string(),
             original_chars,
@@ -1497,7 +2386,7 @@ fn compact_tool_result_for_wire(
          exit_status: {}\n\
          original_chars: {original_chars}\n\
          sha256: {sha}\n\
-         retrieve: retrieve_tool_result ref=sha:{sha}\n\
+         exact_detail: unavailable; no session-owned artifact was recorded\n\
          first_chars:\n\
          {head}\n\n\
          [... truncated {omitted} chars from middle ...]\n\n\
@@ -1589,13 +2478,15 @@ fn build_chat_messages_with_reasoning(
     }
 
     for (message_index, message) in messages.iter().enumerate() {
-        let role = message.role.as_str();
+        // Which wire channel this message belongs in is decided by the shared
+        // placement table, not by an `if` chain local to this adapter.
+        let placement = role_placement(&message.role, WireDialect::ChatCompletions);
         let mut text_parts = Vec::new();
         let mut image_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_infos = Vec::new();
-        let mut tool_results: Vec<(String, String, String)> = Vec::new();
+        let mut tool_results: Vec<(String, String, String, Vec<Value>)> = Vec::new();
         let mut turn_meta_budget: Option<TurnMetaBudget> = None;
 
         for block in &message.content {
@@ -1624,7 +2515,7 @@ fn build_chat_messages_with_reasoning(
                     name,
                     input,
                     caller,
-                    ..
+                    thought_signature,
                 } => {
                     let args = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
                     let mut call = json!({
@@ -1635,6 +2526,9 @@ fn build_chat_messages_with_reasoning(
                             "arguments": args,
                         }
                     });
+                    if let Some(signature) = thought_signature {
+                        call["extra_content"]["google"]["thought_signature"] = json!(signature);
+                    }
                     if let Some(caller) = caller {
                         call["caller"] = json!({
                             "type": caller.caller_type,
@@ -1653,10 +2547,16 @@ fn build_chat_messages_with_reasoning(
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    content_blocks,
                     ..
                 } => {
                     let message_label = format!("Message #{message_index}");
-                    tool_results.push((tool_use_id.clone(), content.clone(), message_label));
+                    tool_results.push((
+                        tool_use_id.clone(),
+                        content.clone(),
+                        message_label,
+                        content_blocks.clone().unwrap_or_default(),
+                    ));
                 }
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
@@ -1664,8 +2564,16 @@ fn build_chat_messages_with_reasoning(
             }
         }
 
-        if role == "assistant" {
-            let content = text_parts.join("\n");
+        if placement.is_assistant_channel() {
+            let content = if placement == RolePlacement::InterruptedAssistant {
+                format!(
+                    "{}{}",
+                    crate::models::INTERRUPTED_ASSISTANT_CONTEXT_PREFIX,
+                    text_parts.join("\n")
+                )
+            } else {
+                text_parts.join("\n")
+            };
             let mut reasoning_content = thinking_parts.join("\n");
             let has_text = !content.trim().is_empty();
             let has_tool_calls = !tool_calls.is_empty();
@@ -1684,7 +2592,7 @@ fn build_chat_messages_with_reasoning(
                 logging::warn(
                     "Substituting placeholder reasoning_content for DeepSeek tool-call assistant message",
                 );
-                reasoning_content = String::from("(reasoning omitted)");
+                reasoning_content = String::from(REASONING_REPLAY_PLACEHOLDER);
                 has_reasoning = true;
             }
 
@@ -1717,11 +2625,15 @@ fn build_chat_messages_with_reasoning(
                 pending_tool_calls.clear();
             }
             out.push(msg);
-        } else if role == "system" {
+        } else if matches!(placement, RolePlacement::System | RolePlacement::Developer) {
             let content = text_parts.join("\n");
             if !content.trim().is_empty() {
                 let mut msg = json!({
-                    "role": "system",
+                    "role": if placement == RolePlacement::Developer {
+                        "developer"
+                    } else {
+                        "system"
+                    },
                     "content": content,
                 });
                 if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
@@ -1729,7 +2641,7 @@ fn build_chat_messages_with_reasoning(
                 }
                 out.push(msg);
             }
-        } else if role == "user" {
+        } else if placement == RolePlacement::User {
             let content = text_parts.join("\n");
             let has_text = !content.trim().is_empty();
             let has_images = !image_parts.is_empty();
@@ -1762,8 +2674,14 @@ fn build_chat_messages_with_reasoning(
             if pending_tool_calls.is_empty() {
                 logging::warn("Dropping tool results without matching tool_calls");
             } else {
-                for (tool_id, content, message_label) in tool_results {
+                let mut tool_result_images = Vec::new();
+                for (tool_id, content, message_label, content_blocks) in tool_results {
                     if let Some(tool_info) = pending_tool_calls.remove(&tool_id) {
+                        let (image, omitted) = crate::image_attach::provider_tool_result_image_refs(
+                            Some(&content_blocks),
+                        );
+                        let content =
+                            crate::image_attach::tool_result_text_with_omission(&content, omitted);
                         let wire_result = compact_tool_result_for_wire(
                             &tool_info.tool_name,
                             &tool_info.input,
@@ -1785,14 +2703,32 @@ fn build_chat_messages_with_reasoning(
                             });
                         }
                         out.push(tool_msg);
+                        if let Some((mime_type, data)) = image {
+                            tool_result_images.push(json!({
+                                "type": "text",
+                                "text": format!(
+                                    "Image returned by tool `{}` (call `{tool_id}`):",
+                                    tool_info.tool_name,
+                                ),
+                            }));
+                            tool_result_images.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{mime_type};base64,{data}")
+                                },
+                            }));
+                        }
                     } else {
                         logging::warn(format!(
                             "Dropping tool result for unknown tool_call_id: {tool_id}"
                         ));
                     }
                 }
+                if !tool_result_images.is_empty() {
+                    out.push(json!({ "role": "user", "content": tool_result_images }));
+                }
             }
-        } else if role != "assistant" {
+        } else if !placement.is_assistant_channel() {
             pending_tool_calls.clear();
         }
     }
@@ -1995,13 +2931,37 @@ fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
 /// Also tallies the size of all replayed `reasoning_content` and logs it, so
 /// users on `RUST_LOG=codewhale_tui=debug` can see how much of their input
 /// budget is being spent re-sending prior thinking traces.
+#[cfg(test)]
 pub(super) fn sanitize_thinking_mode_messages(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
     provider: ApiProvider,
 ) -> Option<u32> {
-    if !should_replay_reasoning_content_for_provider(provider, model, effort) {
+    sanitize_thinking_mode_messages_for_route(body, model, effort, provider, "")
+}
+
+/// Route-aware variant of `sanitize_thinking_mode_messages`.
+///
+/// The wrapper above remains intentionally route-agnostic for existing test
+/// helpers and generic callers. Production chat requests call this version so
+/// exact Kimi Code K3 assistant tool turns retain the reasoning trace that
+/// K3 expects on the next request.
+pub(super) fn sanitize_thinking_mode_messages_for_route(
+    body: &mut Value,
+    model: &str,
+    effort: Option<&str>,
+    provider: ApiProvider,
+    base_url: &str,
+) -> Option<u32> {
+    // Mistral replay is encoded inside polymorphic `content` blocks, not the
+    // DeepSeek `reasoning_content` field. Running the DeepSeek placeholder
+    // sanitizer after reshaping would add a second, invalid reasoning dialect
+    // to assistant tool-call turns.
+    if is_exact_mistral_chat_route(provider, base_url) {
+        return None;
+    }
+    if !should_replay_reasoning_content_for_provider_on_route(provider, base_url, model, effort) {
         return None;
     }
     let messages = body.get_mut("messages").and_then(Value::as_array_mut)?;
@@ -2018,7 +2978,7 @@ pub(super) fn sanitize_thinking_mode_messages(
             .and_then(Value::as_str)
             .is_none_or(|s| s.trim().is_empty());
         if has_tool_calls && needs_placeholder {
-            msg["reasoning_content"] = json!("(reasoning omitted)");
+            msg["reasoning_content"] = json!(REASONING_REPLAY_PLACEHOLDER);
             substitutions = substitutions.saturating_add(1);
             logging::warn(format!(
                 "Final sanitizer: forced reasoning_content placeholder on assistant[{idx}]",
@@ -2135,10 +3095,6 @@ fn requires_reasoning_content(model: &str) -> bool {
         // `reasoning_content` on subsequent turns or the API returns 400.
         || lower.starts_with("deepseek-chat")
         || lower.starts_with("deepseek-reasoner")
-        // Generic reasoning markers used by custom/proxied deployments.
-        || lower.contains("reasoner")
-        || lower.contains("-reasoning")
-        || lower.contains("-thinking")
         || has_deepseek_r_series_marker(&lower)
 }
 
@@ -2158,11 +3114,67 @@ fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
     requires_reasoning_content(model)
 }
 
+#[cfg(test)]
 fn should_replay_reasoning_content_for_provider(
     provider: ApiProvider,
     model: &str,
     effort: Option<&str>,
 ) -> bool {
+    should_replay_reasoning_content_for_provider_on_route(provider, "", model, effort)
+}
+
+/// Route-aware reasoning replay policy.
+///
+/// Keep the bare K3 identifier out of the global model catalog: direct
+/// Moonshot and arbitrary OpenAI-compatible routes can also expose a `k3`
+/// model name, but only Kimi Code's exact membership-plan endpoint has this
+/// replay contract.
+fn should_replay_reasoning_content_for_provider_on_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    // Exact always-thinking routes replay their reasoning trace regardless of
+    // a stale caller effort: the API contract requires the assistant
+    // reasoning field on later tool turns for multi-turn continuity.
+    if is_exact_direct_moonshot_k3_route(provider, base_url, model)
+        || is_exact_kimi_code_k3_route(provider, base_url, model)
+        || (is_exact_mistral_chat_route(provider, base_url)
+            && mistral_model_has_native_reasoning(model))
+    {
+        return true;
+    }
+
+    // The exact Model Studio route policy evaluates BEFORE any generic
+    // model-name heuristic. Only models Alibaba documents as accepting
+    // `preserve_thinking` replay historical `reasoning_content`, plus the
+    // concrete DeepSeek V4 family ids whose own API contract requires the
+    // reasoning field on tool turns. A model named `foo-thinking` or
+    // `foo-reasoner` proves nothing about DashScope's request dialect and
+    // must not gain replay here — replaying stale Thinking blocks feeds the
+    // model its own past reasoning and re-triggers it every turn (observed
+    // as a repeated handoff loop with the always-thinking qwen3.8 family).
+    // Pi does not replay those either.
+    if is_exact_modelstudio_chat_route(provider, base_url) {
+        if modelstudio_model_supports_preserve_thinking(model) {
+            // Thinking-only preserve models (kimi-k2.7-code) are
+            // always-thinking and replay even with a stale `off`; hybrid
+            // preserve models defer to the effort gate like every other
+            // hybrid.
+            if is_exact_modelstudio_thinking_only_route(provider, base_url, model)
+                || !modelstudio_effort_disables_thinking(effort)
+            {
+                return true;
+            }
+            return false;
+        }
+        let lower = model.trim().to_ascii_lowercase();
+        return lower.contains("deepseek-v4")
+            || lower.starts_with("deepseek-chat")
+            || lower.starts_with("deepseek-reasoner");
+    }
+
     if effort
         .map(|value| {
             matches!(
@@ -2176,6 +3188,12 @@ fn should_replay_reasoning_content_for_provider(
     }
 
     if requires_reasoning_content(model) {
+        return true;
+    }
+
+    if is_exact_mistral_chat_route(provider, base_url)
+        && mistral_model_has_adjustable_reasoning(model)
+    {
         return true;
     }
 
@@ -2199,10 +3217,53 @@ fn should_replay_reasoning_content_for_provider(
 /// known reasoning-capable large models are classified only on providers whose
 /// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
 /// deltas become Thinking cells instead of leaking as normal answer text.
+#[cfg(test)]
 fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
+    is_reasoning_model_for_stream_on_route(provider, "", model)
+}
+
+/// Route-aware stream classification for providers that share model names.
+fn is_reasoning_model_for_stream_on_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    if is_exact_kimi_code_k3_route(provider, base_url, model)
+        || is_exact_direct_moonshot_k3_route(provider, base_url, model)
+    {
+        return true;
+    }
+
+    if is_exact_modelstudio_chat_route(provider, base_url)
+        && (modelstudio_model_is_thinking_only(model)
+            || modelstudio_model_supports_preserve_thinking(model))
+    {
+        return true;
+    }
+
     if requires_reasoning_content(model) {
         return true;
     }
+
+    // Model Studio's OpenAI-compatible endpoints (Token Plan / Coding Plan)
+    // stream hybrid-model reasoning as `delta.reasoning_content` (DashScope
+    // dialect) whenever thinking is on — and for the qwen3.x families thinking
+    // is on by server default. Surface those deltas as Thinking instead of
+    // inlining them into the answer text. `reasoning_content` is deliberately
+    // NOT replayed back on later turns (the provider is absent from
+    // `provider_accepts_reasoning_content`): DashScope does not require the
+    // reasoning field in request history.
+    if matches!(
+        provider,
+        ApiProvider::ModelstudioTokenPlan
+            | ApiProvider::ModelstudioTokenPlanAnthropic
+            | ApiProvider::ModelstudioCodingPlan
+            | ApiProvider::ModelstudioCodingPlanAnthropic
+    ) && model_supports_reasoning(model)
+    {
+        return true;
+    }
+
     provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
 }
 
@@ -2210,14 +3271,29 @@ fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
 pub(super) enum ReasoningStreamStyle {
     SeparateField,
     InlineTags,
+    MistralBlocks,
     None,
 }
 
+#[cfg(test)]
 fn reasoning_stream_style_for_stream(
     provider: ApiProvider,
     model: &str,
     configured: Option<&str>,
 ) -> ReasoningStreamStyle {
+    reasoning_stream_style_for_route(provider, "", model, configured)
+}
+
+/// Choose stream decoding semantics for a fully resolved provider route.
+fn reasoning_stream_style_for_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+    configured: Option<&str>,
+) -> ReasoningStreamStyle {
+    if is_exact_mistral_chat_route(provider, base_url) && mistral_model_supports_reasoning(model) {
+        return ReasoningStreamStyle::MistralBlocks;
+    }
     if let Some(configured) = configured {
         if let Some(style) = parse_reasoning_stream_style(configured) {
             return style;
@@ -2226,7 +3302,7 @@ fn reasoning_stream_style_for_stream(
             "Ignoring unrecognized reasoning_stream_style `{configured}`; expected separate_field, inline_tags, or none"
         ));
     }
-    if is_reasoning_model_for_stream(provider, model) {
+    if is_reasoning_model_for_stream_on_route(provider, base_url, model) {
         ReasoningStreamStyle::SeparateField
     } else {
         ReasoningStreamStyle::None
@@ -2287,6 +3363,19 @@ fn has_deepseek_r_series_marker(model_lower: &str) -> bool {
     })
 }
 
+/// Transport-only reasoning replay placeholder. DeepSeek-family chat wires
+/// reject assistant tool-call messages with an empty `reasoning_content`, so
+/// the request serializer substitutes this string for replay only. Providers
+/// that mirror assistant history (GLM-5.x) stream the substituted field back
+/// as a live reasoning delta; ingest must drop that exact echo so a wire-only
+/// placeholder never becomes a persisted or displayed thinking block.
+pub(crate) const REASONING_REPLAY_PLACEHOLDER: &str = "(reasoning omitted)";
+
+#[must_use]
+pub(crate) fn is_reasoning_replay_placeholder(text: &str) -> bool {
+    text.trim() == REASONING_REPLAY_PLACEHOLDER
+}
+
 fn reasoning_delta(
     value: &Value,
     choice_index: u32,
@@ -2297,6 +3386,9 @@ fn reasoning_delta(
         .or_else(|| value.get("reasoning"))
         .and_then(Value::as_str)
     {
+        if is_reasoning_replay_placeholder(reasoning) {
+            return None;
+        }
         return Some(reasoning.to_string());
     }
 
@@ -2324,6 +3416,9 @@ fn reasoning_message_text(value: &Value) -> Option<String> {
         .or_else(|| value.get("reasoning"))
         .and_then(Value::as_str)
     {
+        if is_reasoning_replay_placeholder(reasoning) {
+            return None;
+        }
         return Some(reasoning.to_string());
     }
     value
@@ -2337,7 +3432,16 @@ fn reasoning_message_text(value: &Value) -> Option<String> {
         })
 }
 
+#[cfg(test)]
 pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
+    parse_chat_message_for_route(payload, ApiProvider::Openai, "")
+}
+
+fn parse_chat_message_for_route(
+    payload: &Value,
+    provider: ApiProvider,
+    base_url: &str,
+) -> Result<MessageResponse> {
     let id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -2366,10 +3470,28 @@ pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
     {
         content_blocks.push(ContentBlock::Thinking {
             signature: None,
+            state: None,
             thinking: reasoning.to_string(),
         });
     }
-    if let Some(text) = message.get("content").and_then(Value::as_str)
+    let (mistral_thinking, mistral_text) = if is_exact_mistral_chat_route(provider, base_url) {
+        extract_mistral_polymorphic_content(message)
+    } else {
+        (None, None)
+    };
+    if let Some(thinking) = mistral_thinking.filter(|s| !s.trim().is_empty()) {
+        content_blocks.push(ContentBlock::Thinking {
+            signature: None,
+            state: None,
+            thinking,
+        });
+    }
+    if let Some(text) = mistral_text.filter(|s| !s.trim().is_empty()) {
+        content_blocks.push(ContentBlock::Text {
+            text,
+            cache_control: None,
+        });
+    } else if let Some(text) = message.get("content").and_then(Value::as_str)
         && !text.trim().is_empty()
     {
         content_blocks.push(ContentBlock::Text {
@@ -2408,11 +3530,16 @@ pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
                     })
             });
 
+            let thought_signature = call
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             content_blocks.push(ContentBlock::ToolUse {
                 id,
                 name: from_api_tool_name(&name),
                 input: arguments,
                 caller,
+                thought_signature,
             });
         }
     }
@@ -2678,6 +3805,22 @@ fn parse_sse_chunk_with_reasoning_style(
 ) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
+    // OpenAI-compatible providers surface mid-stream failures as a chunk-level
+    // `error` object (sometimes with `type: "error"`), delivered before
+    // `[DONE]`. Silently dropping it turned rate-limit / context-length /
+    // server errors into a truncated turn that looked successful — the frame
+    // is now surfaced through the same `StreamEvent::Error` contract the
+    // Anthropic path uses (#3014, ops R3).
+    if let Some(error) = chunk.get("error") {
+        let error = match error {
+            Value::Object(_) => error.clone(),
+            Value::String(message) => serde_json::json!({ "message": message }),
+            _ => serde_json::json!({ "message": "provider stream error" }),
+        };
+        events.push(StreamEvent::Error { error });
+        return events;
+    }
+
     let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
         // Usage-only chunk (sent at end with stream_options)
         if let Some(usage_val) = chunk.get("usage") {
@@ -2718,11 +3861,34 @@ fn parse_sse_chunk_with_reasoning_style(
         if let Some(delta) = delta {
             let reasoning_text = reasoning_delta(delta, choice_index, reasoning_detail_buffers)
                 .filter(|s| !s.is_empty());
-            let content_text = delta
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            // Mistral la Plateforme streams reasoning as a polymorphic
+            // `delta.content` value: an array of typed {type: thinking|text}
+            // blocks while thinking, then a plain string once the final
+            // answer starts. Flatten thinking sub-blocks into a single
+            // reasoning delta and treat text sub-blocks as normal content
+            // before the shared string fallback below.
+            let (mistral_thinking, mistral_text) =
+                if reasoning_stream_style == ReasoningStreamStyle::MistralBlocks {
+                    extract_mistral_polymorphic_content(delta)
+                } else {
+                    (None, None)
+                };
+            if let Some(reasoning) = mistral_thinking.as_deref() {
+                push_thinking_delta(
+                    &mut events,
+                    content_index,
+                    text_started,
+                    thinking_started,
+                    reasoning.to_string(),
+                );
+            }
+            let content_text = mistral_text.or_else(|| {
+                delta
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
 
             // Handle reasoning_content / reasoning thinking deltas.
             if reasoning_stream_style == ReasoningStreamStyle::SeparateField
@@ -2839,6 +4005,10 @@ fn parse_sse_chunk_with_reasoning_style(
                                 })
                             });
 
+                            let thought_signature = tc
+                                .pointer("/extra_content/google/thought_signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             events.push(StreamEvent::ContentBlockStart {
                                 index: block_index,
                                 content_block: ContentBlockStart::ToolUse {
@@ -2846,6 +4016,7 @@ fn parse_sse_chunk_with_reasoning_style(
                                     name: from_api_tool_name(&name),
                                     input: json!({}),
                                     caller,
+                                    thought_signature,
                                 },
                             });
                             *content_index = (*content_index).saturating_add(1);
@@ -2952,23 +4123,77 @@ mod stream_diagnostics_tests {
     use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
-    fn stream_open_timeout_defaults_and_clamps_env_values() {
-        assert_eq!(stream_open_timeout_from_env(None), Duration::from_secs(45));
-        assert_eq!(
-            stream_open_timeout_from_env(Some("not-a-number")),
-            Duration::from_secs(45)
+    fn stream_idle_timeout_reports_progress_and_timing() {
+        let message = stream_idle_timeout_message(
+            Duration::from_secs(240),
+            8192,
+            Duration::from_millis(73_500),
+            Duration::from_millis(41_250),
         );
+
         assert_eq!(
-            stream_open_timeout_from_env(Some("1")),
-            Duration::from_secs(5)
+            message,
+            "SSE stream idle timeout after 240s — no data received \
+             (bytes_received=8192, stream_age_ms=73500, ms_since_last_chunk=41250)"
         );
-        assert_eq!(
-            stream_open_timeout_from_env(Some("120")),
-            Duration::from_secs(120)
+    }
+
+    #[test]
+    fn chat_completions_error_frames_surface_as_stream_events() {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_buffers = std::collections::HashMap::new();
+        for chunk in [
+            json!({ "error": { "message": "rate limit exceeded", "type": "rate_limit_error" } }),
+            json!({ "type": "error", "error": { "message": "context length exceeded" } }),
+            json!({ "error": "server error" }),
+        ] {
+            let events = parse_sse_chunk(
+                &chunk,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_buffers,
+                false,
+            );
+            assert_eq!(
+                events.len(),
+                1,
+                "a chunk-level error frame must not be swallowed ({chunk})"
+            );
+            match &events[0] {
+                StreamEvent::Error { error } => assert!(
+                    !error.is_null()
+                        && (error.get("message").and_then(Value::as_str).is_some()
+                            || error.is_string()),
+                    "the provider error message must survive parsing: {error}"
+                ),
+                other => panic!("expected StreamEvent::Error, got {other:?}"),
+            }
+        }
+        // A normal content chunk still parses as a delta after the error path.
+        let deltas = parse_sse_chunk(
+            &json!({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            &mut reasoning_buffers,
+            false,
         );
-        assert_eq!(
-            stream_open_timeout_from_env(Some("999")),
-            Duration::from_secs(300)
+        assert!(
+            deltas.iter().any(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ContentBlockDelta {
+                        delta: Delta::TextDelta { text }, ..
+                    } if text == "ok"
+                )
+            }),
+            "content deltas still parse: {deltas:?}"
         );
     }
 
@@ -3145,19 +4370,27 @@ mod arcee_waf_message_encoding_tests {
 
 #[cfg(test)]
 mod minimax_reasoning_replay_tests {
-    use super::build_chat_messages_for_request_and_provider;
-    use crate::config::{ApiProvider, DEFAULT_MINIMAX_MODEL};
+    use super::{
+        build_chat_messages_for_request_and_provider,
+        build_chat_messages_for_request_and_provider_and_route,
+    };
+    use crate::config::{
+        ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, DEFAULT_MINIMAX_MODEL,
+        DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL, DEFAULT_MOONSHOT_BASE_URL, KIMI_CODE_K3_MODEL,
+    };
+    use crate::models::Role;
     use crate::models::{ContentBlock, Message, MessageRequest};
 
     fn request_with_assistant_thinking() -> MessageRequest {
         MessageRequest {
             model: DEFAULT_MINIMAX_MODEL.to_string(),
             messages: vec![Message {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: vec![
                     ContentBlock::Thinking {
                         thinking: "Inspect tool state".to_string(),
                         signature: None,
+                        state: None,
                     },
                     ContentBlock::Text {
                         text: "Done.".to_string(),
@@ -3204,1244 +4437,185 @@ mod minimax_reasoning_replay_tests {
             Some("Inspect tool state")
         );
     }
+
+    #[test]
+    fn kimi_code_k3_replays_thinking_only_on_the_exact_membership_route() {
+        let mut request = request_with_assistant_thinking();
+        request.model = KIMI_CODE_K3_MODEL.to_string();
+
+        let exact = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Moonshot,
+            DEFAULT_KIMI_CODE_BASE_URL,
+        );
+        assert_eq!(
+            exact[0]
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str),
+            Some("Inspect tool state")
+        );
+
+        let neighbor = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Moonshot,
+            DEFAULT_MOONSHOT_BASE_URL,
+        );
+        assert!(
+            neighbor[0].get("reasoning_content").is_none(),
+            "a generic Moonshot k3 identifier must not inherit Kimi Code replay"
+        );
+    }
+
+    #[test]
+    fn modelstudio_qwen38_wire_body_replays_no_historical_reasoning_across_tool_loop() {
+        // One user handoff, one assistant Thinking + Text + ToolUse turn, and
+        // its matching ToolResult. On the exact Model Studio route the
+        // always-thinking qwen3.8 family must not receive historical
+        // `reasoning_content`, while the handoff occurs exactly once and the
+        // tool call id, arguments, and result stay intact.
+        let mut request = request_with_assistant_thinking();
+        request.model = "qwen3.8-max".to_string();
+        request.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "HANDOFF-SENTINEL: fix the widget.".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "stale thinking from the prior turn".to_string(),
+                        signature: None,
+                        state: None,
+                    },
+                    ContentBlock::Text {
+                        text: "I'll read the widget first.".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_qwen38_001".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({ "path": "widget.rs" }),
+                        caller: None,
+                        thought_signature: None,
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_qwen38_001".to_string(),
+                    content: "widget.rs: struct Widget { .. }".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+        ];
+
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::ModelstudioTokenPlan,
+            DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+        );
+
+        // The handoff occurs exactly once, as a plain user text message.
+        let handoff_carriers: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                    && message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| content.contains("HANDOFF-SENTINEL"))
+            })
+            .collect();
+        assert_eq!(
+            handoff_carriers.len(),
+            1,
+            "the handoff must appear in exactly one user message: {messages:?}"
+        );
+
+        // The assistant turn keeps its text and tool call, but no historical
+        // reasoning_content for qwen3.8.
+        let assistant = messages
+            .iter()
+            .find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+            .expect("assistant message");
+        assert_eq!(
+            assistant.get("content").and_then(serde_json::Value::as_str),
+            Some("I'll read the widget first.")
+        );
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "qwen3.8 must not receive historical reasoning_content: {assistant:?}"
+        );
+        let tool_calls = assistant
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .expect("tool_calls array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], serde_json::json!("call_qwen38_001"));
+        assert_eq!(
+            tool_calls[0].pointer("/function/name"),
+            Some(&serde_json::json!("read"))
+        );
+        assert_eq!(
+            tool_calls[0].pointer("/function/arguments"),
+            Some(&serde_json::json!(r#"{"path":"widget.rs"}"#))
+        );
+
+        // The matching tool result rides along under its original id.
+        let tool_result = messages
+            .iter()
+            .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+            .expect("tool result message");
+        assert_eq!(
+            tool_result.get("tool_call_id"),
+            Some(&serde_json::json!("call_qwen38_001"))
+        );
+        assert_eq!(
+            tool_result
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            Some("widget.rs: struct Widget { .. }")
+        );
+
+        // Control: the same handoff/tool loop with a documented
+        // preserve-thinking model replays its historical reasoning, proving
+        // the strip above is model-gated, not route-gated.
+        let mut preserve_request = request;
+        preserve_request.model = "qwen3.7-plus".to_string();
+        let preserve_messages = build_chat_messages_for_request_and_provider_and_route(
+            &preserve_request,
+            ApiProvider::ModelstudioTokenPlan,
+            DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+        );
+        let preserve_assistant = preserve_messages
+            .iter()
+            .find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+            .expect("assistant message");
+        assert_eq!(
+            preserve_assistant
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str),
+            Some("stale thinking from the prior turn"),
+            "documented preserve-thinking models keep replaying history"
+        );
+    }
 }
 
 // === #103 Phase 4: SSE decoder behavior on canned chunk sequences ============
 
 #[cfg(test)]
-mod stream_decoder_tests {
-    //! Drive `parse_sse_chunk` (the in-place SSE event extractor) over canned
-    //! chunk sequences. The full `handle_chat_completion_stream` path needs a
-    //! live `reqwest::Response` so it isn't unit-testable without a mock HTTP
-    //! harness (issue #69 tracks that). For #103 we exercise the chunk decoder
-    //! directly to verify each "class of stream failure" the engine relies on.
-    use super::*;
-    use crate::models::{ContentBlockStart, Delta, StreamEvent};
-
-    /// Decode a raw SSE-data JSON chunk into our internal events, mirroring
-    /// the per-event call shape used by `handle_chat_completion_stream`.
-    fn decode_chunk(json_text: &str) -> Vec<StreamEvent> {
-        decode_chunk_with_reasoning(json_text, true)
-    }
-
-    fn decode_chunk_with_reasoning(json_text: &str, is_reasoning_model: bool) -> Vec<StreamEvent> {
-        let chunk: Value = serde_json::from_str(json_text).expect("valid SSE JSON");
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        parse_sse_chunk(
-            &chunk,
-            &mut content_index,
-            &mut text_started,
-            &mut thinking_started,
-            &mut tool_indices,
-            &mut reasoning_detail_buffers,
-            is_reasoning_model,
-        )
-    }
-
-    fn decode_chunks_with_style(
-        chunks: &[&str],
-        reasoning_stream_style: ReasoningStreamStyle,
-    ) -> Vec<StreamEvent> {
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        let mut inline_reasoning_tags = InlineReasoningTagState::default();
-        let mut events = Vec::new();
-
-        for chunk in chunks {
-            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
-            events.extend(parse_sse_chunk_with_reasoning_style(
-                &value,
-                &mut content_index,
-                &mut text_started,
-                &mut thinking_started,
-                &mut tool_indices,
-                &mut reasoning_detail_buffers,
-                &mut inline_reasoning_tags,
-                reasoning_stream_style,
-            ));
-        }
-        events
-    }
-
-    fn text_delta_text(events: &[StreamEvent]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::TextDelta { text },
-                    ..
-                } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn thinking_delta_text(events: &[StreamEvent]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { thinking },
-                    ..
-                } => Some(thinking.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn decoder_emits_text_delta_for_content_chunk() {
-        // The "happy" first chunk: a normal content delta. The engine treats
-        // this as `any_content_received = true` and would NOT transparently
-        // retry on a subsequent error.
-        let events = decode_chunk(r#"{"choices":[{"delta":{"content":"hello"}}]}"#);
-        assert!(
-            matches!(
-                events.first(),
-                Some(StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::Text { .. },
-                    ..
-                })
-            ),
-            "first event should open a text block; got {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::ContentBlockDelta {
-                    delta: Delta::TextDelta { text },
-                    ..
-                } if text == "hello")),
-            "should yield a TextDelta carrying 'hello'; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_emits_thinking_delta_for_reasoning_chunk() {
-        // V4 thinking models surface reasoning_content first — the engine
-        // also counts these as content received (so a subsequent stream error
-        // surfaces rather than retrying transparently).
-        let events = decode_chunk(r#"{"choices":[{"delta":{"reasoning_content":"plan..."}}]}"#);
-        assert!(
-            matches!(
-                events.first(),
-                Some(StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::Thinking { .. },
-                    ..
-                })
-            ),
-            "first event should open a thinking block; got {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { thinking },
-                    ..
-                } if thinking == "plan...")),
-            "should yield a ThinkingDelta carrying 'plan...'; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_streams_moonshot_multi_chunk_reasoning_as_thinking() {
-        // #3016: recorded shape from Moonshot's native endpoint — kimi-k2.6
-        // streams `reasoning_content` deltas before the answer text. The
-        // thinking deltas must accumulate into ONE thinking block and the
-        // answer must arrive as text, not be glued into the trace.
-        let chunks = [
-            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check"}}]}"#,
-            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"reasoning_content":" the config."}}]}"#,
-            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"content":"The answer is 42."}}]}"#,
-        ];
-
-        let is_reasoning =
-            is_reasoning_model_for_stream(crate::config::ApiProvider::Moonshot, "kimi-k2.6");
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        let mut events = Vec::new();
-        for chunk in chunks {
-            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
-            events.extend(parse_sse_chunk(
-                &value,
-                &mut content_index,
-                &mut text_started,
-                &mut thinking_started,
-                &mut tool_indices,
-                &mut reasoning_detail_buffers,
-                is_reasoning,
-            ));
-        }
-
-        let thinking: String = events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { thinking },
-                    ..
-                } => Some(thinking.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(thinking, "Let me check the config.");
-
-        let thinking_starts = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    StreamEvent::ContentBlockStart {
-                        content_block: ContentBlockStart::Thinking { .. },
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(thinking_starts, 1, "one thinking block: {events:?}");
-
-        let text: String = events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::TextDelta { text },
-                    ..
-                } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "The answer is 42.");
-    }
-
-    #[test]
-    fn decoder_accepts_openrouter_reasoning_delta_with_extra_fields() {
-        let events = decode_chunk(
-            r#"{"id":"or-1","choices":[{"delta":{"reasoning":"openrouter thought","reasoning_details":[{"type":"summary","text":"extra"}],"native_finish_reason":null}}],"usage":{"completion_tokens_details":{"reasoning_tokens":3}}}"#,
-        );
-
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { thinking },
-                    ..
-                } if thinking == "openrouter thought"
-            )),
-            "OpenRouter-style reasoning deltas with extra fields should not crash decoding; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_streams_minimax_reasoning_details_as_incremental_thinking() {
-        // MiniMax's reasoning_split stream reports reasoning_details text as
-        // a cumulative buffer. Emit only the suffix so the Thinking cell does
-        // not duplicate earlier reasoning chunks.
-        let chunks = [
-            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect"}]}}]}"#,
-            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect config"}]}}]}"#,
-            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"content":"Done."}}]}"#,
-        ];
-
-        let is_reasoning = is_reasoning_model_for_stream(ApiProvider::Minimax, "MiniMax-M3");
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        let mut events = Vec::new();
-        for chunk in chunks {
-            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
-            events.extend(parse_sse_chunk(
-                &value,
-                &mut content_index,
-                &mut text_started,
-                &mut thinking_started,
-                &mut tool_indices,
-                &mut reasoning_detail_buffers,
-                is_reasoning,
-            ));
-        }
-
-        let thinking: String = events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { thinking },
-                    ..
-                } => Some(thinking.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(thinking, "Inspect config");
-
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            StreamEvent::ContentBlockDelta {
-                delta: Delta::TextDelta { text },
-                ..
-            } if text == "Inspect" || text == "Inspect config"
-        )));
-    }
-
-    #[test]
-    fn decoder_does_not_render_reasoning_as_text_for_known_provider_models() {
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        let is_reasoning_model =
-            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro");
-        let events = parse_sse_chunk(
-            &serde_json::json!({
-                "choices": [{
-                    "delta": {
-                        "reasoning_content": "private plan"
-                    }
-                }]
-            }),
-            &mut content_index,
-            &mut text_started,
-            &mut thinking_started,
-            &mut tool_indices,
-            &mut reasoning_detail_buffers,
-            is_reasoning_model,
-        );
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            StreamEvent::ContentBlockDelta {
-                delta: Delta::ThinkingDelta { thinking },
-                ..
-            } if thinking == "private plan"
-        )));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            StreamEvent::ContentBlockDelta {
-                delta: Delta::TextDelta { text },
-                ..
-            } if text == "private plan"
-        )));
-    }
-
-    #[test]
-    fn decoder_treats_reasoning_content_as_text_when_provider_does_not_support_reasoning() {
-        let events = decode_chunk_with_reasoning(
-            r#"{"choices":[{"delta":{"reasoning_content":"hello"}}]}"#,
-            false,
-        );
-
-        assert!(
-            matches!(
-                events.first(),
-                Some(StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::Text { .. },
-                    ..
-                })
-            ),
-            "first event should open a text block; got {events:?}"
-        );
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::TextDelta { text },
-                    ..
-                } if text == "hello"
-            )),
-            "should yield a TextDelta carrying 'hello'; got {events:?}"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(
-                e,
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::ThinkingDelta { .. },
-                    ..
-                }
-            )),
-            "should not emit thinking deltas for generic providers; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn reasoning_style_separate_field_routes_reasoning_to_thinking() {
-        let events = decode_chunks_with_style(
-            &[
-                r#"{"choices":[{"delta":{"reasoning_content":"private plan"}}]}"#,
-                r#"{"choices":[{"delta":{"content":"Public answer."}}]}"#,
-            ],
-            ReasoningStreamStyle::SeparateField,
-        );
-
-        assert_eq!(thinking_delta_text(&events), "private plan");
-        assert_eq!(text_delta_text(&events), "Public answer.");
-    }
-
-    #[test]
-    fn reasoning_style_inline_tags_routes_think_blocks_to_thinking() {
-        let events = decode_chunks_with_style(
-            &[
-                r#"{"choices":[{"delta":{"content":"Before <thi"}}]}"#,
-                r#"{"choices":[{"delta":{"content":"nk>private plan</thi"}}]}"#,
-                r#"{"choices":[{"delta":{"content":"nk> after."}}]}"#,
-            ],
-            ReasoningStreamStyle::InlineTags,
-        );
-
-        assert_eq!(thinking_delta_text(&events), "private plan");
-        assert_eq!(text_delta_text(&events), "Before  after.");
-        assert!(
-            !text_delta_text(&events).contains("<think>"),
-            "inline reasoning tags must not leak into visible text: {events:?}"
-        );
-    }
-
-    #[test]
-    fn reasoning_style_inline_tags_flushes_unclosed_think_at_stream_end() {
-        let events = decode_chunks_with_style(
-            &[
-                r#"{"choices":[{"delta":{"content":"Before <think>partial reasoning"}}]}"#,
-                r#"{"choices":[{"finish_reason":"stop"}]}"#,
-            ],
-            ReasoningStreamStyle::InlineTags,
-        );
-
-        assert_eq!(thinking_delta_text(&events), "partial reasoning");
-        assert_eq!(text_delta_text(&events), "Before ");
-    }
-
-    #[test]
-    fn reasoning_style_inline_tags_ignores_separate_reasoning_field() {
-        let events = decode_chunks_with_style(
-            &[
-                r#"{"choices":[{"delta":{"reasoning_content":"metadata","content":"<think>tagged</think> answer"}}]}"#,
-            ],
-            ReasoningStreamStyle::InlineTags,
-        );
-
-        assert_eq!(thinking_delta_text(&events), "tagged");
-        assert_eq!(text_delta_text(&events), " answer");
-    }
-
-    #[test]
-    fn reasoning_style_none_keeps_inline_tags_visible_text() {
-        let events = decode_chunks_with_style(
-            &[r#"{"choices":[{"delta":{"content":"<think>visible</think> answer"}}]}"#],
-            ReasoningStreamStyle::None,
-        );
-
-        assert_eq!(thinking_delta_text(&events), "");
-        assert_eq!(text_delta_text(&events), "<think>visible</think> answer");
-    }
-
-    #[test]
-    fn configured_reasoning_style_overrides_route_default() {
-        assert_eq!(
-            reasoning_stream_style_for_stream(ApiProvider::Openai, "custom-minimax", None),
-            ReasoningStreamStyle::None
-        );
-        assert_eq!(
-            reasoning_stream_style_for_stream(
-                ApiProvider::Openai,
-                "custom-minimax",
-                Some("inline-tags")
-            ),
-            ReasoningStreamStyle::InlineTags
-        );
-        assert_eq!(
-            reasoning_stream_style_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro", None),
-            ReasoningStreamStyle::SeparateField
-        );
-        assert_eq!(
-            reasoning_stream_style_for_stream(
-                ApiProvider::XiaomiMimo,
-                "mimo-v2.5-pro",
-                Some("none")
-            ),
-            ReasoningStreamStyle::None
-        );
-    }
-
-    #[test]
-    fn decoder_yields_no_events_for_keepalive_chunk() {
-        // DeepSeek often sends `{"choices":[]}` keepalive chunks before
-        // emitting real content. The engine MUST treat a stream error after
-        // these as "no content received" and be eligible for transparent
-        // retry — assert here that the decoder yields no payload events.
-        let events = decode_chunk(r#"{"choices":[]}"#);
-        assert!(
-            events.is_empty(),
-            "empty-choices chunk must produce no events; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_treats_done_frame_as_terminal() {
-        let mut content_index = 0u32;
-        let mut text_started = false;
-        let mut thinking_started = false;
-        let mut tool_indices = std::collections::HashMap::new();
-        let mut reasoning_detail_buffers = std::collections::HashMap::new();
-        let mut inline_reasoning_tags = InlineReasoningTagState::default();
-
-        let outcome = parse_sse_data_frame(
-            "  [DONE]  ",
-            &mut content_index,
-            &mut text_started,
-            &mut thinking_started,
-            &mut tool_indices,
-            &mut reasoning_detail_buffers,
-            &mut inline_reasoning_tags,
-            ReasoningStreamStyle::SeparateField,
-        );
-
-        assert!(
-            matches!(outcome, SseDataFrame::Done),
-            "`data: [DONE]` must terminate the stream instead of waiting for the HTTP connection to close"
-        );
-        assert_eq!(content_index, 0);
-        assert!(!text_started);
-        assert!(!thinking_started);
-        assert!(tool_indices.is_empty());
-    }
-
-    #[test]
-    fn decoder_emits_tool_use_block_for_tool_call_delta() {
-        // Tool-call deltas are content too — once one arrives, transparent
-        // retry must be off (the model has committed to a tool invocation
-        // path that DeepSeek has billed for).
-        let events = decode_chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"grep_files","arguments":"{\"pattern\":\"foo\"}"}}]}}]}"#,
-        );
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::ToolUse { name, .. },
-                    ..
-                } if name == "grep_files"
-            )),
-            "should open a ToolUse block for grep_files; got {events:?}"
-        );
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                StreamEvent::ContentBlockDelta {
-                    delta: Delta::InputJsonDelta { partial_json },
-                    ..
-                } if partial_json.contains("\"pattern\"")
-            )),
-            "should yield InputJsonDelta carrying the tool args; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_uses_fallback_name_for_empty_streaming_tool_name() {
-        let events = decode_chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_empty","function":{"name":"","arguments":"{}"}}]}}]}"#,
-        );
-
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::ToolUse { name, .. },
-                    ..
-                } if name == "unknown_tool"
-            )),
-            "empty upstream tool names should render as unknown_tool; got {events:?}"
-        );
-    }
-
-    #[test]
-    fn non_streaming_response_uses_fallback_name_for_missing_tool_name() {
-        let payload: Value = serde_json::from_str(
-            r#"{
-                "id": "chatcmpl_1",
-                "model": "deepseek-v4-pro",
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "tool_calls": [{
-                            "id": "call_missing",
-                            "function": { "arguments": "{}" }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }]
-            }"#,
-        )
-        .expect("valid response");
-
-        let parsed = parse_chat_message(&payload).expect("message parses");
-        let tool_name = parsed.content.iter().find_map(|block| match block {
-            ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
-            _ => None,
-        });
-
-        assert_eq!(tool_name, Some("unknown_tool"));
-    }
-
-    /// Regression for the parallel-tool-calls-without-id collision (audit
-    /// Finding 8): when the upstream chunk omits the `id` field, the
-    /// fallback used to be the literal string `"tool_call"` for every
-    /// parallel call, so two tool calls in one delta ended up sharing an
-    /// id. Downstream routing then matched the first call's tool_result
-    /// twice and the second call hung. The fallback is now indexed by the
-    /// content-block position, keeping each call unique within the
-    /// response.
-    #[test]
-    fn decoder_assigns_unique_fallback_ids_to_parallel_tool_calls_missing_id() {
-        let events = decode_chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[
-                {"index":0,"function":{"name":"grep_files","arguments":"{\"pattern\":\"a\"}"}},
-                {"index":1,"function":{"name":"read_file","arguments":"{\"path\":\"x\"}"}}
-            ]}}]}"#,
-        );
-
-        let ids: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::ToolUse { id, .. },
-                    ..
-                } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(
-            ids.len(),
-            2,
-            "expected two tool-use blocks for parallel tool calls; got {events:?}"
-        );
-        assert_ne!(
-            ids[0], ids[1],
-            "parallel tool calls without upstream `id` must get distinct fallback ids; got {ids:?}"
-        );
-    }
-
-    #[test]
-    fn decoder_preserves_upstream_tool_call_id_when_present() {
-        // Counter-test to the fallback regression: when the upstream chunk
-        // does include `id`, we forward it verbatim — we shouldn't quietly
-        // rewrite ids the API gave us just because we have a fallback path.
-        let events = decode_chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz","function":{"name":"grep_files","arguments":"{}"}}]}}]}"#,
-        );
-        let id = events
-            .iter()
-            .find_map(|e| match e {
-                StreamEvent::ContentBlockStart {
-                    content_block: ContentBlockStart::ToolUse { id, .. },
-                    ..
-                } => Some(id.as_str()),
-                _ => None,
-            })
-            .expect("tool-use block present");
-        assert_eq!(id, "call_xyz");
-    }
-
-    #[test]
-    fn request_builder_preserves_internal_system_messages() {
-        let messages = vec![Message {
-            role: "system".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "internal runtime event".to_string(),
-                cache_control: None,
-            }],
-        }];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-
-        assert_eq!(built.len(), 1);
-        assert_eq!(built[0]["role"], "system");
-        assert_eq!(built[0]["content"], "internal runtime event");
-    }
-
-    fn tool_use_message(id: &str, name: &str, input: Value) -> Message {
-        Message {
-            role: "assistant".to_string(),
-            content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: name.to_string(),
-                input,
-                caller: None,
-            }],
-        }
-    }
-
-    fn tool_result_message(id: &str, content: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-                is_error: None,
-                content_blocks: None,
-            }],
-        }
-    }
-
-    fn user_message_with_turn_meta(turn_meta: &str, task: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![
-                ContentBlock::Text {
-                    text: turn_meta.to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: task.to_string(),
-                    cache_control: None,
-                },
-            ],
-        }
-    }
-
-    fn user_message_with_tail_turn_meta(task: &str, turn_meta: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![
-                ContentBlock::Text {
-                    text: task.to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: turn_meta.to_string(),
-                    cache_control: None,
-                },
-            ],
-        }
-    }
-
-    fn tool_message_content(messages: &[Value], index: usize) -> &str {
-        messages
-            .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
-            .nth(index)
-            .and_then(|message| message.get("content").and_then(Value::as_str))
-            .expect("tool message content")
-    }
-
-    fn user_message_content(messages: &[Value], index: usize) -> &str {
-        messages
-            .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-            .nth(index)
-            .and_then(|message| message.get("content").and_then(Value::as_str))
-            .expect("user message content")
-    }
-
-    fn with_tool_result_sha_spillover_root<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prior = crate::tools::truncate::set_test_spillover_root(Some(
-            tmp.path().join(".deepseek").join("tool_outputs"),
-        ));
-        struct Restore(Option<std::path::PathBuf>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::tools::truncate::set_test_spillover_root(self.0.take());
-            }
-        }
-        let _restore = Restore(prior);
-        f()
-    }
-
-    #[test]
-    fn request_builder_deduplicates_consecutive_identical_turn_meta_for_wire() {
-        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
-        let messages = vec![
-            user_message_with_turn_meta(turn_meta, "first task"),
-            Message {
-                role: "assistant".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "first answer".to_string(),
-                    cache_control: None,
-                }],
-            },
-            user_message_with_turn_meta(turn_meta, "second task"),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let first = user_message_content(&built, 0);
-        let second = user_message_content(&built, 1);
-        let expected_ref = "<turn_meta_unchanged />";
-
-        assert!(first.starts_with(turn_meta), "got: {first}");
-        assert!(second.starts_with(expected_ref), "got: {second}");
-        assert!(second.ends_with("second task"), "got: {second}");
-        assert_eq!(
-            second,
-            format!("{expected_ref}\nsecond task"),
-            "ref text must stay stable"
-        );
-    }
-
-    #[test]
-    fn request_builder_keeps_tail_turn_meta_after_user_text_for_wire() {
-        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
-        let messages = vec![
-            user_message_with_tail_turn_meta("first task", turn_meta),
-            Message {
-                role: "assistant".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "first answer".to_string(),
-                    cache_control: None,
-                }],
-            },
-            user_message_with_tail_turn_meta("second task", turn_meta),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let first = user_message_content(&built, 0);
-        let second = user_message_content(&built, 1);
-        let expected_ref = "<turn_meta_unchanged />";
-
-        assert_eq!(first, format!("first task\n{turn_meta}"));
-        assert_eq!(second, format!("second task\n{expected_ref}"));
-    }
-
-    #[test]
-    fn request_builder_keeps_changed_turn_meta_full_and_updates_recent_hash() {
-        let first_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
-        let second_meta =
-            "<turn_meta>\nCurrent local date: 2026-05-09\nWorking set: src/lib.rs\n</turn_meta>";
-        let messages = vec![
-            user_message_with_turn_meta(first_meta, "first task"),
-            user_message_with_turn_meta(second_meta, "second task"),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let first = user_message_content(&built, 0);
-        let second = user_message_content(&built, 1);
-
-        assert!(first.starts_with(first_meta), "got: {first}");
-        assert!(second.starts_with(second_meta), "got: {second}");
-        assert!(!second.contains("<TURN_META_REF"), "got: {second}");
-    }
-
-    #[test]
-    fn turn_meta_dedup_is_wire_only_and_does_not_mutate_session_message() {
-        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
-        let messages = vec![
-            user_message_with_turn_meta(turn_meta, "first task"),
-            user_message_with_turn_meta(turn_meta, "second task"),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        assert!(
-            user_message_content(&built, 1).starts_with("<turn_meta_unchanged />"),
-            "got: {}",
-            user_message_content(&built, 1)
-        );
-
-        match &messages[1].content[0] {
-            ContentBlock::Text { text, .. } => assert_eq!(text, turn_meta),
-            other => panic!("expected text block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cache_inspect_reports_turn_meta_dedup_metadata() {
-        let turn_meta = format!(
-            "<turn_meta>\nCurrent local date: 2026-05-09\n{}\n</turn_meta>",
-            "Working set: src/lib.rs\n".repeat(20)
-        );
-        let request = MessageRequest {
-            model: "deepseek-v4-flash".to_string(),
-            messages: vec![
-                user_message_with_turn_meta(&turn_meta, "first task"),
-                user_message_with_turn_meta(&turn_meta, "second task"),
-            ],
-            max_tokens: 0,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            thinking: None,
-            reasoning_effort: None,
-            stream: None,
-            temperature: None,
-            top_p: None,
-        };
-
-        let inspection = inspect_prompt_for_request(&request);
-        let turn_meta_layers: Vec<_> = inspection
-            .layers
-            .iter()
-            .filter_map(|layer| layer.turn_meta.as_ref())
-            .collect();
-
-        assert_eq!(turn_meta_layers.len(), 2);
-        assert_eq!(
-            turn_meta_layers[0].original_chars,
-            turn_meta.chars().count()
-        );
-        assert_eq!(turn_meta_layers[0].sent_chars, turn_meta.chars().count());
-        assert!(!turn_meta_layers[0].deduplicated);
-        assert_eq!(turn_meta_layers[0].sha256, sha256_hex(turn_meta.as_bytes()));
-        assert_eq!(
-            turn_meta_layers[1].original_chars,
-            turn_meta.chars().count()
-        );
-        assert!(turn_meta_layers[1].sent_chars < turn_meta_layers[1].original_chars);
-        assert!(turn_meta_layers[1].deduplicated);
-        assert_eq!(turn_meta_layers[1].sha256, turn_meta_layers[0].sha256);
-    }
-
-    #[test]
-    fn request_builder_truncates_large_tool_result_for_wire() {
-        let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
-        let messages = vec![
-            tool_use_message(
-                "tool-long",
-                "shell_command",
-                json!({"command": "cargo test"}),
-            ),
-            tool_result_message("tool-long", &long_output),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let sent = tool_message_content(&built, 0);
-
-        assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
-        assert!(sent.contains("tool_name: shell_command"), "got: {sent}");
-        assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
-        assert!(sent.contains("original_chars: 14000"), "got: {sent}");
-        assert!(sent.contains("sha256:"), "got: {sent}");
-        assert!(
-            sent.contains("retrieve: retrieve_tool_result ref=sha:"),
-            "got: {sent}"
-        );
-        assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
-        assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
-        assert!(
-            sent.contains("truncated 6000 chars from middle"),
-            "got: {sent}"
-        );
-        assert_ne!(sent, long_output);
-    }
-
-    #[test]
-    fn request_builder_keeps_extreme_tool_output_bounded_and_retrievable() {
-        with_tool_result_sha_spillover_root(|| {
-            let huge_output = format!(
-                "{}{}{}",
-                "DIFF_HEAD\n".repeat(10_000),
-                "MIDDLE_POISON\n".repeat(10_000),
-                "DIFF_TAIL\n".repeat(10_000)
-            );
-            let sha = sha256_hex(huge_output.as_bytes());
-            let messages = vec![
-                tool_use_message("tool-huge", "exec_shell", json!({"command": "git diff"})),
-                tool_result_message("tool-huge", &huge_output),
-            ];
-
-            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-            let sent = tool_message_content(&built, 0);
-
-            assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
-            assert!(sent.contains("tool_name: exec_shell"), "got: {sent}");
-            assert!(sent.contains("command_or_query: git diff"), "got: {sent}");
-            assert!(sent.contains(&format!("sha256: {sha}")), "got: {sent}");
-            assert!(
-                sent.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
-                "got: {sent}"
-            );
-            assert!(
-                sent.chars().count() <= TOOL_RESULT_SENT_CHAR_BUDGET,
-                "truncated result should stay bounded, sent {} chars",
-                sent.chars().count()
-            );
-            assert!(
-                !sent.contains("MIDDLE_POISON"),
-                "omitted middle should not be sent to the next model turn"
-            );
-            assert_ne!(sent, huge_output);
-        });
-    }
-
-    #[test]
-    fn request_builder_does_not_dedup_short_tool_results_for_wire() {
-        let output = "same tool output";
-        let messages = vec![
-            tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
-            tool_result_message("tool-1", output),
-            tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
-            tool_result_message("tool-2", output),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let first = tool_message_content(&built, 0);
-        let second = tool_message_content(&built, 1);
-
-        assert_eq!(first, output);
-        assert_eq!(second, output);
-        assert!(!second.contains("<TOOL_RESULT_REF"), "got: {second}");
-    }
-
-    #[test]
-    fn request_builder_deduplicates_medium_identical_tool_results_with_retrieval_hint() {
-        with_tool_result_sha_spillover_root(|| {
-            // 2,000 chars is intentionally above TOOL_RESULT_DEDUP_MIN_CHARS
-            // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
-            // verifies the cache-saving path for repeated medium outputs that
-            // do not otherwise need truncation.
-            let output = "A".repeat(2_000);
-            let messages = vec![
-                tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
-                tool_result_message("tool-1", &output),
-                tool_use_message("tool-2", "read_file", json!({"path": "README.md"})),
-                tool_result_message("tool-2", &output),
-            ];
-
-            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-            let first = tool_message_content(&built, 0);
-            let second = tool_message_content(&built, 1);
-
-            assert_eq!(first, output);
-            assert!(!first.contains("[TOOL_RESULT_TRUNCATED]"), "got: {first}");
-            assert!(
-                second.starts_with("<TOOL_RESULT_REF sha=\""),
-                "got: {second}"
-            );
-            assert!(
-                second.contains("original_message=\"Message #1\""),
-                "got: {second}"
-            );
-            assert!(second.contains("chars=\"2000\""), "got: {second}");
-            assert!(
-                second.contains("retrieve: retrieve_tool_result ref=sha:"),
-                "got: {second}"
-            );
-        });
-    }
-
-    #[test]
-    fn request_builder_never_dedups_large_identical_write_file_confirmations() {
-        with_tool_result_sha_spillover_root(|| {
-            // A `write_file` result embeds the unified diff + summary; it is a
-            // confirmation, not retrievable data. Two identical >1024-char
-            // write_file results must BOTH stay inline — collapsing the second
-            // to a SHA ref makes the model lose write-success context and
-            // report the file as missing (#1695).
-            let output = "A".repeat(2_000);
-            let messages = vec![
-                tool_use_message("tool-1", "write_file", json!({"path": "big.txt"})),
-                tool_result_message("tool-1", &output),
-                tool_use_message("tool-2", "write_file", json!({"path": "big.txt"})),
-                tool_result_message("tool-2", &output),
-            ];
-
-            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-            let first = tool_message_content(&built, 0);
-            let second = tool_message_content(&built, 1);
-
-            assert_eq!(first, output);
-            assert_eq!(second, output);
-            assert!(!second.contains("<TOOL_RESULT_REF"), "got: {second}");
-
-            // Non-mutation tools still dedup: an identical large read_file
-            // result collapses to a retrievable SHA ref.
-            let read_messages = vec![
-                tool_use_message("read-1", "read_file", json!({"path": "README.md"})),
-                tool_result_message("read-1", &output),
-                tool_use_message("read-2", "read_file", json!({"path": "README.md"})),
-                tool_result_message("read-2", &output),
-            ];
-            let read_built = build_chat_messages(None, &read_messages, "deepseek-v4-flash");
-            let read_first = tool_message_content(&read_built, 0);
-            let read_second = tool_message_content(&read_built, 1);
-            assert_eq!(read_first, output);
-            assert!(
-                read_second.starts_with("<TOOL_RESULT_REF sha=\""),
-                "got: {read_second}"
-            );
-        });
-    }
-
-    #[test]
-    fn large_write_file_result_stays_inline_but_is_persisted_for_retrieval() {
-        // Decoupling regression (#1695 follow-up): a SINGLE very large
-        // `write_file` result must (a) never collapse to a
-        // `<TOOL_RESULT_REF>` (mutation confirmations stay inline) yet
-        // (b) still be persisted to the SHA store so the content elided
-        // by truncation remains retrievable via `retrieve_tool_result`.
-        // Before the fix, folding `!is_mutation_tool` into the single
-        // `dedup_eligible` gate also disabled persistence, so a >12k
-        // mutation diff was truncated AND unrecoverable.
-        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prior = crate::tools::truncate::set_test_spillover_root(Some(
-            tmp.path().join(".deepseek").join("tool_outputs"),
-        ));
-        struct Restore(Option<std::path::PathBuf>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::tools::truncate::set_test_spillover_root(self.0.take());
-            }
-        }
-        let _restore = Restore(prior);
-
-        // > TOOL_RESULT_SENT_CHAR_BUDGET (12_000) so the wire path
-        // truncates and would need a SHA to recover the middle.
-        let big_diff = "D".repeat(20_000);
-        let sha = sha256_hex(big_diff.as_bytes());
-
-        let messages = vec![
-            tool_use_message("w-1", "write_file", json!({"path": "huge.rs"})),
-            tool_result_message("w-1", &big_diff),
-            tool_use_message("w-2", "write_file", json!({"path": "huge.rs"})),
-            tool_result_message("w-2", &big_diff),
-        ];
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let first = tool_message_content(&built, 0);
-        let second = tool_message_content(&built, 1);
-
-        // (a) Both confirmations stay inline — truncated, never a ref.
-        assert!(
-            first.contains("[TOOL_RESULT_TRUNCATED]"),
-            "first should be truncated, got: {first}"
-        );
-        assert!(
-            !first.contains("<TOOL_RESULT_REF"),
-            "first must not be a dedup ref, got: {first}"
-        );
-        assert!(
-            !second.contains("<TOOL_RESULT_REF"),
-            "second identical write_file must stay inline (#1695), got: {second}"
-        );
-        assert!(
-            second.contains("[TOOL_RESULT_TRUNCATED]"),
-            "second should also be inline-truncated, got: {second}"
-        );
-        assert!(
-            first.contains(&format!("sha256: {sha}")),
-            "truncation block should advertise the recovery SHA, got: {first}"
-        );
-        assert!(
-            first.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
-            "truncation block should advertise the recovery command, got: {first}"
-        );
-
-        // (b) The full content was persisted to the SHA store and is
-        // retrievable — the seam `persist_tool_result_for_sha` writes
-        // to and `retrieve_tool_result ref=sha:` reads back from.
-        let path = crate::tools::truncate::sha_spillover_path(&sha)
-            .expect("sha spillover path resolvable under test root");
-        assert!(
-            path.exists(),
-            "large write_file output not persisted: {path:?}"
-        );
-        let persisted = std::fs::read_to_string(&path).expect("read persisted spillover");
-        assert_eq!(
-            persisted, big_diff,
-            "persisted content must match the original write_file result verbatim"
-        );
-
-        // Sanity: a large NON-mutation result still dedups (back-ref on
-        // the second sighting) — decoupling didn't regress #1695's
-        // preserved read-path behavior.
-        let read_messages = vec![
-            tool_use_message("r-1", "read_file", json!({"path": "huge.rs"})),
-            tool_result_message("r-1", &big_diff),
-            tool_use_message("r-2", "read_file", json!({"path": "huge.rs"})),
-            tool_result_message("r-2", &big_diff),
-        ];
-        let read_built = build_chat_messages(None, &read_messages, "deepseek-v4-flash");
-        let read_second = tool_message_content(&read_built, 1);
-        assert!(
-            read_second.starts_with("<TOOL_RESULT_REF sha=\""),
-            "large read_file must still dedup to a ref, got: {read_second}"
-        );
-    }
-
-    #[test]
-    fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
-        let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
-        let messages = vec![
-            tool_use_message(
-                "tool-long",
-                "shell_command",
-                json!({"command": "cargo test"}),
-            ),
-            tool_result_message("tool-long", &long_output),
-        ];
-
-        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
-        let sent = tool_message_content(&built, 0);
-        assert_ne!(sent, long_output);
-
-        match &messages[1].content[0] {
-            ContentBlock::ToolResult { content, .. } => assert_eq!(content, &long_output),
-            other => panic!("expected tool result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn cache_inspect_reports_tool_result_budget_metadata() {
-        with_tool_result_sha_spillover_root(|| {
-            let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
-            let request = MessageRequest {
-                model: "deepseek-v4-flash".to_string(),
-                messages: vec![
-                    tool_use_message("tool-1", "shell_command", json!({"command": "cargo test"})),
-                    tool_result_message("tool-1", &long_output),
-                    tool_use_message("tool-2", "shell_command", json!({"command": "cargo test"})),
-                    tool_result_message("tool-2", &long_output),
-                ],
-                max_tokens: 0,
-                system: None,
-                tools: None,
-                tool_choice: None,
-                metadata: None,
-                thinking: None,
-                reasoning_effort: None,
-                stream: None,
-                temperature: None,
-                top_p: None,
-            };
-
-            let inspection = inspect_prompt_for_request(&request);
-            let tool_layers: Vec<_> = inspection
-                .layers
-                .iter()
-                .filter_map(|layer| layer.tool_result.as_ref())
-                .collect();
-
-            assert_eq!(tool_layers.len(), 2);
-            assert_eq!(tool_layers[0].original_chars, 14_000);
-            assert!(tool_layers[0].sent_chars < tool_layers[0].original_chars);
-            assert!(tool_layers[0].truncated);
-            assert!(!tool_layers[0].deduplicated);
-            assert_eq!(tool_layers[1].original_chars, 14_000);
-            // Keep the reference far smaller than the original 14K output
-            // even with a copyable retrieval hint included.
-            assert!(
-                tool_layers[1].sent_chars < 300,
-                "deduplicated ref grew unexpectedly large: {}",
-                tool_layers[1].sent_chars
-            );
-            assert!(!tool_layers[1].truncated);
-            assert!(tool_layers[1].deduplicated);
-        });
-    }
-}
+#[path = "chat/tests/stream_decoder.rs"]
+mod stream_decoder_tests;
 
 #[cfg(test)]
 mod alias_thinking_detection_tests {
@@ -4455,11 +4629,16 @@ mod alias_thinking_detection_tests {
     //! assistant messages and DeepSeek returns a 400 ("the `reasoning_content`
     //! in the thinking mode must be passed back to the API") on the second
     //! turn. See upstream API docs:
-    //! https://api-docs.deepseek.com/guides/thinking_mode
+    //! <https://api-docs.deepseek.com/guides/thinking_mode>
     use super::{
-        apply_openai_reasoning_effort, apply_provider_token_limit, is_reasoning_model_for_stream,
-        provider_accepts_reasoning_content, requires_reasoning_content,
-        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+        ReasoningStreamStyle, apply_direct_moonshot_k3_fixed_sampling,
+        apply_inkling_reasoning_effort, apply_kimi_code_k3_reasoning_effort,
+        apply_openai_reasoning_effort, apply_provider_token_limit, apply_route_reasoning_controls,
+        is_reasoning_model_for_stream, is_reasoning_model_for_stream_on_route,
+        provider_accepts_reasoning_content, reasoning_stream_style_for_route,
+        requires_reasoning_content, should_replay_reasoning_content,
+        should_replay_reasoning_content_for_provider,
+        should_replay_reasoning_content_for_provider_on_route,
     };
     use crate::config::ApiProvider;
     use serde_json::json;
@@ -4537,6 +4716,474 @@ mod alias_thinking_detection_tests {
         assert!(provider_accepts_reasoning_content(ApiProvider::Moonshot));
     }
 
+    /// Alibaba's classic pay-as-you-go DashScope endpoints are genuine
+    /// Alibaba Chat Completions hosts serving the same models; before
+    /// 2026-08-04 they were missing from the verifier allowlist, so every
+    /// reasoning control was silently stripped there (fail-closed feature
+    /// loss, not a leak). The intl spelling matches provider_defaults.
+    #[test]
+    fn classic_dashscope_hosts_are_verified_modelstudio_chat_routes() {
+        for base_url in [
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/",
+        ] {
+            assert!(
+                super::is_exact_modelstudio_chat_route(ApiProvider::ModelstudioTokenPlan, base_url),
+                "{base_url}"
+            );
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                "qwen3.7-plus",
+                Some("off"),
+            );
+            assert_eq!(body["enable_thinking"], json!(false), "{base_url}: {body}");
+        }
+        // Lookalike hosts stay unverified — fail closed.
+        for base_url in [
+            "https://dashscope.aliyuncs.com.evil.example/compatible-mode/v1",
+            "https://notdashscope.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope.aliyuncs.com/other-path/v1",
+        ] {
+            assert!(
+                !super::is_exact_modelstudio_chat_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url
+                ),
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn modelstudio_hybrid_routes_send_documented_thinking_controls() {
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for (effort, enabled) in [
+            (None, true),
+            (Some("low"), true),
+            (Some("high"), true),
+            (Some("xhigh"), true),
+            (Some("off"), false),
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                "qwen3.7-plus",
+                effort,
+            );
+
+            assert_eq!(body["enable_thinking"], json!(enabled), "{effort:?}");
+            assert_eq!(body["preserve_thinking"], json!(enabled), "{effort:?}");
+            assert!(body.get("thinking").is_none(), "{effort:?}: {body}");
+            assert!(body.get("reasoning_effort").is_none(), "{effort:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn modelstudio_deepseek_v4_maps_effort_to_documented_values() {
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for (requested, expected) in [("low", "high"), ("high", "high"), ("xhigh", "max")] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                "deepseek-v4-pro",
+                Some(requested),
+            );
+
+            assert_eq!(body["enable_thinking"], json!(true), "{requested}");
+            assert_eq!(body["reasoning_effort"], json!(expected), "{requested}");
+        }
+    }
+
+    #[test]
+    fn modelstudio_reasoning_controls_fail_closed_on_custom_gateways() {
+        let mut body = json!({
+            "enable_thinking": true,
+            "preserve_thinking": true,
+            "reasoning_effort": "high",
+        });
+        apply_route_reasoning_controls(
+            &mut body,
+            ApiProvider::ModelstudioTokenPlan,
+            "https://proxy.example/v1",
+            "qwen3.7-plus",
+            Some("high"),
+        );
+
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("preserve_thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn modelstudio_anthropic_identities_write_nothing_on_the_chat_path() {
+        // The Messages adapter owns these two. If `wire = "openai"` ever routes
+        // them through Chat Completions, the shaper must strip rather than
+        // inherit the OpenAI-dialect fields — there is no provider-enum writer
+        // left to re-add them.
+        for provider in [
+            ApiProvider::ModelstudioTokenPlanAnthropic,
+            ApiProvider::ModelstudioCodingPlanAnthropic,
+        ] {
+            for base_url in [
+                crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+                crate::config::MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL,
+            ] {
+                let mut body = json!({ "enable_thinking": true });
+                apply_route_reasoning_controls(
+                    &mut body,
+                    provider,
+                    base_url,
+                    "qwen3.7-plus",
+                    Some("high"),
+                );
+                assert_eq!(body, json!({}), "{provider:?} {base_url}");
+            }
+        }
+    }
+
+    #[test]
+    fn modelstudio_qwen38_route_streams_reasoning_without_replaying_history() {
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for model in ["qwen3.8-max", "qwen3.8-max-preview"] {
+            // qwen3.8 is thinking-only. Effort selection must never hide its
+            // separate reasoning stream, including the stale `off` state
+            // that can arrive before route normalization.
+            assert_eq!(
+                reasoning_stream_style_for_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    model,
+                    None,
+                ),
+                ReasoningStreamStyle::SeparateField,
+                "{model}"
+            );
+            // ...but Alibaba does not document `preserve_thinking` for the
+            // qwen3.8 family, so no historical `reasoning_content` may be
+            // replayed — even when a stale effort claims thinking is off.
+            // Replaying it feeds the model its own past Thinking blocks and
+            // re-triggers them every turn (observed handoff loop).
+            for effort in [None, Some("off"), Some("high"), Some("xhigh")] {
+                assert!(
+                    !should_replay_reasoning_content_for_provider_on_route(
+                        ApiProvider::ModelstudioTokenPlan,
+                        base_url,
+                        model,
+                        effort,
+                    ),
+                    "{model} {effort:?}"
+                );
+            }
+            // ...and no enable/disable or preserve switch is ever sent for
+            // them.
+            for effort in [None, Some("off"), Some("high")] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    model,
+                    effort,
+                );
+                assert!(body.get("enable_thinking").is_none(), "{model}: {body}");
+                assert!(
+                    body.get("preserve_thinking").is_none(),
+                    "{model} {effort:?}: {body}"
+                );
+                assert!(body.get("reasoning_effort").is_none(), "{model}: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn modelstudio_hybrid_route_classifies_reasoning_and_replays_history() {
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                "qwen3.7-plus",
+                None,
+            ),
+            ReasoningStreamStyle::SeparateField,
+        );
+        assert!(should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::ModelstudioTokenPlan,
+            base_url,
+            "qwen3.7-plus",
+            None,
+        ));
+        assert!(!should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::ModelstudioTokenPlan,
+            base_url,
+            "qwen3.7-plus",
+            Some("off"),
+        ));
+    }
+
+    #[test]
+    fn modelstudio_replay_stays_narrow_until_a_live_key_confirms_it() {
+        // Deliberately narrower than PR #5233: only `preserve_thinking` models
+        // replay. GLM and DeepSeek-V3.x on Model Studio stay stripped until
+        // someone with a key confirms DashScope accepts `reasoning_content` in
+        // input messages. deepseek-v4* is unaffected — it replays through
+        // `requires_reasoning_content` on every provider.
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for model in ["glm-5.2", "deepseek-v3.2", "deepseek-v3.1"] {
+            assert!(
+                !should_replay_reasoning_content_for_provider_on_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    model,
+                    None,
+                ),
+                "{model}"
+            );
+        }
+        assert!(should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::ModelstudioTokenPlan,
+            base_url,
+            "deepseek-v4-pro",
+            None,
+        ));
+    }
+
+    #[test]
+    fn modelstudio_coding_plan_chat_route_is_classified_for_all_supported_identities() {
+        // The picker represents Coding Plan as mode = "coding-plan" under
+        // the primary provider id, so the chat client receives
+        // ModelstudioTokenPlan with the Coding Plan URL. Direct configuration
+        // also retains the legacy ModelstudioCodingPlan identity.
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL;
+        for provider in [
+            ApiProvider::ModelstudioTokenPlan,
+            ApiProvider::ModelstudioCodingPlan,
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                provider,
+                base_url,
+                "qwen3.7-plus",
+                Some("high"),
+            );
+
+            assert_eq!(body["enable_thinking"], json!(true), "{provider:?}");
+            assert_eq!(body["preserve_thinking"], json!(true), "{provider:?}");
+            assert_eq!(
+                reasoning_stream_style_for_route(provider, base_url, "qwen3.7-plus", None),
+                ReasoningStreamStyle::SeparateField,
+                "{provider:?}",
+            );
+            assert!(should_replay_reasoning_content_for_provider_on_route(
+                provider,
+                base_url,
+                "qwen3.7-plus",
+                None,
+            ));
+        }
+    }
+
+    #[test]
+    fn modelstudio_workspace_scoped_token_plan_route_is_recognized() {
+        let workspace_url =
+            "https://workspace-123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+        // Stream classification works on the workspace-scoped host...
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::ModelstudioTokenPlan,
+                workspace_url,
+                "qwen3.8-max",
+                None,
+            ),
+            ReasoningStreamStyle::SeparateField,
+        );
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::ModelstudioTokenPlan,
+                workspace_url,
+                "qwen3.7-plus",
+                None,
+            ),
+            ReasoningStreamStyle::SeparateField,
+        );
+        // ...and the route gate decides replay the same way it does on the
+        // default host: qwen3.8 never replays, documented preserve models do.
+        assert!(!should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::ModelstudioTokenPlan,
+            workspace_url,
+            "qwen3.8-max",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::ModelstudioTokenPlan,
+            workspace_url,
+            "qwen3.7-plus",
+            None,
+        ));
+        let mut body = json!({});
+        apply_route_reasoning_controls(
+            &mut body,
+            ApiProvider::ModelstudioTokenPlan,
+            workspace_url,
+            "qwen3.7-plus",
+            Some("high"),
+        );
+        assert_eq!(body["preserve_thinking"], json!(true), "{body}");
+    }
+
+    #[test]
+    fn modelstudio_thinking_named_unknown_model_cannot_bypass_the_route_gate() {
+        // An unknown Model Studio model whose *name* suggests reasoning must
+        // not gain replay: only the documented `preserve_thinking` list (plus
+        // the concrete DeepSeek V4 family ids) authorizes historical
+        // `reasoning_content` on exact Model Studio routes. The generic
+        // `-thinking`/`reasoner` heuristics prove nothing about DashScope's
+        // request dialect.
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for model in [
+            "foo-thinking",
+            "foo-reasoner",
+            "new-model-reasoning",
+            "acme-reasoner-v2",
+        ] {
+            assert!(
+                !should_replay_reasoning_content_for_provider_on_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    model,
+                    None,
+                ),
+                "{model}"
+            );
+            // The shaper writes no reasoning controls for it either — fail
+            // closed on the wire.
+            let mut body = json!({ "enable_thinking": true, "preserve_thinking": true });
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("high"),
+            );
+            assert!(body.get("enable_thinking").is_none(), "{model}: {body}");
+            assert!(body.get("preserve_thinking").is_none(), "{model}: {body}");
+        }
+        // A suggestive name is not a replay contract on any route.
+        assert!(!requires_reasoning_content("foo-thinking"));
+        assert!(!requires_reasoning_content("foo-reasoner"));
+    }
+
+    #[test]
+    fn modelstudio_qwen36_flash_preserves_thinking_per_current_documentation() {
+        // Current Alibaba documentation explicitly includes qwen3.6-flash
+        // (and its documented snapshots) among the `preserve_thinking`
+        // models. Keep positive coverage so any future narrowing of the
+        // preserve list has to remove it deliberately.
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for model in ["qwen3.6-flash", "qwen3.6-flash-2026-04-16"] {
+            assert!(should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                None,
+            ));
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("high"),
+            );
+            assert_eq!(body["enable_thinking"], json!(true), "{model}");
+            assert_eq!(body["preserve_thinking"], json!(true), "{model}: {body}");
+            // Hybrid semantics: an explicit off disables both, and replay
+            // follows the effort gate.
+            assert!(!should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("off"),
+            ));
+            let mut off_body = json!({});
+            apply_route_reasoning_controls(
+                &mut off_body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("off"),
+            );
+            assert_eq!(off_body["enable_thinking"], json!(false), "{model}");
+            assert_eq!(off_body["preserve_thinking"], json!(false), "{model}");
+        }
+
+        for invented in [
+            "qwen3.6-flash-future",
+            "qwen3.7-plus-proxy",
+            "kimi-k2.7-code-unverified",
+        ] {
+            assert!(
+                !should_replay_reasoning_content_for_provider_on_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    invented,
+                    None,
+                ),
+                "prefix lookalikes must fail closed: {invented}"
+            );
+        }
+    }
+
+    #[test]
+    fn modelstudio_kimi_k27_code_is_thinking_only_and_preserves_trace() {
+        // NOTE: unlike the qwen3.8 pair, this classification is asserted by
+        // PR #5233 rather than corroborated by models_dev.bundled.json, which
+        // lists kimi-k2.7-code with `reasoning: true` and no `always_on`.
+        let base_url = crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL;
+        for model in [
+            "kimi-k2.7-code",
+            "kimi/kimi-k2.7-code",
+            "kimi/kimi-k2.7-code-highspeed",
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("off"),
+            );
+
+            assert!(body.get("enable_thinking").is_none(), "{model}: {body}");
+            assert_eq!(body["preserve_thinking"], json!(true), "{model}");
+            assert_eq!(
+                reasoning_stream_style_for_route(
+                    ApiProvider::ModelstudioTokenPlan,
+                    base_url,
+                    model,
+                    None,
+                ),
+                ReasoningStreamStyle::SeparateField,
+                "{model}",
+            );
+            assert!(should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::ModelstudioTokenPlan,
+                base_url,
+                model,
+                Some("off"),
+            ));
+        }
+    }
+
     #[test]
     fn stream_classifies_moonshot_kimi_as_reasoning() {
         // #3016: without this, Kimi thinking leaked into answer text.
@@ -4572,11 +5219,92 @@ mod alias_thinking_detection_tests {
             "GLM-5.2",
             None,
         ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Zai,
+            "GLM-5.3",
+            None,
+        ));
         assert!(!should_replay_reasoning_content_for_provider(
             ApiProvider::Moonshot,
             "kimi-for-coding",
             Some("off"),
         ));
+    }
+
+    #[test]
+    fn bare_k3_reasoning_semantics_are_scoped_to_exact_kimi_code_route() {
+        let kimi_code = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
+        let direct_moonshot = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+
+        assert!(should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::Moonshot,
+            kimi_code,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("high"),
+        ));
+        assert!(is_reasoning_model_for_stream_on_route(
+            ApiProvider::Moonshot,
+            kimi_code,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ));
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Moonshot,
+                kimi_code,
+                crate::config::KIMI_CODE_K3_MODEL,
+                None,
+            ),
+            ReasoningStreamStyle::SeparateField
+        );
+
+        assert!(!should_replay_reasoning_content_for_provider_on_route(
+            ApiProvider::Moonshot,
+            direct_moonshot,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("high"),
+        ));
+        assert!(!is_reasoning_model_for_stream_on_route(
+            ApiProvider::Moonshot,
+            direct_moonshot,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ));
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Moonshot,
+                direct_moonshot,
+                crate::config::KIMI_CODE_K3_MODEL,
+                None,
+            ),
+            ReasoningStreamStyle::None
+        );
+        assert!(
+            should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::Moonshot,
+                kimi_code,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some("off"),
+            ),
+            "exact membership K3 stays always-thinking even for a stale raw Off caller"
+        );
+    }
+
+    #[test]
+    fn direct_moonshot_k3_is_always_thinking_and_replays_reasoning() {
+        let direct = crate::config::DEFAULT_MOONSHOT_BASE_URL;
+        let model = crate::config::MOONSHOT_KIMI_K3_MODEL;
+
+        for effort in [Some("off"), Some("low"), Some("high"), Some("max"), None] {
+            assert!(should_replay_reasoning_content_for_provider_on_route(
+                ApiProvider::Moonshot,
+                direct,
+                model,
+                effort,
+            ));
+        }
+        assert_eq!(
+            reasoning_stream_style_for_route(ApiProvider::Moonshot, direct, model, None),
+            ReasoningStreamStyle::SeparateField
+        );
     }
 
     #[test]
@@ -4587,7 +5315,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, "mimo-v2.5-pro", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::XiaomiMimo,
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5-pro",
+            8192,
+        );
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(
@@ -4605,7 +5339,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.5", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-5.5",
+            4096,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.5", Some("high"));
 
         assert!(body.get("max_tokens").is_none());
@@ -4629,12 +5369,325 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.6-sol", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-5.6-sol",
+            8192,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.6-sol", Some("max"));
 
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["max_completion_tokens"], json!(8192));
         assert_eq!(body["reasoning_effort"], json!("max"));
+    }
+
+    #[test]
+    fn grok_46_uses_exact_first_party_reasoning_effort_ladder() {
+        for (requested, expected) in [
+            ("off", "high"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "xhigh"),
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Xai,
+                crate::config::DEFAULT_XAI_BASE_URL,
+                crate::config::XAI_GROK_4_6_MODEL,
+                Some(requested),
+            );
+            assert_eq!(body, json!({ "reasoning_effort": expected }), "{requested}");
+        }
+
+        let mut provider_default = json!({});
+        apply_route_reasoning_controls(
+            &mut provider_default,
+            ApiProvider::Xai,
+            crate::config::DEFAULT_XAI_BASE_URL,
+            crate::config::XAI_GROK_4_6_MODEL,
+            Some("auto"),
+        );
+        assert_eq!(provider_default, json!({}));
+
+        let mut custom = json!({});
+        apply_route_reasoning_controls(
+            &mut custom,
+            ApiProvider::Xai,
+            "https://gateway.example/v1",
+            crate::config::XAI_GROK_4_6_MODEL,
+            Some("medium"),
+        );
+        assert_eq!(custom, json!({}));
+    }
+
+    #[test]
+    fn grok_45_uses_first_party_ladder_and_maps_xhigh_to_high() {
+        for (requested, expected) in [
+            ("off", "high"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "high"),
+            ("max", "high"),
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Xai,
+                crate::config::DEFAULT_XAI_BASE_URL,
+                crate::config::XAI_GROK_4_5_MODEL,
+                Some(requested),
+            );
+            assert_eq!(body, json!({ "reasoning_effort": expected }), "{requested}");
+        }
+    }
+
+    #[test]
+    fn inkling_uses_its_exact_reasoning_vocabulary_without_thinking_extension() {
+        for (requested, expected) in [
+            ("off", "none"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "max"),
+        ] {
+            let mut body = json!({
+                "thinking": { "type": "enabled" },
+                "reasoning_effort": "xhigh",
+            });
+
+            apply_inkling_reasoning_effort(
+                &mut body,
+                ApiProvider::Together,
+                "thinkingmachines/inkling",
+                Some(requested),
+            );
+
+            assert_eq!(body["reasoning_effort"], json!(expected));
+            assert!(body.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn inkling_reasoning_override_is_scoped_to_the_exact_together_route() {
+        let mut other_model = json!({ "thinking": { "type": "enabled" } });
+        apply_inkling_reasoning_effort(
+            &mut other_model,
+            ApiProvider::Together,
+            "deepseek-ai/DeepSeek-V4-Pro",
+            Some("max"),
+        );
+        assert_eq!(other_model["thinking"]["type"], json!("enabled"));
+        assert!(other_model.get("reasoning_effort").is_none());
+
+        let mut other_provider = json!({ "thinking": { "type": "enabled" } });
+        apply_inkling_reasoning_effort(
+            &mut other_provider,
+            ApiProvider::Openrouter,
+            "thinkingmachines/inkling",
+            Some("max"),
+        );
+        assert_eq!(other_provider["thinking"]["type"], json!("enabled"));
+        assert!(other_provider.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn kimi_code_k3_uses_documented_nested_thinking_effort() {
+        for (requested, expected) in [
+            ("low", json!({ "type": "enabled", "effort": "low" })),
+            ("minimum", json!({ "type": "enabled", "effort": "low" })),
+            ("light", json!({ "type": "enabled", "effort": "low" })),
+            ("medium", json!({ "type": "enabled", "effort": "high" })),
+            ("high", json!({ "type": "enabled", "effort": "high" })),
+            ("xhigh", json!({ "type": "enabled", "effort": "max" })),
+            ("ultra", json!({ "type": "enabled", "effort": "max" })),
+            ("max", json!({ "type": "enabled", "effort": "max" })),
+            ("none", json!({ "type": "enabled", "effort": "low" })),
+            ("off", json!({ "type": "enabled", "effort": "low" })),
+        ] {
+            let mut body = json!({ "reasoning_effort": "stale" });
+            apply_kimi_code_k3_reasoning_effort(
+                &mut body,
+                ApiProvider::Moonshot,
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+                Some(requested),
+            );
+
+            assert_eq!(body["thinking"], expected, "requested {requested}");
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn direct_moonshot_k3_uses_top_level_effort_and_never_disables_thinking() {
+        for (requested, expected) in [
+            ("off", "low"),
+            ("none", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ] {
+            let mut body = json!({
+                "model": crate::config::MOONSHOT_KIMI_K3_MODEL,
+                "thinking": { "type": "disabled" },
+            });
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Moonshot,
+                crate::config::DEFAULT_MOONSHOT_BASE_URL,
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+                Some(requested),
+            );
+
+            assert_eq!(body["reasoning_effort"], json!(expected), "{requested}");
+            assert!(body.get("thinking").is_none(), "{requested}: {body}");
+        }
+
+        let mut provider_default = json!({ "thinking": { "type": "enabled" } });
+        apply_route_reasoning_controls(
+            &mut provider_default,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            Some("auto"),
+        );
+        assert!(provider_default.get("thinking").is_none());
+        assert!(provider_default.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn direct_moonshot_k3_uses_modern_token_field_and_fixed_sampling_only_on_exact_route() {
+        let mut direct = json!({
+            "max_tokens": 64,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        });
+        apply_provider_token_limit(
+            &mut direct,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            64,
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut direct,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_MOONSHOT_BASE_URL,
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        );
+        assert_eq!(direct["max_completion_tokens"], json!(64));
+        assert!(direct.get("max_tokens").is_none());
+        assert!(direct.get("temperature").is_none());
+        assert!(direct.get("top_p").is_none());
+
+        let mut neighbor = json!({
+            "max_tokens": 64,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        });
+        apply_provider_token_limit(
+            &mut neighbor,
+            ApiProvider::Moonshot,
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+            64,
+        );
+        apply_direct_moonshot_k3_fixed_sampling(
+            &mut neighbor,
+            ApiProvider::Moonshot,
+            "https://proxy.example/v1",
+            crate::config::MOONSHOT_KIMI_K3_MODEL,
+        );
+        assert_eq!(neighbor["max_tokens"], json!(64));
+        assert!(neighbor.get("max_completion_tokens").is_none());
+        assert_eq!(neighbor["temperature"], json!(0.2));
+        assert_eq!(neighbor["top_p"], json!(0.9));
+    }
+
+    #[test]
+    fn direct_and_membership_k3_reasoning_dialects_do_not_cross_routes() {
+        let mut membership = json!({});
+        apply_route_reasoning_controls(
+            &mut membership,
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+            Some("max"),
+        );
+        assert_eq!(
+            membership["thinking"],
+            json!({ "type": "enabled", "effort": "max" })
+        );
+        assert!(membership.get("reasoning_effort").is_none());
+
+        for (base_url, model) in [
+            (
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+            ),
+            (
+                crate::config::DEFAULT_MOONSHOT_BASE_URL,
+                crate::config::KIMI_CODE_K3_MODEL,
+            ),
+            (
+                "https://proxy.example/v1",
+                crate::config::MOONSHOT_KIMI_K3_MODEL,
+            ),
+        ] {
+            let mut neighbor = json!({});
+            apply_route_reasoning_controls(
+                &mut neighbor,
+                ApiProvider::Moonshot,
+                base_url,
+                model,
+                Some("max"),
+            );
+            assert_eq!(
+                neighbor["thinking"],
+                json!({ "type": "enabled" }),
+                "{base_url} / {model}"
+            );
+            assert!(neighbor.get("reasoning_effort").is_none());
+            assert!(neighbor.pointer("/thinking/effort").is_none());
+        }
+    }
+
+    #[test]
+    fn kimi_code_k3_effort_override_never_leaks_to_neighbor_routes() {
+        for (base_url, model) in [
+            (crate::config::DEFAULT_KIMI_CODE_BASE_URL, "kimi-k3"),
+            (
+                crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+                crate::config::DEFAULT_KIMI_CODE_MODEL,
+            ),
+            (crate::config::DEFAULT_MOONSHOT_BASE_URL, "k3"),
+        ] {
+            let mut body = json!({ "thinking": { "type": "enabled" } });
+            apply_kimi_code_k3_reasoning_effort(
+                &mut body,
+                ApiProvider::Moonshot,
+                base_url,
+                model,
+                Some("max"),
+            );
+
+            assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+            assert!(
+                body.pointer("/thinking/effort").is_none(),
+                "{base_url} / {model}"
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
     }
 
     #[test]
@@ -4645,7 +5698,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 8192,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Meta, "muse-spark-1.1", 8192);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Meta,
+            "https://api.meta.ai/v1",
+            "muse-spark-1.1",
+            8192,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Meta, "muse-spark-1.1", Some("max"));
 
         assert_eq!(body["max_tokens"], json!(8192));
@@ -4661,7 +5720,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-4o", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            4096,
+        );
         apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-4o", Some("high"));
 
         assert_eq!(
@@ -4680,7 +5745,13 @@ mod alias_thinking_detection_tests {
             "max_tokens": 4096,
         });
 
-        apply_provider_token_limit(&mut body, ApiProvider::Openai, "deepseek-v4-pro", 4096);
+        apply_provider_token_limit(
+            &mut body,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            "deepseek-v4-pro",
+            4096,
+        );
         apply_openai_reasoning_effort(
             &mut body,
             ApiProvider::Openai,
@@ -4742,6 +5813,33 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
+    fn suggestive_unknown_model_names_never_authorize_reasoning_replay() {
+        for provider in [
+            ApiProvider::Openai,
+            ApiProvider::Deepseek,
+            ApiProvider::Openrouter,
+            ApiProvider::Moonshot,
+            ApiProvider::Zai,
+        ] {
+            for model in [
+                "foo-thinking",
+                "foo-reasoner",
+                "acme-reasoning",
+                "future-reasoner-v9",
+            ] {
+                assert!(
+                    !should_replay_reasoning_content_for_provider(provider, model, None),
+                    "{provider:?} {model}"
+                );
+                assert!(
+                    !is_reasoning_model_for_stream(provider, model),
+                    "stream classification must fail closed too: {provider:?} {model}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stream_classifies_deepseek_model_on_openai_provider_as_reasoning() {
         // #1739: the SSE parser must treat a DeepSeek thinking model on the
         // generic `openai` provider (DeepSeek-compatible endpoint) as a
@@ -4767,6 +5865,51 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
+    fn zai_tiered_effort_applies_to_glm_5_2_and_glm_5_3_but_not_5_1() {
+        let zai = crate::config::DEFAULT_ZAI_BASE_URL;
+        // GLM-5.3 inherits GLM-5.2's reasoning_options (effort high/max), so it
+        // must take the same tiered wire path — not the generic toggle.
+        for model in [
+            crate::config::ZAI_GLM_5_2_MODEL,
+            crate::config::ZAI_GLM_5_3_MODEL,
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("max"));
+            assert_eq!(body["reasoning_effort"], json!("max"), "{model} at max");
+
+            let mut body = json!({});
+            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("high"));
+            assert_eq!(body["reasoning_effort"], json!("high"), "{model} at high");
+        }
+
+        // GLM-5.1 and GLM-5-Turbo keep only the generic thinking control.
+        for model in [
+            crate::config::ZAI_GLM_5_1_MODEL,
+            crate::config::ZAI_GLM_5_TURBO_MODEL,
+        ] {
+            let mut body = json!({});
+            apply_route_reasoning_controls(&mut body, ApiProvider::Zai, zai, model, Some("max"));
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{model} must not receive tiered effort"
+            );
+        }
+
+        // A compatible gateway is not evidence of the Z.ai dialect, for 5.3
+        // exactly as for 5.2.
+        let mut body = json!({"thinking": {"type": "enabled"}});
+        apply_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Zai,
+            "https://gateway.example.com/v1",
+            crate::config::ZAI_GLM_5_3_MODEL,
+            Some("max"),
+        );
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
     fn stream_classifies_known_large_reasoning_models_as_reasoning() {
         // Xiaomi MiMo and OpenRouter/Qwen/Trinity can stream private reasoning through a
         // `reasoning` delta without using a DeepSeek-looking model name. The
@@ -4783,6 +5926,10 @@ mod alias_thinking_detection_tests {
         assert!(
             is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.2"),
             "GLM-5.2 should stream reasoning_content as thinking on direct Z.ai"
+        );
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.3"),
+            "GLM-5.3 inherits GLM-5.2's reasoning capability on direct Z.ai"
         );
         for model in [
             "arcee-ai/trinity-large-thinking",
@@ -4831,5 +5978,887 @@ mod alias_thinking_detection_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod image_block_wire_tests {
+    //! The OpenAI-compatible projection of [`ContentBlock::ImageUrl`].
+    //!
+    //! Chat Completions is the wire format behind the large majority of
+    //! CodeWhale's provider routes, so a regression here is a regression for
+    //! most of them at once. The shape is fixed by OpenAI's spec: a `user`
+    //! message whose `content` is an array of parts, with the image as
+    //! `{"type":"image_url","image_url":{"url":…}}`.
+    use super::{ApiProvider, build_chat_wire_body};
+    use crate::models::Role;
+    use crate::models::{ContentBlock, ImageUrlContent, Message, MessageRequest};
+
+    const DATA_URL: &str = "data:image/png;base64,QUJD";
+
+    fn request_with_image() -> MessageRequest {
+        MessageRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "what is in this screenshot?".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::ImageUrl {
+                        image_url: ImageUrlContent {
+                            url: DATA_URL.to_string(),
+                        },
+                    },
+                ],
+            }],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn user_image_becomes_a_multimodal_parts_array() {
+        let body = build_chat_wire_body(
+            &request_with_image(),
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            false,
+        )
+        .expect("wire body");
+
+        let messages = body.body["messages"].as_array().expect("messages");
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("a user message");
+        let parts = user["content"]
+            .as_array()
+            .expect("content must be a parts array once an image is present, not a bare string");
+
+        let image = parts
+            .iter()
+            .find(|part| part["type"] == "image_url")
+            .expect("an image_url part");
+        assert_eq!(image["image_url"]["url"], DATA_URL);
+
+        let text = parts
+            .iter()
+            .find(|part| part["type"] == "text")
+            .expect("the accompanying text part");
+        assert!(
+            text["text"]
+                .as_str()
+                .expect("text")
+                .contains("what is in this screenshot?"),
+            "the question must survive alongside the image: {user}"
+        );
+    }
+
+    #[test]
+    fn deepseek_vision_exp_uses_chat_image_url_request_shape() {
+        let mut request = request_with_image();
+        request.model = "deepseek-v4-flash-vision-exp".to_string();
+
+        let body = build_chat_wire_body(
+            &request,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com/beta",
+            false,
+        )
+        .expect("DeepSeek vision wire body");
+
+        assert_eq!(body.body["model"], "deepseek-v4-flash-vision-exp");
+        let messages = body.body["messages"].as_array().expect("messages");
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("a user message");
+        let parts = user["content"]
+            .as_array()
+            .expect("DeepSeek vision content must use multimodal parts");
+
+        assert!(parts.iter().any(|part| {
+            part["type"] == "text" && part["text"] == "what is in this screenshot?"
+        }));
+        assert!(
+            parts.iter().any(|part| {
+                part["type"] == "image_url" && part["image_url"]["url"] == DATA_URL
+            })
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_image_keeps_its_plain_string_content() {
+        // Promoting every user turn to a parts array would change the request
+        // bytes for every text-only route, and with them the prompt-cache
+        // prefix. Images must be the only thing that triggers the array form.
+        let mut request = request_with_image();
+        request.messages[0]
+            .content
+            .retain(|block| !matches!(block, ContentBlock::ImageUrl { .. }));
+
+        let body = build_chat_wire_body(
+            &request,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            false,
+        )
+        .expect("wire body");
+
+        let messages = body.body["messages"].as_array().expect("messages");
+        let user = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .expect("a user message");
+        assert!(
+            user["content"].is_string(),
+            "text-only turns must stay a plain string: {user}"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_follows_its_tool_message_as_multimodal_user_content() {
+        let mut request = request_with_image();
+        request.messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_image_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "shot.png"}),
+                    caller: None,
+                    thought_signature: None,
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_image_1".to_string(),
+                    content: "screenshot captured".to_string(),
+                    is_error: Some(false),
+                    content_blocks: Some(vec![serde_json::json!({
+                        "type": "image",
+                        "mime_type": "image/png",
+                        "data": "QUJD",
+                    })]),
+                }],
+            },
+        ];
+
+        let body = build_chat_wire_body(
+            &request,
+            ApiProvider::Openai,
+            "https://api.openai.com/v1",
+            false,
+        )
+        .expect("wire body");
+        let messages = body.body["messages"].as_array().expect("messages");
+        let tool_index = messages
+            .iter()
+            .position(|message| message["role"] == "tool")
+            .expect("tool result");
+        assert_eq!(messages[tool_index]["tool_call_id"], "call_image_1");
+        assert_eq!(messages[tool_index]["content"], "screenshot captured");
+
+        let image_message = &messages[tool_index + 1];
+        assert_eq!(image_message["role"], "user");
+        let parts = image_message["content"].as_array().expect("image parts");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("read") && text.contains("call_image_1"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod mistral_reasoning_tests {
+    use super::*;
+
+    fn request_with_assistant_thinking_and_tool() -> MessageRequest {
+        MessageRequest {
+            model: "mistral-medium-latest".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "Inspect the current state before calling the tool."
+                                .to_string(),
+                            signature: None,
+                            state: None,
+                        },
+                        ContentBlock::Text {
+                            text: "I will inspect it now.".to_string(),
+                            cache_control: None,
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-1".to_string(),
+                            name: "read_file".to_string(),
+                            input: json!({"path": "README.md"}),
+                            caller: None,
+                            thought_signature: None,
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-1".to_string(),
+                        content: "contents".to_string(),
+                        is_error: None,
+                        content_blocks: None,
+                    }],
+                },
+            ],
+            max_tokens: 64,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("high".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn mistral_effort_wire_value_covers_codewhale_tiers() {
+        assert_eq!(mistral_reasoning_effort_wire_value("off"), Some("none"));
+        assert_eq!(
+            mistral_reasoning_effort_wire_value("disabled"),
+            Some("none")
+        );
+        assert_eq!(mistral_reasoning_effort_wire_value("none"), Some("none"));
+        assert_eq!(mistral_reasoning_effort_wire_value("false"), Some("none"));
+        assert_eq!(mistral_reasoning_effort_wire_value("high"), Some("high"));
+        assert_eq!(mistral_reasoning_effort_wire_value("xhigh"), Some("high"));
+        assert_eq!(mistral_reasoning_effort_wire_value("max"), Some("high"));
+        assert_eq!(mistral_reasoning_effort_wire_value("ultra"), Some("high"));
+        assert_eq!(
+            mistral_reasoning_effort_wire_value("ultracode"),
+            Some("high")
+        );
+        // Intermediate tiers must be omitted so the request falls back to
+        // Mistral's own default rather than 400 code 3051 on unsupported
+        // values like "low"/"medium" that the server does not accept today.
+        assert_eq!(mistral_reasoning_effort_wire_value("low"), None);
+        assert_eq!(mistral_reasoning_effort_wire_value("medium"), None);
+        assert_eq!(mistral_reasoning_effort_wire_value("mid"), None);
+        assert_eq!(mistral_reasoning_effort_wire_value("minimal"), None);
+    }
+
+    #[test]
+    fn mistral_model_gate_only_matches_reasoning_capable_families() {
+        assert!(mistral_model_supports_reasoning("mistral-medium-latest"));
+        assert!(mistral_model_supports_reasoning("mistral-medium-3-5"));
+        assert!(mistral_model_supports_reasoning("mistral-small-latest"));
+        assert!(mistral_model_supports_reasoning("mistral-small-2603"));
+        assert!(mistral_model_supports_reasoning("magistral-small-latest"));
+        assert!(mistral_model_supports_reasoning("MISTRAL-MEDIUM-LATEST"));
+        assert!(!mistral_model_supports_reasoning("mistral-code-latest"));
+        assert!(!mistral_model_supports_reasoning("codestral-latest"));
+        assert!(!mistral_model_supports_reasoning("mistral-large-latest"));
+        assert!(!mistral_model_supports_reasoning("mistral-nemo-2407"));
+    }
+
+    #[test]
+    fn mistral_route_shaper_writes_reasoning_only_for_supported_models() {
+        let mut body = json!({"model": "mistral-medium-latest"});
+        apply_mistral_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            "mistral-medium-latest",
+            Some("high"),
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        let mut body = json!({"model": "mistral-code-latest"});
+        apply_mistral_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            "mistral-code-latest",
+            Some("high"),
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "non-reasoning models must never see reasoning_effort (Mistral 400s on 3051): {body}"
+        );
+
+        let mut body = json!({"model": "mistral-medium-latest", "reasoning_effort": "stale"});
+        apply_mistral_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            "mistral-medium-latest",
+            Some("low"),
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "intermediate tiers must be stripped rather than sent unsupported: {body}"
+        );
+
+        // Non-Mistral providers must not be touched by this shaper.
+        let mut body = json!({"model": "deepseek-v4-pro", "reasoning_effort": "high"});
+        apply_mistral_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            "deepseek-v4-pro",
+            Some("high"),
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        let mut body = json!({
+            "model": "mistral-medium-latest",
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "stale",
+        });
+        apply_mistral_route_reasoning_controls(
+            &mut body,
+            ApiProvider::Mistral,
+            "https://gateway.example.test/v1",
+            "mistral-medium-latest",
+            Some("high"),
+        );
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        let mut native = json!({"model": "magistral-small-latest"});
+        apply_mistral_route_reasoning_controls(
+            &mut native,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            "magistral-small-latest",
+            Some("off"),
+        );
+        assert!(
+            native.get("reasoning_effort").is_none(),
+            "legacy native Magistral is always-reasoning and does not use the adjustable effort field"
+        );
+    }
+
+    #[test]
+    fn mistral_wire_dialect_is_limited_to_exact_first_party_routes() {
+        for official in [
+            "https://api.mistral.ai/v1",
+            "https://api.eu.mistral.ai/v1/",
+            "https://api.us.mistral.ai/v1",
+        ] {
+            assert!(is_exact_mistral_chat_route(ApiProvider::Mistral, official));
+        }
+        for neighbor in [
+            "http://api.mistral.ai/v1",
+            "https://api.mistral.ai/v2",
+            "https://proxy.example.test/v1",
+            "https://api.mistral.ai.evil.test/v1",
+        ] {
+            assert!(!is_exact_mistral_chat_route(ApiProvider::Mistral, neighbor));
+        }
+        assert!(!is_exact_mistral_chat_route(
+            ApiProvider::Openai,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+        ));
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Mistral,
+                crate::config::DEFAULT_MISTRAL_BASE_URL,
+                "mistral-medium-latest",
+                None,
+            ),
+            ReasoningStreamStyle::MistralBlocks
+        );
+        assert_eq!(
+            reasoning_stream_style_for_route(
+                ApiProvider::Mistral,
+                "https://gateway.example.test/v1",
+                "mistral-medium-latest",
+                None,
+            ),
+            ReasoningStreamStyle::None
+        );
+    }
+
+    #[test]
+    fn extract_mistral_polymorphic_content_flattens_thinking_and_text() {
+        // Non-reasoning response: plain string content. Extractor returns
+        // (None, None) so the shared string fallback still runs.
+        let plain = json!({"content": "Hello world"});
+        assert_eq!(extract_mistral_polymorphic_content(&plain), (None, None));
+
+        // Missing content: no panic, returns (None, None).
+        let empty = json!({});
+        assert_eq!(extract_mistral_polymorphic_content(&empty), (None, None));
+
+        // Reasoning response: nested thinking array + text block.
+        let reasoning = json!({"content": [
+            {"type": "thinking", "thinking": [
+                {"type": "text", "text": "First "},
+                {"type": "text", "text": "second."},
+            ], "closed": true},
+            {"type": "text", "text": "Final answer."},
+        ]});
+        let (thinking, text) = extract_mistral_polymorphic_content(&reasoning);
+        assert_eq!(thinking.as_deref(), Some("First second."));
+        assert_eq!(text.as_deref(), Some("Final answer."));
+
+        // Thinking-only chunk (mid-stream) with no closing text yet.
+        let thinking_only = json!({"content": [
+            {"type": "thinking", "thinking": [{"type": "text", "text": "still thinking"}]},
+        ]});
+        let (thinking, text) = extract_mistral_polymorphic_content(&thinking_only);
+        assert_eq!(thinking.as_deref(), Some("still thinking"));
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn reshape_mistral_messages_reconstructs_polymorphic_shape_for_assistant_replay() {
+        // Assistant message with stored reasoning_content is reshaped into
+        // Mistral's polymorphic content-as-array shape.
+        let mut messages = vec![
+            json!({"role": "user", "content": "compute 3+4"}),
+            json!({
+                "role": "assistant",
+                "content": "The answer is 7.",
+                "reasoning_content": "Let me add 3 and 4 to get 7.",
+            }),
+            json!({"role": "user", "content": "now multiply by 2"}),
+        ];
+        reshape_mistral_messages_for_reasoning_replay(&mut messages);
+
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"].is_string(),
+            "user turns are left untouched: {}",
+            messages[0]
+        );
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(
+            messages[1].get("reasoning_content").is_none(),
+            "reasoning_content field must be removed after reshape: {}",
+            messages[1]
+        );
+        let content = messages[1]["content"]
+            .as_array()
+            .expect("assistant content is now an array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["closed"], true);
+        assert_eq!(content[0]["thinking"][0]["type"], "text");
+        assert_eq!(
+            content[0]["thinking"][0]["text"],
+            "Let me add 3 and 4 to get 7."
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "The answer is 7.");
+
+        // Assistant with no reasoning stays as-is (plain string content).
+        let mut plain = vec![json!({"role": "assistant", "content": "hi"})];
+        reshape_mistral_messages_for_reasoning_replay(&mut plain);
+        assert_eq!(plain[0]["content"], "hi");
+
+        // Empty reasoning is treated as absent — no reshape.
+        let mut empty = vec![json!({
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "   ",
+        })];
+        reshape_mistral_messages_for_reasoning_replay(&mut empty);
+        assert_eq!(empty[0]["content"], "hi");
+    }
+
+    #[test]
+    fn mistral_prompt_builder_replays_stored_thinking_as_polymorphic_content() {
+        let request = request_with_assistant_thinking_and_tool();
+        let exact = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+        );
+        let assistant = &exact[0];
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("tool_calls").is_some());
+        let content = assistant["content"]
+            .as_array()
+            .expect("exact Mistral history uses polymorphic content");
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(
+            content[0]["thinking"][0]["text"],
+            "Inspect the current state before calling the tool."
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "I will inspect it now.");
+
+        for (provider, base_url) in [
+            (ApiProvider::Mistral, "https://gateway.example.test/v1"),
+            (ApiProvider::Openai, crate::config::DEFAULT_MISTRAL_BASE_URL),
+        ] {
+            let neighbor = build_chat_messages_for_request_and_provider_and_route(
+                &request, provider, base_url,
+            );
+            assert!(neighbor[0].get("reasoning_content").is_none());
+            assert!(
+                neighbor[0]["content"].is_string(),
+                "unproven routes must not inherit Mistral's polymorphic dialect: {}",
+                neighbor[0]
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_stream_tool_call_replay_does_not_gain_reasoning_content() {
+        let request = request_with_assistant_thinking_and_tool();
+        let wire = build_chat_wire_body(
+            &request,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+            true,
+        )
+        .expect("Mistral stream wire body");
+        let assistant = &wire.body["messages"][0];
+        assert!(assistant["content"].is_array());
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("tool_calls").is_some());
+        assert_eq!(wire.body["reasoning_effort"], "high");
+        assert_eq!(wire.replay_input_tokens, None);
+    }
+
+    #[test]
+    fn mistral_nonstream_parser_is_route_isolated() {
+        let payload = json!({
+            "id": "chatcmpl-mistral",
+            "model": "mistral-medium-latest",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": [
+                        {"type": "text", "text": "private trace"}
+                    ], "closed": true},
+                    {"type": "text", "text": "public answer"}
+                ]}
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+        let mistral = parse_chat_message_for_route(
+            &payload,
+            ApiProvider::Mistral,
+            crate::config::DEFAULT_MISTRAL_BASE_URL,
+        )
+        .expect("Mistral payload parses");
+        assert!(matches!(
+            &mistral.content[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "private trace"
+        ));
+        assert!(matches!(
+            &mistral.content[1],
+            ContentBlock::Text { text, .. } if text == "public answer"
+        ));
+
+        let generic = parse_chat_message(&payload).expect("generic payload parses");
+        assert!(
+            !generic
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { .. })),
+            "typed arrays from another provider must not be reinterpreted as Mistral thinking"
+        );
+    }
+
+    #[test]
+    fn mistral_shared_capability_matches_wire_contract() {
+        for model in [
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "magistral-small-latest",
+        ] {
+            assert!(crate::models::model_supports_reasoning(model), "{model}");
+        }
+        for model in ["mistral-code-latest", "mistral-large-latest"] {
+            assert!(!crate::models::model_supports_reasoning(model), "{model}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod google_thought_signature_tests {
+    use super::*;
+
+    // ── Google thought signatures (#v0.9.8 Google backend) ──────────────
+    use crate::config::{DEFAULT_GOOGLE_BASE_URL, DEFAULT_OPENAI_BASE_URL};
+
+    fn google_request_with_signed_tool(signature: Option<&str>) -> MessageRequest {
+        MessageRequest {
+            model: "gemini-3.1-pro-preview".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Read the config.".to_string(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "Reading now.".to_string(),
+                            cache_control: None,
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-g-1".to_string(),
+                            name: "read".to_string(),
+                            input: json!({"path": "config.toml"}),
+                            caller: None,
+                            thought_signature: signature.map(str::to_string),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call-g-1".to_string(),
+                        content: "key = \"value\"".to_string(),
+                        is_error: None,
+                        content_blocks: None,
+                    }],
+                },
+            ],
+            max_tokens: 64,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: Some("high".to_string()),
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn google_route_round_trips_thought_signatures_on_replayed_tool_calls() {
+        let request = google_request_with_signed_tool(Some("SIG-abc123"));
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+        );
+        let assistant = messages
+            .iter()
+            .find(|m| m.get("role") == Some(&json!("assistant")))
+            .expect("assistant replay message");
+        let signature = assistant
+            .pointer("/tool_calls/0/extra_content/google/thought_signature")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(signature, Some("SIG-abc123"));
+    }
+
+    #[test]
+    fn google_route_fails_closed_when_replayed_signature_is_missing() {
+        let request = google_request_with_signed_tool(None);
+        let error = build_chat_wire_body(
+            &request,
+            ApiProvider::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            false,
+        )
+        .err()
+        .expect("missing signature must fail closed before transport");
+        assert!(
+            error.to_string().contains("thought signature"),
+            "error must name the missing signature: {error}"
+        );
+    }
+
+    #[test]
+    fn google_missing_signature_is_a_warning_not_an_error_for_flash_lite() {
+        // 2.5 Flash-Lite ships thinking off; Google may legitimately omit
+        // signatures there, so replay proceeds.
+        let mut request = google_request_with_signed_tool(None);
+        request.model = "gemini-2.5-flash-lite".to_string();
+        build_chat_wire_body(
+            &request,
+            ApiProvider::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            false,
+        )
+        .expect("flash-lite replay must not require a signature");
+    }
+
+    #[test]
+    fn non_google_routes_never_see_google_extra_content() {
+        let request = google_request_with_signed_tool(Some("SIG-abc123"));
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            &request,
+            ApiProvider::Openai,
+            DEFAULT_OPENAI_BASE_URL,
+        );
+        for message in &messages {
+            if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                for call in tool_calls {
+                    assert!(
+                        call.get("extra_content").is_none(),
+                        "Google-only fields must not leak to other providers"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn google_neighbor_base_url_does_not_get_google_dialect() {
+        // A Google provider row pointed at some other gateway must not
+        // carry signatures or fail closed: the dialect binds to the exact
+        // official route, not to provider identity alone.
+        let request = google_request_with_signed_tool(None);
+        build_chat_wire_body(
+            &request,
+            ApiProvider::Google,
+            "https://gateway.example.com/v1",
+            false,
+        )
+        .expect("non-official Google base URL must not require signatures");
+        let messages = build_chat_messages_for_request_and_provider_and_route(
+            &google_request_with_signed_tool(Some("SIG")),
+            ApiProvider::Google,
+            "https://gateway.example.com/v1",
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.pointer("/tool_calls/0/extra_content").is_none()),
+            "signatures must not be sent to a non-Google endpoint"
+        );
+    }
+
+    #[test]
+    fn google_thinking_level_maps_effort_onto_documented_body_field() {
+        let mut request = google_request_with_signed_tool(Some("SIG"));
+        request.reasoning_effort = Some("high".to_string());
+        let body = build_chat_wire_body(
+            &request,
+            ApiProvider::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            false,
+        )
+        .expect("valid google body");
+        assert_eq!(
+            body.body
+                .pointer("/google/thinking_config/thinking_level")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+
+        let mut low = google_request_with_signed_tool(Some("SIG"));
+        low.reasoning_effort = Some("low".to_string());
+        let body = build_chat_wire_body(&low, ApiProvider::Google, DEFAULT_GOOGLE_BASE_URL, false)
+            .expect("valid google body");
+        assert_eq!(
+            body.body
+                .pointer("/google/thinking_config/thinking_level")
+                .and_then(serde_json::Value::as_str),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn google_signature_captured_from_non_streaming_tool_call() {
+        let payload = json!({
+            "id": "resp-1",
+            "model": "gemini-3.1-pro-preview",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-g-9",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{\"path\":\"x\"}"
+                        },
+                        "extra_content": {
+                            "google": { "thought_signature": "SIG-stream" }
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let response = parse_chat_message(&payload).expect("parses");
+        let signature = response.content.iter().find_map(|block| match block {
+            ContentBlock::ToolUse {
+                thought_signature, ..
+            } => thought_signature.clone(),
+            _ => None,
+        });
+        assert_eq!(signature.as_deref(), Some("SIG-stream"));
+    }
+
+    #[test]
+    fn google_signature_captured_from_streaming_first_chunk() {
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-g-7",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{}" },
+                        "extra_content": {
+                            "google": { "thought_signature": "SIG-delta" }
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_buffers = std::collections::HashMap::new();
+        let mut inline_tags = InlineReasoningTagState::default();
+        let events = parse_sse_chunk_with_reasoning_style(
+            &chunk,
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            &mut reasoning_buffers,
+            &mut inline_tags,
+            ReasoningStreamStyle::None,
+        );
+        let signature = events.iter().find_map(|event| match event {
+            StreamEvent::ContentBlockStart {
+                content_block:
+                    ContentBlockStart::ToolUse {
+                        thought_signature, ..
+                    },
+                ..
+            } => thought_signature.clone(),
+            _ => None,
+        });
+        assert_eq!(signature.as_deref(), Some("SIG-delta"));
     }
 }

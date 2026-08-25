@@ -15,12 +15,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use codewhale_release::{
-    CHECKSUM_MANIFEST_ASSET, ReleaseChannel, ReleaseQuery, UPDATE_USER_AGENT,
+    CHECKSUM_MANIFEST_ASSET, InstallMethod, ReleaseChannel, ReleaseQuery, UPDATE_USER_AGENT,
+    cnb_mirror_override_active, cnb_mirror_supports_target, cnb_release_base_url,
     compare_release_versions, is_beta_tag, mirror_asset_url, resolve_release_query,
     update_is_needed, update_network_fallback_hint,
 };
 use reqwest::Proxy;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/Hmbown/CodeWhale/releases/latest";
@@ -28,6 +32,14 @@ const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/Hmbown/CodeWhale/releases/download";
 const UPDATE_HTTP_ATTEMPTS: usize = 3;
 const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
+/// Ceiling for one asset download. Generous, because release binaries are tens
+/// of megabytes and some of the networks this exists for are slow.
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Ceiling for one checksum-manifest probe. The manifest is a few hundred
+/// bytes, so this is only a backstop against a source that accepts the
+/// connection and then stalls — the winner is whichever probe *returns* first,
+/// never whichever one outlasts a timeout.
+const MANIFEST_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "android")]
 const ANDROID_PROC_SELF_MAPS: &str = "/proc/self/maps";
 
@@ -40,7 +52,7 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     let legacy_binary = is_legacy_binary(&current_exe);
     ensure_supported_release_target(std::env::consts::OS, std::env::consts::ARCH)?;
 
-    let targets = update_targets_for_exe(&current_exe);
+    let plan = update_plan_for_exe(&current_exe);
     let channel = ReleaseChannel::from_beta_flag(beta);
     let current_version = env!("CARGO_PKG_VERSION");
     let proxy = proxy_arg
@@ -55,15 +67,24 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
         println!();
         println!("{}", legacy_binary_message(&current_exe));
     }
+    if let Some(warning) = managed_install_warning(InstallMethod::detect(&current_exe)) {
+        println!();
+        println!("{warning}");
+    }
 
     if check_only {
-        let latest_tag = latest_release_tag(channel, proxy.as_ref())
+        let fetched = fetch_latest_release(channel, proxy.as_ref())
             .with_context(update_network_fallback_hint)?;
+        let latest_tag = &fetched.release.tag_name;
         println!("Latest {} release: {latest_tag}", channel.label());
-        if update_is_needed(channel, current_version, &latest_tag)? {
+        if update_is_needed(channel, current_version, latest_tag)? {
             println!("Update available. Run `codewhale update` to install {latest_tag}.");
+            println!(
+                "Release source: {}",
+                describe_release_source_for_check(&fetched, &plan.asset_stem, proxy.as_ref())
+            );
         } else {
-            match compare_release_versions(current_version, &latest_tag)? {
+            match compare_release_versions(current_version, latest_tag)? {
                 Ordering::Greater => {
                     println!("Current build is newer than the latest published release.");
                 }
@@ -82,10 +103,11 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     let latest_tag = &release.tag_name;
     println!("Latest {} release: {latest_tag}", channel.label());
 
-    if let UpdateReleaseSource::Mirror { base_url } = &fetched.source {
+    if fetched.source.is_pinned_mirror() {
         if channel == ReleaseChannel::Beta {
             println!(
-                "Using release mirror {base_url}; --beta does not select GitHub beta releases in mirror mode."
+                "Using {}; --beta does not select GitHub beta releases in mirror mode.",
+                fetched.source.describe()
             );
         }
     } else if !update_is_needed(channel, current_version, latest_tag)? {
@@ -93,96 +115,104 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
         return Ok(());
     }
 
-    // Step 2: Download the aggregated SHA256 checksum manifest if available
-    let checksum_manifest = match select_checksum_manifest_asset(release) {
-        Some(checksum_asset) => {
-            println!("Downloading {}...", checksum_asset.name);
-            let checksum_bytes = download_url(&checksum_asset.browser_download_url, proxy.as_ref())
-                .with_context(|| {
-                    format!(
-                        "failed to download {}\n{}",
-                        checksum_asset.name,
-                        update_network_fallback_hint()
-                    )
-                })?;
-            let checksum_text = std::str::from_utf8(&checksum_bytes)
-                .with_context(|| format!("{} is not valid UTF-8", checksum_asset.name))?;
-            Some(parse_checksum_manifest(checksum_text)?)
-        }
-        None => {
-            println!("  (no SHA256 checksum manifest found; skipping verification)");
-            None
-        }
-    };
+    // Step 2: Lock the checksum manifest and the binary to a single source. On
+    // targets the CNB mirror publishes, this races the two tiny manifests so a
+    // GitHub-blocked network never has to wait out a stalled asset download.
+    let download = resolve_download_plan(&fetched, &plan.asset_stem, proxy.as_ref())?;
+    println!("Release source: {}", download.source.describe());
 
-    // Step 3: Download and verify every colocated binary in the install.
-    let mut downloads = Vec::new();
-    for target in &targets {
-        let asset = select_platform_asset(release, &target.asset_stem).with_context(|| {
-            format!(
-                "no asset found for platform {} in release {latest_tag}. \
-                     Available assets: {}",
-                target.asset_stem,
-                release
-                    .assets
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+    // Step 3: Download and verify the sole implementation binary once. The
+    // installed `codew` and pre-0.9.5 `codewhale-tui` command paths are
+    // compatibility names for these exact bytes, not separate release assets.
+    println!("Downloading {}...", download.binary_name);
+    let bytes = download_url(&download.binary_url, proxy.as_ref()).with_context(|| {
+        format!(
+            "failed to download {} from {}\n{}",
+            download.binary_name,
+            download.source.describe(),
+            update_network_fallback_hint()
+        )
+    })?;
 
-        println!("Downloading {}...", asset.name);
-        let bytes =
-            download_url(&asset.browser_download_url, proxy.as_ref()).with_context(|| {
-                format!(
-                    "failed to download {}\n{}",
-                    asset.name,
-                    update_network_fallback_hint()
-                )
-            })?;
+    verify_downloaded_asset(&download, &bytes)?;
 
-        if let Some(checksums) = &checksum_manifest {
-            let expected = checksums
-                .get(&asset.name)
-                .with_context(|| format!("checksum manifest is missing {}", asset.name))?;
-            let actual = sha256_hex(&bytes);
-            if !actual.eq_ignore_ascii_case(expected) {
-                bail!(
-                    "SHA256 mismatch for {}!\n  expected: {expected}\n  actual:   {actual}",
-                    asset.name
-                );
-            }
-        }
+    preflight_downloaded_binary(&download.binary_name, &bytes)?;
 
-        preflight_downloaded_binary(&asset.name, &bytes)?;
-        downloads.push((target.path.clone(), asset.name.clone(), bytes));
-    }
+    println!(
+        "SHA256 checksum verified against {CHECKSUM_MANIFEST_ASSET} from {}.",
+        download.source.label()
+    );
 
-    if checksum_manifest.is_some() {
-        println!("SHA256 checksum verified.");
-    }
-
-    // Step 4: Replace binaries only after all downloads and the primary
+    // Step 4: Replace command paths only after the download and the running
     // executable identity verify. The preflight happens before a colocated
-    // sibling can change, then the primary is checked again just in time.
-    replace_verified_downloads(&downloads, || {
+    // compatibility path can change, then the identity is checked just in time.
+    replace_verified_downloads(&plan.target_paths, &bytes, || {
         validate_primary_update_identity(&executable_identity)
     })?;
 
     println!(
         "\n✅ Successfully updated to {latest_tag}!\n\
-         Updated binaries:\n{}\n\
+         Release source: {source}\n\
+         Updated binaries:\n{targets}\n\
          \n\
          Restart the application to use the new version.",
-        downloads
+        source = download.source.describe(),
+        targets = plan
+            .target_paths
             .iter()
-            .map(|(path, asset, _)| format!("  - {} ({asset})", path.display()))
+            .map(|path| format!("  - {} ({})", path.display(), download.binary_name))
             .collect::<Vec<_>>()
             .join("\n")
     );
 
     Ok(())
+}
+
+/// Fail closed when the downloaded bytes do not match the manifest that came
+/// from the same source. A mismatch is never a reason to install anyway, and
+/// never a reason to retry against the source that lost the probe: the two
+/// build their own artifacts, so their checksums are not interchangeable.
+fn verify_downloaded_asset(download: &DownloadPlan, bytes: &[u8]) -> Result<()> {
+    let expected = download
+        .checksums
+        .get(&download.binary_name)
+        .with_context(|| {
+            format!(
+                "{CHECKSUM_MANIFEST_ASSET} from {} is missing {}",
+                download.source.describe(),
+                download.binary_name
+            )
+        })?;
+    let actual = sha256_hex(bytes);
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!(
+            "SHA256 mismatch for {} from {}!\n  expected: {expected}\n  actual:   {actual}",
+            download.binary_name,
+            download.source.describe()
+        );
+    }
+    Ok(())
+}
+
+/// Warn when self-update would overwrite a binary a package manager owns.
+///
+/// We warn rather than refuse: the download still produces a working newer
+/// binary, and refusing would break workflows that have been doing this for
+/// releases. But the manager's metadata will then describe a version that is
+/// no longer on disk, and its next upgrade silently reverts the user — so say
+/// so, and name the command that would have done this properly.
+fn managed_install_warning(method: InstallMethod) -> Option<String> {
+    if method.supports_self_update() {
+        return None;
+    }
+    Some(format!(
+        "Warning: this binary looks like a {label} install.\n  \
+         `{command}` is the command that updates it cleanly.\n  \
+         Self-updating in place still works, but leaves {label} describing a version\n  \
+         that is no longer on disk, and its next upgrade will revert this update.",
+        label = method.label(),
+        command = method.update_command()
+    ))
 }
 
 /// Resolve the executable that the updater is allowed to replace.
@@ -499,7 +529,8 @@ fn validate_primary_update_identity(identity: &UpdateExecutableIdentity) -> Resu
 }
 
 fn replace_verified_downloads<F>(
-    downloads: &[(PathBuf, String, Vec<u8>)],
+    target_paths: &[PathBuf],
+    verified_bytes: &[u8],
     validate_primary_identity: F,
 ) -> Result<()>
 where
@@ -508,11 +539,12 @@ where
     // Fail before mutating a sibling if the primary pathname no longer names
     // the process image that initiated this update.
     validate_primary_identity()?;
-    for (path, _, bytes) in downloads.iter().rev() {
-        replace_binary_with_validation(path, bytes, || {
+    for path in target_paths.iter().rev() {
+        replace_binary_with_validation(path, verified_bytes, || {
             // Re-check after each temp file is fully staged and immediately
-            // before every destructive rename. This protects paired installs
-            // before the sibling as well as just in time for the primary.
+            // before every destructive rename. The running command is first
+            // in the plan and therefore replaced last, after its colocated
+            // compatibility names have received the same verified bytes.
             validate_primary_identity()
         })?;
     }
@@ -563,10 +595,356 @@ struct FetchedRelease {
     source: UpdateReleaseSource,
 }
 
+/// Where a release's assets come from.
+///
+/// This names the *asset* origin, which is not always the origin of the release
+/// metadata: without an override the tag is resolved from GitHub, and only then
+/// is the asset source chosen between GitHub and the first-party CNB mirror.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UpdateReleaseSource {
+    /// Canonical GitHub Releases.
     GitHub,
+    /// The first-party CNB mirror release for this exact tag (Linux x64 only).
+    Cnb { base_url: String },
+    /// An operator-supplied asset directory (`CODEWHALE_RELEASE_BASE_URL`).
     Mirror { base_url: String },
+}
+
+impl UpdateReleaseSource {
+    /// Short, stable name for status output.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub Releases",
+            Self::Cnb { .. } => "CNB mirror",
+            Self::Mirror { .. } => "release mirror",
+        }
+    }
+
+    /// The asset directory this source serves from, when it has one.
+    fn base_url(&self) -> Option<&str> {
+        match self {
+            Self::GitHub => None,
+            Self::Cnb { base_url } | Self::Mirror { base_url } => Some(base_url),
+        }
+    }
+
+    /// Label plus asset directory — what status lines and the final receipt
+    /// print, so "which source did this binary come from?" is answerable
+    /// without rerunning the updater.
+    fn describe(&self) -> String {
+        match self.base_url() {
+            Some(base_url) => format!("{} ({base_url})", self.label()),
+            None => self.label().to_string(),
+        }
+    }
+
+    /// True when an environment override, not a probe, chose this source. Such
+    /// a source also carries the pinned version, so the "already up to date"
+    /// shortcut does not apply to it.
+    fn is_pinned_mirror(&self) -> bool {
+        !matches!(self, Self::GitHub)
+    }
+}
+
+/// One source that could serve this release, and the two URLs that must come
+/// from it together: the checksum manifest, and the binary that manifest
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseSourceCandidate {
+    source: UpdateReleaseSource,
+    manifest_url: String,
+    binary_name: String,
+    binary_url: String,
+}
+
+/// A source locked in for this update, with its manifest already fetched,
+/// parsed, and confirmed to cover the binary we are about to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadPlan {
+    source: UpdateReleaseSource,
+    binary_name: String,
+    binary_url: String,
+    /// Parsed checksums from this same source, already confirmed to cover
+    /// `binary_name`. A plan cannot exist without this proof.
+    checksums: HashMap<String, String>,
+}
+
+/// Fetches one candidate's checksum manifest. Injected so the selection logic
+/// can be tested without a network.
+type ManifestFetcher = dyn Fn(&ReleaseSourceCandidate) -> Result<Vec<u8>> + Send + Sync;
+
+/// Build the candidate list for proactive source selection, or `None` when this
+/// update keeps a single canonical source.
+///
+/// Selection applies only when the release metadata came from GitHub (an
+/// explicit override already named the source) and the target is one the CNB
+/// mirror actually publishes. Every other target is left exactly as it was.
+fn proactive_source_candidates(
+    fetched: &FetchedRelease,
+    asset_stem: &str,
+    os: &str,
+    rust_arch: &str,
+) -> Option<Vec<ReleaseSourceCandidate>> {
+    if fetched.source != UpdateReleaseSource::GitHub || !cnb_mirror_supports_target(os, rust_arch) {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    if let Some(github) = github_source_candidate(&fetched.release, asset_stem) {
+        candidates.push(github);
+    }
+    candidates.push(cnb_source_candidate(
+        &fetched.release.tag_name,
+        os,
+        rust_arch,
+    ));
+    Some(candidates)
+}
+
+/// The canonical GitHub candidate for a release the API already described.
+///
+/// Asset URLs come from the release payload when it advertises them. A release
+/// that lists the platform binary but not the manifest still gets a candidate:
+/// GitHub serves release assets from a stable per-tag path, so the manifest is
+/// addressable even when the payload omits it.
+fn github_source_candidate(release: &Release, asset_stem: &str) -> Option<ReleaseSourceCandidate> {
+    let asset = select_platform_asset(release, asset_stem)?;
+    let manifest_url = select_checksum_manifest_asset(release)
+        .map(|manifest| manifest.browser_download_url.clone())
+        .unwrap_or_else(|| {
+            let tag_name = format!("v{}", release.tag_name.trim_start_matches('v'));
+            mirror_asset_url(
+                &format!("{GITHUB_RELEASE_DOWNLOAD_BASE_URL}/{tag_name}"),
+                CHECKSUM_MANIFEST_ASSET,
+            )
+        });
+    Some(ReleaseSourceCandidate {
+        source: UpdateReleaseSource::GitHub,
+        manifest_url,
+        binary_name: asset.name.clone(),
+        binary_url: asset.browser_download_url.clone(),
+    })
+}
+
+/// The first-party CNB candidate for this exact tag.
+///
+/// CNB builds its own artifacts from the tagged source, so its manifest only
+/// describes its own binaries — which is precisely why the manifest and the
+/// binary have to be taken from the same source.
+fn cnb_source_candidate(tag_name: &str, os: &str, rust_arch: &str) -> ReleaseSourceCandidate {
+    let base_url = cnb_release_base_url(tag_name);
+    let binary_name = release_asset_name_for_prefix("codewhale", os, rust_arch);
+    ReleaseSourceCandidate {
+        manifest_url: mirror_asset_url(&base_url, CHECKSUM_MANIFEST_ASSET),
+        binary_url: mirror_asset_url(&base_url, &binary_name),
+        binary_name,
+        source: UpdateReleaseSource::Cnb { base_url },
+    }
+}
+
+/// Decide where this update's bytes come from, and prove the choice before
+/// committing to it.
+fn resolve_download_plan(
+    fetched: &FetchedRelease,
+    asset_stem: &str,
+    proxy: Option<&Proxy>,
+) -> Result<DownloadPlan> {
+    match proactive_source_candidates(
+        fetched,
+        asset_stem,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ) {
+        Some(candidates) => {
+            println!(
+                "Probing {CHECKSUM_MANIFEST_ASSET} for {} from {}...",
+                fetched.release.tag_name,
+                candidate_labels(&candidates)
+            );
+            select_release_source(candidates, manifest_probe_fetcher(proxy))
+                .with_context(update_network_fallback_hint)
+        }
+        None => single_source_download_plan(fetched, asset_stem, proxy),
+    }
+}
+
+fn candidate_labels(candidates: &[ReleaseSourceCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| candidate.source.label())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// Name the source `--check` would download from, without downloading anything
+/// bigger than a manifest — and without contacting anything at all when an
+/// override already fixed the answer.
+fn describe_release_source_for_check(
+    fetched: &FetchedRelease,
+    asset_stem: &str,
+    proxy: Option<&Proxy>,
+) -> String {
+    let Some(candidates) = proactive_source_candidates(
+        fetched,
+        asset_stem,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ) else {
+        return fetched.source.describe();
+    };
+    match select_release_source(candidates, manifest_probe_fetcher(proxy)) {
+        Ok(plan) => plan.source.describe(),
+        // A failed probe is a real answer for `--check` to report, not a reason
+        // to fail a command whose whole job is to describe the release.
+        Err(error) => format!("unresolved — {error:#}"),
+    }
+}
+
+/// Resolve a source that does not participate in the Linux-x64 race.
+///
+/// This path is still fail-closed: every platform and every explicit mirror
+/// must publish a valid manifest from the same source that covers the selected
+/// binary. The binary is not downloaded until that proof exists.
+fn single_source_download_plan(
+    fetched: &FetchedRelease,
+    asset_stem: &str,
+    proxy: Option<&Proxy>,
+) -> Result<DownloadPlan> {
+    let release = &fetched.release;
+    let asset = select_platform_asset(release, asset_stem).with_context(|| {
+        format!(
+            "no asset found for platform {asset_stem} in release {}. \
+             Available assets: {}",
+            release.tag_name,
+            release
+                .assets
+                .iter()
+                .map(|asset| asset.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let checksum_asset = select_checksum_manifest_asset(release).with_context(|| {
+        format!(
+            "release {} from {} does not publish required {CHECKSUM_MANIFEST_ASSET}; refusing to download {} without checksum verification",
+            release.tag_name,
+            fetched.source.describe(),
+            asset.name
+        )
+    })?;
+    println!("Downloading {}...", checksum_asset.name);
+    let checksum_bytes =
+        download_url(&checksum_asset.browser_download_url, proxy).with_context(|| {
+            format!(
+                "failed to download {} from {}\n{}",
+                checksum_asset.name,
+                fetched.source.describe(),
+                update_network_fallback_hint()
+            )
+        })?;
+    let checksum_text = std::str::from_utf8(&checksum_bytes)
+        .with_context(|| format!("{} is not valid UTF-8", checksum_asset.name))?;
+    let checksums = parse_checksum_manifest(checksum_text).with_context(|| {
+        format!(
+            "failed to parse {} from {}",
+            checksum_asset.name,
+            fetched.source.describe()
+        )
+    })?;
+    if !checksums.contains_key(&asset.name) {
+        bail!(
+            "{} from {} does not list {}; refusing to download an unverified update",
+            checksum_asset.name,
+            fetched.source.describe(),
+            asset.name
+        );
+    }
+
+    Ok(DownloadPlan {
+        source: fetched.source.clone(),
+        binary_name: asset.name.clone(),
+        binary_url: asset.browser_download_url.clone(),
+        checksums,
+    })
+}
+
+fn manifest_probe_fetcher(proxy: Option<&Proxy>) -> Arc<ManifestFetcher> {
+    let proxy = proxy.cloned();
+    Arc::new(move |candidate: &ReleaseSourceCandidate| {
+        download_url_with_timeout(
+            &candidate.manifest_url,
+            proxy.as_ref(),
+            MANIFEST_PROBE_TIMEOUT,
+        )
+    })
+}
+
+/// Probe every candidate at once and take the first one that answers with a
+/// usable manifest.
+///
+/// "First" means first to *return*, not first in the list and not whichever one
+/// survives a timeout: a source that is slow or unreachable simply loses, and a
+/// source that answers with a manifest that does not cover this platform's
+/// binary loses too. Once a winner is chosen its receiver is dropped, so a
+/// straggler's result has nowhere to land and is ignored.
+fn select_release_source(
+    candidates: Vec<ReleaseSourceCandidate>,
+    fetch_manifest: Arc<ManifestFetcher>,
+) -> Result<DownloadPlan> {
+    if candidates.is_empty() {
+        bail!("no release source publishes an asset for this platform");
+    }
+
+    let (result_tx, result_rx) = mpsc::channel();
+    for candidate in candidates {
+        let result_tx = result_tx.clone();
+        let fetch_manifest = Arc::clone(&fetch_manifest);
+        thread::spawn(move || {
+            let outcome = probe_release_source(&candidate, &*fetch_manifest);
+            let _ = result_tx.send((candidate, outcome));
+        });
+    }
+    drop(result_tx);
+
+    let mut failures = Vec::new();
+    while let Ok((candidate, outcome)) = result_rx.recv() {
+        match outcome {
+            Ok(checksums) => {
+                return Ok(DownloadPlan {
+                    source: candidate.source,
+                    binary_name: candidate.binary_name,
+                    binary_url: candidate.binary_url,
+                    checksums,
+                });
+            }
+            Err(error) => failures.push(format!("  - {}: {error:#}", candidate.source.describe())),
+        }
+    }
+
+    bail!(
+        "no release source published a usable {CHECKSUM_MANIFEST_ASSET} for this platform:\n{}",
+        failures.join("\n")
+    )
+}
+
+fn probe_release_source(
+    candidate: &ReleaseSourceCandidate,
+    fetch_manifest: &ManifestFetcher,
+) -> Result<HashMap<String, String>> {
+    let bytes = fetch_manifest(candidate)
+        .with_context(|| format!("failed to fetch {}", candidate.manifest_url))?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is not valid UTF-8", candidate.manifest_url))?;
+    let checksums = parse_checksum_manifest(text)
+        .with_context(|| format!("failed to parse {}", candidate.manifest_url))?;
+    if !checksums.contains_key(&candidate.binary_name) {
+        bail!(
+            "{} does not list {}",
+            candidate.manifest_url,
+            candidate.binary_name
+        );
+    }
+    Ok(checksums)
 }
 
 fn ensure_supported_release_target(os: &str, arch: &str) -> Result<()> {
@@ -603,10 +981,11 @@ fn legacy_binary_message(current_exe: &Path) -> String {
         "\
 this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
 
-The package has been renamed to `codewhale`. This update will install canonical
-CodeWhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
-legacy command when the install directory is writable. DeepSeek provider support
-is unchanged.
+The package has been renamed to `codewhale`. This update will install the
+canonical `codewhale` command and refresh any existing `codew` or
+`codewhale-tui` compatibility command from the same binary beside the legacy
+command when the install directory is writable.
+DeepSeek provider support is unchanged.
 
 If this update cannot write to the install directory, reinstall using your
 original install method:
@@ -619,13 +998,14 @@ original install method:
     cargo uninstall deepseek-tui-cli 2>/dev/null || true
     cargo uninstall deepseek-tui 2>/dev/null || true
     cargo install codewhale-cli --locked
-    cargo install codewhale-tui --locked
 
   Homebrew:
+    brew upgrade codewhale
+    # existing Cellar/deepseek-tui installs can still:
     brew upgrade deepseek-tui
 
   Manual binary:
-    download the matched codewhale and codewhale-tui assets from
+    download the matched codewhale asset from
     https://github.com/Hmbown/CodeWhale/releases/latest
 
 Once `codewhale` is on your PATH, run `codewhale update` for future updates.",
@@ -633,96 +1013,79 @@ Once `codewhale` is on your PATH, run `codewhale update` for future updates.",
     )
 }
 
-pub(crate) fn binary_prefix_for_exe(current_exe: &Path) -> &'static str {
+fn command_name_for_exe(current_exe: &Path) -> String {
     let exe_name = current_exe
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("codewhale")
         .to_ascii_lowercase();
-    if exe_name.contains("codewhale-tui") || exe_name.contains("deepseek-tui") {
-        "codewhale-tui"
-    } else {
-        "codewhale"
-    }
+    exe_name
+        .strip_suffix(".exe")
+        .unwrap_or(&exe_name)
+        .to_string()
 }
 
-fn sibling_prefix_for(prefix: &str) -> &'static str {
-    if prefix == "codewhale-tui" {
-        "codewhale"
-    } else {
-        "codewhale-tui"
-    }
+fn command_path_beside(current_exe: &Path, command: &str) -> PathBuf {
+    current_exe.with_file_name(format!("{command}{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
-    current_exe.with_file_name(format!("{sibling_prefix}{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn canonical_binary_path_for_prefix(current_exe: &Path, prefix: &str) -> PathBuf {
-    if is_legacy_binary(current_exe) {
-        current_exe.with_file_name(format!("{prefix}{}", std::env::consts::EXE_SUFFIX))
-    } else {
+fn installed_command_path(current_exe: &Path, command: &str) -> PathBuf {
+    if command_name_for_exe(current_exe) == command {
         current_exe.to_path_buf()
-    }
-}
-
-fn legacy_binary_name_for_prefix(prefix: &str) -> &'static str {
-    if prefix == "codewhale-tui" {
-        "deepseek-tui"
     } else {
-        "deepseek"
+        command_path_beside(current_exe, command)
     }
 }
 
-fn legacy_sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
-    current_exe.with_file_name(format!(
-        "{}{}",
-        legacy_binary_name_for_prefix(sibling_prefix),
-        std::env::consts::EXE_SUFFIX
-    ))
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
-fn should_update_sibling(
-    current_exe: &Path,
-    canonical_sibling: &Path,
-    sibling_prefix: &str,
-) -> bool {
-    canonical_sibling.exists()
-        || (is_legacy_binary(current_exe)
-            && legacy_sibling_binary_path(current_exe, sibling_prefix).exists())
+fn legacy_tui_command_exists_beside(current_exe: &Path) -> bool {
+    command_name_for_exe(current_exe) == "deepseek-tui"
+        || command_path_beside(current_exe, "deepseek-tui").exists()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UpdateTarget {
-    path: PathBuf,
+struct UpdatePlan {
+    target_paths: Vec<PathBuf>,
     asset_stem: String,
 }
 
-fn update_targets_for_exe(current_exe: &Path) -> Vec<UpdateTarget> {
-    let current_prefix = binary_prefix_for_exe(current_exe);
-    let mut targets = vec![UpdateTarget {
-        path: canonical_binary_path_for_prefix(current_exe, current_prefix),
+fn update_plan_for_exe(current_exe: &Path) -> UpdatePlan {
+    let mut target_paths = Vec::new();
+
+    // Keep the process image first so reverse-order replacement updates the
+    // command currently running the updater last. Pre-rebrand command names
+    // retain their historical migration behavior: install canonical commands
+    // beside them instead of overwriting the legacy path.
+    if !is_legacy_binary(current_exe) {
+        push_unique_path(&mut target_paths, current_exe.to_path_buf());
+    }
+
+    let primary = installed_command_path(current_exe, "codewhale");
+    push_unique_path(&mut target_paths, primary);
+
+    for alias in ["codew", "codewhale-tui"] {
+        let alias_path = installed_command_path(current_exe, alias);
+        let migrate_legacy_tui = alias == "codewhale-tui"
+            && is_legacy_binary(current_exe)
+            && legacy_tui_command_exists_beside(current_exe);
+        if alias_path.exists() || command_name_for_exe(current_exe) == alias || migrate_legacy_tui {
+            push_unique_path(&mut target_paths, alias_path);
+        }
+    }
+
+    UpdatePlan {
+        target_paths,
         asset_stem: release_asset_stem_for_prefix(
-            current_prefix,
+            "codewhale",
             std::env::consts::OS,
             std::env::consts::ARCH,
         ),
-    }];
-
-    let sibling_prefix = sibling_prefix_for(current_prefix);
-    let sibling = sibling_binary_path(current_exe, sibling_prefix);
-    if should_update_sibling(current_exe, &sibling, sibling_prefix) {
-        targets.push(UpdateTarget {
-            path: sibling,
-            asset_stem: release_asset_stem_for_prefix(
-                sibling_prefix,
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-            ),
-        });
     }
-
-    targets
 }
 
 fn release_asset_stem_for_prefix(prefix: &str, os: &str, rust_arch: &str) -> String {
@@ -741,8 +1104,8 @@ fn release_asset_name_for_prefix(prefix: &str, os: &str, rust_arch: &str) -> Str
 
 #[cfg(test)]
 fn release_asset_stem_for(current_exe: &Path, os: &str, rust_arch: &str) -> String {
-    let prefix = binary_prefix_for_exe(current_exe);
-    release_asset_stem_for_prefix(prefix, os, rust_arch)
+    let _ = current_exe;
+    release_asset_stem_for_prefix("codewhale", os, rust_arch)
 }
 
 pub(crate) fn asset_matches_platform(asset_name: &str, binary_name: &str) -> bool {
@@ -850,20 +1213,22 @@ pub(crate) fn validate_and_build_proxy(proxy_str: &str) -> Result<Proxy> {
 }
 
 fn update_http_client(proxy: Option<&Proxy>) -> Result<reqwest::blocking::Client> {
+    update_http_client_with_timeout(proxy, UPDATE_DOWNLOAD_TIMEOUT)
+}
+
+fn update_http_client_with_timeout(
+    proxy: Option<&Proxy>,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Client> {
     let mut builder = codewhale_release::platform_blocking_http_client_builder();
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy.clone());
     }
     builder
         .user_agent(UPDATE_USER_AGENT)
-        .timeout(Duration::from_secs(5 * 60))
+        .timeout(timeout)
         .build()
         .context("failed to build update HTTP client")
-}
-
-fn latest_release_tag(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Result<String> {
-    let FetchedRelease { release, .. } = fetch_latest_release(channel, proxy)?;
-    Ok(release.tag_name)
 }
 
 /// Fetch the latest release metadata from GitHub.
@@ -876,7 +1241,7 @@ fn fetch_latest_release(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Resul
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             ),
-            source: UpdateReleaseSource::Mirror { base_url },
+            source: pinned_mirror_source(base_url),
         }),
         ReleaseQuery::GitHubLatest { url } => match fetch_latest_release_from_url(url, proxy) {
             Ok(release) => Ok(FetchedRelease {
@@ -899,6 +1264,19 @@ fn fetch_latest_release(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Resul
             release: fetch_latest_beta_release_from_url(url, proxy)?,
             source: UpdateReleaseSource::GitHub,
         }),
+    }
+}
+
+/// Name the source an environment override selected.
+///
+/// `CODEWHALE_USE_CNB_MIRROR` and `CODEWHALE_RELEASE_BASE_URL` both resolve to
+/// a base URL, but only the first is the first-party mirror — reporting them
+/// alike would hide which one a user actually asked for.
+fn pinned_mirror_source(base_url: String) -> UpdateReleaseSource {
+    if cnb_mirror_override_active() {
+        UpdateReleaseSource::Cnb { base_url }
+    } else {
+        UpdateReleaseSource::Mirror { base_url }
     }
 }
 
@@ -929,13 +1307,11 @@ fn release_from_asset_base_url(
         browser_download_url: mirror_asset_url(base_url, CHECKSUM_MANIFEST_ASSET),
     }];
 
-    for prefix in ["codewhale", "codewhale-tui"] {
-        let name = release_asset_name_for_prefix(prefix, os, rust_arch);
-        assets.push(Asset {
-            browser_download_url: mirror_asset_url(base_url, &name),
-            name,
-        });
-    }
+    let name = release_asset_name_for_prefix("codewhale", os, rust_arch);
+    assets.push(Asset {
+        browser_download_url: mirror_asset_url(base_url, &name),
+        name,
+    });
 
     Release {
         tag_name: tag_name.to_string(),
@@ -1095,7 +1471,7 @@ fn release_tag_from_github_release_html(body: &str) -> Option<String> {
 
 fn fetch_latest_beta_release_from_url(url: &str, proxy: Option<&Proxy>) -> Result<Release> {
     let body = fetch_release_json(url, "release list", proxy)?;
-    // GitHub caps this endpoint at 100 releases per page. CodeWhale uses the
+    // GitHub caps this endpoint at 100 releases per page. Codewhale uses the
     // first page as the latest-beta search window, matching GitHub's ordering.
     let releases: Vec<Release> = serde_json::from_str(&body).with_context(|| {
         format!("failed to parse release list JSON from GitHub API. Response: {body}")
@@ -1109,9 +1485,17 @@ fn fetch_latest_beta_release_from_url(url: &str, proxy: Option<&Proxy>) -> Resul
 
 /// Download a URL to bytes.
 fn download_url(url: &str, proxy: Option<&Proxy>) -> Result<Vec<u8>> {
+    download_url_with_timeout(url, proxy, UPDATE_DOWNLOAD_TIMEOUT)
+}
+
+fn download_url_with_timeout(
+    url: &str,
+    proxy: Option<&Proxy>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let mut last_error = None;
     for attempt in 1..=UPDATE_HTTP_ATTEMPTS {
-        match download_url_once(url, proxy) {
+        match download_url_once(url, proxy, timeout) {
             Ok((status, bytes)) if status.is_success() => return Ok(bytes),
             Ok((status, bytes)) => {
                 let body = String::from_utf8_lossy(&bytes);
@@ -1133,8 +1517,12 @@ fn download_url(url: &str, proxy: Option<&Proxy>) -> Result<Vec<u8>> {
     Err(last_error.unwrap_or_else(|| anyhow!("failed to download {url}")))
 }
 
-fn download_url_once(url: &str, proxy: Option<&Proxy>) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-    let client = update_http_client(proxy)?;
+fn download_url_once(
+    url: &str,
+    proxy: Option<&Proxy>,
+    timeout: Duration,
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    let client = update_http_client_with_timeout(proxy, timeout)?;
     let response = client
         .get(url)
         .send()
@@ -1308,7 +1696,7 @@ fn glibc_compatibility_message(
     };
     format!(
         "\
-Prebuilt CodeWhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
+Prebuilt Codewhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
 
 Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
 2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
@@ -1316,7 +1704,6 @@ Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
 Install from source on this host instead:
 
   cargo install codewhale-cli --locked
-  cargo install codewhale-tui --locked
 
 Release engineering follow-up: build Linux GNU assets against an older glibc
 baseline, or add a musl/static Linux asset. Set CODEWHALE_SKIP_GLIBC_CHECK=1 to
@@ -1429,10 +1816,68 @@ fn backup_path_for(target: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex, MutexGuard};
     use std::thread;
+
+    /// Release-source environment variables are process-wide, so the tests that
+    /// exercise override precedence take this lock and restore what they found.
+    static UPDATE_ENV_LOCK: Mutex<()> = Mutex::new(());
+    const UPDATE_ENV_VARS: &[&str] = &[
+        codewhale_release::RELEASE_BASE_URL_ENV,
+        codewhale_release::LEGACY_RELEASE_BASE_URL_ENV,
+        codewhale_release::DEEPSEEK_RELEASE_BASE_URL_ENV,
+        codewhale_release::CNB_MIRROR_ENV,
+        codewhale_release::UPDATE_VERSION_ENV,
+        codewhale_release::LEGACY_UPDATE_VERSION_ENV,
+    ];
+
+    struct UpdateEnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl UpdateEnvGuard {
+        fn clear() -> Self {
+            let lock = UPDATE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = UPDATE_ENV_VARS
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect();
+            for &name in UPDATE_ENV_VARS {
+                // SAFETY: tests that mutate these process-wide vars hold UPDATE_ENV_LOCK.
+                unsafe { std::env::remove_var(name) };
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for UpdateEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                // SAFETY: the guard still holds UPDATE_ENV_LOCK while restoring state.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_update_env(name: &str, value: &str) {
+        // SAFETY: callers hold an UpdateEnvGuard, which serializes env mutation.
+        unsafe { std::env::set_var(name, value) };
+    }
 
     #[cfg(unix)]
     fn write_test_executable(path: &Path) {
@@ -1502,7 +1947,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(resolved, executable.canonicalize().unwrap());
-        assert_eq!(update_targets_for_exe(&resolved)[0].path, resolved);
+        assert_eq!(update_plan_for_exe(&resolved).target_paths[0], resolved);
     }
 
     #[cfg(unix)]
@@ -1525,10 +1970,7 @@ mod tests {
 
         let resolved =
             resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &invoked).unwrap();
-        let target_paths = update_targets_for_exe(&resolved)
-            .into_iter()
-            .map(|target| target.path)
-            .collect::<Vec<_>>();
+        let target_paths = update_plan_for_exe(&resolved).target_paths;
 
         assert_eq!(
             target_paths,
@@ -1788,19 +2230,8 @@ mod tests {
         std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
         std::fs::rename(&swapped_primary, &primary).unwrap();
 
-        let downloads = vec![
-            (
-                primary.clone(),
-                "codewhale-android-arm64".to_string(),
-                b"downloaded primary".to_vec(),
-            ),
-            (
-                sibling.clone(),
-                "codewhale-tui-android-arm64".to_string(),
-                b"downloaded sibling".to_vec(),
-            ),
-        ];
-        let error = replace_verified_downloads(&downloads, || {
+        let target_paths = vec![primary.clone(), sibling.clone()];
+        let error = replace_verified_downloads(&target_paths, b"downloaded binary", || {
             resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &primary)
                 .map(|_| ())
         })
@@ -1834,20 +2265,9 @@ mod tests {
         write_test_executable(&swapped_primary);
         std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
 
-        let downloads = vec![
-            (
-                primary.clone(),
-                "codewhale-android-arm64".to_string(),
-                b"downloaded primary".to_vec(),
-            ),
-            (
-                sibling.clone(),
-                "codewhale-tui-android-arm64".to_string(),
-                b"downloaded sibling".to_vec(),
-            ),
-        ];
+        let target_paths = vec![primary.clone(), sibling.clone()];
         let validation_calls = Cell::new(0);
-        let error = replace_verified_downloads(&downloads, || {
+        let error = replace_verified_downloads(&target_paths, b"downloaded binary", || {
             let call = validation_calls.get() + 1;
             validation_calls.set(call);
             if call == 1 {
@@ -1885,13 +2305,9 @@ mod tests {
         write_test_executable(&swapped_primary);
         std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
 
-        let downloads = vec![(
-            primary.clone(),
-            "codewhale-android-arm64".to_string(),
-            b"downloaded primary".to_vec(),
-        )];
+        let target_paths = vec![primary.clone()];
         let validation_calls = Cell::new(0);
-        let error = replace_verified_downloads(&downloads, || {
+        let error = replace_verified_downloads(&target_paths, b"downloaded binary", || {
             let call = validation_calls.get() + 1;
             validation_calls.set(call);
             if call == 1 {
@@ -1924,58 +2340,25 @@ mod tests {
         );
     }
 
-    /// Verify binary prefix detection for dispatcher vs TUI binary.
+    /// Every command name resolves to the sole implementation asset.
     #[test]
-    fn test_binary_prefix_detection() {
-        // TUI binary should use codewhale-tui prefix
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("codewhale-tui")),
-            "codewhale-tui"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("codewhale-tui.exe")),
-            "codewhale-tui"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("CodeWhale-TUI.exe")),
-            "codewhale-tui"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("/usr/local/bin/codewhale-tui")),
-            "codewhale-tui"
-        );
-
-        // Dispatcher binary should use codewhale prefix
-        assert_eq!(binary_prefix_for_exe(Path::new("codewhale")), "codewhale");
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("codewhale.exe")),
-            "codewhale"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("/usr/local/bin/codewhale")),
-            "codewhale"
-        );
-
-        // Fallback for unknown names
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("other-binary")),
-            "codewhale"
-        );
-
-        // Legacy names still map to the canonical update asset prefixes.
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("deepseek-tui")),
-            "codewhale-tui"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("/usr/local/bin/deepseek-tui")),
-            "codewhale-tui"
-        );
-        assert_eq!(
-            binary_prefix_for_exe(Path::new("DeepSeek-TUI.exe")),
-            "codewhale-tui"
-        );
-        assert_eq!(binary_prefix_for_exe(Path::new("deepseek")), "codewhale");
+    fn every_invocation_name_uses_codewhale_release_asset() {
+        for command in [
+            "codewhale",
+            "codewhale.exe",
+            "codew",
+            "codew.exe",
+            "codewhale-tui",
+            "CodeWhale-TUI.exe",
+            "deepseek",
+            "deepseek-tui",
+            "other-binary",
+        ] {
+            assert_eq!(
+                release_asset_stem_for(Path::new(command), "macos", "aarch64"),
+                "codewhale-macos-arm64"
+            );
+        }
     }
 
     #[test]
@@ -1992,11 +2375,31 @@ mod tests {
     }
 
     #[test]
+    fn managed_installs_are_warned_before_self_update_overwrites_them() {
+        let npm = managed_install_warning(InstallMethod::Npm).expect("npm is package-managed");
+        assert!(npm.contains("npm install -g codewhale@latest"));
+        assert!(npm.contains("revert this update"));
+
+        let brew =
+            managed_install_warning(InstallMethod::Homebrew).expect("brew is package-managed");
+        assert!(brew.contains("brew upgrade codewhale"));
+
+        assert!(managed_install_warning(InstallMethod::Cargo).is_some());
+
+        let omarchy =
+            managed_install_warning(InstallMethod::Omarchy).expect("Omarchy is package-managed");
+        assert!(omarchy.contains("omarchy update"));
+
+        // A plain release binary is exactly what this updater is for.
+        assert!(managed_install_warning(InstallMethod::Binary).is_none());
+    }
+
+    #[test]
     fn legacy_binary_message_gives_copy_pasteable_migration_steps() {
         let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
 
         assert!(message.contains("legacy deepseek/deepseek-tui command name"));
-        assert!(message.contains("install canonical"));
+        assert!(message.contains("canonical `codewhale` command"));
         assert!(message.contains("DeepSeek provider support"));
         assert!(message.contains("is unchanged"));
         assert!(message.contains("npm uninstall -g deepseek-tui"));
@@ -2004,13 +2407,14 @@ mod tests {
         assert!(message.contains("cargo uninstall deepseek-tui-cli 2>/dev/null || true"));
         assert!(message.contains("cargo uninstall deepseek-tui 2>/dev/null || true"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
-        assert!(message.contains("cargo install codewhale-tui --locked"));
+        assert!(!message.contains("cargo install codewhale-tui --locked"));
+        assert!(message.contains("brew upgrade codewhale"));
         assert!(message.contains("brew upgrade deepseek-tui"));
         assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
     }
 
     #[test]
-    fn legacy_dispatcher_update_targets_canonical_codewhale_pair() {
+    fn legacy_dispatcher_update_targets_canonical_compatibility_commands() {
         let dir = tempfile::TempDir::new().unwrap();
         let dispatcher = dir
             .path()
@@ -2021,14 +2425,10 @@ mod tests {
         std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
         std::fs::write(&tui, b"legacy tui").unwrap();
 
-        let targets = update_targets_for_exe(&dispatcher);
-        let paths = targets
-            .iter()
-            .map(|target| target.path.clone())
-            .collect::<Vec<_>>();
+        let plan = update_plan_for_exe(&dispatcher);
 
         assert_eq!(
-            paths,
+            plan.target_paths,
             vec![
                 dir.path()
                     .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX)),
@@ -2036,12 +2436,12 @@ mod tests {
                     .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX))
             ]
         );
-        assert!(targets[0].asset_stem.starts_with("codewhale-"));
-        assert!(targets[1].asset_stem.starts_with("codewhale-tui-"));
+        assert!(plan.asset_stem.starts_with("codewhale-"));
+        assert!(!plan.asset_stem.starts_with("codewhale-tui-"));
     }
 
     #[test]
-    fn legacy_tui_update_targets_canonical_tui_pair() {
+    fn legacy_tui_update_targets_canonical_compatibility_commands() {
         let dir = tempfile::TempDir::new().unwrap();
         let dispatcher = dir
             .path()
@@ -2052,23 +2452,19 @@ mod tests {
         std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
         std::fs::write(&tui, b"legacy tui").unwrap();
 
-        let targets = update_targets_for_exe(&tui);
-        let paths = targets
-            .iter()
-            .map(|target| target.path.clone())
-            .collect::<Vec<_>>();
+        let plan = update_plan_for_exe(&tui);
 
         assert_eq!(
-            paths,
+            plan.target_paths,
             vec![
                 dir.path()
-                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX)),
+                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX)),
                 dir.path()
-                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX))
+                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX))
             ]
         );
-        assert!(targets[0].asset_stem.starts_with("codewhale-tui-"));
-        assert!(targets[1].asset_stem.starts_with("codewhale-"));
+        assert!(plan.asset_stem.starts_with("codewhale-"));
+        assert!(!plan.asset_stem.starts_with("codewhale-tui-"));
     }
 
     #[test]
@@ -2078,18 +2474,9 @@ mod tests {
             ("codewhale", "macos", "x86_64", "codewhale-macos-x64"),
             ("codewhale", "linux", "x86_64", "codewhale-linux-x64"),
             ("codewhale", "windows", "x86_64", "codewhale-windows-x64"),
-            (
-                "codewhale-tui",
-                "macos",
-                "aarch64",
-                "codewhale-tui-macos-arm64",
-            ),
-            (
-                "codewhale-tui",
-                "linux",
-                "x86_64",
-                "codewhale-tui-linux-x64",
-            ),
+            ("codewhale", "windows", "aarch64", "codewhale-windows-arm64"),
+            ("codew", "macos", "aarch64", "codewhale-macos-arm64"),
+            ("codewhale-tui", "linux", "x86_64", "codewhale-linux-x64"),
         ];
 
         for (exe, os, arch, expected) in cases {
@@ -2098,7 +2485,7 @@ mod tests {
     }
 
     #[test]
-    fn update_targets_include_existing_sibling_tui_for_dispatcher() {
+    fn update_plan_includes_existing_compatibility_tui_for_primary() {
         let dir = tempfile::TempDir::new().unwrap();
         let dispatcher = dir
             .path()
@@ -2109,30 +2496,94 @@ mod tests {
         std::fs::write(&dispatcher, b"dispatcher").unwrap();
         std::fs::write(&tui, b"tui").unwrap();
 
-        let targets = update_targets_for_exe(&dispatcher);
-        let paths = targets
+        let plan = update_plan_for_exe(&dispatcher);
+        let paths = plan
+            .target_paths
             .iter()
-            .map(|target| target.path.as_path())
+            .map(PathBuf::as_path)
             .collect::<Vec<_>>();
 
         assert_eq!(paths, vec![dispatcher.as_path(), tui.as_path()]);
-        assert!(targets[0].asset_stem.starts_with("codewhale-"));
-        assert!(targets[1].asset_stem.starts_with("codewhale-tui-"));
+        assert!(plan.asset_stem.starts_with("codewhale-"));
+        assert!(!plan.asset_stem.starts_with("codewhale-tui-"));
     }
 
     #[test]
-    fn update_targets_skip_missing_sibling() {
+    fn update_plan_skips_missing_compatibility_commands() {
         let dir = tempfile::TempDir::new().unwrap();
         let dispatcher = dir
             .path()
             .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&dispatcher, b"dispatcher").unwrap();
 
-        let targets = update_targets_for_exe(&dispatcher);
+        let plan = update_plan_for_exe(&dispatcher);
 
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].path, dispatcher);
-        assert!(targets[0].asset_stem.starts_with("codewhale-"));
+        assert_eq!(plan.target_paths, vec![dispatcher]);
+        assert!(plan.asset_stem.starts_with("codewhale-"));
+    }
+
+    #[test]
+    fn v094_three_command_install_updates_every_path_from_primary_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir
+            .path()
+            .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX));
+        let codew = dir
+            .path()
+            .join(format!("codew{}", std::env::consts::EXE_SUFFIX));
+        let legacy_tui = dir
+            .path()
+            .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
+        for path in [&primary, &codew, &legacy_tui] {
+            std::fs::write(path, b"v0.9.4 old bytes").unwrap();
+        }
+
+        let plan = update_plan_for_exe(&primary);
+        assert_eq!(
+            plan.target_paths,
+            vec![primary.clone(), codew.clone(), legacy_tui.clone()]
+        );
+        assert!(plan.asset_stem.starts_with("codewhale-"));
+        assert!(!plan.asset_stem.contains("codewhale-tui"));
+
+        replace_verified_downloads(&plan.target_paths, b"v0.9.5 primary bytes", || Ok(())).unwrap();
+
+        for path in [&primary, &codew, &legacy_tui] {
+            assert_eq!(std::fs::read(path).unwrap(), b"v0.9.5 primary bytes");
+        }
+        assert_ne!(std::fs::read(codew).unwrap(), b"v0.9.4 old bytes");
+    }
+
+    #[test]
+    fn direct_alias_invocation_keeps_running_path_first_and_updates_primary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir
+            .path()
+            .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX));
+        let codew = dir
+            .path()
+            .join(format!("codew{}", std::env::consts::EXE_SUFFIX));
+        let legacy_tui = dir
+            .path()
+            .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
+        for invoked in [&codew, &legacy_tui] {
+            for path in [&primary, &codew, &legacy_tui] {
+                std::fs::write(path, b"old").unwrap();
+            }
+            let plan = update_plan_for_exe(invoked);
+            assert_eq!(plan.target_paths.first(), Some(invoked));
+            assert!(plan.target_paths.contains(&primary));
+            assert!(plan.target_paths.contains(&codew));
+            assert!(plan.target_paths.contains(&legacy_tui));
+            assert!(plan.asset_stem.starts_with("codewhale-"));
+            assert!(!plan.asset_stem.starts_with("codewhale-tui-"));
+
+            replace_verified_downloads(&plan.target_paths, b"new primary bytes", || Ok(()))
+                .unwrap();
+            for path in [&primary, &codew, &legacy_tui] {
+                assert_eq!(std::fs::read(path).unwrap(), b"new primary bytes");
+            }
+        }
     }
 
     #[test]
@@ -2252,7 +2703,7 @@ mod tests {
             Some(GlibcVersion::new(2, 35, 0)),
         );
 
-        assert!(message.contains("Prebuilt CodeWhale asset `codewhale-linux-x64`"));
+        assert!(message.contains("Prebuilt Codewhale asset `codewhale-linux-x64`"));
         assert!(message.contains("requires GLIBC_2.39"));
         assert!(message.contains("this system has glibc 2.35"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
@@ -2324,10 +2775,9 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert_eq!(content, "fresh binary");
     }
 
-    /// Mocked GitHub release payload covering both the dispatcher (`codewhale`)
-    /// and the legacy TUI (`codewhale-tui`) binaries across our published
-    /// platform/arch matrix, plus a checksum sibling that must never be picked
-    /// as the primary binary.
+    /// Mocked GitHub release payload covering the sole implementation binary
+    /// across the published platform/arch matrix, plus a checksum sibling that
+    /// must never be picked as the binary.
     fn mocked_release() -> Release {
         let json = r#"{
           "tag_name": "v0.8.8",
@@ -2337,10 +2787,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             { "name": "codewhale-macos-arm64",        "browser_download_url": "https://example.invalid/codewhale-macos-arm64" },
             { "name": "codewhale-windows-x64.exe",    "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe" },
             { "name": "codewhale-windows-x64.exe.sha256", "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe.sha256" },
-            { "name": "codewhale-tui-linux-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-linux-x64" },
-            { "name": "codewhale-tui-macos-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-macos-x64" },
-            { "name": "codewhale-tui-macos-arm64",    "browser_download_url": "https://example.invalid/codewhale-tui-macos-arm64" },
-            { "name": "codewhale-tui-windows-x64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-x64.exe" }
+            { "name": "codewhale-windows-arm64.exe",  "browser_download_url": "https://example.invalid/codewhale-windows-arm64.exe" }
           ]
         }"#;
         serde_json::from_str(json).expect("mock release JSON")
@@ -2354,6 +2801,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             ("macos", "x86_64", "codewhale-macos-x64"),
             ("linux", "x86_64", "codewhale-linux-x64"),
             ("windows", "x86_64", "codewhale-windows-x64.exe"),
+            ("windows", "aarch64", "codewhale-windows-arm64.exe"),
         ];
 
         for (os, arch, expected) in cases {
@@ -2365,34 +2813,38 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     }
 
     #[test]
-    fn mocked_release_selects_tui_asset_when_tui_binary_invokes_update() {
+    fn mocked_release_selects_primary_asset_when_compatibility_alias_invokes_update() {
         let release = mocked_release();
         let stem = release_asset_stem_for(
             Path::new("/usr/local/bin/codewhale-tui"),
             "macos",
             "aarch64",
         );
-        let asset = select_platform_asset(&release, &stem).expect("TUI platform asset");
-        assert_eq!(asset.name, "codewhale-tui-macos-arm64");
+        let asset = select_platform_asset(&release, &stem).expect("primary platform asset");
+        assert_eq!(asset.name, "codewhale-macos-arm64");
+
+        let windows_stem = release_asset_stem_for(Path::new("C:\\codew.exe"), "windows", "aarch64");
+        let windows_asset =
+            select_platform_asset(&release, &windows_stem).expect("Windows ARM64 primary asset");
+        assert_eq!(windows_asset.name, "codewhale-windows-arm64.exe");
     }
 
     #[test]
     fn android_arm64_maps_to_android_release_assets() {
         // The generic format!("{prefix}-{os}-{arch}") path naturally produces
-        // Android asset stems. Verify the full stem for both dispatcher and TUI
-        // binaries so `codewhale update` on Termux requests Android assets, not
-        // linux-arm64 (#4241).
+        // Android asset stems. Verify every supported command name resolves to
+        // the primary Android asset, never Linux or a removed TUI asset (#4241).
         assert_eq!(
             release_asset_stem_for_prefix("codewhale", "android", "aarch64"),
             "codewhale-android-arm64"
         );
         assert_eq!(
-            release_asset_stem_for_prefix("codewhale-tui", "android", "aarch64"),
-            "codewhale-tui-android-arm64"
+            release_asset_stem_for(Path::new("codewhale-tui"), "android", "aarch64"),
+            "codewhale-android-arm64"
         );
         assert_eq!(
-            release_asset_stem_for_prefix("codew", "android", "aarch64"),
-            "codew-android-arm64"
+            release_asset_stem_for(Path::new("codew"), "android", "aarch64"),
+            "codewhale-android-arm64"
         );
     }
 
@@ -2434,10 +2886,10 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             dispatcher.browser_download_url,
             "https://mirror.example/releases/v0.8.36/codewhale-linux-x64"
         );
-        let tui = select_platform_asset(&release, "codewhale-tui-linux-x64").expect("tui asset");
-        assert_eq!(
-            tui.browser_download_url,
-            "https://mirror.example/releases/v0.8.36/codewhale-tui-linux-x64"
+        assert_eq!(release.assets.len(), 2);
+        assert!(
+            select_platform_asset(&release, "codewhale-tui-linux-x64").is_none(),
+            "mirror fallback must not synthesize a removed TUI asset"
         );
     }
 
@@ -2455,9 +2907,17 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             select_platform_asset(&release, "codewhale-windows-x64")
                 .is_some_and(|asset| asset.name == "codewhale-windows-x64.exe")
         );
+        assert!(select_platform_asset(&release, "codewhale-tui-windows-x64").is_none());
+
+        let arm_release = release_from_mirror_base_url(
+            "https://mirror.example/releases/v0.9.1",
+            "v0.9.1",
+            "windows",
+            "aarch64",
+        );
         assert!(
-            select_platform_asset(&release, "codewhale-tui-windows-x64")
-                .is_some_and(|asset| asset.name == "codewhale-tui-windows-x64.exe")
+            select_platform_asset(&arm_release, "codewhale-windows-arm64")
+                .is_some_and(|asset| asset.name == "codewhale-windows-arm64.exe")
         );
     }
 
@@ -2487,11 +2947,8 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             dispatcher.browser_download_url,
             "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
         );
-        let tui = select_platform_asset(&release, "codewhale-tui-macos-arm64").expect("tui asset");
-        assert_eq!(
-            tui.browser_download_url,
-            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-tui-macos-arm64"
-        );
+        assert_eq!(release.assets.len(), 2);
+        assert!(select_platform_asset(&release, "codewhale-tui-macos-arm64").is_none());
     }
 
     #[test]
@@ -2528,11 +2985,11 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     fn cnb_release_base_url_includes_tag_directory() {
         assert_eq!(
             codewhale_release::cnb_release_base_url("0.8.47"),
-            "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.8.47"
         );
         assert_eq!(
             codewhale_release::cnb_release_base_url("v0.8.47"),
-            "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.8.47"
         );
     }
 
@@ -2606,11 +3063,22 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             "{hint}"
         );
         assert!(hint.contains("codewhale-cli"), "{hint}");
-        assert!(hint.contains("codewhale-tui --locked"), "{hint}");
+        assert!(!hint.contains("codewhale-tui --locked"), "{hint}");
     }
 
     fn serve_http_responses(
         responses: Vec<(&'static str, &'static str, &'static [u8])>,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        serve_http_owned_responses(
+            responses
+                .into_iter()
+                .map(|(status, content_type, body)| (status, content_type, body.to_vec()))
+                .collect(),
+        )
+    }
+
+    fn serve_http_owned_responses(
+        responses: Vec<(&'static str, &'static str, Vec<u8>)>,
     ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
@@ -2631,7 +3099,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
                     body.len()
                 )
                 .expect("write test response headers");
-                stream.write_all(body).expect("write test response body");
+                stream.write_all(&body).expect("write test response body");
             }
         });
 
@@ -2644,6 +3112,686 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         body: &'static [u8],
     ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
         serve_http_responses(vec![(status, content_type, body)])
+    }
+
+    // ---------------------------------------------------------------------
+    // Proactive first-party source selection.
+    //
+    // Every test here is deterministic and offline. Probe order is fixed by a
+    // gate rather than by sleeping, because the contract under test is "the
+    // first source to *answer* wins" — a timing-based test would be asserting
+    // the scheduler, not the selector.
+    // ---------------------------------------------------------------------
+
+    /// A one-shot gate that holds one probe until another has answered.
+    #[derive(Default)]
+    struct ProbeGate {
+        opened: Mutex<bool>,
+        ready: Condvar,
+    }
+
+    impl ProbeGate {
+        fn open(&self) {
+            *self.opened.lock().unwrap_or_else(|err| err.into_inner()) = true;
+            self.ready.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut opened = self.opened.lock().unwrap_or_else(|err| err.into_inner());
+            while !*opened {
+                opened = self
+                    .ready
+                    .wait(opened)
+                    .unwrap_or_else(|err| err.into_inner());
+            }
+        }
+    }
+
+    /// One source's scripted response, plus when it is allowed to answer.
+    struct ScriptedProbe {
+        wait_for: Option<Arc<ProbeGate>>,
+        then_open: Option<Arc<ProbeGate>>,
+        answer: Result<String, String>,
+    }
+
+    impl ScriptedProbe {
+        fn ready(answer: Result<String, String>) -> Self {
+            Self {
+                wait_for: None,
+                then_open: None,
+                answer,
+            }
+        }
+
+        fn held(gate: &Arc<ProbeGate>, answer: Result<String, String>) -> Self {
+            Self {
+                wait_for: Some(Arc::clone(gate)),
+                then_open: None,
+                answer,
+            }
+        }
+
+        fn opening(mut self, gate: &Arc<ProbeGate>) -> Self {
+            self.then_open = Some(Arc::clone(gate));
+            self
+        }
+    }
+
+    fn scripted_manifest_fetcher(
+        script: Vec<(&'static str, ScriptedProbe)>,
+    ) -> Arc<ManifestFetcher> {
+        let script: HashMap<&'static str, ScriptedProbe> = script.into_iter().collect();
+        Arc::new(move |candidate: &ReleaseSourceCandidate| {
+            let label = candidate.source.label();
+            let probe = script
+                .get(label)
+                .unwrap_or_else(|| panic!("no scripted probe for {label}"));
+            if let Some(gate) = &probe.wait_for {
+                gate.wait();
+            }
+            let answer = probe
+                .answer
+                .clone()
+                .map(String::into_bytes)
+                .map_err(|message| anyhow!(message));
+            if let Some(gate) = &probe.then_open {
+                gate.open();
+            }
+            answer
+        })
+    }
+
+    fn manifest_covering_linux_x64() -> String {
+        format!(
+            "{}  codewhale-linux-x64\n{}  codew-linux-x64\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        )
+    }
+
+    fn manifest_missing_linux_x64() -> String {
+        format!("{}  codewhale-macos-arm64\n", "c".repeat(64))
+    }
+
+    fn github_fetched_release(tag_name: &str) -> FetchedRelease {
+        FetchedRelease {
+            release: Release {
+                tag_name: tag_name.to_string(),
+                prerelease: is_beta_tag(tag_name),
+                assets: vec![
+                    Asset {
+                        name: "codewhale-linux-x64".to_string(),
+                        browser_download_url: format!(
+                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/codewhale-linux-x64"
+                        ),
+                    },
+                    Asset {
+                        name: CHECKSUM_MANIFEST_ASSET.to_string(),
+                        browser_download_url: format!(
+                            "https://github.com/Hmbown/CodeWhale/releases/download/{tag_name}/{CHECKSUM_MANIFEST_ASSET}"
+                        ),
+                    },
+                ],
+            },
+            source: UpdateReleaseSource::GitHub,
+        }
+    }
+
+    fn candidates_for(
+        fetched: &FetchedRelease,
+        os: &str,
+        arch: &str,
+    ) -> Option<Vec<ReleaseSourceCandidate>> {
+        proactive_source_candidates(fetched, "codewhale-linux-x64", os, arch)
+    }
+
+    fn linux_x64_candidates(tag_name: &str) -> Vec<ReleaseSourceCandidate> {
+        candidates_for(&github_fetched_release(tag_name), "linux", "x86_64")
+            .expect("linux x64 must race GitHub against the CNB mirror")
+    }
+
+    #[test]
+    fn cnb_wins_when_its_manifest_answers_first() {
+        let github_gate = Arc::new(ProbeGate::default());
+        let fetch = scripted_manifest_fetcher(vec![
+            (
+                "GitHub Releases",
+                ScriptedProbe::held(&github_gate, Ok(manifest_covering_linux_x64())),
+            ),
+            (
+                "CNB mirror",
+                ScriptedProbe::ready(Ok(manifest_covering_linux_x64())),
+            ),
+        ]);
+
+        let plan = select_release_source(linux_x64_candidates("v9.9.9"), fetch)
+            .expect("a source must win");
+        github_gate.open();
+
+        assert_eq!(
+            plan.source,
+            UpdateReleaseSource::Cnb {
+                base_url: cnb_release_base_url("v9.9.9"),
+            }
+        );
+        assert_eq!(
+            plan.binary_url,
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v9.9.9/codewhale-linux-x64",
+            "the binary must come from the source whose manifest won"
+        );
+        assert_eq!(plan.binary_name, "codewhale-linux-x64");
+        assert!(
+            plan.checksums.contains_key("codewhale-linux-x64"),
+            "the winning manifest must be carried forward, not refetched"
+        );
+    }
+
+    #[test]
+    fn github_wins_when_its_manifest_answers_first() {
+        let cnb_gate = Arc::new(ProbeGate::default());
+        let fetch = scripted_manifest_fetcher(vec![
+            (
+                "GitHub Releases",
+                ScriptedProbe::ready(Ok(manifest_covering_linux_x64())),
+            ),
+            (
+                "CNB mirror",
+                ScriptedProbe::held(&cnb_gate, Ok(manifest_covering_linux_x64())),
+            ),
+        ]);
+
+        let plan = select_release_source(linux_x64_candidates("v9.9.9"), fetch)
+            .expect("a source must win");
+        // The losing worker may finish now that the selector has observed the
+        // GitHub result. Opening this gate from inside GitHub's fetch closure
+        // was too early: CNB could parse and send first after both fetches had
+        // returned, making the test assert scheduler luck rather than arrival.
+        cnb_gate.open();
+
+        assert_eq!(plan.source, UpdateReleaseSource::GitHub);
+        assert_eq!(
+            plan.binary_url,
+            "https://github.com/Hmbown/CodeWhale/releases/download/v9.9.9/codewhale-linux-x64"
+        );
+    }
+
+    #[test]
+    fn a_source_that_answers_first_but_cannot_serve_this_platform_loses() {
+        // GitHub answers first every time here; it just answers with something
+        // unusable. The loser of a race is decided by the manifest, not by
+        // arrival order alone.
+        for first_answer in [
+            Err("connection refused".to_string()),
+            Ok(manifest_missing_linux_x64()),
+            Ok("not a checksum manifest".to_string()),
+            Ok(String::new()),
+        ] {
+            let cnb_gate = Arc::new(ProbeGate::default());
+            let fetch = scripted_manifest_fetcher(vec![
+                (
+                    "GitHub Releases",
+                    ScriptedProbe::ready(first_answer.clone()).opening(&cnb_gate),
+                ),
+                (
+                    "CNB mirror",
+                    ScriptedProbe::held(&cnb_gate, Ok(manifest_covering_linux_x64())),
+                ),
+            ]);
+
+            let plan = select_release_source(linux_x64_candidates("v9.9.9"), fetch)
+                .unwrap_or_else(|err| panic!("CNB must win over {first_answer:?}: {err:#}"));
+
+            assert_eq!(
+                plan.source,
+                UpdateReleaseSource::Cnb {
+                    base_url: cnb_release_base_url("v9.9.9"),
+                },
+                "unusable first answer {first_answer:?} must not win"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_fails_closed_when_no_source_is_usable() {
+        let fetch = scripted_manifest_fetcher(vec![
+            (
+                "GitHub Releases",
+                ScriptedProbe::ready(Err("dns failure".to_string())),
+            ),
+            (
+                "CNB mirror",
+                ScriptedProbe::ready(Ok(manifest_missing_linux_x64())),
+            ),
+        ]);
+
+        let err = select_release_source(linux_x64_candidates("v9.9.9"), fetch)
+            .expect_err("no usable source must fail rather than download unverified bytes");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("no release source published a usable"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("dns failure"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("does not list codewhale-linux-x64"),
+            "the unusable manifest must be reported as unusable: {message}"
+        );
+        assert!(
+            message.contains("GitHub Releases") && message.contains("CNB mirror"),
+            "both failures must be attributed: {message}"
+        );
+    }
+
+    #[test]
+    fn only_linux_x64_races_the_cnb_mirror() {
+        let fetched = github_fetched_release("v9.9.9");
+
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("linux", "riscv64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("android", "aarch64"),
+        ] {
+            assert!(
+                candidates_for(&fetched, os, arch).is_none(),
+                "{os}/{arch} must keep its single canonical source"
+            );
+        }
+
+        let raced = candidates_for(&fetched, "linux", "x86_64").expect("linux x64 races");
+        assert_eq!(raced.len(), 2);
+    }
+
+    #[test]
+    fn cnb_candidate_targets_the_exact_tag_and_platform_asset() {
+        let candidate = cnb_source_candidate("v0.9.0-beta.2", "linux", "x86_64");
+
+        assert_eq!(
+            candidate.source,
+            UpdateReleaseSource::Cnb {
+                base_url: cnb_release_base_url("v0.9.0-beta.2"),
+            }
+        );
+        assert_eq!(
+            candidate.manifest_url,
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.9.0-beta.2/codewhale-artifacts-sha256.txt"
+        );
+        assert_eq!(
+            candidate.binary_url,
+            "https://cnb.cool/codewhale.net/codewhale/-/releases/download/v0.9.0-beta.2/codewhale-linux-x64"
+        );
+        assert_eq!(candidate.binary_name, "codewhale-linux-x64");
+    }
+
+    #[test]
+    fn github_candidate_addresses_the_manifest_even_when_the_payload_omits_it() {
+        let release = Release {
+            tag_name: "0.9.9".to_string(),
+            prerelease: false,
+            assets: vec![Asset {
+                name: "codewhale-linux-x64".to_string(),
+                browser_download_url: "https://cdn.example/codewhale-linux-x64".to_string(),
+            }],
+        };
+
+        let candidate =
+            github_source_candidate(&release, "codewhale-linux-x64").expect("github candidate");
+
+        assert_eq!(
+            candidate.manifest_url,
+            "https://github.com/Hmbown/CodeWhale/releases/download/v0.9.9/codewhale-artifacts-sha256.txt"
+        );
+        assert_eq!(
+            candidate.binary_url,
+            "https://cdn.example/codewhale-linux-x64"
+        );
+    }
+
+    #[test]
+    fn every_single_source_platform_requires_a_checksum_manifest() {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+            ("android", "aarch64"),
+        ] {
+            let asset_stem = release_asset_stem_for_prefix("codewhale", os, arch);
+            let asset_name = release_asset_name_for_prefix("codewhale", os, arch);
+            let fetched = FetchedRelease {
+                release: Release {
+                    tag_name: "v9.9.9".to_string(),
+                    prerelease: false,
+                    assets: vec![Asset {
+                        name: asset_name.clone(),
+                        browser_download_url: format!("https://cdn.example/{asset_name}"),
+                    }],
+                },
+                source: UpdateReleaseSource::GitHub,
+            };
+
+            let err = single_source_download_plan(&fetched, &asset_stem, None)
+                .expect_err("a missing manifest must fail before the binary download");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("does not publish required codewhale-artifacts-sha256.txt"),
+                "{os}/{arch} unexpectedly allowed an unverifiable plan: {message}"
+            );
+            assert!(message.contains(&asset_name), "{os}/{arch}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_single_source_manifest_fails_before_binary_download() {
+        let (manifest_url, request_rx, handle) =
+            serve_http_once("200 OK", "text/plain", b"not a checksum manifest\n");
+        let fetched = FetchedRelease {
+            release: Release {
+                tag_name: "v9.9.9".to_string(),
+                prerelease: false,
+                assets: vec![
+                    Asset {
+                        name: CHECKSUM_MANIFEST_ASSET.to_string(),
+                        browser_download_url: manifest_url,
+                    },
+                    Asset {
+                        name: "codewhale-macos-arm64".to_string(),
+                        browser_download_url: "https://cdn.example/should-not-download".to_string(),
+                    },
+                ],
+            },
+            source: UpdateReleaseSource::GitHub,
+        };
+
+        let err = single_source_download_plan(&fetched, "codewhale-macos-arm64", None)
+            .expect_err("a malformed manifest must fail closed");
+        let message = format!("{err:#}");
+        assert!(message.contains("failed to parse"), "{message}");
+        assert!(
+            message.contains("invalid SHA256 manifest line"),
+            "{message}"
+        );
+        let request = request_rx.recv().expect("manifest request");
+        assert!(request.starts_with("GET /release "), "got {request:?}");
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn a_single_source_manifest_must_cover_the_exact_platform_binary() {
+        let manifest = format!("{}  codewhale-linux-x64\n", "a".repeat(64));
+        let (manifest_url, request_rx, handle) =
+            serve_http_owned_responses(vec![("200 OK", "text/plain", manifest.into_bytes())]);
+        let fetched = FetchedRelease {
+            release: Release {
+                tag_name: "v9.9.9".to_string(),
+                prerelease: false,
+                assets: vec![
+                    Asset {
+                        name: CHECKSUM_MANIFEST_ASSET.to_string(),
+                        browser_download_url: manifest_url,
+                    },
+                    Asset {
+                        name: "codewhale-windows-x64.exe".to_string(),
+                        browser_download_url: "https://cdn.example/should-not-download.exe"
+                            .to_string(),
+                    },
+                ],
+            },
+            source: UpdateReleaseSource::GitHub,
+        };
+
+        let err = single_source_download_plan(&fetched, "codewhale-windows-x64", None)
+            .expect_err("a manifest for another platform must fail closed");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("does not list codewhale-windows-x64.exe"),
+            "{message}"
+        );
+        let request = request_rx.recv().expect("manifest request");
+        assert!(request.starts_with("GET /release "), "got {request:?}");
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn an_explicit_mirror_remains_pinned_and_verified_from_that_mirror() {
+        let bytes = b"verified mirror bytes";
+        let manifest = format!("{}  codewhale-macos-arm64\n", sha256_hex(bytes));
+        let (url, request_rx, handle) =
+            serve_http_owned_responses(vec![("200 OK", "text/plain", manifest.into_bytes())]);
+        let base_url = url.trim_end_matches("/release").to_string();
+        let fetched = FetchedRelease {
+            release: release_from_mirror_base_url(&base_url, "9.9.9", "macos", "aarch64"),
+            source: UpdateReleaseSource::Mirror {
+                base_url: base_url.clone(),
+            },
+        };
+
+        let plan = single_source_download_plan(&fetched, "codewhale-macos-arm64", None)
+            .expect("the explicit mirror's valid manifest should produce a plan");
+        assert_eq!(
+            plan.source,
+            UpdateReleaseSource::Mirror {
+                base_url: base_url.clone(),
+            }
+        );
+        assert_eq!(
+            plan.binary_url,
+            mirror_asset_url(&base_url, "codewhale-macos-arm64")
+        );
+        verify_downloaded_asset(&plan, bytes)
+            .expect("the pinned mirror's checksum must verify its bytes");
+        let request = request_rx.recv().expect("manifest request");
+        assert!(
+            request.starts_with("GET /codewhale-artifacts-sha256.txt "),
+            "got {request:?}"
+        );
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn a_github_release_without_this_platform_leaves_cnb_as_the_only_candidate() {
+        let fetched = FetchedRelease {
+            release: Release {
+                tag_name: "v9.9.9".to_string(),
+                prerelease: false,
+                assets: vec![Asset {
+                    name: "codewhale-macos-arm64".to_string(),
+                    browser_download_url: "https://cdn.example/codewhale-macos-arm64".to_string(),
+                }],
+            },
+            source: UpdateReleaseSource::GitHub,
+        };
+
+        let candidates = candidates_for(&fetched, "linux", "x86_64").expect("linux x64 races");
+
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(
+            candidates[0].source,
+            UpdateReleaseSource::Cnb { .. }
+        ));
+    }
+
+    #[test]
+    fn beta_tags_race_the_same_two_sources_as_stable_tags() {
+        let candidates = linux_x64_candidates("v0.9.0-beta.2");
+
+        assert_eq!(candidates[0].source, UpdateReleaseSource::GitHub);
+        assert_eq!(
+            candidates[1].source,
+            UpdateReleaseSource::Cnb {
+                base_url: cnb_release_base_url("v0.9.0-beta.2"),
+            },
+            "the beta tag must be carried into the CNB URL verbatim"
+        );
+    }
+
+    #[test]
+    fn explicit_overrides_take_precedence_over_probing() {
+        {
+            let _env = UpdateEnvGuard::clear();
+            set_update_env(
+                codewhale_release::RELEASE_BASE_URL_ENV,
+                "https://mirror.example/assets",
+            );
+            set_update_env(codewhale_release::UPDATE_VERSION_ENV, "9.9.9");
+
+            let fetched = fetch_latest_release(ReleaseChannel::Stable, None)
+                .expect("a pinned mirror resolves without a network");
+
+            assert_eq!(
+                fetched.source,
+                UpdateReleaseSource::Mirror {
+                    base_url: "https://mirror.example/assets".to_string(),
+                }
+            );
+            assert!(fetched.source.is_pinned_mirror());
+            assert!(
+                candidates_for(&fetched, "linux", "x86_64").is_none(),
+                "an explicit base URL must never be raced against CNB"
+            );
+            assert_eq!(
+                describe_release_source_for_check(&fetched, "codewhale-linux-x64", None),
+                "release mirror (https://mirror.example/assets)"
+            );
+        }
+
+        {
+            let _env = UpdateEnvGuard::clear();
+            set_update_env(codewhale_release::CNB_MIRROR_ENV, "1");
+            set_update_env(codewhale_release::UPDATE_VERSION_ENV, "9.9.9");
+
+            let fetched = fetch_latest_release(ReleaseChannel::Stable, None)
+                .expect("the CNB override resolves without a network");
+
+            assert_eq!(
+                fetched.source,
+                UpdateReleaseSource::Cnb {
+                    base_url: cnb_release_base_url("9.9.9"),
+                },
+                "an explicit CNB request must be reported as CNB, not as a generic mirror"
+            );
+            assert!(
+                candidates_for(&fetched, "linux", "x86_64").is_none(),
+                "an explicit CNB request must not be raced back against GitHub"
+            );
+        }
+
+        {
+            let _env = UpdateEnvGuard::clear();
+            set_update_env(codewhale_release::CNB_MIRROR_ENV, "1");
+            set_update_env(
+                codewhale_release::RELEASE_BASE_URL_ENV,
+                "https://mirror.example/assets",
+            );
+
+            let fetched = fetch_latest_release(ReleaseChannel::Stable, None)
+                .expect("a pinned mirror resolves without a network");
+
+            assert_eq!(
+                fetched.source,
+                UpdateReleaseSource::Mirror {
+                    base_url: "https://mirror.example/assets".to_string(),
+                },
+                "an explicit base URL outranks the CNB flag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_locked_source_serves_both_the_manifest_and_the_binary() {
+        const BINARY: &[u8] = b"\x7fELF codewhale linux x64 payload";
+        let manifest = format!("{}  codewhale-linux-x64\n", sha256_hex(BINARY));
+        let (url, request_rx, handle) = serve_http_owned_responses(vec![
+            ("200 OK", "text/plain", manifest.into_bytes()),
+            ("200 OK", "application/octet-stream", BINARY.to_vec()),
+        ]);
+        let origin = url.trim_end_matches("/release").to_string();
+        let candidate = ReleaseSourceCandidate {
+            source: UpdateReleaseSource::Cnb {
+                base_url: origin.clone(),
+            },
+            manifest_url: mirror_asset_url(&origin, CHECKSUM_MANIFEST_ASSET),
+            binary_name: "codewhale-linux-x64".to_string(),
+            binary_url: mirror_asset_url(&origin, "codewhale-linux-x64"),
+        };
+
+        let plan = select_release_source(vec![candidate], manifest_probe_fetcher(None))
+            .expect("the only reachable source must win");
+        let bytes = download_url(&plan.binary_url, None).expect("binary download");
+        verify_downloaded_asset(&plan, &bytes)
+            .expect("bytes from the locked source must match its own manifest");
+
+        assert_eq!(bytes, BINARY);
+        let manifest_request = request_rx.recv().expect("manifest request");
+        let binary_request = request_rx.recv().expect("binary request");
+        assert!(
+            manifest_request.starts_with("GET /codewhale-artifacts-sha256.txt "),
+            "got {manifest_request:?}"
+        );
+        assert!(
+            binary_request.starts_with("GET /codewhale-linux-x64 "),
+            "got {binary_request:?}"
+        );
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn a_checksum_mismatch_fails_closed_and_names_the_source() {
+        let mut plan = DownloadPlan {
+            source: UpdateReleaseSource::Cnb {
+                base_url: cnb_release_base_url("v9.9.9"),
+            },
+            binary_name: "codewhale-linux-x64".to_string(),
+            binary_url: "https://cnb.example/codewhale-linux-x64".to_string(),
+            checksums: HashMap::from([("codewhale-linux-x64".to_string(), "a".repeat(64))]),
+        };
+
+        let err = verify_downloaded_asset(&plan, b"tampered bytes")
+            .expect_err("a mismatch must never install");
+        let message = format!("{err:#}");
+        assert!(message.contains("SHA256 mismatch"), "{message}");
+        assert!(message.contains("CNB mirror"), "{message}");
+
+        plan.checksums = HashMap::from([("codew-linux-x64".to_string(), "a".repeat(64))]);
+        let err = verify_downloaded_asset(&plan, b"bytes")
+            .expect_err("an uncovered asset must never install");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("is missing codewhale-linux-x64"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn release_sources_describe_themselves_for_status_and_receipts() {
+        assert_eq!(UpdateReleaseSource::GitHub.describe(), "GitHub Releases");
+        assert!(!UpdateReleaseSource::GitHub.is_pinned_mirror());
+
+        let cnb = UpdateReleaseSource::Cnb {
+            base_url: cnb_release_base_url("v9.9.9"),
+        };
+        assert_eq!(
+            cnb.describe(),
+            "CNB mirror (https://cnb.cool/codewhale.net/codewhale/-/releases/download/v9.9.9)"
+        );
+        assert!(cnb.is_pinned_mirror());
+
+        let mirror = UpdateReleaseSource::Mirror {
+            base_url: "https://mirror.example/assets".to_string(),
+        };
+        assert_eq!(
+            mirror.describe(),
+            "release mirror (https://mirror.example/assets)"
+        );
+        assert!(mirror.is_pinned_mirror());
     }
 
     #[test]

@@ -1,15 +1,14 @@
 //! Tool dispatch — plan/execute helpers for the per-turn tool batch.
 //!
 //! Extracted from `core/engine.rs` (P1.3). The high-level ordering still
-//! lives in `Engine::handle_deepseek_turn`; this module owns:
+//! lives in `Engine::run_turn`; this module owns:
 //!
 //! * Streaming-buffer parsing into a finalized `serde_json::Value` tool input
 //!   (`final_tool_input`, `parse_tool_input`, fenced/JSON segment helpers).
 //! * The `multi_tool_use.parallel` payload parser.
 //! * Policy predicates the turn loop consults — when a batch can run in
-//!   parallel, when an `update_plan` step should stop the turn, when a Plan
-//!   prompt should force a plan-first hop, and the small set of read-only
-//!   MCP tools that are safe to run in parallel.
+//!   parallel and the small set of read-only MCP tools that are safe to run
+//!   in parallel.
 //! * The tool execution plan/outcome types the batch driver passes around.
 //!
 //! All items are `pub(super)`-only: the public engine surface (Op/Event,
@@ -18,10 +17,14 @@
 use serde_json::json;
 
 use crate::models::{Tool, ToolCaller};
-use crate::tools::spec::{ToolError, ToolResult};
-use crate::tui::app::AppMode;
+use crate::tools::spec::{
+    ResourceClaim, ToolError, ToolExecutionOutcome, ToolResult, ToolResultContentBlock,
+    schedule_non_conflicting,
+};
 
 use super::ToolUseState;
+
+const MAX_SCHEMA_CONTAINER_REPAIR_BYTES: usize = 64 * 1024;
 
 // === Types ============================================================
 
@@ -32,7 +35,8 @@ pub(super) struct ToolExecOutcome {
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) started_at: std::time::Instant,
-    pub(super) result: Result<ToolResult, ToolError>,
+    pub(super) terminal: ToolExecutionOutcome,
+    pub(super) content_blocks: Vec<ToolResultContentBlock>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,7 @@ pub(super) struct ToolExecutionPlan {
     pub(super) supports_parallel: bool,
     pub(super) read_only: bool,
     pub(super) detached_start: bool,
+    pub(super) resources: Vec<ResourceClaim>,
     pub(super) blocked_error: Option<ToolError>,
     pub(super) guard_result: Option<ToolResult>,
 }
@@ -189,6 +194,7 @@ pub(super) fn format_tool_error_with_schema(
         ToolError::Timeout { seconds } => format!(
             "Tool '{tool_name}' timed out after {seconds}s. Try a narrower scope or a longer timeout."
         ),
+        ToolError::Cancelled { message } => message.clone(),
         ToolError::NotAvailable { message } => {
             let lower = message.to_ascii_lowercase();
             // #3020: Pass through self-explanatory messages that already name the
@@ -224,7 +230,6 @@ pub(super) fn format_tool_error_with_schema(
         }
     };
 
-    let message = with_transient_tool_fallback_hint(message, err, tool_name);
     let (category, bad_field) = match err {
         ToolError::InvalidInput { .. } => ("invalid_input", None),
         ToolError::MissingField { field } => ("missing_field", Some(field.as_str())),
@@ -246,100 +251,6 @@ pub(super) fn format_tool_error_with_schema(
         "side_effect_status": "not_started"
     });
     format!("{message}\nTool validation feedback: {feedback}")
-}
-
-fn with_transient_tool_fallback_hint(message: String, err: &ToolError, tool_name: &str) -> String {
-    if message_already_has_recovery_hint(&message) {
-        return message;
-    }
-
-    let Some(hint) = transient_tool_fallback_hint(err, tool_name, &message) else {
-        return message;
-    };
-
-    format!("{message} Fallback: {hint}")
-}
-
-fn message_already_has_recovery_hint(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("recovery:") || lower.contains("fallback:")
-}
-
-fn transient_tool_fallback_hint(
-    err: &ToolError,
-    tool_name: &str,
-    formatted_message: &str,
-) -> Option<&'static str> {
-    if !is_transient_tool_failure(err, formatted_message) {
-        return None;
-    }
-
-    let lower_tool = tool_name.to_ascii_lowercase();
-    if lower_tool.contains("web_search")
-        || lower_tool.contains("web_run")
-        || lower_tool == "web.run"
-    {
-        return Some(
-            "after one retry, switch to a direct URL/open/fetch path or cached context instead of repeating the same search.",
-        );
-    }
-
-    if lower_tool.contains("fetch_url") {
-        return Some(
-            "after one retry, try a narrower URL/source, use search results or cached context, or state the access limit instead of repeating the same request.",
-        );
-    }
-
-    if lower_tool.contains("file_search") || lower_tool.contains("grep") {
-        return Some(
-            "after one retry, narrow the query/path or inspect likely files directly instead of repeating the same search unchanged.",
-        );
-    }
-
-    if lower_tool.contains("exec_shell")
-        || lower_tool.contains("run_tests")
-        || lower_tool.contains("run_verifiers")
-    {
-        return Some(
-            "after one retry, narrow the command/scope, increase timeout only for expected long runs, or switch to file-level evidence.",
-        );
-    }
-
-    if lower_tool.contains("agent") {
-        return Some(
-            "after one retry, reduce delegated scope or continue in the parent context instead of repeatedly spawning the same agent.",
-        );
-    }
-
-    Some(
-        "after one retry, choose a different tool or narrower strategy instead of repeating the same call unchanged.",
-    )
-}
-
-fn is_transient_tool_failure(err: &ToolError, formatted_message: &str) -> bool {
-    if matches!(err, ToolError::Timeout { .. }) {
-        return true;
-    }
-
-    if !matches!(err, ToolError::ExecutionFailed { .. }) {
-        return false;
-    }
-
-    let lower = formatted_message.to_ascii_lowercase();
-    [
-        "timeout",
-        "timed out",
-        "request failed",
-        "connection",
-        "network",
-        "http 429",
-        "rate limit",
-        "http 5",
-        "anti-bot",
-        "captcha",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 // === Streaming-buffer parsing =========================================
@@ -392,6 +303,70 @@ pub(super) fn parse_tool_input(buffer: &str) -> Option<serde_json::Value> {
     }
     extract_json_segment(trimmed)
         .and_then(|segment| serde_json::from_str::<serde_json::Value>(&segment).ok())
+}
+
+/// Decode a JSON container that a provider encoded as a string when the tool
+/// schema explicitly requires an object or array.
+///
+/// This intentionally avoids general argument coercion: the string must be
+/// bounded, parse as strict JSON, and decode to the declared container type.
+/// Primitive strings are never coerced.
+pub(super) fn normalize_schema_json_containers(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+) -> usize {
+    let expected_container = if schema_declares_type(schema, "object") {
+        Some("object")
+    } else if schema_declares_type(schema, "array") {
+        Some("array")
+    } else {
+        None
+    };
+
+    if let (Some(expected), serde_json::Value::String(encoded)) = (expected_container, &*value)
+        && encoded.len() <= MAX_SCHEMA_CONTAINER_REPAIR_BYTES
+        && let Ok(decoded) = serde_json::from_str::<serde_json::Value>(encoded)
+        && ((expected == "object" && decoded.is_object())
+            || (expected == "array" && decoded.is_array()))
+    {
+        *value = decoded;
+        return 1 + normalize_schema_json_containers(value, schema);
+    }
+
+    match value {
+        serde_json::Value::Object(object) => {
+            let properties = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            object
+                .iter_mut()
+                .map(|(key, child)| {
+                    properties
+                        .and_then(|items| items.get(key))
+                        .map(|child_schema| normalize_schema_json_containers(child, child_schema))
+                        .unwrap_or(0)
+                })
+                .sum()
+        }
+        serde_json::Value::Array(items) => schema
+            .get("items")
+            .map(|item_schema| {
+                items
+                    .iter_mut()
+                    .map(|item| normalize_schema_json_containers(item, item_schema))
+                    .sum()
+            })
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn schema_declares_type(schema: &serde_json::Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(value)) => value == expected,
+        Some(serde_json::Value::Array(values)) => values.iter().any(|value| value == expected),
+        _ => false,
+    }
 }
 
 pub(super) fn malformed_tool_arguments_input(buffer: &str) -> serde_json::Value {
@@ -495,7 +470,17 @@ pub(super) fn parse_parallel_tool_calls(
 
 #[cfg(test)]
 pub(super) fn should_parallelize_tool_batch(plans: &[ToolExecutionPlan]) -> bool {
-    !plans.is_empty() && plans.iter().all(tool_plan_can_join_parallel_batch)
+    if plans.is_empty() || !plans.iter().all(tool_plan_can_join_parallel_batch) {
+        return false;
+    }
+    schedule_non_conflicting(
+        plans
+            .iter()
+            .map(|plan| ((), plan.resources.clone()))
+            .collect(),
+    )
+    .len()
+        == 1
 }
 
 pub(super) fn tool_plan_is_parallel_safe(plan: &ToolExecutionPlan) -> bool {
@@ -512,96 +497,29 @@ pub(super) fn plan_tool_execution_batches(
     plans: Vec<ToolExecutionPlan>,
 ) -> Vec<ToolExecutionBatch> {
     let mut batches = Vec::new();
-    let mut parallel_chunk = Vec::new();
+    let mut parallel_candidates = Vec::new();
+
+    let flush_parallel = |parallel_candidates: &mut Vec<_>,
+                          batches: &mut Vec<ToolExecutionBatch>| {
+        for chunk in schedule_non_conflicting(std::mem::take(parallel_candidates)) {
+            batches.push(ToolExecutionBatch::Parallel(chunk));
+        }
+    };
 
     for plan in plans {
         if tool_plan_can_join_parallel_batch(&plan) {
-            parallel_chunk.push(plan);
+            let resources = plan.resources.clone();
+            parallel_candidates.push((plan, resources));
             continue;
         }
 
-        if !parallel_chunk.is_empty() {
-            batches.push(ToolExecutionBatch::Parallel(std::mem::take(
-                &mut parallel_chunk,
-            )));
-        }
+        flush_parallel(&mut parallel_candidates, &mut batches);
         batches.push(ToolExecutionBatch::Serial(Box::new(plan)));
     }
 
-    if !parallel_chunk.is_empty() {
-        batches.push(ToolExecutionBatch::Parallel(parallel_chunk));
-    }
+    flush_parallel(&mut parallel_candidates, &mut batches);
 
     batches
-}
-
-pub(super) fn should_stop_after_plan_tool(
-    mode: AppMode,
-    tool_name: &str,
-    result: &Result<ToolResult, ToolError>,
-) -> bool {
-    mode == AppMode::Plan && tool_name == "update_plan" && result.is_ok()
-}
-
-pub(super) fn should_force_update_plan_first(mode: AppMode, content: &str) -> bool {
-    if mode != AppMode::Plan {
-        return false;
-    }
-
-    let lower = content.to_ascii_lowercase();
-    // Only shortcut genuinely lightweight plan asks. Bare "make a plan" wording
-    // is often used for repo/version/build work where Plan mode still needs to
-    // inspect available context before publishing the handoff artifact.
-    let asks_for_direct_plan = [
-        "quick plan",
-        "short plan",
-        "simple plan",
-        "3-step plan",
-        "3 step plan",
-        "three-step plan",
-        "three step plan",
-        "high-level plan",
-        "high level plan",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-
-    if !asks_for_direct_plan {
-        return false;
-    }
-
-    let asks_for_repo_exploration = [
-        "inspect the repo",
-        "inspect the code",
-        "explore the repo",
-        "search the repo",
-        "read the code",
-        "review the code",
-        "analyze the code",
-        "investigate",
-        "figure out",
-        "figuring out",
-        "look through",
-        "understand the current",
-        "current state",
-        "ground it in the codebase",
-        "based on the codebase",
-        "repo",
-        "codebase",
-        "version",
-        "ver ",
-        "release",
-        "build",
-        "benchmark",
-        "api server",
-        "github.com",
-        "http://",
-        "https://",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-
-    !asks_for_repo_exploration
 }
 
 pub(super) fn mcp_tool_is_parallel_safe(name: &str) -> bool {
@@ -631,5 +549,60 @@ pub(super) fn mcp_tool_approval_description(name: &str) -> String {
         format!("Read-only MCP tool '{name}'")
     } else {
         format!("MCP tool '{name}' may have side effects")
+    }
+}
+
+#[cfg(test)]
+mod schema_json_container_tests {
+    use super::*;
+    use crate::tools::spec::ToolSpec;
+    use serde_json::json;
+
+    #[test]
+    fn decodes_nested_containers_and_passes_tool_validation() {
+        let schema = crate::tools::user_input::RequestUserInputTool.input_schema();
+        let encoded_options = serde_json::to_string(&json!([
+            { "label": "Repository", "description": "Inspect the current repository" },
+            { "label": "Workspace", "description": "Inspect the whole workspace" }
+        ]))
+        .expect("encode options");
+        let encoded_questions = serde_json::to_string(&json!([{
+            "header": "Scope",
+            "id": "scope",
+            "question": "Which scope should be inspected?",
+            "options": encoded_options
+        }]))
+        .expect("encode questions");
+        let mut input = json!({ "questions": encoded_questions });
+
+        assert_eq!(normalize_schema_json_containers(&mut input, &schema), 2);
+        assert!(input["questions"].is_array());
+        assert!(input["questions"][0]["options"].is_array());
+        crate::tools::user_input::UserInputRequest::from_value(&input)
+            .expect("normalized input must still pass tool-specific validation");
+    }
+
+    #[test]
+    fn leaves_primitives_wrong_types_and_unbounded_strings_unchanged() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string" },
+                "count": { "type": "integer" },
+                "items": { "type": "array" },
+                "oversized": { "type": "array" }
+            }
+        });
+        let oversized = format!("[\"{}\"]", "x".repeat(MAX_SCHEMA_CONTAINER_REPAIR_BYTES));
+        let mut input = json!({
+            "text": "[\"still text\"]",
+            "count": "10",
+            "items": "{\"wrong\":\"container\"}",
+            "oversized": oversized
+        });
+        let before = input.clone();
+
+        assert_eq!(normalize_schema_json_containers(&mut input, &schema), 0);
+        assert_eq!(input, before);
     }
 }

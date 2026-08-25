@@ -108,7 +108,7 @@ async fn clear_replaces_prior_transcript_with_visible_confirmation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn persistent_work_commands_report_visible_dispatch_requests() {
-    run_scenario(PERSISTENT_WORK_SCENARIO, 7).await;
+    run_scenario(PERSISTENT_WORK_SCENARIO, 8).await;
 }
 
 async fn run_scenario(name: &'static str, expected_steps: usize) {
@@ -130,25 +130,11 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 
 fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
     let options = TuiOptions {
-        model: "deepseek-v4-pro".to_string(),
-        workspace: tmpdir.path().to_path_buf(),
-        config_path: None,
-        config_profile: None,
-        allow_shell: false,
-        use_alt_screen: true,
-        use_mouse_capture: false,
-        use_bracketed_paste: true,
-        max_subagents: 1,
         skills_dir: tmpdir.path().join("skills"),
         memory_path: tmpdir.path().join("memory.md"),
         notes_path: tmpdir.path().join("notes.txt"),
         mcp_config_path: tmpdir.path().join("mcp.json"),
-        use_memory: false,
-        start_in_agent_mode: false,
-        skip_onboarding: true,
-        yolo: false,
-        resume_session_id: None,
-        initial_input: None,
+        ..crate::test_support::test_tui_options(tmpdir.path())
     };
     App::new(options, &Config::default())
 }

@@ -18,6 +18,7 @@ fn none_request(kind: ProviderKind) -> RouteRequest {
         model_selector: None,
         saved_provider_model: None,
         base_url_override: None,
+        limit_overrides: Vec::new(),
     }
 }
 
@@ -56,8 +57,9 @@ fn every_provider_kind_has_a_wellformed_descriptor() {
             );
         }
 
-        // The wire protocol accessor must not panic for any kind.
-        let _ = descriptor.protocol();
+        // Current fixed providers resolve a concrete protocol for their
+        // default endpoint key.
+        let _ = descriptor.protocol_for_endpoint("chat");
     }
 }
 
@@ -72,12 +74,13 @@ fn every_provider_kind_resolves_its_default_route() {
         });
 
         assert_eq!(
-            candidate.provider_kind, kind,
+            candidate.provider_kind(),
+            kind,
             "{kind:?}: resolved to a different provider"
         );
         assert_eq!(
-            candidate.provider_id,
-            ProviderId::from_kind(kind),
+            candidate.provider_id(),
+            &ProviderId::from_kind(kind),
             "{kind:?}: resolved provider id mismatch"
         );
 
@@ -96,7 +99,7 @@ fn every_provider_kind_resolves_its_default_route() {
                 |offering| offering.wire_model_id.as_str().to_string(),
             );
         assert_eq!(
-            candidate.wire_model_id.as_str(),
+            candidate.wire_model_id().as_str(),
             expected_wire,
             "{kind:?}: None selector must resolve to the bundled default offering (or descriptor default)"
         );
@@ -112,24 +115,93 @@ fn every_provider_kind_resolves_the_auto_selector() {
             model_selector: Some(LogicalModelRef::from("auto")),
             saved_provider_model: None,
             base_url_override: None,
+            limit_overrides: Vec::new(),
         };
         let candidate = resolver
             .resolve(&request)
             .unwrap_or_else(|err| panic!("{kind:?}: `auto` must resolve, got {err:?}"));
 
         assert_eq!(
-            candidate.provider_kind, kind,
+            candidate.provider_kind(),
+            kind,
             "{kind:?}: auto resolved to a different provider"
         );
         assert!(
-            candidate.logical_model.is_auto(),
+            candidate.logical_model().is_auto(),
             "{kind:?}: `auto` must stay the auto sentinel, never a literal model"
         );
         // `auto` with no catalog default falls back to the descriptor default,
         // which conformance #2 already pins; here we only assert it resolves.
         assert!(
-            !candidate.wire_model_id.as_str().trim().is_empty(),
+            !candidate.wire_model_id().as_str().trim().is_empty(),
             "{kind:?}: auto resolved to an empty wire model"
         );
+    }
+}
+
+#[test]
+fn modelstudio_qwen38_max_offering_publishes_1m_context() {
+    use super::RouteLimits;
+
+    let offering = bundled_offerings()
+        .into_iter()
+        .find(|offering| {
+            offering.provider.as_str() == "modelstudio-token-plan"
+                && offering.wire_model_id.as_str() == "qwen3.8-max"
+        })
+        .expect("modelstudio qwen3.8-max offering");
+    assert_eq!(
+        offering.limits,
+        RouteLimits {
+            context_tokens: Some(1_000_000),
+            input_tokens: None,
+            output_tokens: Some(131_072),
+        },
+        "hand-seam limits must not be empty (empty won collisions and fell to 128K)"
+    );
+}
+
+#[test]
+fn modelstudio_image_input_capability_is_per_model() {
+    use super::capabilities::CapabilityState;
+
+    // Owner's Token Plan console (verified 2026-08-03) lists Visual
+    // Understanding for exactly these four models; upstream Models.dev
+    // modalities agree (image/video input) and mark the rest text-only.
+    const VISION: &[&str] = &[
+        "qwen3.8-max",
+        "qwen3.8-max-preview",
+        "qwen3.7-plus",
+        "qwen3.6-flash",
+    ];
+    const TEXT_ONLY: &[&str] = &[
+        "qwen3.7-max",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash-0731",
+        "glm-5.2",
+    ];
+    // Catalog surface is one vendor identity; plan/dialect are config.
+    const PROVIDERS: &[&str] = &["modelstudio-token-plan"];
+
+    let offerings = bundled_offerings();
+    for provider in PROVIDERS {
+        for (models, expected) in [
+            (VISION, CapabilityState::Supported),
+            (TEXT_ONLY, CapabilityState::Unsupported),
+        ] {
+            for model in models {
+                let offering = offerings
+                    .iter()
+                    .find(|offering| {
+                        offering.provider.as_str() == *provider
+                            && offering.wire_model_id.as_str() == *model
+                    })
+                    .unwrap_or_else(|| panic!("{provider}/{model}: missing bundled offering"));
+                assert_eq!(
+                    offering.capabilities.image_input, expected,
+                    "{provider}/{model}: image_input drifted from the console-verified capability"
+                );
+            }
+        }
     }
 }

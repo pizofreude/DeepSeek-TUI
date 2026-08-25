@@ -1,116 +1,79 @@
-<!-- source: README.md sha256:561a074b0e36 -->
-# CodeWhale
+<!-- source: README.md sha256:a56bca473dbd -->
+# Codewhale
 
-터미널에서 쓰는 코딩 에이전트입니다. 어떤 모델과도 동작하며, 오픈 모델을
-우선합니다.
+Codewhale은 Rust로 만든 터미널용 오픈 소스 코딩 에이전트로, 사용자들과 함께 공개적으로 개선해 나갑니다.
 
-프로바이더, 모델, 작업을 지정하면 코드를 읽고, 파일을 편집하고, 명령을
-실행하고, 결과를 확인하며, 작업이 끝나거나 사용자의 판단이 필요해질
-때까지 계속 진행합니다. 대화형 작업에는 TUI를, 스크립트와 CI에는
-`codewhale exec`를 사용합니다. Rust로 작성되었고, MIT 라이선스이며,
-전부 사용자의 컴퓨터에서 실행됩니다.
+![터미널에서 실행 중인 Codewhale](assets/screenshot.webp)
 
-이 프로젝트는 `deepseek-tui`로 시작했습니다. 그 주위에 형성된
-커뮤니티에 더 많은 프로바이더가 필요했고, 지금은 DeepSeek, Claude, GPT,
-Kimi, GLM과 그 밖의 30개 이상이 같은 런타임과 같은 도구를 통해
-실행됩니다.
-
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-
-![터미널에서 실행 중인 CodeWhale](assets/screenshot.png)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 ## 설치
 
 ```bash
 npm install -g codewhale
+codewhale
 ```
 
-Cargo, Docker, Nix, Scoop, 사전 빌드 아카이브, Android/Termux, 그리고
-GitHub에 접근할 수 없는 사용자를 위한 CNB 미러는
-[docs/INSTALL.md](docs/INSTALL.md)에서 다룹니다. `deepseek-tui`에서
-넘어오나요? 설정과 세션은 그대로 이어집니다 —
-[docs/REBRAND.md](docs/REBRAND.md)를 참고하세요.
+처음 실행하면 공급자 연결 과정을 안내하며, 오프라인 상태로 계속 사용할 수도 있습니다. Codewhale은 Cargo, Docker, Nix, Scoop, 사전 빌드 아카이브, Android/Termux, CNB 미러도 지원합니다. [설치 안내서](docs/INSTALL.md)를 참조하세요.
 
-## 사용
+각 셸에서 Tab 자동 완성은 명령 한 줄로 설정할 수 있습니다 — `codewhale completion bash|zsh|fish|powershell|elvish`. [셸 자동 완성](docs/INSTALL.md#8-shell-completions)을 참조하세요.
+
+## 사용법
+
+팀원에게 말하듯 Codewhale에 요청하세요:
+
+```text
+Fix the failing tests and explain what changed.
+```
+
+TUI를 열지 않고 작업을 실행할 수도 있습니다:
 
 ```bash
-codewhale auth set --provider deepseek   # or export ANTHROPIC_API_KEY, etc.
-codewhale                                # open the TUI
-codewhale exec "fix the failing test"    # headless
+codewhale exec "fix the failing tests and explain what changed"
 ```
 
-TUI 안에서: `/model`은 프로바이더와 모델을 함께 전환하고, `/fleet`은
-워커 팀을 실행하며, `/restore`는 한 턴을 되돌립니다. `Tab`은
-Plan / Act / Operate 모드를 순환하고, `Shift+Tab`은
-Ask / Auto-Review / Full Access 승인 태세를 순환하며, `!`는 일반 승인
-경로를 거쳐 셸 명령을 실행합니다.
+Codewhale은 저장소를 읽고, 파일을 편집하고, 명령을 실행하고, 결과를 확인하며 목표를 향해 계속 작업할 수 있습니다. 어느 정도의 접근 권한을 줄지는 사용자가 결정합니다.
 
-## 하는 일
+## Codewhale을 선택하는 이유
 
-- 선택한 프로바이더 + 모델을 구체적인 라우트로 해석합니다: 엔드포인트,
-  와이어 프로토콜, 컨텍스트 한도, 가격. 컨텍스트 예산과 비용 표시는
-  실제 라우트에서 나오며, 알 수 없는 가격은 $0가 아니라 알 수 없음으로
-  표시됩니다. ([docs/PROVIDERS.md](docs/PROVIDERS.md))
-- 호스팅형 오픈 모델 프로바이더(`deepseek`, `openrouter`, `moonshot`,
-  `zai`, `minimax`, `nvidia-nim`, …)와 통신하고, 키 없이 자체
-  `vllm` / `sglang` / `ollama`에 연결하며, Anthropic에는 thinking과
-  프롬프트 캐싱을 갖춘 Messages API로 네이티브 연결합니다.
-- 여러 워커를 내구성 있게 실행합니다: Fleet은 작업을 추가 전용 원장에
-  기록하므로 실행은 재시작에도 살아남고, `fleet resume`은 멈춘
-  지점부터 이어서 진행합니다. Workflow는 더 큰 작업을 재개 가능하고
-  검증 가능한 레인으로 계획합니다. ([docs/FLEET.md](docs/FLEET.md))
-- 위험을 감이 아니라 코드로 통제합니다: 세 가지 모드(Plan은 읽기 전용),
-  별도의 승인 태세, OS 샌드박싱(Seatbelt, Landlock + seccomp, bwrap),
-  도구 호출마다 허용/거부/질문할 수 있는 훅, 그리고 `/restore`가 실제
-  히스토리를 결코 건드리지 않게 하는 side-git 스냅샷.
-- 저장소가 자체 법을 선언할 수 있습니다:
-  `.codewhale/constitution.json`의 불변 조건은 Full Access조차 건너뛸
-  수 없는 쓰기 보류로 컴파일됩니다.
-  ([docs/CONFIGURATION.md](docs/CONFIGURATION.md))
-- 양방향으로 MCP를 지원하고, 재사용 가능한 스킬을 불러오며, HTTP/SSE 및
-  ACP 런타임 API를 노출하고, 커뮤니티
-  [VS Code GUI](https://github.com/HengQuWorld/CodeWhale-VSCode)를
-  뒷받침합니다.
-- TUI는 작업을 점검할 수 있는 리시트로 보여 주고, 움직이는 라이브 행은
-  하나로 유지하며, 실제 컨텍스트 인스펙터, 12가지 테마, 모션 축소
-  모드와 ASCII 안전 모드를 갖추고 있습니다. UI 언어는 영어, 중국어
-  간체, 일본어, 베트남어, 스페인어, 포르투갈어, 한국어를 지원하며,
-  중국어 번체는 부분 지원입니다.
+- **원하는 모델을 사용하세요.** 호스팅 공급자에 연결하거나 Ollama, vLLM, SGLang을 통해 로컬 모델을 사용할 수 있습니다. `/model`로 공급자와 모델을 전환하세요.
+- **계속 주도권을 가지세요.** Plan은 읽기 전용입니다. Ask, Auto-Review, Full Access는 승인 동작을 명확하게 보여 줍니다. `/undo`는 마지막 턴을 되돌리고 `/restore`는 작업 공간을 이전 스냅샷으로 복원합니다.
+- **긴 작업도 체계적으로 관리하세요.** 세션을 저장하고, 지속되는 `/goal`을 설정하고, 워크플로 실행 전에 검토하며, 에이전트의 내부 지시가 대화 기록에 섞이지 않도록 여러 에이전트를 조율할 수 있습니다.
+- **이미 사용 중인 에이전트를 확장하세요.** MCP 서버와 스킬을 연결하고, 훅을 구성하고, 에이전트 역할을 프로젝트나 개인 설정에 읽기 쉬운 파일로 보관할 수 있습니다.
 
-그 밖의 모든 것 — 설정, 키 바인딩, 샌드박스 세부 사항, 아키텍처 — 은
-[docs](docs)와 [codewhale.net](https://codewhale.net/)에 있습니다.
+명령과 키보드 단축키를 보려면 TUI에서 `/help`를 실행하세요.
 
-## 기여
+## 안전
 
-모든 피드백은 선물입니다. 이슈, PR, 재현 절차, 로그, 기능 요청, 첫
-기여는 모두 이곳에서 실제 프로젝트 작업입니다. PR을 그대로 병합할 수
-없을 때는 메인테이너가 작동하는 부분을 거두어 반영하고, 작성자의
-크레딧은 커밋, 변경 로그,
-[docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md)에 그대로 남습니다.
-사용하는 모델이나 프로바이더가 빠져 있거나 무언가가 여러분의 컴퓨터에서
-깨진다면, 그것을 알려 주는 일이 할 수 있는 가장 유용한 일입니다.
+Codewhale은 사용자가 허용한 접근 권한으로 사용자의 컴퓨터에서 실행됩니다. 승인 모드와 저장소 규칙은 에이전트가 할 수 있는 일을 제한하며, 지원되는 환경에서는 선택적 OS 샌드박싱으로 더 강력한 실행 경계를 추가할 수 있습니다. 가격이 알려지지 않은 모델은 무료로 표시하지 않고 미확인 상태로 둡니다.
 
-- [열려 있는 이슈](https://github.com/Hmbown/CodeWhale/issues) — 처음
-  기여하기 좋은 작업이 여기에 있습니다
-- [CONTRIBUTING.md](CONTRIBUTING.md) — 개발 환경 설정과 PR 흐름
-- [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) — 이 프로젝트를 빚어 온
-  모든 사람
-- [Buy me a coffee](https://www.buymeacoffee.com/hmbown)
+정확한 정책 적용 순서는 [권한 부여 순서](docs/AUTHORIZATION_ORDER.md)에서, 로컬 설정은 [구성](docs/CONFIGURATION.md)에서 확인하세요.
 
-프로젝트를 시작하게 해 준 모델과 지원을 제공한
-[DeepSeek](https://github.com/deepseek-ai), Whale Brother family로
-맞이해 준 [DataWhale](https://github.com/datawhalechina) 🐋, 그리고
-터미널 에이전트 경험에 함께 협력해 준
-[OpenWarp](https://github.com/zerx-lab/warp)와
-[Open Design](https://github.com/nexu-io/open-design)에 감사드립니다.
+## 문서
+
+- [공급자와 로컬 모델](docs/PROVIDERS.md)
+- [에이전트 팀](docs/FLEET.md)
+- [MCP](docs/MCP.md), [훅](docs/HOOKS.md), [구성](docs/CONFIGURATION.md)
+- [로컬 웹 클라이언트](docs/WEB.md)
+- [전체 문서](docs)
+
+## 커뮤니티 참여
+
+사람들이 Codewhale을 사용하고, 불편한 점을 알리고, 수정에 힘을 보탤 때 Codewhale은 더 좋아집니다. 필요한 공급자가 없거나 워크플로가 불편하거나 터미널 UI가 작업을 방해한다면 [issue를 등록](https://github.com/Hmbown/CodeWhale/issues)해 주세요. 개선 방법을 알고 있다면 [pull request를 등록](CONTRIBUTING.md)해 주세요. 첫 기여도 환영하며, 반영된 작업에는 기여자의 이름을 남깁니다.
+
+[Discord](https://discord.gg/37gfS3ksug)에 참여하거나 WeChat에서 Hunter(`hunterbown`)를 추가한 뒤 Whale Brothers 그룹 참여를 요청하세요.
+
+## 프로젝트 역사
+
+Codewhale은 `deepseek-tui`로 시작했으며 해당 구성 및 세션과의 호환성을 계속 유지합니다. 현재는 특정 공급자에 종속되지 않고 독립적으로 관리되며, 어떤 모델 공급자와도 제휴하지 않습니다.
+
+모든 기여자와 프로젝트의 성장을 도운 오픈 소스 커뮤니티에 감사드립니다. [기여자 기록](docs/CONTRIBUTORS.md)을 확인하세요.
 
 ## 라이선스
 
-[MIT](LICENSE). 독립 커뮤니티 프로젝트이며, 어떤 모델 프로바이더와도
-제휴 관계가 없습니다.
-
-[![Star History Chart](https://api.star-history.com/chart?repos=Hmbown/CodeWhale&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FCodeWhale&type=date)
+[MIT](LICENSE). 다른 오픈 소스 프로젝트를 바탕으로 수정한 부분은 [타사 고지](docs/THIRD_PARTY_NOTICES.md)에 기록되어 있습니다.

@@ -6,10 +6,20 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod contract;
+pub mod discovery;
 mod groups;
 pub mod traits;
 pub mod user_commands;
 pub mod user_registry;
+
+#[cfg(test)]
+#[path = "epic_dispatch_acceptance.rs"]
+mod epic_dispatch_acceptance;
+
+#[cfg(test)]
+#[path = "epic_discovery_acceptance.rs"]
+mod epic_discovery_acceptance;
 
 use std::sync::OnceLock;
 
@@ -90,7 +100,74 @@ fn build_registry() -> traits::CommandRegistry {
     for &group in groups::all_command_groups() {
         registry.register_group(group);
     }
+    #[cfg(test)]
+    {
+        registry.register_test_only(feat015_ctx_command());
+    }
     registry
+}
+
+/// FEAT-015 test-only contextual command (D6).
+///
+/// Registered into the global registry only in test builds; the production
+/// registry is untouched. The command implements the portable contract
+/// `RegisterCommand` shape, and its handler cannot name concrete `App`; the
+/// TUI bridge resolves metadata and dispatches it through public `execute()`.
+#[cfg(test)]
+struct Feat015TestCommand;
+
+#[cfg(test)]
+impl codewhale_command_contract::metadata::RegisterCommand<CommandResult> for Feat015TestCommand {
+    fn info() -> &'static codewhale_command_contract::metadata::CommandInfo {
+        static INFO: codewhale_command_contract::metadata::CommandInfo =
+            codewhale_command_contract::metadata::CommandInfo {
+                name: "feat015ctx",
+                aliases: &[],
+                usage: "/feat015ctx",
+                description_key: "cmd_workspace_description",
+            };
+        &INFO
+    }
+
+    fn handler() -> codewhale_command_contract::handler::CommandHandler<CommandResult> {
+        codewhale_command_contract::handler::CommandHandler::Contextual(feat015_contextual)
+    }
+}
+
+/// Test-only contextual handler: reads workspace, mode, and currency facets
+/// through the envelope and returns the host-selected result type. It has no
+/// concrete `App` parameter or TUI state in its input surface.
+#[cfg(test)]
+fn feat015_contextual(
+    contexts: codewhale_command_contract::handler::CommandContexts<'_>,
+    arg: Option<&str>,
+) -> CommandResult {
+    use codewhale_command_contract::handler::ContextParts;
+    let parts: ContextParts<'_> = contexts.into_parts();
+    let workspace = parts.workspace.expect("workspace facet").workspace();
+    let mode = parts.mode_policy.expect("mode-policy facet").mode();
+    let currency = parts.cost.expect("cost facet").display_currency();
+    let normalized = arg.unwrap_or("");
+    CommandResult::message(format!(
+        "feat015ctx workspace={} mode={:?} currency={:?} arg={}",
+        workspace.display(),
+        mode,
+        currency,
+        normalized
+    ))
+}
+
+#[cfg(test)]
+static FEAT015_CTX: OnceLock<&'static traits::ContextualCommand> = OnceLock::new();
+
+#[cfg(test)]
+fn feat015_ctx_command() -> &'static traits::ContextualCommand {
+    FEAT015_CTX.get_or_init(|| {
+        Box::leak(Box::new(
+            traits::ContextualCommand::from_contract::<Feat015TestCommand>()
+                .expect("FEAT-015 portable registration must bridge into the TUI registry"),
+        ))
+    })
 }
 
 pub fn registry() -> &'static traits::CommandRegistry {
@@ -107,6 +184,16 @@ pub fn get_command_info(name: &str) -> Option<&'static CommandInfo> {
 
 /// Execute a slash command
 pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
+    // Keep the command's raw remainder available for commands whose payload is
+    // byte-sensitive. Most slash commands intentionally receive a normalized
+    // argument below; `/preview-request --prompt`, however, must describe the
+    // exact prompt the send path would receive, including trailing whitespace
+    // and newlines.
+    let dispatch_input = cmd.trim_start();
+    let command_token_end = dispatch_input
+        .find(char::is_whitespace)
+        .unwrap_or(dispatch_input.len());
+    let raw_remainder = &dispatch_input[command_token_end..];
     let trimmed = cmd.trim();
 
     // `$skillname` is a backward-compatible alias for `/skill skillname`.
@@ -149,8 +236,10 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         return result;
     }
 
-    // Permanent backward-compatible aliases. They predate the group-owned
-    // registry and remain documented in docs/architecture/command-dispatch.md.
+    // Permanent backward-compatible mode aliases. They select a fixed mode
+    // rather than the canonical `/mode` behavior, so they still dispatch
+    // before registry lookup. Ordinary compatibility aliases belong in their
+    // command's `CommandInfo` metadata.
     match command.as_str() {
         "jihua" => {
             return groups::config::dispatch(app, "jihua", arg).unwrap_or_else(|| {
@@ -162,16 +251,32 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
                 CommandResult::error("The /zidong alias could not be dispatched.")
             });
         }
-        "slop" | "canzha" => {
-            return groups::config::dispatch(app, "debt", arg).unwrap_or_else(|| {
-                CommandResult::error("The /debt command could not be dispatched.")
-            });
-        }
         _ => {}
     }
 
     if let Some(command_object) = registry().get(command.as_str()) {
-        return command_object.execute(app, arg);
+        let command_arg = if command_object.info().name == "preview-request" {
+            Some(raw_remainder)
+        } else {
+            arg
+        };
+        // FEAT-015 dual-path seam (D2): a migrated entry with a
+        // capability-scoped handler receives the envelope built from `app`;
+        // everything else keeps the legacy `execute(app, args)` path. No
+        // production entry is migrated in FEAT-015, so the contextual branch
+        // is only reachable by the test-only fixture (D6).
+        if let Some(handler) = command_object.contextual_handler() {
+            let mut bundle = app.command_contexts();
+            return match handler {
+                codewhale_command_contract::handler::CommandHandler::Pure(pure_fn) => {
+                    pure_fn(command_arg)
+                }
+                codewhale_command_contract::handler::CommandHandler::Contextual(contextual) => {
+                    contextual(bundle.contexts(), command_arg)
+                }
+            };
+        }
+        return command_object.execute(app, command_arg);
     }
 
     match command.as_str() {
@@ -193,7 +298,10 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
             if let Some(result) = groups::skills::run_skill_by_name(app, command.as_str(), arg) {
                 return result;
             }
-            let suggestions = suggest_command_names(command.as_str(), 3);
+            let suggestions =
+                user_registry::with_registry_for_workspace(Some(&app.workspace), |user_commands| {
+                    suggest_command_names(command.as_str(), 3, user_commands)
+                });
             if suggestions.is_empty() {
                 CommandResult::error(format!(
                     "Unknown command: /{command}. Type /help for available commands."
@@ -251,7 +359,42 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
-fn suggest_command_names(input: &str, limit: usize) -> Vec<String> {
+fn best_suggestion_score<'a>(
+    query: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<(u8, usize)> {
+    let mut best: Option<(u8, usize)> = None;
+    for candidate in candidates {
+        let prefix_match = candidate.starts_with(query) || query.starts_with(candidate);
+        let contains_match = candidate.contains(query) || query.contains(candidate);
+        let distance = edit_distance(candidate, query);
+        let close_typo = distance <= 2;
+        if !(prefix_match || contains_match || close_typo) {
+            continue;
+        }
+
+        let rank = if prefix_match {
+            0
+        } else if contains_match {
+            1
+        } else {
+            2
+        };
+
+        match best {
+            Some((best_rank, best_distance))
+                if rank > best_rank || (rank == best_rank && distance >= best_distance) => {}
+            _ => best = Some((rank, distance)),
+        }
+    }
+    best
+}
+
+fn suggest_command_names(
+    input: &str,
+    limit: usize,
+    user_commands: &user_registry::UserCommandRegistry,
+) -> Vec<String> {
     let query = input.trim().to_ascii_lowercase();
     if query.is_empty() || limit == 0 {
         return Vec::new();
@@ -259,33 +402,34 @@ fn suggest_command_names(input: &str, limit: usize) -> Vec<String> {
 
     let mut scored: Vec<(u8, usize, String)> = Vec::new();
     for command in registry().infos() {
-        let mut best: Option<(u8, usize)> = None;
-        for candidate in std::iter::once(command.name).chain(command.aliases.iter().copied()) {
-            let prefix_match = candidate.starts_with(&query) || query.starts_with(candidate);
-            let contains_match = candidate.contains(&query) || query.contains(candidate);
-            let distance = edit_distance(candidate, &query);
-            let close_typo = distance <= 2;
-            if !(prefix_match || contains_match || close_typo) {
-                continue;
-            }
-
-            let rank = if prefix_match {
-                0
-            } else if contains_match {
-                1
-            } else {
-                2
-            };
-
-            match best {
-                Some((best_rank, best_distance))
-                    if rank > best_rank || (rank == best_rank && distance >= best_distance) => {}
-                _ => best = Some((rank, distance)),
-            }
+        // A user command can shadow a built-in canonical name or just one of
+        // its aliases. Score only the built-in spellings that still dispatch
+        // to the built-in so suggestions never advertise different behavior.
+        if user_commands.get(command.name).is_some() {
+            continue;
         }
-
-        if let Some((rank, distance)) = best {
+        let candidates = std::iter::once(command.name).chain(
+            command
+                .aliases
+                .iter()
+                .copied()
+                .filter(|alias| user_commands.get(alias).is_none()),
+        );
+        if let Some((rank, distance)) = best_suggestion_score(&query, candidates) {
             scored.push((rank, distance, command.name.to_string()));
+        }
+    }
+
+    for command in user_commands.iter().filter(|command| !command.hidden) {
+        let candidates = std::iter::once(command.name.as_str()).chain(
+            command.aliases.iter().map(String::as_str).filter(|alias| {
+                user_commands
+                    .get(alias)
+                    .is_some_and(|resolved| resolved.name == command.name)
+            }),
+        );
+        if let Some((rank, distance)) = best_suggestion_score(&query, candidates) {
+            scored.push((rank, distance, command.name.clone()));
         }
     }
 
@@ -308,33 +452,26 @@ mod tests {
     use crate::localization::{Locale, MessageId};
     use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
     use crate::tools::todo::TodoStatus;
-    use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
+    use crate::tui::app::{App, AppAction, TuiOptions};
+    use crate::tui::work_surface::{RailPanel, WorkSurfacePlacement};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
+
+    fn is_palette_safe_command_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        !bytes.is_empty()
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+            && !name.contains("--")
+    }
 
     fn create_test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -344,6 +481,22 @@ mod tests {
         super::user_registry::reload(None);
         let registry = super::user_registry::current_registry();
         assert!(registry.is_valid());
+    }
+
+    #[test]
+    fn preview_request_dispatch_preserves_prompt_edge_bytes() {
+        let mut app = create_test_app();
+        let result = execute("/preview-request --prompt   lead\ntrail  ", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(matches!(
+            result.action,
+            Some(AppAction::PreviewOutboundRequest {
+                json: false,
+                base_prompt_only: false,
+                hypothetical_prompt,
+            }) if hypothetical_prompt.as_deref() == Some("  lead\ntrail  ")
+        ));
     }
 
     #[test]
@@ -402,16 +555,13 @@ mod tests {
     #[test]
     fn command_registry_contains_config_and_links_but_not_set_or_deepseek() {
         assert!(command_infos().iter().any(|cmd| cmd.name == "config"));
-        let sidebar = command_infos()
+        let rail = command_infos()
             .into_iter()
-            .find(|cmd| cmd.name == "sidebar")
-            .expect("sidebar command should exist");
-        assert_eq!(sidebar.description_id, MessageId::CmdSidebarDescription);
-        assert!(
-            sidebar
-                .description_for(Locale::En)
-                .contains("right sidebar")
-        );
+            .find(|cmd| cmd.name == "rail")
+            .expect("rail command should exist");
+        assert_eq!(rail.aliases, &["sidebar"]);
+        assert_eq!(rail.description_id, MessageId::CmdSidebarDescription);
+        assert!(rail.description_for(Locale::En).contains("rail"));
         assert!(command_infos().iter().any(|cmd| cmd.name == "links"));
         let hf = command_infos()
             .into_iter()
@@ -432,6 +582,21 @@ mod tests {
             .find(|cmd| cmd.name == "links")
             .expect("links command should exist");
         assert_eq!(links.aliases, &["dashboard", "api", "lianjie"]);
+    }
+
+    #[test]
+    fn transcript_command_is_discoverable_and_opens_live_overlay() {
+        let transcript = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "transcript")
+            .expect("transcript command should exist");
+        assert_eq!(transcript.usage, "/transcript");
+        assert!(transcript.show_in_empty_discovery());
+
+        let mut app = create_test_app();
+        let result = execute("/transcript", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(result.action, Some(AppAction::OpenLiveTranscript)));
     }
 
     #[test]
@@ -461,13 +626,31 @@ mod tests {
         let mut app = create_test_app();
         let result = execute("/rlm 2 inspect this long corpus", &mut app);
         assert!(!result.is_error);
-        assert!(result.message.as_deref().unwrap_or("").contains("depth 2"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("persistent working context")
+        );
         let Some(AppAction::SendMessage(message)) = result.action else {
             panic!("expected SendMessage action");
         };
-        assert!(message.contains("rlm_open"));
-        assert!(message.contains("rlm_configure"));
-        assert!(message.contains("sub_rlm_max_depth: 2"));
+        assert!(message.contains("session-persistent working context"));
+        assert!(message.contains("Do not use legacy `rlm` tool actions"));
+    }
+
+    /// `/kernel` was briefly introduced by an in-flight change and rejected:
+    /// the persistent working context is ordinary Agent behavior, not a
+    /// control surface users have to learn.
+    #[test]
+    fn kernel_is_not_a_command() {
+        let mut app = create_test_app();
+        let result = execute("/kernel inspect the fresh corpus", &mut app);
+        assert!(
+            result.is_error,
+            "/kernel must not resolve to a registered command"
+        );
     }
 
     #[test]
@@ -485,8 +668,8 @@ mod tests {
     #[test]
     fn relay_slash_command_routes_to_session_relay_instruction() {
         let mut app = create_test_app();
-        app.hunt.quarry = Some("Unify the work surface".to_string());
-        app.hunt.token_budget = Some(12_000);
+        app.goal.objective = Some("Unify the work surface".to_string());
+        app.goal.token_budget = Some(12_000);
         {
             let mut todos = app.todos.try_lock().expect("todo lock");
             todos.add("inspect workspace".to_string(), TodoStatus::Completed);
@@ -529,10 +712,21 @@ mod tests {
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
         assert!(message.contains("Goal token budget: 12000"));
-        assert!(message.contains("To-do (primary progress surface, 50% complete)"));
-        assert!(message.contains("#1 [completed] inspect workspace"));
-        assert!(message.contains("#2 [in_progress] patch relay command"));
-        assert!(message.contains("Optional strategy metadata from update_plan"));
+        // #3983: the relay artifact shows the same bounded To-do snapshot body
+        // a forked agent is handed — byte for byte.
+        let expected_body = crate::todo_snapshot::todo_snapshot_body(
+            &app.todos.try_lock().expect("todo lock").snapshot(),
+        )
+        .expect("canonical body");
+        assert_eq!(
+            expected_body,
+            "To-do (50% settled)\n- [x] #1 inspect workspace\n- [~] #2 patch relay command"
+        );
+        assert!(
+            message.contains(&expected_body),
+            "relay must embed the canonical To-do body: {message}"
+        );
+        assert!(message.contains("Conversational strategy notes from update_plan"));
         assert!(message.contains("Objective: Keep relays grounded"));
         assert!(message.contains("Explanation: RLM-style strategy"));
         assert!(message.contains("Source: transcript context"));
@@ -544,6 +738,78 @@ mod tests {
         assert!(
             !message.contains("Work checklist"),
             "relay copy should use To-do vocabulary: {message}"
+        );
+    }
+
+    /// #3983: `update_plan` is conversational strategy, not a To-do. A session
+    /// with plan state and an empty To-do has no list to hand off, and the
+    /// relay artifact must not manufacture one.
+    #[test]
+    fn relay_does_not_present_plan_only_state_as_work_state() {
+        let mut app = create_test_app();
+        {
+            let mut plan = app.plan_state.try_lock().expect("plan lock");
+            plan.update(UpdatePlanArgs {
+                objective: Some("Ship the To-do seam".to_string()),
+                plan: vec![PlanItemArg {
+                    step: "draft the renderer".to_string(),
+                    status: StepStatus::InProgress,
+                }],
+                ..UpdatePlanArgs::default()
+            });
+        }
+
+        let result = execute("/relay", &mut app);
+        let Some(AppAction::SendMessage(message)) = result.action else {
+            panic!("expected SendMessage action");
+        };
+
+        assert!(
+            !message.contains("Current To-do:"),
+            "plan-only state must not render as a To-do: {message}"
+        );
+        assert!(
+            !message.contains("To-do ("),
+            "plan-only state must not synthesize a To-do list: {message}"
+        );
+        assert!(message.contains("Conversational strategy notes from update_plan"));
+    }
+
+    /// #3983: a graph-backed update is authoritative immediately, even before
+    /// the compatibility To-do projection is published to the UI.
+    #[tokio::test]
+    async fn relay_reads_same_turn_graph_backed_work_update() {
+        use crate::tools::spec::ToolSpec as _;
+
+        let mut app = create_test_app();
+        let work =
+            crate::work_graph::new_shared_work_runtime(app.todos.clone(), app.plan_state.clone());
+        app.runtime_services.work = Some(work.clone());
+
+        let mut context = crate::tools::spec::ToolContext::new(app.workspace.clone());
+        context.runtime.work = Some(work);
+        crate::tools::todo::TodoWriteTool::new(app.todos.clone())
+            .execute(
+                serde_json::json!({
+                    "todos": [{"content": "relay the staged graph", "status": "in_progress"}]
+                }),
+                &context,
+            )
+            .await
+            .expect("graph-backed todo_write");
+
+        assert!(
+            app.todos.lock().await.snapshot().is_empty(),
+            "precondition: legacy projection has not published yet"
+        );
+
+        let result = execute("/relay", &mut app);
+        let Some(AppAction::SendMessage(message)) = result.action else {
+            panic!("expected SendMessage action");
+        };
+        assert!(
+            message.contains("[~] #1 relay the staged graph"),
+            "{message}"
         );
     }
 
@@ -635,10 +901,8 @@ mod tests {
                 let info = cmd.info();
                 assert!(!info.name.is_empty(), "command name must not be empty");
                 assert!(
-                    info.name
-                        .chars()
-                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()),
-                    "/{} command names must be lowercase ASCII",
+                    is_palette_safe_command_name(info.name),
+                    "/{} command names must be lowercase ASCII kebab-case",
                     info.name
                 );
                 let usage_prefix = format!("/{}", info.name);
@@ -667,9 +931,9 @@ mod tests {
                 has_debug = true;
                 assert_eq!(
                     commands.len(),
-                    11,
+                    13,
                     "debug group (group-local metadata exception) expected \
-                     exactly 11 commands, got {}",
+                     exactly 13 commands, got {}",
                     commands.len()
                 );
             }
@@ -685,9 +949,16 @@ mod tests {
             "debug group not found (expected first command: /tokens)"
         );
 
-        // Consistency: group-iterated command count must match registry
+        // Consistency: group-iterated command count must match registry.
+        // FEAT-015 registers one test-only contextual command (`/feat015ctx`)
+        // under `#[cfg(test)]` to prove the dual-path seam (D6); the nine
+        // production groups remain exactly 96 commands.
+        let test_only_count = command_infos()
+            .iter()
+            .filter(|info| info.name == "feat015ctx")
+            .count();
         assert_eq!(
-            total_commands,
+            total_commands + test_only_count,
             command_infos().len(),
             "group-iterated command count must match registry infos count"
         );
@@ -723,11 +994,8 @@ mod tests {
                 command.name
             );
             assert!(
-                command
-                    .name
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()),
-                "/{} command names must stay lowercase ASCII",
+                is_palette_safe_command_name(command.name),
+                "/{} command names must stay lowercase ASCII kebab-case",
                 command.name
             );
 
@@ -745,6 +1013,26 @@ mod tests {
                 "/{} must have non-empty English help text",
                 command.name
             );
+            // #3913: descriptions must not restate the usage field — the
+            // palette and /help already append `usage` when arguments exist.
+            assert!(
+                !description.contains(command.usage),
+                "/{} description embeds its usage string {:?}: {description:?}",
+                command.name,
+                command.usage
+            );
+            assert!(
+                !description.contains(&format!("/{}", command.name)),
+                "/{} description embeds slash-command syntax that usage already covers: {description:?}",
+                command.name
+            );
+            for banned_prefix in ["Toolbox:", "Reference:"] {
+                assert!(
+                    !description.starts_with(banned_prefix),
+                    "/{} description should not start with {banned_prefix:?}: {description:?}",
+                    command.name
+                );
+            }
 
             let palette_command = command.palette_command();
             assert!(
@@ -788,6 +1076,31 @@ mod tests {
                     command.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn flagship_orchestration_and_workspace_commands_are_visible_at_the_palette_root() {
+        for name in [
+            "auto",
+            "goal",
+            "hooks",
+            "tokens",
+            "translate",
+            "workflow",
+            "workspace",
+        ] {
+            let info = registry()
+                .get_info(name)
+                .unwrap_or_else(|| panic!("/{name} must be registered"));
+            assert!(
+                info.show_in_empty_discovery(),
+                "/{name} must appear at the palette root (#5442 / #5439)"
+            );
+            assert!(
+                !traits::ADVANCED_DISCOVERY_COMMANDS.contains(&name),
+                "/{name} must not stay on the Advanced discovery list"
+            );
         }
     }
 
@@ -965,74 +1278,98 @@ mod tests {
     }
 
     #[test]
-    fn execute_sidebar_toggles_visibility() {
+    fn execute_rail_sets_placement_and_reports_actual_state() {
         let mut app = create_test_app();
-        app.set_sidebar_focus(SidebarFocus::Pinned);
-        app.last_sidebar_host_width = Some(120);
 
-        let result = execute("/sidebar", &mut app);
+        let result = execute("/rail off", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
-        assert!(app.status_message.is_none());
-        assert_eq!(result.message.as_deref(), Some("Sidebar is hidden"));
+        assert_eq!(app.work_surface.placement, WorkSurfacePlacement::Off);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rail is off")
+        );
 
-        let result = execute("/sidebar", &mut app);
+        let result = execute("/rail right", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
-        assert!(app.status_message.is_none());
-        assert_eq!(result.message.as_deref(), Some("Sidebar is visible"));
+        assert_eq!(app.work_surface.placement, WorkSurfacePlacement::Right);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("right placement")
+        );
+
+        // The /sidebar alias drives the same rail.
+        let result = execute("/sidebar left", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(app.work_surface.placement, WorkSurfacePlacement::Left);
+
+        // Bare /rail reports the actual rendered state; it must never claim
+        // visibility for a surface that cannot render.
+        app.work_surface.placement = WorkSurfacePlacement::Off;
+        let result = execute("/rail", &mut app);
+        assert!(!result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rail is off")
+        );
     }
 
     #[test]
-    fn execute_sidebar_accepts_explicit_focus_targets() {
+    fn execute_rail_accepts_panel_targets_and_legacy_words() {
         let mut app = create_test_app();
-        app.last_sidebar_host_width = Some(120);
 
-        let result = execute("/sidebar tasks", &mut app);
+        let result = execute("/rail agents", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
-        assert!(app.status_message.is_none());
+        assert_eq!(app.work_surface.panel, RailPanel::Agents);
 
-        let result = execute("/sidebar activity", &mut app);
+        let result = execute("/sidebar context", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(app.work_surface.panel, RailPanel::Context);
+
+        let result = execute("/rail activity", &mut app);
         assert!(!result.is_error);
         assert_eq!(
-            app.sidebar_focus,
-            SidebarFocus::Tasks,
-            "activity is the user-facing alias for the Activity panel"
+            app.work_surface.panel,
+            RailPanel::Tasks,
+            "activity maps onto the Tasks panel"
         );
 
-        let result = execute("/sidebar off", &mut app);
+        let result = execute("/rail pinned", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
-        assert!(app.status_message.is_none());
-
-        let result = execute("/sidebar closed", &mut app);
-        assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
-        assert!(app.status_message.is_none());
-
-        let result = execute("/sidebar none", &mut app);
-        assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
-        assert!(app.status_message.is_none());
+        assert_eq!(app.work_surface.panel, RailPanel::Pinned);
 
         let result = execute("/sidebar on", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.sidebar_focus, SidebarFocus::Pinned);
-        assert!(app.status_message.is_none());
+        assert_eq!(
+            app.work_surface.placement,
+            WorkSurfacePlacement::Top,
+            "on restores the default top rail"
+        );
+
+        let result = execute("/sidebar none", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(app.work_surface.placement, WorkSurfacePlacement::Off);
     }
 
     #[test]
-    fn execute_sidebar_rejects_invalid_args() {
+    fn execute_rail_rejects_invalid_args() {
         let mut app = create_test_app();
-        let result = execute("/sidebar maybe", &mut app);
+        let result = execute("/rail maybe", &mut app);
         assert!(result.is_error);
         assert!(
             result
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Usage: /sidebar")
+                .contains("Usage: /rail")
         );
     }
 
@@ -1042,6 +1379,12 @@ mod tests {
         for cmd in ["/links", "/dashboard", "/api", "/lianjie"] {
             let result = execute(cmd, &mut app);
             let msg = result.message.expect("links commands should return text");
+            assert!(msg.contains("https://codewhale.net/en/docs"));
+            assert!(msg.contains("https://codewhale.net/en/community"));
+            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://app.codewhale.net"));
+            assert!(msg.contains("separate sign-in"));
+            assert!(msg.contains("not connected to the current local session"));
             assert!(msg.contains("https://platform.deepseek.com"));
             assert!(result.action.is_none());
         }
@@ -1083,7 +1426,7 @@ mod tests {
 
     struct ConfigPathGuard {
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathGuard {
@@ -1115,7 +1458,7 @@ mod tests {
     }
 
     /// Build an App scoped to an isolated tempdir so dispatch-side-effects
-    /// (e.g. `/init` writing AGENTS.md, `/export` writing chat transcripts,
+    /// (e.g. `/init` writing AGENTS.md, explicit `/export <path>` writes, or
     /// `/logout` clearing credentials) don't pollute the repo working tree or
     /// the developer's real config when the smoke tests run.
     fn create_isolated_test_app() -> (App, tempfile::TempDir, ConfigPathGuard) {
@@ -1125,25 +1468,12 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
         let guard = ConfigPathGuard::new(&config_path);
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: workspace.clone(),
             config_path: Some(config_path),
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
             skills_dir: workspace.join("skills"),
             memory_path: workspace.join("memory.md"),
             notes_path: workspace.join("notes.txt"),
             mcp_config_path: workspace.join("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(workspace.clone())
         };
         let app = App::new(options, &Config::default());
         (app, tmpdir, guard)
@@ -1157,10 +1487,9 @@ mod tests {
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
     /// runner unwinds the panic and reports the offending command.
-    /// `/save` and `/export` default their output paths to `cwd`-relative
-    /// filenames when no arg is supplied, which would scribble files into
-    /// `crates/tui/` when CI runs from there. Pass an explicit tempdir-
-    /// relative path for those two so the dispatch test stays sandboxed.
+    /// `/save` still defaults its output path, while `/export` accepts a legacy
+    /// direct file path. Pass explicit tempdir paths so this smoke test covers
+    /// both file handlers without touching the developer's clipboard.
     fn invocation_for(command_name: &str, alias_or_name: &str, tmpdir: &std::path::Path) -> String {
         match command_name {
             "save" => format!("/{alias_or_name} {}", tmpdir.join("session.json").display()),
@@ -1203,8 +1532,8 @@ mod tests {
         let Some(AppAction::SendMessage(message)) = result.action else {
             panic!("expected /rlm to send a model instruction");
         };
-        assert!(message.contains(r#"content: "inspect   this   corpus""#));
-        assert!(message.contains("sub_rlm_max_depth: 3"));
+        assert!(message.contains(r#"this text: "inspect   this   corpus""#));
+        assert!(message.contains("session-persistent working context"));
     }
 
     #[test]
@@ -1236,16 +1565,21 @@ mod tests {
         assert!(note_help.contains("Usage: /note"));
 
         let mut app = create_test_app();
-        let result = execute("/hunt ship layer 2 | budget: 100", &mut app);
+        let result = execute("/goal ship layer 2 | budget: 100", &mut app);
         assert!(!result.is_error);
-        assert_eq!(app.hunt.quarry.as_deref(), Some("ship layer 2"));
-        assert_eq!(app.hunt.token_budget, Some(100));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SetGoalObjective {
+                ref objective,
+                token_budget: Some(100)
+            }) if objective == "ship layer 2"
+        ));
+        // The hunt-era alias is gone: `/hunt` must not resolve anymore.
+        assert!(execute("/hunt ship layer 2", &mut app).is_error);
 
         let (mut app, _tmpdir, _guard) = create_isolated_test_app();
-        let skills = execute("/skills", &mut app)
-            .message
-            .expect("/skills should return text");
-        assert!(skills.contains("Skills location:"));
+        let result = execute("/skills", &mut app);
+        assert!(matches!(result.action, Some(AppAction::OpenSkillsManager)));
 
         let mut app = create_test_app();
         let result = execute("/task list", &mut app);
@@ -1397,5 +1731,257 @@ mod tests {
         let mut app = create_test_app();
         let result = execute("/help", &mut app);
         assert!(!result.is_error);
+    }
+
+    fn write_test_skill(root: &Path, name: &str) {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Test {name} skill\n---\nFollow the test instructions."
+            ),
+        )
+        .expect("skill fixture");
+    }
+
+    #[test]
+    fn task_bearing_skill_invocations_send_the_task_on_the_activated_turn() {
+        for invocation in ["$foo do X", "/foo do X", "/skill foo do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "foo");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Skill 'foo' activated")),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: foo")),
+                "{invocation} did not arm foo for the dispatched task"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_skill_still_arms_the_next_message() {
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "foo");
+
+        let result = execute("$foo", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.action.is_none());
+        assert!(
+            app.active_skill
+                .as_deref()
+                .is_some_and(|instruction| instruction.contains("# Skill: foo"))
+        );
+    }
+
+    #[test]
+    fn shorthand_can_invoke_a_skill_named_install_without_stealing_management_commands() {
+        for invocation in ["$install do X", "/install do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "install");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: install")),
+                "{invocation} did not activate the install skill"
+            );
+        }
+
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "install");
+        let result = execute("/skill install", &mut app);
+        assert!(result.is_error, "management subcommand should show usage");
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("/skill install"))
+        );
+        assert!(result.action.is_none());
+        assert!(app.active_skill.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-015: test-only contextual dispatch through the public dispatcher
+    // (D6). The fixture is registered into the global registry only in test
+    // builds and executes through the public `execute()`.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat015_contextual_command_executes_through_public_dispatcher() {
+        let mut app = create_test_app();
+        let result = execute("/feat015ctx hello", &mut app);
+        assert!(!result.is_error, "{result:?}");
+        let message = result.message.expect("message");
+        assert!(message.contains("workspace="), "{message}");
+        assert!(message.contains("mode="), "{message}");
+        assert!(message.contains("currency="), "{message}");
+        assert!(message.contains("arg=hello"), "{message}");
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn feat015_contextual_command_is_registered_only_in_test_builds() {
+        // The fixture entry is present in the test-build registry with a
+        // capability-scoped handler; production builds never see it.
+        assert!(registry().has_contextual_handler("feat015ctx"));
+        let info = registry().get_info("feat015ctx").expect("info");
+        assert_eq!(info.name, "feat015ctx");
+        assert_eq!(
+            info.description_id,
+            crate::localization::MessageId::CmdWorkspaceDescription,
+            "portable description_key must bridge to the TUI localization id"
+        );
+    }
+
+    #[test]
+    fn feat015_all_production_entries_remain_legacy() {
+        // FEAT-015 shipped no production contextual command, so the assertion
+        // below used to exclude nothing. FEAT-018 migrates the utility group;
+        // the remaining non-fixture commands must still use the legacy
+        // concrete-App path. The seven utility entries are asserted separately
+        // by the FEAT-018 public-dispatch and inventory tests (Phase 6).
+        const FEAT_018_UTILITY: &[&str] = &[
+            "attach",
+            "automation",
+            "jobs",
+            "mcp",
+            "network",
+            "task",
+            "update",
+        ];
+        for info in command_infos() {
+            if info.name == "feat015ctx" || FEAT_018_UTILITY.contains(&info.name) {
+                continue;
+            }
+            assert!(
+                !registry().has_contextual_handler(info.name),
+                "/{} must remain on the legacy dispatch path",
+                info.name
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-018: public pure/contextual dispatch and seven-entry inventory
+    // (Task 6.2). These tests enter through the public registry/dispatch seam
+    // and prove both handler variants plus all seven utility metadata records.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat018_all_seven_utility_entries_are_registered_with_portable_handlers() {
+        for name in [
+            "attach",
+            "automation",
+            "jobs",
+            "mcp",
+            "network",
+            "task",
+            "update",
+        ] {
+            let info = registry()
+                .get_info(name)
+                .unwrap_or_else(|| panic!("/{name} must be registered"));
+            assert_eq!(info.name, name, "canonical name");
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must carry a portable handler"
+            );
+        }
+    }
+
+    #[test]
+    fn feat018_pure_utility_command_dispatches_through_public_seam() {
+        let mut app = create_test_app();
+        // /jobs is a Pure handler: it must execute without building an
+        // envelope and return the same action as the parser.
+        let result = execute("/jobs list", &mut app);
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            matches!(
+                result.action,
+                Some(crate::tui::app::AppAction::ShellJob(
+                    crate::tui::app::ShellJobAction::List
+                ))
+            ),
+            "{result:?}"
+        );
+
+        // /update is Pure too; a bare check should reach the plan resolver and
+        // return a message (or a safe error in a test environment), never a panic.
+        let result = execute("/update", &mut app);
+        assert!(result.message.is_some() || result.is_error, "{result:?}");
+    }
+
+    #[test]
+    fn feat018_contextual_utility_commands_dispatch_through_public_seam() {
+        let mut app = create_test_app();
+
+        // /automation (contextual, presentation facet): list action.
+        let automation = execute("/automation list", &mut app);
+        assert!(
+            matches!(
+                automation.action,
+                Some(crate::tui::app::AppAction::Automation(
+                    crate::tui::app::AutomationAction::List
+                ))
+            ),
+            "{automation:?}"
+        );
+
+        // /task (contextual, workspace facet): digest without a runtime must
+        // produce the canonical no-active text.
+        let task = execute("/task digest", &mut app);
+        assert_eq!(
+            task.message.as_deref(),
+            Some("No active operations or to-do items."),
+            "{task:?}"
+        );
+
+        // /mcp (contextual, presentation facet): status maps to Show action.
+        let mcp = execute("/mcp status", &mut app);
+        assert!(
+            matches!(
+                mcp.action,
+                Some(crate::tui::app::AppAction::Mcp(
+                    crate::tui::app::McpUiAction::Show
+                ))
+            ),
+            "{mcp:?}"
+        );
+
+        // /attach (contextual, workspace + media facets): missing path is a
+        // safe error, never a panic, and the composer is untouched.
+        let attach = execute("/attach", &mut app);
+        assert!(attach.is_error, "{attach:?}");
+        assert!(app.input.is_empty(), "composer must stay unchanged");
+
+        // /network (pure): list produces a message.
+        let network = execute("/network list", &mut app);
+        assert!(network.message.is_some() || network.is_error, "{network:?}");
     }
 }

@@ -3,6 +3,7 @@
 
 #[cfg(all(test, feature = "long-running-tests"))]
 mod acceptance;
+mod advisor;
 mod agent;
 mod anchor;
 mod clear;
@@ -12,6 +13,7 @@ mod constitution;
 // migration scaffolding; see docs/architecture/command-dispatch.md.
 #[allow(clippy::module_inception)]
 mod core;
+mod effort;
 mod exit;
 mod feedback;
 mod fleet;
@@ -20,10 +22,12 @@ mod hf;
 mod home;
 mod hooks;
 mod hotbar;
+mod lane;
 mod links;
 mod model;
 mod modeldb;
 mod models;
+mod pin;
 mod profile;
 mod provider;
 mod queue;
@@ -31,7 +35,9 @@ mod rlm;
 mod setup;
 mod stash;
 mod subagents;
+mod transcript;
 mod translate;
+mod turn;
 pub mod util;
 pub mod voice;
 mod workflow;
@@ -50,6 +56,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 anchor::AnchorCmd::info(),
                 anchor::AnchorCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                advisor::AdvisorCmd::info(),
+                advisor::AdvisorCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 help::HelpCmd::info(),
@@ -100,8 +110,20 @@ impl CommandGroup for CoreCommands {
                 fleet::FleetCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                lane::LaneCmd::info(),
+                lane::LaneCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 workflow::WorkflowCmd::info(),
                 workflow::WorkflowCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                workflow::WorkflowsCmd::info(),
+                workflow::WorkflowsCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                workflow::AutoCmd::info(),
+                workflow::AutoCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 hotbar::HotbarCmd::info(),
@@ -122,6 +144,14 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 links::LinksCmd::info(),
                 links::LinksCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                transcript::TranscriptCmd::info(),
+                transcript::TranscriptCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                turn::TurnCmd::info(),
+                turn::TurnCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 feedback::FeedbackCmd::info(),
@@ -152,6 +182,7 @@ impl CommandGroup for CoreCommands {
                 voice::VoiceCmd::info(),
                 voice::VoiceCmd::execute,
             )),
+            Box::new(FunctionCommand::new(&effort::EFFORT_INFO, effort::effort,)),
             Box::new(FunctionCommand::new(
                 voice::VoiceSendCmd::info(),
                 voice::VoiceSendCmd::execute,
@@ -159,6 +190,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 voice::VoiceControlCmd::info(),
                 voice::VoiceControlCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                pin::PinCmd::info(),
+                pin::PinCmd::execute
             )),
         ])
     }

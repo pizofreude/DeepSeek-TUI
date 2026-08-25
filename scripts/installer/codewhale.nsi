@@ -1,16 +1,17 @@
 ; codewhale.nsi — NSIS installer for CodeWhale (Windows)
 ;
 ; Requirements (see https://github.com/Hmbown/CodeWhale/issues/1983):
-;   - Install codewhale.exe, codew.exe, and codewhale-tui.exe side-by-side
+;   - Install codewhale.exe and codew.exe side-by-side (single binary, no codewhale-tui.exe)
 ;   - Default to %LOCALAPPDATA%\Programs\CodeWhale\bin
 ;   - Add install dir to current-user PATH
 ;   - Uninstaller removes the PATH entry
+;   - Install codewhale.bat and a current-user Start Menu shortcut (#1854)
+;   - Uninstaller removes the launcher and shortcut
 ;
 ; Usage:
-;   1. Place all .exe files next to this script:
+;   1. Place the binaries next to this script (codewhale.bat is already here):
 ;        codewhale.exe
 ;        codew.exe
-;        codewhale-tui.exe
 ;   2. Build:
 ;        makensis /DVERSION=1.2.3 codewhale.nsi
 ;   3. Output: CodeWhaleSetup.exe (in current directory)
@@ -20,10 +21,6 @@
 ;--------------------------------
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
-!include "StrFunc.nsh"
-
-${StrStr}
-${UnStrStr}
 
 ;--------------------------------
 ; General
@@ -71,32 +68,27 @@ BrandingText "${PRODUCT_NAME} Installer"
 ; Installer Sections
 ;--------------------------------
 Section "Install" SecInstall
+  SetOutPath "$INSTDIR"
+  File "update-user-path.ps1"
+
   SetOutPath "$INSTDIR\bin"
 
-  ; Copy binaries
+  ; Copy binaries (single binary) and the Windows Terminal launcher (#1854)
   File "codewhale.exe"
   File "codew.exe"
-  File "codewhale-tui.exe"
+  File "codewhale.bat"
 
   ; Write uninstaller
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  ; Add to current-user PATH
-  ; Read existing PATH, append only when the exact entry is absent.
-  ReadRegStr $0 HKCU "Environment" "Path"
-  StrCpy $2 ";$0;"
-  StrCpy $3 ";$INSTDIR\bin;"
-  ${StrStr} $1 $2 $3
-  StrCmp $1 "" 0 path_already_set
-    StrCmp $0 "" empty_path
-      WriteRegExpandStr HKCU "Environment" "Path" "$0;$INSTDIR\bin"
-      Goto path_done
-    empty_path:
-      WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR\bin"
-    path_done:
-    ; Notify the system about the environment change
-    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
-  path_already_set:
+  CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\bin\codewhale.bat" "" "$INSTDIR\bin\codewhale.exe" 0
+
+  ; NSIS strings default to 1024 characters. ReadRegStr returns an empty string
+  ; when a registry value exceeds that limit, which used to make a long user
+  ; PATH look absent and overwrite it. Use PowerShell/.NET registry APIs so the
+  ; complete raw value and its REG_SZ/REG_EXPAND_SZ kind are preserved.
+  Call AddToUserPath
 
   ; Store install directory for uninstaller
   WriteRegStr HKCU "Software\${PRODUCT_NAME}" "InstallDir" "$INSTDIR"
@@ -115,120 +107,52 @@ Section "Install" SecInstall
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "EstimatedSize" "$0"
 SectionEnd
 
+Function AddToUserPath
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\update-user-path.ps1" -Operation Add -Entry "$INSTDIR\bin"' $0
+  IntCmp $0 0 add_path_done
+    DetailPrint "Failed to add CodeWhale to the current-user PATH (exit code $0)."
+    IfSilent +2
+      MessageBox MB_ICONSTOP|MB_OK "CodeWhale could not safely update your user PATH. Installation has stopped without replacing the existing PATH."
+    SetErrorLevel 1
+    Abort
+
+  add_path_done:
+    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
+FunctionEnd
+
 ;--------------------------------
 ; Uninstaller Section
 ;--------------------------------
 Section "Uninstall"
-  ; Remove binaries
+  ; Remove only CodeWhale's exact entry before deleting the helper. The helper
+  ; handles PATH values longer than NSIS_MAX_STRLEN without truncation.
+  Call un.RemoveFromUserPath
+
+  ; Remove binaries, launcher, and Start Menu shortcut (single binary)
   Delete "$INSTDIR\bin\codewhale.exe"
   Delete "$INSTDIR\bin\codew.exe"
-  Delete "$INSTDIR\bin\codewhale-tui.exe"
+  Delete "$INSTDIR\bin\codewhale.bat"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
+  RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
+  Delete "$INSTDIR\update-user-path.ps1"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR\bin"
   RMDir "$INSTDIR"
-
-  ; Remove from current-user PATH
-  ReadRegStr $0 HKCU "Environment" "Path"
-  StrCpy $2 ";$0;"
-  StrCpy $3 ";$INSTDIR\bin;"
-  ${UnStrStr} $1 $2 $3
-  StrCmp $1 "" path_clean_done
-    Push "$0"
-    Push "$INSTDIR\bin"
-    Call un.RemoveFromPath
-    Pop $0
-    WriteRegExpandStr HKCU "Environment" "Path" "$0"
-    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
-  path_clean_done:
 
   ; Remove registry keys
   DeleteRegKey HKCU "Software\${PRODUCT_NAME}"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 SectionEnd
 
-;--------------------------------
-; Helper: Remove exact directory entries from PATH (uninstaller version)
-; Input: PATH string (on stack), directory to remove (on stack)
-; Output: cleaned PATH (on stack)
-;--------------------------------
-Function un.RemoveFromPath
-  Exch $R0 ; directory to remove
-  Exch
-  Exch $R1 ; original PATH
-  Push $R2 ; padded path
-  Push $R3 ; padded needle
-  Push $R4 ; match result
-  Push $R5 ; prefix
-  Push $R6 ; suffix
-  Push $R7 ; offset/length
+Function un.RemoveFromUserPath
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\update-user-path.ps1" -Operation Remove -Entry "$INSTDIR\bin"' $0
+  IntCmp $0 0 remove_path_done
+    DetailPrint "Failed to remove CodeWhale from the current-user PATH (exit code $0)."
+    IfSilent +2
+      MessageBox MB_ICONSTOP|MB_OK "CodeWhale could not safely update your user PATH. Uninstallation has stopped without replacing the existing PATH."
+    SetErrorLevel 1
+    Abort
 
-  loop:
-    StrCmp $R1 "" done
-    StrCpy $R2 ";$R1;"
-    StrCpy $R3 ";$R0;"
-    ${UnStrStr} $R4 $R2 $R3
-    StrCmp $R4 "" done
-
-    ; Prefix before the exact `;dir;` match in the padded PATH.
-    StrLen $R5 $R2
-    StrLen $R6 $R4
-    IntOp $R6 $R5 - $R6
-    StrCpy $R5 $R2 $R6
-
-    ; Suffix after the exact `;dir;` match in the padded PATH.
-    StrLen $R7 $R3
-    IntOp $R7 $R6 + $R7
-    StrCpy $R6 $R2 "" $R7
-
-    Push $R5
-    Call un.TrimPathEdgeSemicolons
-    Pop $R5
-    Push $R6
-    Call un.TrimPathEdgeSemicolons
-    Pop $R6
-
-    StrCmp $R5 "" 0 +3
-      StrCpy $R1 $R6
-      Goto loop
-    StrCmp $R6 "" 0 +3
-      StrCpy $R1 $R5
-      Goto loop
-    StrCpy $R1 "$R5;$R6"
-    Goto loop
-
-  done:
-    Pop $R7
-    Pop $R6
-    Pop $R5
-    Pop $R4
-    Pop $R3
-    Pop $R2
-    Pop $R0
-    Exch $R1
-FunctionEnd
-
-Function un.TrimPathEdgeSemicolons
-  Exch $R9
-  Push $R8
-
-  trim_leading:
-    StrCpy $R8 $R9 1
-    StrCmp $R8 ";" 0 trim_trailing
-      StrCpy $R9 $R9 "" 1
-      Goto trim_leading
-
-  trim_trailing:
-    StrLen $R8 $R9
-    IntCmp $R8 0 trim_done
-    IntOp $R8 $R8 - 1
-    StrCpy $R8 $R9 1 $R8
-    StrCmp $R8 ";" 0 trim_done
-      StrLen $R8 $R9
-      IntOp $R8 $R8 - 1
-      StrCpy $R9 $R9 $R8
-      Goto trim_trailing
-
-  trim_done:
-    Pop $R8
-    Exch $R9
+  remove_path_done:
+    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 FunctionEnd

@@ -26,6 +26,7 @@ use std::path::Path;
 use crate::fleet::profile::{FleetProfileDraft, UntrustedProfileParse};
 use crate::llm_client::LlmClient;
 use crate::localization::Locale;
+use crate::models::Role;
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
 /// Output budget for the one-shot profile draft. Profiles are small; this is
@@ -157,7 +158,7 @@ pub(crate) fn workspace_fingerprint(workspace: &Path) -> String {
 /// pin the guardrails.
 fn profile_drafting_system_prompt() -> String {
     concat!(
-        "You are helping a CodeWhale user draft a fleet agent profile: a small, ",
+        "You are helping a Codewhale user draft a fleet agent profile: a small, ",
         "durable description of one worker role their agent fleet can spawn.\n\n",
         "Return ONLY one JSON object — no markdown fences, no commentary — with these ",
         "fields (include \"model\" only when a specific target model is given below; ",
@@ -219,7 +220,7 @@ pub(crate) fn profile_drafting_request(
     MessageRequest {
         model: request_model.to_string(),
         messages: vec![Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::Text {
                 text: profile_drafting_user_prompt(role, model, locale, workspace_fingerprint),
                 cache_control: None,
@@ -233,7 +234,7 @@ pub(crate) fn profile_drafting_request(
         thinking: None,
         reasoning_effort: Some("off".to_string()),
         stream: Some(false),
-        temperature: Some(0.2),
+        temperature: None,
         top_p: None,
     }
 }
@@ -270,6 +271,12 @@ pub(crate) async fn draft_fleet_profile_with_model<C: LlmClient>(
         .create_message(request)
         .await
         .map_err(|err| format!("request failed: {err:#}"))?;
+    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+        return Err(format!(
+            "the draft reply was incomplete (provider stop reason `{}`)",
+            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+        ));
+    }
     let text = profile_draft_response_text(&response.content);
     match FleetProfileDraft::from_untrusted_json(&text) {
         UntrustedProfileParse::Drafted(draft) => Ok(draft),
@@ -528,6 +535,7 @@ mod tests {
                 thinking: r#"{"id":"scratchpad","role_hint":"x","description":"half-formed"}"#
                     .to_string(),
                 signature: None,
+                state: None,
             },
         );
         mock.push_message_response(response);

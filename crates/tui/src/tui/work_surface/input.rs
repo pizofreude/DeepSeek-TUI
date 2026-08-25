@@ -2,11 +2,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 
 use crate::tui::app::{App, SidebarRowAction};
 
-use super::interaction::{
-    activate_primary, activate_stop, claim_focus, close_opened, disarm_stop, on_selection_changed,
-    release_focus,
+use super::interaction::{activate_primary, claim_focus, close_opened, release_focus};
+use super::model::{
+    SIDE_WIDTH_MAX, SIDE_WIDTH_MIN, TOP_HEIGHT_MAX, TOP_HEIGHT_MIN, WorkRow, WorkRowId,
+    WorkSurfacePlacement, visible_rows_for_panel,
 };
-use super::model::{WorkRow, WorkRowId, project};
 
 #[derive(Debug, Default)]
 pub struct MouseOutcome {
@@ -14,12 +14,70 @@ pub struct MouseOutcome {
     pub action: Option<SidebarRowAction>,
 }
 
+/// `← for agents`: switch the rail to the Agents panel and give it keyboard
+/// ownership so ↑/↓ + Enter select and focus a worker. Returns `false` when
+/// the rail cannot show agents right now (rail off, or nothing to list); the
+/// caller then opens the `/agents` register instead so the key still lands.
+pub fn enter_agents(app: &mut App) -> bool {
+    app.work_surface.panel = super::model::RailPanel::Agents;
+    if app.work_surface.placement == WorkSurfacePlacement::Off
+        || app.work_surface.effective_placement == WorkSurfacePlacement::Off
+        || app.work_surface.last_area.is_none()
+    {
+        release_focus(app);
+        return false;
+    }
+    let rows = visible_rows_for_panel(app);
+    let first_agent = rows
+        .iter()
+        .find(|row| {
+            row.selectable
+                && row.id.0.starts_with("worker:")
+                && app
+                    .work_surface
+                    .hitboxes
+                    .iter()
+                    .any(|hitbox| hitbox.id == row.id)
+        })
+        .map(|row| row.id.clone());
+    let Some(first_agent) = first_agent else {
+        return false;
+    };
+    claim_focus(app);
+    let selected_agent_is_visible = app.work_surface.selected.as_ref().is_some_and(|selected| {
+        rows.iter()
+            .any(|row| row.selectable && row.id == *selected && row.id.0.starts_with("worker:"))
+            && app
+                .work_surface
+                .hitboxes
+                .iter()
+                .any(|hitbox| hitbox.id == *selected)
+    });
+    if !selected_agent_is_visible {
+        app.work_surface.selected = Some(first_agent);
+    }
+    app.work_surface.clamp_selection(&rows);
+    app.needs_redraw = true;
+    true
+}
+
 /// Handle the work surface's focused keyboard contract. `Alt+W` enters the
 /// surface from the composer; Esc returns ownership to the composer (or clears
 /// a local stop arm / open detail first). Plain printable input always returns
 /// ownership to the composer instead of becoming a hidden panel shortcut.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowAction>> {
-    let rows = project(app);
+    // A starved, mini-window-hidden, or explicitly disabled rail owns no
+    // cells, so it cannot own keyboard focus. `collapse_strip` normally
+    // clears this at layout time; this guard also closes the pre-redraw race.
+    if app.work_surface.last_area.is_none() {
+        if app.work_surface.focused {
+            release_focus(app);
+        }
+        return None;
+    }
+    // Keyboard and mouse share one row source per panel: Enter on the
+    // selected row must open the same world a click would.
+    let rows = visible_rows_for_panel(app);
     if rows.is_empty() {
         return None;
     }
@@ -42,11 +100,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         return None;
     }
 
+    // The details chord opens the selected row's own world; the transcript
+    // pager owns ⌥V only when no work row is selected.
+    if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
+        let action = selected_row(app, &rows)
+            .and_then(|row| activate_primary(app, &row.id, row.primary_action.clone()));
+        if action.is_some() {
+            app.work_surface.clamp_selection(&rows);
+            app.needs_redraw = true;
+            return Some(action);
+        }
+        return None;
+    }
+
     let action = match key.code {
         KeyCode::Esc => {
-            if app.work_surface.stop_arm.is_some() {
-                disarm_stop(app);
-            } else if app.work_surface.opened.is_some() {
+            if app.work_surface.opened.is_some() {
                 close_opened(app);
             } else {
                 release_focus(app);
@@ -55,54 +124,30 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         }
         KeyCode::Up => {
             move_selection(app, &rows, -1);
-            on_selection_changed(app);
             None
         }
         KeyCode::Down => {
             move_selection(app, &rows, 1);
-            on_selection_changed(app);
             None
         }
         KeyCode::Home => {
             select_edge(app, &rows, false);
-            on_selection_changed(app);
             None
         }
         KeyCode::End => {
             select_edge(app, &rows, true);
-            on_selection_changed(app);
             None
         }
         KeyCode::PageUp => {
             move_selection(app, &rows, -(app.work_surface.visible_rows.max(1) as isize));
-            on_selection_changed(app);
             None
         }
         KeyCode::PageDown => {
             move_selection(app, &rows, app.work_surface.visible_rows.max(1) as isize);
-            on_selection_changed(app);
             None
         }
-        KeyCode::Delete => selected_row(app, &rows).and_then(|row| {
-            row.stop_action
-                .clone()
-                .and_then(|action| activate_stop(app, &row.id, action))
-        }),
-        KeyCode::Enter => {
-            // Enter confirms an armed Stop on the selected row; otherwise it
-            // toggles the primary Open/detail action.
-            if let Some(arm) = app.work_surface.stop_arm.as_ref()
-                && arm.is_active()
-                && app.work_surface.selected.as_ref() == Some(&arm.row_id)
-            {
-                let row_id = arm.row_id.clone();
-                let action = arm.action.clone();
-                activate_stop(app, &row_id, action)
-            } else {
-                selected_row(app, &rows)
-                    .and_then(|row| activate_primary(app, &row.id, row.primary_action.clone()))
-            }
-        }
+        KeyCode::Enter => selected_row(app, &rows)
+            .and_then(|row| activate_primary(app, &row.id, row.primary_action.clone())),
         _ => return None,
     };
     app.work_surface.clamp_selection(&rows);
@@ -114,6 +159,106 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
     let Some(area) = app.work_surface.last_area else {
         return MouseOutcome::default();
     };
+    let placement = app.work_surface.effective_placement;
+    let on_divider = match placement {
+        WorkSurfacePlacement::Off => false,
+        WorkSurfacePlacement::Top => {
+            mouse.row == area.bottom().saturating_sub(1)
+                && mouse.column >= area.x
+                && mouse.column < area.right()
+        }
+        WorkSurfacePlacement::Left => {
+            mouse.column == area.right().saturating_sub(1)
+                && mouse.row >= area.y
+                && mouse.row < area.bottom()
+        }
+        WorkSurfacePlacement::Right => {
+            mouse.column == area.x && mouse.row >= area.y && mouse.row < area.bottom()
+        }
+    };
+
+    if matches!(mouse.kind, MouseEventKind::Moved) && app.work_surface.divider_hovered != on_divider
+    {
+        app.work_surface.divider_hovered = on_divider;
+        app.needs_redraw = true;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Moved if on_divider => {
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_divider => {
+            app.work_surface.resizing = true;
+            app.work_surface.divider_hovered = true;
+            app.work_surface.resize_anchor_column = mouse.column;
+            app.work_surface.resize_anchor_row = mouse.row;
+            app.work_surface.resize_anchor_size = match placement {
+                WorkSurfacePlacement::Top => area.height,
+                WorkSurfacePlacement::Left | WorkSurfacePlacement::Right => area.width,
+                WorkSurfacePlacement::Off => area.width,
+            };
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.work_surface.resizing => {
+            let anchor = i32::from(app.work_surface.resize_anchor_size);
+            match placement {
+                WorkSurfacePlacement::Top => {
+                    let delta =
+                        i32::from(mouse.row) - i32::from(app.work_surface.resize_anchor_row);
+                    app.work_surface.top_height = (anchor + delta)
+                        .clamp(i32::from(TOP_HEIGHT_MIN), i32::from(TOP_HEIGHT_MAX))
+                        as u16;
+                }
+                WorkSurfacePlacement::Left => {
+                    let delta =
+                        i32::from(mouse.column) - i32::from(app.work_surface.resize_anchor_column);
+                    app.work_surface.side_width = (anchor + delta)
+                        .clamp(i32::from(SIDE_WIDTH_MIN), i32::from(SIDE_WIDTH_MAX))
+                        as u16;
+                }
+                WorkSurfacePlacement::Right => {
+                    let delta =
+                        i32::from(app.work_surface.resize_anchor_column) - i32::from(mouse.column);
+                    app.work_surface.side_width = (anchor + delta)
+                        .clamp(i32::from(SIDE_WIDTH_MIN), i32::from(SIDE_WIDTH_MAX))
+                        as u16;
+                }
+                WorkSurfacePlacement::Off => {}
+            }
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.work_surface.resizing => {
+            app.work_surface.resizing = false;
+            app.work_surface.divider_hovered = on_divider;
+            let top_height = app.work_surface.top_height;
+            let side_width = app.work_surface.side_width;
+            if let Err(error) = crate::settings::Settings::transact(|settings| {
+                settings.work_surface_top_height = top_height;
+                settings.work_surface_side_width = side_width;
+                Ok(())
+            }) {
+                app.status_message =
+                    Some(format!("Failed to save To-do/Sub-agent bar size: {error}"));
+            }
+            app.needs_redraw = true;
+            return MouseOutcome {
+                consumed: true,
+                action: None,
+            };
+        }
+        _ => {}
+    }
     let inside = mouse.column >= area.x
         && mouse.column < area.right()
         && mouse.row >= area.y
@@ -182,41 +327,10 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
                 };
             };
             claim_focus(app);
-            let hitbox = app
-                .work_surface
-                .hitboxes
-                .iter()
-                .find(|candidate| candidate.row_y == mouse.row)
-                .cloned();
-
-            let in_stop = hitbox.as_ref().is_some_and(|hit| {
-                hit.stop_zone_start_col
-                    .zip(hit.stop_zone_end_col)
-                    .is_some_and(|(start, end)| mouse.column >= start && mouse.column < end)
-            });
-            let in_open = hitbox.as_ref().is_some_and(|hit| {
-                hit.open_zone_start_col
-                    .zip(hit.open_zone_end_col)
-                    .is_some_and(|(start, end)| mouse.column >= start && mouse.column < end)
-            });
-
-            let previous = app.work_surface.selected.clone();
             app.work_surface.selected = Some(row.id.clone());
-            if previous.as_ref() != Some(&row.id) {
-                on_selection_changed(app);
-            }
             app.needs_redraw = true;
 
-            let action = if in_stop {
-                row.stop_action
-                    .clone()
-                    .and_then(|action| activate_stop(app, &row.id, action))
-            } else if in_open || row.primary_action.is_some() {
-                // Open zone and row body share the primary activate/toggle.
-                activate_primary(app, &row.id, row.primary_action.clone())
-            } else {
-                None
-            };
+            let action = activate_primary(app, &row.id, row.primary_action.clone());
             MouseOutcome {
                 consumed: true,
                 action,

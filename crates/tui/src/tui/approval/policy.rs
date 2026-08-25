@@ -5,6 +5,7 @@
 //! policy itself.
 
 use crate::command_safety::is_parallel_readonly_command;
+use crate::tools::canonical_action::canonical_action_alias;
 use serde_json::Value;
 
 /// Categorizes tools by cost/risk level.
@@ -69,20 +70,26 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
         // Workflow is multi-agent orchestration; reuse Agent stakes/routing
         // and specialize the impact card via build_impact_summary (#4126).
         ToolCategory::Agent
-    } else if matches!(name, "write_file" | "edit_file" | "apply_patch") {
+    } else if matches!(
+        name,
+        "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
+    ) {
         ToolCategory::FileWrite
     } else if matches!(
         name,
-        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server"
+        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server" | "registry_sync"
     ) {
         ToolCategory::Network
     } else if matches!(
         name,
-        "exec_shell"
+        "bash"
+            | "Bash"
+            | "exec_shell"
             | "task_shell_start"
             | "task_shell_wait"
             | "exec_shell_wait"
             | "exec_shell_interact"
+            | "exec_shell_cancel"
             | "exec_wait"
             | "exec_interact"
     ) {
@@ -96,7 +103,8 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
         ToolCategory::McpAction
     } else if matches!(
         name,
-        "read_file"
+        "read"
+            | "read_file"
             | "list_dir"
             | "work_update"
             | "todo_write"
@@ -106,6 +114,12 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
             | "update_plan"
             | "search"
             | "file_search"
+            | "grep_files"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
             | "project"
             | "diagnostics"
     ) || name.starts_with("read_")
@@ -113,7 +127,7 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
         || name.starts_with("get_")
     {
         ToolCategory::Safe
-    } else if name == "start_mcp_server" {
+    } else if matches!(name, "start_mcp_server" | "start_registry_mcp_server") {
         // Starting an MCP server spawns child processes or opens network
         // connections — classify as McpAction to trigger appropriate
         // approval prompts.
@@ -121,6 +135,12 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
     } else {
         ToolCategory::Unknown
     }
+}
+
+/// Categorize a concrete call after resolving an action-based canonical tool.
+#[must_use]
+pub fn get_tool_category_for_call(name: &str, params: &Value) -> ToolCategory {
+    get_tool_category(canonical_action_alias(name, params))
 }
 
 #[must_use]
@@ -133,10 +153,10 @@ pub fn classify_stakes(
     if matches!(risk, RiskLevel::Benign) {
         return ApprovalStakes::Routine;
     }
-    match crate::tui::auto_review::ToolActionKind::from_tool_call(tool_name, params, category) {
+    let semantic_name = canonical_action_alias(tool_name, params);
+    match crate::tui::auto_review::ToolActionKind::from_tool_call(semantic_name, params, category) {
         crate::tui::auto_review::ToolActionKind::Publish
-        | crate::tui::auto_review::ToolActionKind::Destructive
-        | crate::tui::auto_review::ToolActionKind::Secret => ApprovalStakes::Critical,
+        | crate::tui::auto_review::ToolActionKind::Destructive => ApprovalStakes::Critical,
         _ => ApprovalStakes::Elevated,
     }
 }
@@ -150,13 +170,14 @@ pub fn classify_stakes(
 /// copy on anything that can touch state outside this turn.
 #[must_use]
 pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) -> RiskLevel {
+    let tool_name = canonical_action_alias(tool_name, params);
     match category {
         // Read paths and discovery.
         ToolCategory::Safe | ToolCategory::McpRead => RiskLevel::Benign,
         // Query-only network is benign; opening a URL pulls arbitrary
         // remote content, so it stays destructive.
         ToolCategory::Network => match tool_name {
-            "web_search" | "wait_for_dev_server" => RiskLevel::Benign,
+            "web_search" | "wait_for_dev_server" | "registry_sync" => RiskLevel::Benign,
             // web_run is benign for search/query, but its `open`/`click`
             // actions fetch model-supplied URLs (arbitrary remote content) -
             // destructive, consistent with fetch_url.
@@ -260,6 +281,38 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_flags_are_not_benign() {
+        let category = get_tool_category("exec_shell");
+        for command in [
+            "fd -x ./pwn.sh",
+            "fd -uHtx ./pwn.sh",
+            "rg --pre /tmp/evil.sh needle .",
+            "git grep -O needle",
+            "git grep -nO needle",
+        ] {
+            assert_eq!(
+                classify_risk("exec_shell", category, &json!({"command": command})),
+                RiskLevel::Destructive,
+                "{command} should not be classified as benign"
+            );
+        }
+
+        for command in [
+            "fd -e rs .",
+            "fd -H --type f src",
+            "rg needle crates/",
+            "git grep needle crates/",
+            "git grep -n needle crates/",
+        ] {
+            assert_eq!(
+                classify_risk("exec_shell", category, &json!({"command": command})),
+                RiskLevel::Benign,
+                "{command} should remain benign"
+            );
+        }
+    }
+
+    #[test]
     fn web_run_open_and_click_fetch_remote_content() {
         let category = get_tool_category("web_run");
         assert_eq!(
@@ -282,5 +335,88 @@ mod tests {
             ),
             RiskLevel::Destructive
         );
+    }
+
+    #[test]
+    fn canonical_actions_keep_legacy_approval_categories_and_risk() {
+        let cases = [
+            ("Bash", "run", ToolCategory::Shell, RiskLevel::Destructive),
+            ("Bash", "wait", ToolCategory::Shell, RiskLevel::Destructive),
+            (
+                "Bash",
+                "interact",
+                ToolCategory::Shell,
+                RiskLevel::Destructive,
+            ),
+            (
+                "Bash",
+                "cancel",
+                ToolCategory::Shell,
+                RiskLevel::Destructive,
+            ),
+            ("File", "read", ToolCategory::Safe, RiskLevel::Benign),
+            ("File", "list", ToolCategory::Safe, RiskLevel::Benign),
+            ("File", "search_name", ToolCategory::Safe, RiskLevel::Benign),
+            (
+                "File",
+                "search_content",
+                ToolCategory::Safe,
+                RiskLevel::Benign,
+            ),
+            (
+                "File",
+                "write",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            (
+                "File",
+                "edit",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            (
+                "File",
+                "patch",
+                ToolCategory::FileWrite,
+                RiskLevel::Destructive,
+            ),
+            ("Git", "status", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "diff", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "log", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "show", ToolCategory::Safe, RiskLevel::Benign),
+            ("Git", "blame", ToolCategory::Safe, RiskLevel::Benign),
+            (
+                "Run",
+                "tests",
+                ToolCategory::Unknown,
+                RiskLevel::Destructive,
+            ),
+            (
+                "Run",
+                "verifiers",
+                ToolCategory::Unknown,
+                RiskLevel::Destructive,
+            ),
+            ("Web", "search", ToolCategory::Network, RiskLevel::Benign),
+            (
+                "Web",
+                "fetch",
+                ToolCategory::Network,
+                RiskLevel::Destructive,
+            ),
+            ("Web", "wait", ToolCategory::Network, RiskLevel::Benign),
+        ];
+
+        for (family, action, expected_category, expected_risk) in cases {
+            let params = json!({"action": action});
+            let category = get_tool_category_for_call(family, &params);
+            assert_eq!(category, expected_category, "{family}.{action}");
+            assert_eq!(
+                classify_risk(family, category, &params),
+                expected_risk,
+                "{family}.{action}"
+            );
+        }
     }
 }

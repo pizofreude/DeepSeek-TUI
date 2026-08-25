@@ -1,6 +1,7 @@
 //! `/setup` command.
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
+#[cfg(test)]
 use crate::config::ApiProvider;
 use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
@@ -34,15 +35,10 @@ impl RegisterCommand for SetupCmd {
                         "Usage: /setup provider [provider-name]".to_string(),
                     );
                 }
-                let Some(provider) = ApiProvider::parse(raw_provider) else {
-                    return CommandResult::error(format!(
-                        "Unknown provider '{raw_provider}'. Expected: {}.",
-                        ApiProvider::names_hint()
-                    ));
+                return match super::provider::provider_setup_action_for_name(raw_provider) {
+                    Ok(action) => CommandResult::action(action),
+                    Err(message) => CommandResult::error(message),
                 };
-                return CommandResult::action(AppAction::OpenProviderSetup {
-                    provider: Some(provider),
-                });
             }
         }
 
@@ -110,25 +106,7 @@ mod tests {
 
     fn test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -229,6 +207,31 @@ mod tests {
             result.action,
             Some(AppAction::OpenProviderSetup {
                 provider: Some(ApiProvider::Anthropic)
+            })
+        );
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn setup_provider_ds4_opens_keyless_local_preset() {
+        let mut app = test_app();
+
+        let result = SetupCmd::execute(&mut app, Some("provider ds4"));
+
+        assert_eq!(result.action, Some(AppAction::OpenDs4Setup));
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn setup_provider_agnes_opens_unpublished_template() {
+        let mut app = test_app();
+
+        let result = SetupCmd::execute(&mut app, Some("provider agnes"));
+
+        assert_eq!(
+            result.action,
+            Some(AppAction::OpenTemplateSetup {
+                template_id: "agnes".to_string(),
             })
         );
         assert!(result.message.is_none());

@@ -26,6 +26,7 @@ use crate::localization::Locale;
 use crate::models::{ContentBlock, Message, MessageRequest, SystemPrompt};
 
 use super::{GuidedConstitutionDraft, autonomy_label};
+use crate::models::Role;
 
 /// Output budget for the one-shot draft. Roomy enough for a full constitution
 /// (bounds cap the persisted form far below this), small enough to be a real
@@ -37,7 +38,7 @@ pub(crate) const DRAFT_MAX_TOKENS: u32 = 1600;
 /// tests can pin the guardrails.
 fn drafting_system_prompt() -> String {
     concat!(
-        "You are helping a new CodeWhale user draft their user constitution: durable, ",
+        "You are helping a new Codewhale user draft their user constitution: durable, ",
         "advisory standing preferences for how an AI coding agent should work with them ",
         "across all their projects.\n\n",
         "Return ONLY one JSON object — no markdown fences, no commentary — with exactly ",
@@ -126,7 +127,7 @@ pub(crate) fn drafting_request(
     MessageRequest {
         model: request_model.to_string(),
         messages: vec![Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::Text {
                 text: drafting_user_prompt(draft, freeform_note, locale),
                 cache_control: None,
@@ -140,7 +141,7 @@ pub(crate) fn drafting_request(
         thinking: None,
         reasoning_effort: Some("off".to_string()),
         stream: Some(false),
-        temperature: Some(0.2),
+        temperature: None,
         top_p: None,
     }
 }
@@ -177,6 +178,12 @@ pub(crate) async fn draft_constitution_with_model<C: LlmClient>(
         .create_message(request)
         .await
         .map_err(|err| format!("request failed: {err:#}"))?;
+    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+        return Err(format!(
+            "the draft reply was incomplete (provider stop reason `{}`)",
+            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+        ));
+    }
     let text = draft_response_text(&response.content);
     match UserConstitution::from_untrusted_json(&text) {
         UntrustedDraftParse::Drafted(constitution) => Ok(constitution),
@@ -402,6 +409,7 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: r#"Maybe {"about":"A half-formed scratchpad draft."}"#.to_string(),
                 signature: None,
+                state: None,
             },
         );
         mock.push_message_response(response);

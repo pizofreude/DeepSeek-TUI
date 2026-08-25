@@ -42,6 +42,8 @@ pub enum ProviderKind {
     #[serde(alias = "volcengine-ark", alias = "volcengine_ark", alias = "ark")]
     Volcengine,
     Openrouter,
+    #[serde(alias = "orca_router", alias = "orca")]
+    Orcarouter,
     #[serde(alias = "mimo", alias = "xiaomi", alias = "xiaomi_mimo")]
     XiaomiMimo,
     #[serde(alias = "novita-ai", alias = "novita_ai")]
@@ -59,6 +61,8 @@ pub enum ProviderKind {
     Sglang,
     Vllm,
     Ollama,
+    #[serde(alias = "ollama_cloud")]
+    OllamaCloud,
     #[serde(alias = "hugging-face", alias = "hugging_face", alias = "hf")]
     Huggingface,
     #[serde(alias = "together-ai", alias = "together_ai", alias = "togetherai")]
@@ -111,6 +115,15 @@ pub enum ProviderKind {
     Sakana,
     #[serde(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[serde(alias = "opencode_go", alias = "opencodego")]
+    OpencodeGo,
+    #[serde(
+        alias = "opencode_zen",
+        alias = "opencodezen",
+        alias = "zen",
+        alias = "opencode"
+    )]
+    OpencodeZen,
     #[serde(
         alias = "meta-ai",
         alias = "meta_ai",
@@ -122,6 +135,86 @@ pub enum ProviderKind {
     Meta,
     #[serde(alias = "x-ai", alias = "x_ai", alias = "grok")]
     Xai,
+    /// Mistral AI — la Plateforme (OpenAI-compatible Chat Completions).
+    #[serde(
+        alias = "mistral-ai",
+        alias = "mistral_ai",
+        alias = "mistralai",
+        alias = "la-plateforme",
+        alias = "la_plateforme"
+    )]
+    Mistral,
+    /// Jiangsu Telecom TokenHub (OpenAI-compatible).
+    ///
+    /// An AI gateway operated by Jiangsu Telecom that speaks the OpenAI Chat
+    /// Completions wire protocol and serves a broad model catalog; each API key
+    /// may access a different subset of models.
+    #[serde(
+        alias = "telecom-js",
+        alias = "telecom_js",
+        alias = "telecomjs-cn",
+        alias = "tokenhub"
+    )]
+    Telecomjs,
+    /// Alibaba Cloud Model Studio — Token Plan (OpenAI-compatible Chat Completions).
+    ///
+    /// Token Plan Personal and Team share the same endpoint. Both the OpenAI
+    /// and Anthropic dialects are available; select the Anthropic dialect via
+    /// `modelstudio-token-plan-anthropic`. Pay-as-you-go workspace-id templating
+    /// is out of scope for v1; use a custom provider for that plan.
+    #[serde(
+        alias = "modelstudio-token-plan",
+        alias = "modelstudio_token_plan",
+        alias = "alibaba-token-plan",
+        alias = "dashscope-token-plan"
+    )]
+    ModelstudioTokenPlan,
+    /// Alibaba Cloud Model Studio — Token Plan Anthropic-compatible endpoint.
+    #[serde(
+        alias = "modelstudio-token-plan-anthropic",
+        alias = "modelstudio_token_plan_anthropic",
+        alias = "alibaba-token-plan-anthropic"
+    )]
+    ModelstudioTokenPlanAnthropic,
+    /// Alibaba Cloud Model Studio — Coding Plan (OpenAI-compatible Chat Completions).
+    #[serde(
+        alias = "modelstudio-coding-plan",
+        alias = "modelstudio_coding_plan",
+        alias = "alibaba-coding-plan",
+        alias = "dashscope-coding-plan"
+    )]
+    ModelstudioCodingPlan,
+    /// Alibaba Cloud Model Studio — Coding Plan Anthropic-compatible endpoint.
+    #[serde(
+        alias = "modelstudio-coding-plan-anthropic",
+        alias = "modelstudio_coding_plan_anthropic",
+        alias = "alibaba-coding-plan-anthropic"
+    )]
+    ModelstudioCodingPlanAnthropic,
+    /// Google Antigravity (`agy` CLI) — consent-gated read-only credential
+    /// import only; the cloud-code wire protocol is not implemented and
+    /// requests fail closed with an actionable message.
+    #[serde(alias = "agy")]
+    Antigravity,
+    /// Google — Gemini OpenAI-compatible endpoint. Its own backend, not an
+    /// OpenAI alias: thought signatures on tool calls are captured and
+    /// replayed per Google's contract.
+    #[serde(
+        alias = "google-gemini",
+        alias = "google_gemini",
+        alias = "gemini",
+        alias = "google-ai",
+        alias = "google_ai",
+        alias = "ai-studio",
+        alias = "aistudio"
+    )]
+    Google,
+    /// Eden AI — OpenAI-compatible AI gateway (aggregator).
+    ///
+    /// Serves a broad catalog of upstream models under `provider/model`
+    /// namespaced wire ids over the OpenAI Chat Completions protocol.
+    #[serde(alias = "eden-ai", alias = "eden_ai", alias = "edenai")]
+    Edenai,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// A single dynamic identity for arbitrary `[providers.<name>]
@@ -133,15 +226,21 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 34] = [
+    /// Catalog / picker surface: one identity per vendor.
+    ///
+    /// Dual-wire dialect kinds (`*Anthropic`) and Model Studio plan variants
+    /// stay on the enum for serde and `provider_for_kind`, but they are not
+    /// first-class catalog rows. Plan is `mode` / base_url; dialect is
+    /// `wire = openai|anthropic` on the primary provider config.
+    pub const ALL: [Self; 42] = [
         Self::Deepseek,
-        Self::DeepseekAnthropic,
         Self::NvidiaNim,
         Self::Openai,
         Self::Atlascloud,
         Self::WanjieArk,
         Self::Volcengine,
         Self::Openrouter,
+        Self::Orcarouter,
         Self::XiaomiMimo,
         Self::Novita,
         Self::Fireworks,
@@ -152,6 +251,7 @@ impl ProviderKind {
         Self::Sglang,
         Self::Vllm,
         Self::Ollama,
+        Self::OllamaCloud,
         Self::Huggingface,
         Self::Together,
         Self::Qianfan,
@@ -161,12 +261,19 @@ impl ProviderKind {
         Self::Zai,
         Self::Stepfun,
         Self::Minimax,
-        Self::MinimaxAnthropic,
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::OpencodeGo,
+        Self::OpencodeZen,
         Self::Meta,
         Self::Xai,
+        Self::Mistral,
+        Self::Telecomjs,
+        Self::ModelstudioTokenPlan,
+        Self::Google,
+        Self::Antigravity,
+        Self::Edenai,
         Self::Custom,
     ];
 
@@ -201,9 +308,65 @@ impl ProviderKind {
             .map(|p| p.kind())
     }
 
+    /// Parse a provider identifier for **config-table identity** — the kind
+    /// used to look up credentials, model, and base URL in the user's
+    /// `[providers.*]` tables.
+    ///
+    /// [`parse`](Self::parse) is *catalog* identity: legacy dual-wire
+    /// spellings (`deepseek-anthropic`, `minimax-anthropic`, the Model Studio
+    /// plan/dialect kinds) are aliases of the vendor primary and collapse
+    /// onto it so pickers show one row per vendor. That collapse must not
+    /// decide which config table holds the user's credentials: TOML serde
+    /// keeps the legacy kind for `provider = "deepseek-anthropic"`, so env
+    /// (`CODEWHALE_PROVIDER`) and `config set provider` must resolve the same
+    /// way or the user's own named table is orphaned with the key present.
+    ///
+    /// An exact canonical-id or `provider_config_key` match across the full
+    /// registry (including legacy dialect/plan kinds) therefore wins over
+    /// alias collapse; everything else falls back to [`parse`](Self::parse).
+    /// Wire-endpoint selection is unaffected: it keys off the resolved kind's
+    /// `wire` config, not this parse.
+    #[must_use]
+    pub fn parse_config_identity(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        provider::all_providers()
+            .iter()
+            .find(|p| {
+                trimmed.eq_ignore_ascii_case(p.id())
+                    || trimmed.eq_ignore_ascii_case(p.provider_config_key())
+            })
+            .map(|p| p.kind())
+            .or_else(|| Self::parse(trimmed))
+    }
+
     #[must_use]
     pub fn is_siliconflow(self) -> bool {
         matches!(self, Self::Siliconflow | Self::SiliconflowCN)
+    }
+
+    /// Canonical durable-credential slot in the local secret store.
+    ///
+    /// Most providers own a slot named after their id. Variants authenticated
+    /// by the SAME account share one slot so a single saved key (or logout)
+    /// applies to the whole family:
+    ///
+    /// - `SiliconflowCN` shares `siliconflow` (historical China-endpoint slot,
+    ///   already the TUI/CLI convention).
+    /// - The four Alibaba Cloud Model Studio variants share
+    ///   `modelstudio-token-plan`: one Model Studio account/key authenticates
+    ///   the Token Plan and Coding Plan endpoints in both wire dialects, so
+    ///   per-variant slots produced three bogus "missing key" rows whenever
+    ///   one variant held the key.
+    #[must_use]
+    pub fn secret_store_slot(self) -> &'static str {
+        match self {
+            Self::SiliconflowCN => "siliconflow",
+            Self::ModelstudioTokenPlan
+            | Self::ModelstudioTokenPlanAnthropic
+            | Self::ModelstudioCodingPlan
+            | Self::ModelstudioCodingPlanAnthropic => "modelstudio-token-plan",
+            _ => self.as_str(),
+        }
     }
 
     /// Return the built-in metadata entry for this provider.

@@ -94,12 +94,18 @@ pub struct CatalogOffering {
     /// unknown, not "text-only").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<ModelsDevModalities>,
+    /// Whether this provider offering accepts attachments, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<bool>,
     /// Whether this offering supports reasoning, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     /// Whether tool calling is supported, when known (#4115).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<bool>,
+    /// Whether structured output is supported, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<bool>,
     /// Provider-scoped reasoning controls / accepted effort metadata. Kept as
     /// raw JSON so the same model family served through different gateways can
     /// expose different effort vocabularies without lossy collapsing.
@@ -143,6 +149,22 @@ impl CatalogOffering {
                 .as_ref()
                 .map(RouteLimits::from)
                 .unwrap_or_default(),
+            capabilities: crate::route::RouteCapabilities {
+                attachments: crate::route::CapabilityState::from_optional_bool(self.attachment),
+                image_input: crate::models_dev::image_input_support(self.modalities.as_ref()),
+                reasoning: crate::route::CapabilityState::from_optional_bool(self.reasoning),
+                native_tool_calls: crate::route::CapabilityState::from_optional_bool(
+                    self.tool_call,
+                ),
+                structured_output: crate::route::CapabilityState::from_optional_bool(
+                    self.structured_output,
+                ),
+                server_side_web_search: crate::route::documented_server_side_web_search(
+                    &self.provider,
+                    &self.wire_model_id,
+                ),
+                ..crate::route::RouteCapabilities::default()
+            },
             pricing: crate::pricing::route_pricing_sku(self),
         }
     }
@@ -264,8 +286,10 @@ fn offerings_from_models_dev(
                 limit: model.limit.clone(),
                 cost: model.cost.clone(),
                 modalities: model.modalities.clone(),
+                attachment: model.attachment,
                 reasoning: model.reasoning,
                 tool_call: model.tool_call,
+                structured_output: model.structured_output,
                 reasoning_options: model.reasoning_options.clone(),
                 source: source.clone(),
             });
@@ -645,13 +669,61 @@ impl CatalogCompiler {
 /// Normalization folds case in the scheme/host, trims trailing slashes, and
 /// drops a default-port suffix, so cosmetically different spellings of the same
 /// endpoint share a cache scope while genuinely different endpoints do not. The
-/// fingerprint is a dependency-free FNV-1a hex digest; it is deterministic
-/// within and across runs but is not a cryptographic hash (it identifies a
-/// cache bucket, nothing security-sensitive).
+/// fingerprint is a SHA-256 digest. Secret-bearing URLs are mapped to one
+/// constant redacted input before hashing, so userinfo, query credentials, and
+/// fragments never enter the digest function at all.
 #[must_use]
 pub fn base_url_fingerprint(base_url: &str) -> String {
-    let normalized = normalize_base_url(base_url);
-    fnv1a_hex(normalized.as_bytes())
+    use sha2::Digest as _;
+
+    let normalized = secret_free_fingerprint_input(base_url);
+    let digest = sha2::Sha256::digest(normalized.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn secret_free_fingerprint_input(base_url: &str) -> String {
+    const REDACTED: &str = "invalid-or-secret-bearing-url";
+    let trimmed = base_url.trim();
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return REDACTED.to_string();
+        }
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let authority_with_userinfo = &rest[..authority_end];
+        if authority_with_userinfo.contains(['?', '#']) {
+            return REDACTED.to_string();
+        }
+        let authority = authority_with_userinfo
+            .rsplit_once('@')
+            .map_or(authority_with_userinfo, |(_, host)| host);
+        if authority.is_empty() {
+            return REDACTED.to_string();
+        }
+        let path = rest[authority_end..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
+        return normalize_base_url(&format!("{scheme}://{authority}{path}"));
+    }
+    // Scheme-less input still has an authority, and it can still carry
+    // `user:pass@` userinfo. Strip it exactly as the scheme branch does, so the
+    // digest input never contains a credential.
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or_default();
+    let authority_end = without_query.find('/').unwrap_or(without_query.len());
+    let authority = &without_query[..authority_end];
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if authority.is_empty() {
+        return REDACTED.to_string();
+    }
+    normalize_base_url(&format!("{authority}{}", &without_query[authority_end..]))
 }
 
 fn normalize_base_url(base_url: &str) -> String {
@@ -680,17 +752,6 @@ fn normalize_base_url(base_url: &str) -> String {
     } else {
         trimmed.to_ascii_lowercase()
     }
-}
-
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
 }
 
 /// Current unix time in seconds, for callers assembling deltas / cache entries.

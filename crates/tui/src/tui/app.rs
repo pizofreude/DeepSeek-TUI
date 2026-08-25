@@ -1,15 +1,15 @@
 //! Application state for the `DeepSeek` TUI.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
-use serde::{Deserialize, Serialize};
+use ratatui::style::Color;
 use serde_json::Value;
-use thiserror::Error;
 
 use codewhale_config::{ProviderChain, route::RouteLimits};
 
@@ -17,8 +17,7 @@ use crate::artifacts::ArtifactRecord;
 use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_TEXT_MODEL, SavedCredential, has_api_key, has_api_key_for,
-    save_api_key, save_api_key_for,
+    ApiProvider, ApprovalPolicyControl, Config, DEFAULT_TEXT_MODEL, has_api_key, has_api_key_for,
 };
 use crate::config_ui::ConfigUiMode;
 use crate::core::authority::{ModeSessionPrefs, base_policy_for_mode};
@@ -30,18 +29,19 @@ use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::resource_telemetry::TokenThroughput;
 use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
-use crate::settings::Settings;
+use crate::settings::{InlineDiffMode, Settings};
 use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
-use crate::tools::subagent::SubAgentResult;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
-use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
+use crate::tui::history::{HistoryCell, TranscriptActionOwner, TranscriptRenderOptions};
 use crate::tui::hotbar::HotbarActionRegistry;
+use crate::tui::motion::MotionPolicy;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
@@ -49,6 +49,29 @@ use crate::tui::sidebar::SidebarWorkSummary;
 use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
+
+mod composer;
+mod init;
+mod status;
+mod types;
+
+pub use composer::ComposerHistorySearch;
+pub(crate) use composer::{InputHistoryDraft, char_count};
+#[cfg(test)]
+pub(crate) use composer::{
+    MAX_SUBMITTED_INPUT_CHARS, next_grapheme_boundary, prev_grapheme_boundary,
+};
+pub use status::{StatusToast, StatusToastLevel};
+pub use types::{
+    AppAction, AppMode, AppModeUi, AutomationAction, ComposerDensity, ComposerSubmitAction,
+    ComposerSubmitChord, InitialInput, McpUiAction, QueuedMessage, ReasoningEffort,
+    SettingSelection, ShellJobAction, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind,
+    ToolCollapseMode, ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
+};
+pub(crate) use types::{
+    CacheReplayTarget, EffectiveReasoningEffort, GoalControlIntent, PendingGoalControl,
+    WORKFLOW_DRAFT_INSTRUCTION_PREFIX,
+};
 
 // === Types ===
 
@@ -61,20 +84,58 @@ pub struct ActiveTurnMetadata {
     pub turn_id: String,
     pub created_at: DateTime<Utc>,
     pub route: Option<TurnRoute>,
+    /// Auto decision metadata captured with this exact authoritative route.
+    pub auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
+    /// Non-secret proof of the exact endpoint + credential this turn launched
+    /// against, adopted at `TurnStarted` from the engine's route receipt — not
+    /// re-resolved from mutable config. Only populated for routes that can
+    /// produce a follow-up prompt suggestion; see
+    /// [`crate::tui::prompt_suggestion::capture_route_authority`].
+    pub suggestion_authority: Option<crate::tui::prompt_suggestion::SuggestionRouteAuthority>,
 }
 
-/// State machine for onboarding new users.
+/// Identity of the compaction pass currently rewriting session context.
+///
+/// The event id prevents a delayed terminal event from clearing a newer pass,
+/// while `auto` selects the truthful live label in the phase strip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveCompaction {
+    pub(crate) id: String,
+    pub(crate) auto: bool,
+}
+
+/// Per-message context estimates used by the render-time context meter.
+/// Messages are append-only in the steady state; only the streaming tail is
+/// mutable, so the tail is refreshed while older entries remain cached.
+#[derive(Debug, Default)]
+pub(crate) struct ContextTokenCache {
+    pub(crate) message_tokens: Vec<usize>,
+}
+
+impl ContextTokenCache {
+    pub(crate) fn clear(&mut self) {
+        self.message_tokens.clear();
+    }
+}
+
+/// State machine for onboarding new users: one decision per screen, and
+/// only the decisions this install genuinely needs (#3938).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingState {
     Welcome,
-    /// Pick the UI locale before any other config decisions (#566).
-    /// Defaults to auto-detection from `LC_ALL` / `LANG`; explicit picks
+    /// Pick the UI locale — shown only when it cannot be confidently
+    /// inferred from settings or `LC_ALL` / `LANG` (#566). Explicit picks
     /// land in the persisted settings.toml via `Settings::set("locale", …)`.
     Language,
+    /// Choose a provider/model route — shown only when no usable local,
+    /// authenticated, or BYOK route is configured. The canonical provider
+    /// picker modal carries the choice itself.
     Provider,
-    ApiKey,
+    /// Trust the workspace — shown only when a trust decision is required.
     TrustDirectory,
-    Tips,
+    /// "You're ready." Enter opens the real composer pre-seeded with a
+    /// first task for this folder. Never an educational surface.
+    Ready,
     None,
 }
 
@@ -142,12 +203,31 @@ pub(crate) fn shell_command_from_bang_input(input: &str) -> Result<Option<&str>,
     if command.is_empty() {
         return Err("Usage: ! <shell command>");
     }
+
     Ok(Some(command))
+}
+
+pub(crate) fn is_stop_word(input: &str, stop_words: &[String]) -> Option<String> {
+    let trimmed = input.trim();
+    let after_prefix = trimmed
+        .strip_prefix('+')
+        .or_else(|| trimmed.strip_prefix('!'))
+        .map_or(trimmed, str::trim_start);
+    let word = after_prefix.trim_end_matches(|c: char| c.is_ascii_punctuation());
+    if word.is_empty() || word.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let lower = word.to_ascii_lowercase();
+    stop_words
+        .iter()
+        .find(|stop_word| stop_word.to_ascii_lowercase() == lower)
+        .cloned()
 }
 
 fn initial_onboarding_state(
     skip_onboarding: bool,
     was_onboarded: bool,
+    _needs_language: bool,
     needs_api_key: bool,
     needs_workspace_trust: bool,
 ) -> OnboardingState {
@@ -156,10 +236,17 @@ fn initial_onboarding_state(
     }
 
     if was_onboarded && needs_api_key {
-        OnboardingState::ApiKey
+        // Missing-key recovery uses the canonical provider picker so it can
+        // preserve the configured provider, endpoint, and model route before
+        // asking for a replacement secret.
+        OnboardingState::Provider
     } else if was_onboarded && needs_workspace_trust {
         OnboardingState::TrustDirectory
     } else {
+        // First run always starts at Welcome. Enter then routes to language,
+        // provider setup, trust, or ready depending on what this run needs.
+        // Skipping Welcome to land on the provider list was an over-correction:
+        // new users never saw a start screen or the calm API-key explanation.
         OnboardingState::Welcome
     }
 }
@@ -173,16 +260,33 @@ fn onboarding_is_workspace_trust_gate(
     !skip_onboarding && was_onboarded && !needs_api_key && needs_workspace_trust
 }
 
-/// Supported application modes for the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppMode {
-    Agent,
-    #[allow(dead_code)]
-    Auto,
-    /// Legacy compatibility alias; resolves to [`Self::Agent`] + bypass approvals.
-    Yolo,
-    Plan,
-    Operate,
+/// Resolve the launch onboarding state and the missing-key-recovery flag in one
+/// place. When the active xAI OAuth credential is missing (`xai_oauth_needs_reauth`),
+/// the user already chose xAI and only needs to re-authenticate it — so the
+/// generic provider picker must NOT reopen (returns `OnboardingState::None` and
+/// `missing_key_recovery = false`); the caller surfaces a re-auth message (#5032).
+fn launch_onboarding_decision(
+    skip_onboarding: bool,
+    was_onboarded: bool,
+    needs_language: bool,
+    needs_api_key: bool,
+    needs_workspace_trust: bool,
+    xai_oauth_needs_reauth: bool,
+) -> (OnboardingState, bool) {
+    let onboarding = if xai_oauth_needs_reauth && was_onboarded {
+        OnboardingState::None
+    } else {
+        initial_onboarding_state(
+            skip_onboarding,
+            was_onboarded,
+            needs_language,
+            needs_api_key,
+            needs_workspace_trust,
+        )
+    };
+    let missing_key_recovery =
+        !skip_onboarding && was_onboarded && needs_api_key && !xai_oauth_needs_reauth;
+    (onboarding, missing_key_recovery)
 }
 
 /// One row in the per-turn cache-telemetry ring (`/cache` debug surface, #263).
@@ -191,6 +295,9 @@ pub struct TurnCacheRecord {
     /// API provider used for the turn. This is recorded so cache misses can be
     /// correlated with provider/model route changes.
     pub provider: Option<ApiProvider>,
+    /// Exact non-secret configured route key. This distinguishes named custom
+    /// providers which all share [`ApiProvider::Custom`].
+    pub provider_identity: Option<String>,
     /// Concrete model used for the turn. For auto-model turns this is the
     /// routed model, not the literal `auto` setting.
     pub model: Option<String>,
@@ -210,6 +317,18 @@ pub struct TurnCacheRecord {
     ///   — in that case the `/cache` formatter infers the miss as
     ///   `input_tokens − cache_hit_tokens`.
     pub cache_miss_tokens: Option<u32>,
+    /// Cache-creation tokens (`cache_creation_input_tokens` on Anthropic-style
+    ///   payloads). Billed at a premium where the provider publishes one, so
+    ///   they are recorded as their own class rather than folded into misses.
+    pub cache_write_tokens: Option<u32>,
+    /// Reasoning tokens the provider reported. **Informational only**: every
+    ///   provider counts these inside `output_tokens`, so they are never added
+    ///   to billable output.
+    pub reasoning_tokens: Option<u32>,
+    /// The turn's cost with its provenance and per-class completeness, taken
+    ///   from the same call that fed the session total. `None` for records made
+    ///   without route provenance (legacy rows, synthetic test rows).
+    pub cost_audit: Option<crate::pricing::TurnCostAudit>,
     /// Approximate tokens spent re-sending prior `reasoning_content` on
     ///   V4-thinking tool-calling turns (chars/3 heuristic). Helps separate
     ///   cache misses caused by reasoning-replay churn from misses caused by
@@ -217,163 +336,6 @@ pub struct TurnCacheRecord {
     pub reasoning_replay_tokens: Option<u32>,
     /// Local timestamp the turn telemetry was recorded.
     pub recorded_at: Instant,
-}
-
-/// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
-///
-/// The config file accepts all five string values for forward-compat with
-/// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
-/// `Off` to `Low` and displays/sends `Max` as `xhigh` at the provider
-/// boundary. The default keyboard cycler walks the three DeepSeek-distinct
-/// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
-/// [`ReasoningEffort::cycle_next_for_provider`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningEffort {
-    Off,
-    Low,
-    Medium,
-    High,
-    Auto,
-    #[default]
-    Max,
-}
-
-impl ReasoningEffort {
-    /// Parse a config-file string into an effort tier. Unknown values fall
-    /// back to the default (`Max`) rather than erroring out.
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" | "false" => Self::Off,
-            "low" | "minimal" => Self::Low,
-            "medium" | "mid" => Self::Medium,
-            "high" => Self::High,
-            "auto" | "automatic" => Self::Auto,
-            "max" | "maximum" | "xhigh" | "ultracode" => Self::Max,
-            _ => Self::default(),
-        }
-    }
-
-    #[must_use]
-    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
-        Self::from_setting(value).normalize_for_provider(provider)
-    }
-
-    /// Canonical lowercase label used for config storage and UI hints.
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Auto => "auto",
-            Self::Max => "max",
-        }
-    }
-
-    /// Short label for the header chip.
-    #[must_use]
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Low => "low",
-            Self::Medium => "med",
-            Self::High => "high",
-            Self::Auto => "auto",
-            Self::Max => "max",
-        }
-    }
-
-    /// Provider-facing label for user-visible surfaces.
-    #[must_use]
-    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
-        match (provider, self.normalize_for_provider(provider)) {
-            (ApiProvider::OpenaiCodex, Self::Low) => "low",
-            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
-            (ApiProvider::OpenaiCodex, Self::High) => "high",
-            (ApiProvider::OpenaiCodex, Self::Max) => "xhigh",
-            (_, effort) => effort.short_label(),
-        }
-    }
-
-    /// Value forwarded to the engine/client. `None` means "provider default"
-    /// (for `Off` we still emit `"off"` so the client can inject
-    /// `thinking = {"type": "disabled"}`).
-    #[must_use]
-    pub fn api_value(self) -> Option<&'static str> {
-        Some(self.as_setting())
-    }
-
-    #[must_use]
-    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
-        if provider != ApiProvider::OpenaiCodex {
-            return self;
-        }
-        match self {
-            Self::Off => Self::Low,
-            Self::Auto => Self::Medium,
-            other => other,
-        }
-    }
-
-    #[must_use]
-    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
-        if provider != ApiProvider::OpenaiCodex {
-            return self.api_value();
-        }
-        Some(match self.normalize_for_provider(provider) {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "xhigh",
-            Self::Off => "low",
-            Self::Auto => "medium",
-        })
-    }
-
-    #[must_use]
-    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
-        self.api_value_for_provider(provider)
-            .unwrap_or_else(|| self.as_setting())
-    }
-
-    /// Cycle through the three behaviorally distinct tiers.
-    #[must_use]
-    pub fn cycle_next(self) -> Self {
-        match self {
-            Self::Off => Self::High,
-            Self::Auto => Self::Off,
-            Self::Low | Self::Medium | Self::High => Self::Max,
-            Self::Max => Self::Off,
-        }
-    }
-
-    #[must_use]
-    pub fn cycle_next_for_provider(self, provider: ApiProvider) -> Self {
-        if provider != ApiProvider::OpenaiCodex {
-            return self.cycle_next();
-        }
-        match self.normalize_for_provider(provider) {
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::Max,
-            Self::Max => Self::Low,
-            Self::Off | Self::Auto => Self::Low,
-        }
-    }
-}
-
-/// Sidebar content focus mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarFocus {
-    Auto,
-    Pinned,
-    Tasks,
-    Agents,
-    Context,
-    Hidden,
 }
 
 /// Browsing context captured when the `/model` picker is dismissed (#4109).
@@ -405,10 +367,138 @@ pub struct ProviderPickerMemory {
     pub selected_provider_id: Option<String>,
 }
 
+/// Bounded status vocabulary for the per-agent current-activity projection.
+///
+/// This is presentation state derived from structured worker/mailbox events;
+/// renderers map these variants to labels but never infer them from strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCurrentActivityStatus {
+    Queued,
+    Starting,
+    Running,
+    ModelWait,
+    RunningTool,
+    Waiting,
+    Done,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl From<AgentWorkerStatus> for AgentCurrentActivityStatus {
+    fn from(status: AgentWorkerStatus) -> Self {
+        match status {
+            AgentWorkerStatus::Queued => Self::Queued,
+            AgentWorkerStatus::Starting => Self::Starting,
+            AgentWorkerStatus::Running => Self::Running,
+            AgentWorkerStatus::WaitingForUser => Self::Waiting,
+            AgentWorkerStatus::ModelWait => Self::ModelWait,
+            AgentWorkerStatus::RunningTool => Self::RunningTool,
+            AgentWorkerStatus::Completed => Self::Done,
+            AgentWorkerStatus::Failed => Self::Failed,
+            AgentWorkerStatus::Cancelled => Self::Canceled,
+            AgentWorkerStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCurrentActivity {
+    pub status: AgentCurrentActivityStatus,
+    /// Safe bounded context, never a raw child transcript or tool result.
+    pub detail: Option<String>,
+    /// Safe display name for the one tool currently executing.
+    pub current_tool: Option<String>,
+    pub step: Option<u32>,
+}
+
+impl AgentCurrentActivity {
+    #[must_use]
+    pub fn bounded(
+        status: AgentCurrentActivityStatus,
+        detail: Option<String>,
+        current_tool: Option<String>,
+        step: Option<u32>,
+    ) -> Self {
+        fn bounded_nonempty(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| bound_agent_activity_text(&value))
+                .filter(|value| !value.trim().is_empty())
+        }
+
+        Self {
+            status,
+            detail: bounded_nonempty(detail),
+            current_tool: bounded_nonempty(current_tool),
+            step,
+        }
+    }
+}
+
+/// Convert untrusted child-agent text into a compact UI-safe projection.
+/// Full transcript artifacts remain the source of truth; only summaries that
+/// can enter the parent transcript/sidebar pass through this seam.
+pub(crate) fn bound_agent_activity_text(value: &str) -> String {
+    let mut visible = String::with_capacity(value.len());
+    crate::tui::osc8::strip_ansi_into(value, &mut visible);
+    let redacted = codewhale_config::persistence::redact_secrets(&visible);
+    crate::tui::history::summarize_tool_output(&redacted)
+}
+
+/// One bounded, structured tool outcome for the Agent Details projection.
+///
+/// This is populated only from `ToolCallCompleted` mailbox envelopes. It is
+/// deliberately not inferred from free-form progress text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecentAction {
+    pub tool: String,
+    pub step: u32,
+    pub ok: bool,
+}
+
+impl AgentRecentAction {
+    #[must_use]
+    pub fn bounded(tool: &str, step: u32, ok: bool) -> Self {
+        Self {
+            tool: bound_agent_activity_text(tool),
+            step,
+            ok,
+        }
+    }
+}
+
+pub(crate) const MAX_AGENT_RECENT_ACTIONS: usize = 3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+    /// Structured, bounded answer to "what is this agent doing now?".
+    pub current_activity: Option<AgentCurrentActivity>,
+    /// Last tool observed running for this child. Cleared by the matching
+    /// completion envelope so Work never presents a settled tool as live.
+    pub current_tool: Option<String>,
+    /// Successful file mutations observed for this child in this session.
+    pub files_touched: u32,
+    /// At most three tool outcomes observed through structured lifecycle
+    /// envelopes, oldest to newest.
+    pub recent_actions: VecDeque<AgentRecentAction>,
+    /// Effective route facts observed from the child's installed spawn route
+    /// or a later provider usage envelope. The launch event carries the exact
+    /// model frozen into the child runtime; usage may confirm it while also
+    /// supplying provider identity.
+    pub resolved_provider: Option<String>,
+    pub resolved_model: Option<String>,
+    /// Tokens this child has *used* (input + output), accumulated across its
+    /// own usage envelopes — the same total the worker budget tracks.
+    /// `None` until the provider actually reports usage: a sub-agent whose
+    /// spend is unknown renders no token figure at all rather than a
+    /// fabricated `0`.
+    pub received_tokens: Option<u64>,
+    /// Unsettled items on this child's own To-do list, from the latest
+    /// `WorkState` envelope. `None` until a real list is published — the
+    /// strip never invents a `0 left` chip for agents with no checklist.
+    pub todos_remaining: Option<u32>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -433,757 +523,6 @@ impl Default for LspRepairState {
             latest: "unavailable",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComposerDensity {
-    Compact,
-    Comfortable,
-    Spacious,
-}
-
-impl ComposerDensity {
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "compact" | "tight" => Self::Compact,
-            "spacious" | "loose" => Self::Spacious,
-            _ => Self::Comfortable,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptSpacing {
-    Compact,
-    Comfortable,
-    Spacious,
-}
-
-impl TranscriptSpacing {
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "compact" | "tight" => Self::Compact,
-            "spacious" | "loose" => Self::Spacious,
-            _ => Self::Comfortable,
-        }
-    }
-}
-
-impl SidebarFocus {
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => Self::Pinned,
-            // Persist/compat key remains "tasks"; user-facing panel is Activity (#4147/#4135).
-            "tasks" | "activity" | "live" | "running" => Self::Tasks,
-            "agents" | "subagents" | "sub-agents" => Self::Agents,
-            "context" | "session" => Self::Context,
-            "hidden" | "hide" | "closed" | "off" | "none" => Self::Hidden,
-            _ => Self::Auto,
-        }
-    }
-
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Pinned => "pinned",
-            Self::Tasks => "tasks",
-            Self::Agents => "agents",
-            Self::Context => "context",
-            Self::Hidden => "hidden",
-        }
-    }
-}
-
-/// Controls how dense tool-call runs are collapsed in the transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCollapseMode {
-    /// Collapse qualifying tool runs by default.
-    Compact,
-    /// Never collapse tool runs automatically.
-    Expanded,
-    /// Collapse only when calm mode is active.
-    Calm,
-}
-
-impl ToolCollapseMode {
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "expanded" | "off" | "none" => Self::Expanded,
-            "calm" | "calm-mode" | "calm_only" | "calm-only" => Self::Calm,
-            // `collapsed`/`collapse` are issue #3256's preferred names for the
-            // default; treat them like the canonical `compact`.
-            _ => Self::Compact,
-        }
-    }
-
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Compact => "compact",
-            Self::Expanded => "expanded",
-            Self::Calm => "calm",
-        }
-    }
-
-    #[must_use]
-    pub fn is_active(self, calm_mode: bool) -> bool {
-        match self {
-            Self::Compact => true,
-            Self::Expanded => false,
-            Self::Calm => calm_mode,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusToastLevel {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-pub struct StatusToast {
-    pub text: String,
-    pub level: StatusToastLevel,
-    pub created_at: Instant,
-    pub ttl_ms: Option<u64>,
-}
-
-impl StatusToast {
-    #[must_use]
-    pub fn new(text: impl Into<String>, level: StatusToastLevel, ttl_ms: Option<u64>) -> Self {
-        Self {
-            text: text.into(),
-            level,
-            created_at: Instant::now(),
-            ttl_ms,
-        }
-    }
-
-    #[must_use]
-    pub fn is_expired(&self, now: Instant) -> bool {
-        self.ttl_ms
-            .is_some_and(|ttl| now.duration_since(self.created_at).as_millis() >= u128::from(ttl))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComposerHistorySearch {
-    pre_search_input: String,
-    pre_search_cursor: usize,
-    query: String,
-    selected: usize,
-}
-
-impl ComposerHistorySearch {
-    fn new(pre_search_input: String, pre_search_cursor: usize) -> Self {
-        Self {
-            pre_search_input,
-            pre_search_cursor,
-            query: String::new(),
-            selected: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InputHistoryDraft {
-    input: String,
-    cursor: usize,
-}
-
-pub(crate) fn char_count(text: &str) -> usize {
-    text.chars().count()
-}
-
-fn byte_index_at_char(text: &str, char_index: usize) -> usize {
-    if char_index == 0 {
-        return 0;
-    }
-    text.char_indices()
-        .nth(char_index)
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| text.len())
-}
-
-fn remove_char_at(text: &mut String, char_index: usize) -> bool {
-    let start = byte_index_at_char(text, char_index);
-    if start >= text.len() {
-        return false;
-    }
-    let ch = text[start..].chars().next().unwrap();
-    let end = start + ch.len_utf8();
-    text.replace_range(start..end, "");
-    true
-}
-
-fn normalize_paste_text(text: &str) -> String {
-    if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        text.to_string()
-    }
-}
-
-fn sanitize_api_key_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
-}
-
-fn strip_raw_mouse_report_runs(input: &str, cursor: usize) -> Option<(String, usize)> {
-    // First pass: strip the well-defined control-sequence fragment
-    // shapes that crossterm sometimes hands us as `Char(c)` keystrokes
-    // when its event reader is interrupted mid-sequence during dense
-    // streaming output (#1915). This covers OSC 8 hyperlink fragments
-    // (`]8;;URL`, including the closing `]8;;`) and Kitty keyboard
-    // protocol fragments (`[?…u`, `[>…u`, `[?u`).
-    let (after_fragments, after_fragments_cursor, fragments_changed) =
-        strip_control_sequence_fragments(input, cursor);
-
-    // Second pass: the existing run-based filter handles SGR mouse
-    // reports (`[<35;44;18M`) and the multi-terminator burst shape
-    // (`5;46;18M;48;18M`) introduced in e63a4ba4a. It operates on a
-    // narrow char set so it can't be confused with user-typed text.
-    let chars: Vec<char> = after_fragments.chars().collect();
-    let mut output = String::with_capacity(after_fragments.len());
-    let mut new_cursor = 0usize;
-    let mut changed = fragments_changed;
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if is_raw_mouse_report_run_char(chars[index]) {
-            let start = index;
-            while index < chars.len() && is_raw_mouse_report_run_char(chars[index]) {
-                index += 1;
-            }
-            let run = &chars[start..index];
-            if let Some(keep) = raw_mouse_report_keep_mask(run) {
-                changed = true;
-                for (offset, ch) in run.iter().copied().enumerate() {
-                    if !keep[offset] {
-                        continue;
-                    }
-                    if start + offset < cursor {
-                        new_cursor += 1;
-                    }
-                    output.push(ch);
-                }
-                continue;
-            }
-            for (offset, ch) in run.iter().copied().enumerate() {
-                if start + offset < after_fragments_cursor {
-                    new_cursor += 1;
-                }
-                output.push(ch);
-            }
-            continue;
-        }
-
-        if index < after_fragments_cursor {
-            new_cursor += 1;
-        }
-        output.push(chars[index]);
-        index += 1;
-    }
-
-    changed.then(|| {
-        let cursor = new_cursor.min(char_count(&output));
-        (output, cursor)
-    })
-}
-
-fn is_raw_mouse_report_run_char(ch: char) -> bool {
-    matches!(ch, '\x1b' | '[' | '<' | ';' | ':' | 'M' | 'm') || ch.is_ascii_digit()
-}
-
-fn looks_like_raw_mouse_report_run(run: &[char]) -> bool {
-    if run.len() < 5 {
-        return false;
-    }
-    let has_separator = run.iter().any(|ch| matches!(ch, ';' | ':'));
-    let terminators = run.iter().filter(|ch| matches!(ch, 'M' | 'm')).count();
-    if !has_separator || terminators == 0 {
-        return false;
-    }
-    has_sgr_mouse_marker(run) || terminators >= 2
-}
-
-fn has_sgr_mouse_marker(run: &[char]) -> bool {
-    run.windows(2).any(|window| window == ['[', '<'])
-}
-
-fn raw_mouse_report_keep_mask(run: &[char]) -> Option<Vec<bool>> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut index = 0usize;
-
-    while index < run.len() {
-        let (start, body_start) = if run[index] == '\x1b'
-            && run.get(index + 1) == Some(&'[')
-            && run.get(index + 2) == Some(&'<')
-        {
-            (index, index + 3)
-        } else if run[index] == '[' && run.get(index + 1) == Some(&'<') {
-            (index, index + 2)
-        } else {
-            index += 1;
-            continue;
-        };
-
-        let mut end = body_start;
-        let mut has_digit = false;
-        let mut has_separator = false;
-        let mut matched = false;
-        while end < run.len() {
-            match run[end] {
-                '0'..='9' => {
-                    has_digit = true;
-                    end += 1;
-                }
-                ';' | ':' => {
-                    has_separator = true;
-                    end += 1;
-                }
-                'M' | 'm' if has_digit && has_separator => {
-                    ranges.push((start, end + 1));
-                    index = end + 1;
-                    matched = true;
-                    break;
-                }
-                _ => break,
-            }
-        }
-        if !matched {
-            index = index.saturating_add(1);
-        }
-    }
-
-    if ranges.is_empty() {
-        if looks_like_raw_mouse_report_run(run) {
-            return Some(vec![false; run.len()]);
-        }
-        return None;
-    }
-
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-    let first_start = ranges[0].0;
-    let mut prefix_start = first_start;
-    while prefix_start > 0 && is_raw_mouse_report_fragment_char(run[prefix_start - 1]) {
-        prefix_start -= 1;
-    }
-    if prefix_start < first_start
-        && looks_like_raw_mouse_report_fragment(&run[prefix_start..first_start])
-    {
-        ranges.push((prefix_start, first_start));
-    }
-
-    let last_end = ranges.iter().map(|(_, end)| *end).max().unwrap_or_default();
-    if last_end < run.len() && looks_like_raw_mouse_report_fragment(&run[last_end..]) {
-        ranges.push((last_end, run.len()));
-    }
-
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-    let mut keep = vec![true; run.len()];
-    for (start, end) in ranges {
-        for slot in keep.iter_mut().take(end.min(run.len())).skip(start) {
-            *slot = false;
-        }
-    }
-    Some(keep)
-}
-
-fn is_raw_mouse_report_fragment_char(ch: char) -> bool {
-    matches!(ch, ';' | ':' | 'M' | 'm') || ch.is_ascii_digit()
-}
-
-fn looks_like_raw_mouse_report_fragment(run: &[char]) -> bool {
-    if run.len() < 4 {
-        return false;
-    }
-    run.iter().any(|ch| ch.is_ascii_digit())
-        && run.iter().any(|ch| matches!(ch, ';' | ':'))
-        && run.iter().any(|ch| matches!(ch, 'M' | 'm'))
-}
-
-/// Scan `input` for control-sequence fragment shapes (#1915) — OSC 8
-/// hyperlinks and Kitty keyboard protocol responses — and excise each
-/// match. Returns `(output, new_cursor, changed)`. Cursor positions
-/// inside an excised fragment are moved to the fragment's start.
-///
-/// The match shapes are deliberately narrow so legitimate text like
-/// `[is this ok?]` or a typed URL survives untouched:
-///
-/// - **OSC 8**: `(\x1b?)] 8 ; ...` consuming everything up to the
-///   first BEL (`\x07`), `\x1b\\`, lone `\\`, or the next `\x1b]8;`
-///   block — terminator characters are optional because crossterm may
-///   have already consumed them.
-/// - **Kitty CSI**: `(\x1b?) [ (? | > | < | =) ... u` — the
-///   private-parameter prefix is what distinguishes a Kitty response
-///   from a user-typed `[…u` (which is exceedingly rare and would
-///   need an explicit private-parameter byte to be a real CSI).
-fn strip_control_sequence_fragments(input: &str, cursor: usize) -> (String, usize, bool) {
-    let chars: Vec<char> = input.chars().collect();
-    let mut output = String::with_capacity(input.len());
-    let mut new_cursor = 0usize;
-    let mut changed = false;
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if let Some(end) = match_osc8_fragment(&chars, index) {
-            // The excised span contributes nothing to `output`, so
-            // `new_cursor` simply doesn't tick for any of those
-            // characters. A cursor that was inside the span ends up at
-            // the fragment's start position in the rewritten input,
-            // which matches the existing run-stripper's behavior.
-            index = end;
-            changed = true;
-            continue;
-        }
-
-        if let Some(end) = match_kitty_csi_fragment(&chars, index) {
-            index = end;
-            changed = true;
-            continue;
-        }
-
-        if index < cursor {
-            new_cursor += 1;
-        }
-        output.push(chars[index]);
-        index += 1;
-    }
-
-    let cursor = new_cursor.min(char_count(&output));
-    (output, cursor, changed)
-}
-
-/// If an OSC 8 hyperlink fragment starts at `chars[start]`, return its
-/// end index (exclusive). The leading `ESC` is optional because
-/// crossterm's event parser often consumes it before reclassifying the
-/// tail as keystrokes.
-fn match_osc8_fragment(chars: &[char], start: usize) -> Option<usize> {
-    let body_start = if chars.get(start) == Some(&'\x1b')
-        && chars.get(start + 1) == Some(&']')
-        && chars.get(start + 2) == Some(&'8')
-        && chars.get(start + 3) == Some(&';')
-    {
-        start + 4
-    } else if chars.get(start) == Some(&']')
-        && chars.get(start + 1) == Some(&'8')
-        && chars.get(start + 2) == Some(&';')
-    {
-        start + 3
-    } else {
-        return None;
-    };
-
-    // After `]8;` we expect the OSC 8 payload: an optional second `;`
-    // (params separator), then the URL (or empty for the closing
-    // wrapper), then a terminator. We deliberately stop at the first
-    // ASCII whitespace so a typed `]8;` followed by real prose can't
-    // swallow the user's words — real OSC 8 URLs don't contain spaces.
-    let mut end = body_start;
-    while end < chars.len() {
-        let ch = chars[end];
-        // BEL terminator.
-        if ch == '\x07' {
-            return Some(end + 1);
-        }
-        // `ESC \\` string terminator (ST).
-        if ch == '\x1b' && chars.get(end + 1) == Some(&'\\') {
-            return Some(end + 2);
-        }
-        // Lone `\\` — crossterm sometimes delivers ST with the leading
-        // ESC already consumed, leaving just `\\` as a Char keystroke.
-        if ch == '\\' {
-            return Some(end + 1);
-        }
-        // Start of the next OSC 8 wrapper (closing `]8;;` glued to the
-        // body) — close the current fragment here so the next iteration
-        // matches that one separately.
-        if ch == '\x1b' && chars.get(end + 1) == Some(&']') {
-            return Some(end);
-        }
-        if ch == ']' && chars.get(end + 1) == Some(&'8') && chars.get(end + 2) == Some(&';') {
-            return Some(end);
-        }
-        if ch.is_whitespace() {
-            // We never crossed a terminator, so this isn't a real
-            // fragment — give up rather than eat user prose.
-            return None;
-        }
-        end += 1;
-    }
-
-    // Reached end of input without a terminator or whitespace. Treat as
-    // a fragment in flight (its tail will arrive on a later keystroke
-    // and get filtered then).
-    Some(end)
-}
-
-/// If a private-parameter CSI fragment starts at `chars[start]`, return its
-/// end index (exclusive). Shape: `(ESC)? [ (? | > | < | =) [0-9;:]* <final>`
-/// where `<final>` is any ASCII letter. This covers the Kitty keyboard
-/// protocol (`…u`) *and* the DEC private mode set/reset sequences a terminal
-/// emits during a session — bracketed paste (`[?2004h`/`[?2004l`), mouse
-/// capture (`[?1000h`), focus reporting (`[?1004h`), and synchronized output
-/// (`[?2026h`). Those end in `h`/`l`, not `u`, so the old `u`-only terminator
-/// let the leading `[` leak into the composer during dense streaming (#2592,
-/// regression of #1915). The private-parameter byte (`?`, `>`, `<`, `=`) is
-/// what keeps this distinct from text the user might plausibly type.
-fn match_kitty_csi_fragment(chars: &[char], start: usize) -> Option<usize> {
-    let after_csi = if chars.get(start) == Some(&'\x1b') && chars.get(start + 1) == Some(&'[') {
-        start + 2
-    } else if chars.get(start) == Some(&'[') {
-        start + 1
-    } else {
-        return None;
-    };
-
-    let priv_byte = chars.get(after_csi)?;
-    if !matches!(priv_byte, '?' | '>' | '<' | '=') {
-        return None;
-    }
-
-    let mut end = after_csi + 1;
-    let mut saw_param = false;
-    while end < chars.len() {
-        let ch = chars[end];
-        if ch.is_ascii_digit() || ch == ';' || ch == ':' {
-            saw_param = true;
-            end += 1;
-            continue;
-        }
-        // Final byte. The Kitty keyboard protocol ends in `u` and is valid
-        // with no parameters (`[?u`). DEC private mode set/reset ends in
-        // `h`/`l` and always carries a numeric mode — bracketed paste
-        // (`[?2004h`/`l`), mouse capture (`[?1000h`), focus reporting
-        // (`[?1004h`), synchronized output (`[?2026h`). Require a parameter
-        // before `h`/`l` so ordinary text like `[?help]` is left untouched.
-        return match ch {
-            'u' => Some(end + 1),
-            'h' | 'l' if saw_param => Some(end + 1),
-            _ => None,
-        };
-    }
-    None
-}
-
-const MAX_SUBMITTED_INPUT_CHARS: usize = 16_000;
-/// Maximum characters displayed in the composer for oversized input.
-/// Beyond this, the text is truncated for rendering but the full content
-/// is preserved for model submission (#3263).
-const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
-const MAX_DRAFT_HISTORY: usize = 50;
-
-impl AppMode {
-    /// Productive keyboard cycle: Plan -> Act -> Plan.
-    ///
-    /// `Auto` remains an internal variant while the real implementation is
-    /// redesigned; do not expose it through user-facing mode selection (#3733).
-    /// `Yolo` is kept for parse/back-compat only and is not in the Tab cycle.
-    /// Operate remains parseable for restored sessions and compatibility, but
-    /// user-facing selection must not offer a fail-closed mode whose control
-    /// board and host-enforced workflow receipts are not shipped yet.
-    pub const CYCLE: [Self; 2] = [Self::Plan, Self::Agent];
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "agent" | "act" | "auto" | "1" => Some(Self::Agent),
-            "plan" | "2" => Some(Self::Plan),
-            "operate" | "operation" | "ops" | "3" => Some(Self::Operate),
-            // Invisible one-way permission shorthand only — never a visible mode.
-            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
-                Some(Self::Yolo)
-            }
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn from_setting(value: &str) -> Self {
-        // Unreleased Multitask never shipped; normalize leftover settings to Operate.
-        match value.trim().to_ascii_lowercase().as_str() {
-            "multitask" | "multi" | "5" => Self::Operate,
-            other => Self::parse(other).unwrap_or(Self::Agent),
-        }
-    }
-
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Auto => "agent",
-            // Write current permission vocabulary, not the legacy YOLO label.
-            Self::Yolo => "agent",
-            Self::Plan => "plan",
-            Self::Operate => "operate",
-        }
-    }
-
-    /// Short label used in the UI footer.
-    pub fn label(self) -> &'static str {
-        match self {
-            AppMode::Agent => "ACT",
-            AppMode::Auto => "ACT",
-            AppMode::Yolo => "ACT",
-            AppMode::Plan => "PLAN",
-            AppMode::Operate => "OPERATE",
-        }
-    }
-
-    #[must_use]
-    pub fn display_name(self) -> &'static str {
-        match self {
-            AppMode::Agent => "Act",
-            AppMode::Auto => "Act",
-            AppMode::Yolo => "Act",
-            AppMode::Plan => "Plan",
-            AppMode::Operate => "Operate",
-        }
-    }
-
-    #[must_use]
-    pub fn number(self) -> char {
-        match self {
-            AppMode::Agent | AppMode::Auto | AppMode::Yolo => '1',
-            AppMode::Plan => '2',
-            AppMode::Operate => '3',
-        }
-    }
-
-    #[must_use]
-    pub fn uses_agent_baseline(self) -> bool {
-        matches!(self, Self::Agent | Self::Auto | Self::Operate)
-    }
-
-    /// Operate gets a higher parallel launch floor so background fan-out is
-    /// not throttled to a single slot when config is low.
-    #[must_use]
-    pub fn mode_delegation_launch_floor(self) -> usize {
-        match self {
-            Self::Operate => 4,
-            _ => 1,
-        }
-    }
-
-    /// Localized short name for the mode picker (user-facing surface only).
-    #[must_use]
-    pub fn display_name_localized(self, locale: Locale) -> Cow<'static, str> {
-        tr(
-            locale,
-            match self {
-                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgent,
-                AppMode::Plan => MessageId::AppModePlan,
-                AppMode::Operate => MessageId::AppModeOperate,
-            },
-        )
-    }
-
-    /// Localized one-line hint for the mode picker (user-facing surface only).
-    #[must_use]
-    pub fn picker_hint_localized(self, locale: Locale) -> Cow<'static, str> {
-        tr(
-            locale,
-            match self {
-                AppMode::Agent | AppMode::Auto | AppMode::Yolo => MessageId::AppModeAgentHint,
-                AppMode::Plan => MessageId::AppModePlanHint,
-                AppMode::Operate => MessageId::AppModeOperateHint,
-            },
-        )
-    }
-
-    #[allow(dead_code)]
-    /// Description shown in help or onboarding text.
-    pub fn description(self) -> &'static str {
-        match self {
-            AppMode::Agent | AppMode::Auto => {
-                "Act mode - direct work in the current session with tools"
-            }
-            AppMode::Yolo => "Act mode with Full Access (legacy compatibility setting)",
-            AppMode::Plan => "Plan mode - research and design before implementing",
-            AppMode::Operate => "Operate mode - coordinate a Fleet for multi-step work",
-        }
-    }
-
-    #[must_use]
-    pub fn next(self) -> Self {
-        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
-            return Self::Agent;
-        };
-        Self::CYCLE[(index + 1) % Self::CYCLE.len()]
-    }
-
-    #[must_use]
-    pub fn previous(self) -> Self {
-        let Some(index) = Self::CYCLE.iter().position(|mode| *mode == self) else {
-            return Self::Agent;
-        };
-        Self::CYCLE[(index + Self::CYCLE.len() - 1) % Self::CYCLE.len()]
-    }
-}
-
-/// Configuration required to bootstrap the TUI.
-#[derive(Clone)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct TuiOptions {
-    pub model: String,
-    pub workspace: PathBuf,
-    pub config_path: Option<PathBuf>,
-    pub config_profile: Option<String>,
-    pub allow_shell: bool,
-    /// Use the alternate screen buffer (fullscreen TUI).
-    pub use_alt_screen: bool,
-    /// Capture mouse input for internal scrolling/selection.
-    pub use_mouse_capture: bool,
-    /// Enable terminal bracketed-paste mode (OSC `?2004h` / `?2004l`). Defaults
-    /// on; settable via `bracketed_paste = false` in `settings.toml` for the
-    /// rare terminal that mishandles it.
-    pub use_bracketed_paste: bool,
-    /// Maximum number of concurrent sub-agents.
-    pub max_subagents: usize,
-    #[allow(dead_code)]
-    pub skills_dir: PathBuf,
-    #[allow(dead_code)]
-    pub memory_path: PathBuf,
-    #[allow(dead_code)]
-    pub notes_path: PathBuf,
-    #[allow(dead_code)]
-    pub mcp_config_path: PathBuf,
-    #[allow(dead_code)]
-    pub use_memory: bool,
-    /// Start in agent mode (defaults to agent; --yolo starts in YOLO)
-    pub start_in_agent_mode: bool,
-    /// Skip onboarding screens
-    pub skip_onboarding: bool,
-    /// Auto-approve tool executions (yolo mode)
-    pub yolo: bool,
-    /// Resume a previous session by ID
-    pub resume_session_id: Option<String>,
-    /// Pre-populate the composer with this text when the TUI starts.
-    /// Used by `deepseek pr <N>` (#451) to drop the model into a
-    /// session with the PR context already typed — the user can edit
-    /// before sending or hit Enter to fire as-is.
-    pub initial_input: Option<InitialInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InitialInput {
-    /// Pre-populate the composer and wait for the user to press Enter.
-    ///
-    /// Used by `codewhale pr <N>` (#451) to drop the model into a session
-    /// with the PR context already typed so the user can edit before sending.
-    Prefill(String),
-    /// Pre-populate the composer, submit it once startup is ready, then keep
-    /// the interactive session open for follow-up messages (#2370).
-    Submit(String),
 }
 
 /// Pre-session launch menu state for the underwater shell.
@@ -1223,8 +562,10 @@ impl LaunchState {
         let worktree_available = std::process::Command::new("git")
             .current_dir(workspace)
             .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .is_ok_and(|output| output.status.success());
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
         Self {
             visible,
             selected: 0,
@@ -1234,42 +575,6 @@ impl LaunchState {
             worktree_available,
             row_areas: Vec::new(),
         }
-    }
-}
-
-// === Sub-state structs for App field organization (#377) ===
-
-/// Vim modal editing mode for the composer input area.
-///
-/// Enabled via `[composer] mode = "vim"` in `settings.toml`.  When the
-/// composer vim mode is active the user starts in `Normal` mode and presses
-/// `i`, `a`, or `o` to enter `Insert` mode.  `Esc` from `Insert` returns to
-/// `Normal`.  Standard vim motions (`h`/`j`/`k`/`l`, `w`/`b`, `0`/`$`, `x`,
-/// `dd`) work in `Normal` mode.  `Visual` is reserved for future selection
-/// support and currently behaves like `Normal`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VimMode {
-    /// Normal / command mode — motions and operators, no text insertion.
-    #[default]
-    Normal,
-    /// Insert mode — characters are appended at the cursor as typed.
-    Insert,
-    /// Visual mode — reserved for future selection support.
-    Visual,
-}
-
-impl VimMode {
-    /// Localized status-bar label shown in the composer border (user-facing).
-    #[must_use]
-    pub fn label_localized(self, locale: Locale) -> Cow<'static, str> {
-        tr(
-            locale,
-            match self {
-                Self::Normal => MessageId::VimModeNormal,
-                Self::Insert => MessageId::VimModeInsert,
-                Self::Visual => MessageId::VimModeVisual,
-            },
-        )
     }
 }
 
@@ -1296,22 +601,6 @@ pub struct MentionCompletionCache {
     pub follow_links: bool,
     /// Cached completion entries.
     pub entries: Vec<String>,
-}
-
-/// Cached full candidate walk for @-mention completions. One workspace walk
-/// serves every subsequent keystroke of the same mention token — the
-/// per-keystroke synchronous re-walk was the dominant composer latency on
-/// large repos (#3757). Path-like partials (containing `/` or starting with
-/// `.`) bypass this cache because local path-reference completions are
-/// needle-dependent.
-#[derive(Debug, Clone)]
-pub struct MentionCandidateCache {
-    pub workspace: PathBuf,
-    pub cwd: Option<PathBuf>,
-    pub walk_depth: usize,
-    pub follow_links: bool,
-    pub collected_at: std::time::Instant,
-    pub candidates: Vec<String>,
 }
 
 /// Composer input state — grouped fields for the text input area.
@@ -1345,9 +634,12 @@ pub struct ComposerState {
     /// Cached @-mention completions to avoid re-walking the filesystem when
     /// the cursor moves inside the same mention token.
     pub mention_completion_cache: Option<MentionCompletionCache>,
-    /// Cached full candidate list so successive keystrokes inside one mention
-    /// token filter in memory instead of re-walking the workspace (#3757).
-    pub mention_candidate_cache: Option<MentionCandidateCache>,
+    /// Serialized background discovery and its bounded candidate cache. All
+    /// filesystem traversal for composer completions lives behind this owner.
+    pub(crate) mention_discovery: crate::tui::mention_completion::MentionDiscovery,
+    /// Launch directory captured once so rendering a completion popup never
+    /// needs to call `getcwd` on the UI thread.
+    pub(crate) mention_cwd: Option<PathBuf>,
     /// Whether vim modal editing is enabled for this composer.
     /// Sourced from `Settings::composer_vim_mode` at startup.
     pub vim_enabled: bool,
@@ -1384,7 +676,8 @@ impl Default for ComposerState {
             mention_menu_selected: 0,
             mention_menu_hidden: false,
             mention_completion_cache: None,
-            mention_candidate_cache: None,
+            mention_discovery: crate::tui::mention_completion::MentionDiscovery::default(),
+            mention_cwd: std::env::current_dir().ok(),
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
@@ -1404,10 +697,12 @@ pub struct ViewportState {
     pub transcript_scrollbar_dragging: bool,
     pub last_transcript_area: Option<Rect>,
     pub last_composer_area: Option<Rect>,
-    /// Outer rect of the right-hand sidebar (when visible), stored at render
-    /// time so mouse hit-testing can keep scroll events over the sidebar from
-    /// leaking into the transcript viewport.
-    pub last_sidebar_area: Option<Rect>,
+    /// Last left-click trace over the composer, for double/triple-click
+    /// word/line selection (crossterm does not decode click counts).
+    pub composer_click_trace: Option<crate::tui::mouse_ui::ComposerClickTrace>,
+    /// Painted band occupied by the active inline approval. Stored so wheel
+    /// routing can prefer the visible card over side surfaces underneath it.
+    pub last_approval_area: Option<Rect>,
     /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
     pub last_workflow_panel_area: Option<Rect>,
     pub last_workflow_cancel_area: Option<Rect>,
@@ -1439,7 +734,8 @@ impl Default for ViewportState {
             transcript_scrollbar_dragging: false,
             last_transcript_area: None,
             last_composer_area: None,
-            last_sidebar_area: None,
+            composer_click_trace: None,
+            last_approval_area: None,
             last_workflow_panel_area: None,
             last_workflow_cancel_area: None,
             last_transcript_top: 0,
@@ -1454,53 +750,25 @@ impl Default for ViewportState {
     }
 }
 
-/// Verdict for a hunt (#2092).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HuntVerdict {
-    #[default]
-    Hunting,
-    Hunted,
-    Wounded,
-    Escaped,
-}
-
-impl HuntVerdict {
-    #[must_use]
-    pub fn goal_status(self) -> crate::tools::goal::GoalStatus {
-        match self {
-            Self::Hunting => crate::tools::goal::GoalStatus::Active,
-            Self::Hunted => crate::tools::goal::GoalStatus::Complete,
-            Self::Wounded => crate::tools::goal::GoalStatus::Paused,
-            Self::Escaped => crate::tools::goal::GoalStatus::Blocked,
-        }
-    }
-
-    #[must_use]
-    pub fn from_goal_status(status: crate::tools::goal::GoalStatus) -> Self {
-        match status {
-            crate::tools::goal::GoalStatus::Active => Self::Hunting,
-            crate::tools::goal::GoalStatus::Paused => Self::Wounded,
-            crate::tools::goal::GoalStatus::Complete => Self::Hunted,
-            crate::tools::goal::GoalStatus::Blocked => Self::Escaped,
-        }
-    }
-}
-
-/// Hunt tracking state (#2092 — was GoalState).
+/// Host-side tracking state for the active thread goal. Mirrors the
+/// engine's authoritative `SharedGoalState` snapshot (`GoalUpdated`) so the
+/// sidebar, top bar, and system prompt all read one truth.
 #[derive(Debug, Clone, Default)]
-pub struct HuntState {
-    pub quarry: Option<String>,
+pub struct HostGoalState {
+    pub objective: Option<String>,
     pub token_budget: Option<u32>,
     pub tokens_used: u64,
     pub time_used_seconds: u64,
     pub continuation_count: u32,
+    /// Why an unfinished goal is paused. Kept separate from the four-state
+    /// status so usage, budget, and run-limit stops stay distinguishable.
+    pub pause_reason: Option<crate::tools::goal::GoalPauseReason>,
     pub started_at: Option<Instant>,
-    /// When the goal reached a terminal verdict (Hunted/Wounded/Escaped).
+    /// When the goal reached a terminal status (Complete/Blocked).
     /// While `None`, elapsed time keeps growing; once set, the sidebar freezes
     /// the timer at `finished_at - started_at` so completed goals stop ticking.
     pub finished_at: Option<Instant>,
-    pub verdict: HuntVerdict,
+    pub status: crate::tools::goal::GoalStatus,
 }
 
 /// Session cost and token telemetry state.
@@ -1508,9 +776,18 @@ pub struct HuntState {
 pub struct SessionState {
     pub session_cost: f64,
     pub session_cost_cny: f64,
+    /// Priced estimate accumulated from the in-flight turn's per-step
+    /// `TurnUsage` receipts, so the cost surfaces move while a long agentic
+    /// turn is still running. Display-only: cleared at `TurnComplete`, which
+    /// re-prices the whole turn's cumulative usage authoritatively into
+    /// `session_cost`. Never persisted.
+    pub pending_turn_cost: f64,
+    pub pending_turn_cost_cny: f64,
     pub subagent_cost: f64,
     pub subagent_cost_cny: f64,
-    pub subagent_cost_event_seqs: HashSet<u64>,
+    /// Redacted provider-response identities already accrued. The same
+    /// fingerprints are persisted by the session and worker projections.
+    pub subagent_usage_sources: HashSet<String>,
     pub displayed_cost_high_water: f64,
     pub displayed_cost_high_water_cny: f64,
     pub last_prompt_tokens: Option<u32>,
@@ -1525,7 +802,55 @@ pub struct SessionState {
     pub total_input_tokens: u32,
     pub total_cache_hit_tokens: u32,
     pub total_cache_miss_tokens: u32,
+    /// Cache-creation (cache-write) tokens across the session. Tracked as its
+    /// own class because providers that publish a write premium bill it above
+    /// the ordinary input rate, so folding it into misses understated spend.
+    pub total_cache_write_tokens: u32,
     pub total_output_tokens: u32,
+    /// Turns whose route was money-metered and produced an authoritative
+    /// price. These are exactly the turns inside `session_cost`.
+    pub cost_priced_turns: u32,
+    /// Turns whose route was money-metered — or of unknown billing basis — but
+    /// produced no authoritative price, so they are missing from `session_cost`
+    /// entirely. `/cost` reports this instead of presenting the subtotal as a
+    /// complete figure.
+    pub cost_unpriced_turns: u32,
+    /// CNY-specific coverage. Most providers publish USD only, so these cannot
+    /// share the USD counters without falsely calling a mixed-route CNY subtotal
+    /// complete.
+    pub cost_cny_priced_turns: u32,
+    pub cost_cny_unpriced_turns: u32,
+    /// Stable reason labels for the unpriced turns, in sorted order.
+    ///
+    /// `String` rather than `&'static str` because this state round-trips
+    /// through a saved session: a label read back from disk was written by some
+    /// build's vocabulary, not necessarily this one's.
+    pub cost_unpriced_reasons: BTreeSet<String>,
+    pub cost_cny_unpriced_reasons: BTreeSet<String>,
+    /// Token classes used on some route this session that carry no published
+    /// price. Their turns fail closed rather than under-report.
+    pub cost_unpriced_classes: BTreeSet<String>,
+    /// Provenance labels of the pricing rows behind the priced turns
+    /// (`models_dev_bundled`, `provider_live`, `provider_docs`, …).
+    pub cost_pricing_provenances: BTreeSet<String>,
+    /// Live-pricing downgrade receipts: a live catalog row that could not be
+    /// verified for the endpoint that served a turn, so the bundled snapshot was
+    /// used instead of claiming authoritative live provenance.
+    pub cost_live_pricing_defects: BTreeSet<String>,
+    /// Live-pricing defects for which no bundled row could produce a price.
+    pub cost_live_pricing_unusable_defects: BTreeSet<String>,
+    /// One redacted receipt per distinct audited route:
+    /// provider, configured identity, wire model, billing surface, endpoint
+    /// fingerprint, billing mode, currency. Never a URL, credential, or filesystem path.
+    pub cost_route_receipts: BTreeSet<String>,
+    /// True when the restored session has no coverage state at all.
+    ///
+    /// Sessions written before coverage was tracked deserialize their new fields
+    /// from serde defaults, which look exactly like "0 priced, 0 unpriced" — i.e.
+    /// a complete total covering nothing. That reading is false, so the load path
+    /// marks the session explicitly unknown and `/cost` says so rather than
+    /// presenting fabricated completeness, even for an all-zero record (#4318).
+    pub cost_coverage_unknown_legacy: bool,
     pub turn_cache_history: VecDeque<TurnCacheRecord>,
     pub last_cache_inspection: Option<PromptInspection>,
     pub last_warmup_key: Option<CacheWarmupKey>,
@@ -1534,6 +859,8 @@ pub struct SessionState {
     /// `/cache inspect` uses this to inspect the same tool schema bytes
     /// that were eligible for the provider's prefix cache.
     pub last_tool_catalog: Option<Vec<Tool>>,
+    /// Exact tool field captured at the latest model request seam.
+    pub last_tool_request_snapshot: Option<crate::tool_inspection::ToolInspectionSnapshot>,
     /// API base URL used by the most recent model request or cache warmup.
     pub last_base_url: Option<String>,
 }
@@ -1553,24 +880,33 @@ pub enum SidebarRowAction {
     /// The user confirms with Enter or cancels by editing/clearing the draft.
     #[allow(dead_code)] // destructive confirm path; mouse_ui already matches it (TUI-DOG-008)
     PrefillCommand(String),
-    HotbarSlot(u8),
     ToggleAgentDetails {
         agent_id: String,
     },
-    /// Drill into the child's transcript card (action tree, status, summary)
-    /// in the detail pager — registered on the expanded dossier rows (#2889
-    /// slice, dogfood A3).
+    /// Select the persistent Agents panel. This is deliberately a navigation
+    /// action rather than a modal: the Subagents summary is a group door, so
+    /// it should reveal the standing register instead of fabricating a detail
+    /// page for the count itself.
+    ShowSubagentsPanel,
+    /// Open the child's bounded, safe status projection. Exact transcript
+    /// evidence is a separate explicit action (#2889).
     OpenAgentDetail {
+        agent_id: String,
+    },
+    /// Open the child's artifact-first exact transcript. This is separate
+    /// from the safe default details projection (#2889).
+    OpenAgentTranscript {
         agent_id: String,
     },
     CancelAgent {
         agent_id: String,
     },
-    /// Safe read-only inspection for work rows without a mutable backend
-    /// action (for example an agent-owned To-do item).
-    InspectText {
-        label: String,
-        detail: String,
+    /// Open the Work Graph inspector in the shared pager. Any lifecycle stop
+    /// action is carried into that inspector instead of consuming row width.
+    InspectWork {
+        title: String,
+        body: String,
+        stop_action: Option<Box<SidebarRowAction>>,
     },
 }
 
@@ -1580,24 +916,12 @@ impl SidebarRowAction {
         match self {
             Self::Command(command) => Some(command.as_str()),
             Self::PrefillCommand(_)
-            | Self::HotbarSlot(_)
             | Self::ToggleAgentDetails { .. }
+            | Self::ShowSubagentsPanel
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::CancelAgent { .. }
-            | Self::InspectText { .. } => None,
-        }
-    }
-
-    #[must_use]
-    pub fn is_cancel_action(&self) -> bool {
-        match self {
-            Self::Command(command) => command.contains(" cancel "),
-            Self::PrefillCommand(command) => command.contains(" cancel "),
-            Self::CancelAgent { .. } => true,
-            Self::ToggleAgentDetails { .. }
-            | Self::OpenAgentDetail { .. }
-            | Self::InspectText { .. }
-            | Self::HotbarSlot(_) => false,
+            | Self::InspectWork { .. } => None,
         }
     }
 }
@@ -1642,9 +966,11 @@ impl Default for SessionState {
         Self {
             session_cost: 0.0,
             session_cost_cny: 0.0,
+            pending_turn_cost: 0.0,
+            pending_turn_cost_cny: 0.0,
             subagent_cost: 0.0,
             subagent_cost_cny: 0.0,
-            subagent_cost_event_seqs: HashSet::new(),
+            subagent_usage_sources: HashSet::new(),
             displayed_cost_high_water: 0.0,
             displayed_cost_high_water_cny: 0.0,
             last_prompt_tokens: None,
@@ -1658,11 +984,25 @@ impl Default for SessionState {
             total_input_tokens: 0,
             total_cache_hit_tokens: 0,
             total_cache_miss_tokens: 0,
+            total_cache_write_tokens: 0,
             total_output_tokens: 0,
+            cost_priced_turns: 0,
+            cost_unpriced_turns: 0,
+            cost_cny_priced_turns: 0,
+            cost_cny_unpriced_turns: 0,
+            cost_unpriced_reasons: BTreeSet::new(),
+            cost_cny_unpriced_reasons: BTreeSet::new(),
+            cost_unpriced_classes: BTreeSet::new(),
+            cost_pricing_provenances: BTreeSet::new(),
+            cost_live_pricing_defects: BTreeSet::new(),
+            cost_live_pricing_unusable_defects: BTreeSet::new(),
+            cost_route_receipts: BTreeSet::new(),
+            cost_coverage_unknown_legacy: false,
             turn_cache_history: VecDeque::new(),
             last_cache_inspection: None,
             last_warmup_key: None,
             last_tool_catalog: None,
+            last_tool_request_snapshot: None,
             last_base_url: None,
         }
     }
@@ -1674,6 +1014,7 @@ impl SessionState {
         self.total_input_tokens = 0;
         self.total_cache_hit_tokens = 0;
         self.total_cache_miss_tokens = 0;
+        self.total_cache_write_tokens = 0;
         self.total_output_tokens = 0;
         self.last_output_throughput = None;
     }
@@ -1692,6 +1033,8 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_model: String,
     pub previous_model_ids_passthrough: bool,
     pub previous_route_limits: Option<RouteLimits>,
+    pub previous_route_base_url: String,
+    pub previous_context_window_source: crate::route_runtime::ContextWindowSource,
     pub previous_context_window_override: Option<u32>,
     pub previous_config: Config,
     pub previous_onboarding: OnboardingState,
@@ -1699,8 +1042,66 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_api_key_env_only: bool,
 }
 
+/// Opaque completion returned by a spawned dispatch task. It carries the
+/// captured data needed to apply success or rollback on the event loop.
+pub type DispatchApplyFn = Box<
+    dyn FnOnce(
+            &mut App,
+            &crate::core::engine::EngineHandle,
+            &crate::config::Config,
+        ) -> anyhow::Result<()>
+        + Send,
+>;
+
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
+/// A route change made in-session that the user has not yet decided how to
+/// save. Route changes are temporary by default; persisting them requires an
+/// explicit choice (Update this Fleet / Save as a new Fleet / Remember as my
+/// default / Keep for this session only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRouteSave {
+    /// Provider identity the session is now on.
+    pub provider_identity: String,
+    /// Exact model id the session is now on.
+    pub model: String,
+    /// The selected Fleet at change time, when one exists.
+    pub fleet: Option<(String, crate::fleet::store::FleetScope)>,
+}
+
+/// Write `provider_identity`/`model` to `settings.toml` as the route the next
+/// launch should open with, and return the line to show the operator.
+///
+/// `default_provider` is what `App::new` consults first, so pinning it is the
+/// half that actually survives a restart; the provider-scoped entry carries the
+/// model. `default_model` is a DeepSeek-only legacy key and is written only for
+/// those providers, matching how startup reads it back.
+fn persist_route_as_startup_default(provider_identity: &str, model: &str) -> String {
+    let route = format!("{provider_identity}/{model}");
+    match try_persist_route_as_startup_default(provider_identity, model) {
+        Ok(()) => format!("Remembered {route} as the startup default (settings.toml)."),
+        Err(err) => format!("Save failed: {err}"),
+    }
+}
+
+fn try_persist_route_as_startup_default(
+    provider_identity: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    crate::settings::Settings::transact(|settings| {
+        settings.default_provider = Some(provider_identity.to_string());
+        settings.set_model_for_provider(provider_identity, model);
+        if matches!(
+            crate::config::ApiProvider::parse(provider_identity),
+            Some(crate::config::ApiProvider::Deepseek)
+                | Some(crate::config::ApiProvider::DeepseekCN)
+        ) {
+            settings.set("default_model", model)?;
+        }
+        Ok(())
+    })
+}
+
 pub struct App {
     pub mode: AppMode,
     /// Registered hotbar actions available for future slot config/render layers.
@@ -1714,7 +1115,7 @@ pub struct App {
     /// so the replacement shell can be removed or promoted as one unit.
     pub work_surface: crate::tui::work_surface::WorkSurfaceState,
     /// Goal sub-state.
-    pub hunt: HuntState,
+    pub goal: HostGoalState,
     /// Session sub-state (cost, tokens, telemetry).
     pub session: SessionState,
     /// Active tool restriction from custom slash command frontmatter.
@@ -1722,20 +1123,46 @@ pub struct App {
     pub active_allowed_tools: Option<Vec<String>>,
     /// True when the active custom slash command opted into pause/resume.
     pub pausable: bool,
+    /// A route change made in-session awaits an explicit save decision. When
+    /// set, the next key press opens the route-save prompt unless a modal is
+    /// already open.
+    pub pending_route_save: Option<PendingRouteSave>,
     /// True after Esc paused a pausable command and before it is resumed or cancelled.
     pub paused: bool,
     /// Saved custom-command objective while the command is paused.
-    pub paused_quarry: Option<String>,
+    pub paused_goal_objective: Option<String>,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
+    /// Bumped when destructive reindexing could make a cached Space owner name
+    /// a different cell before redraw; ordinary streaming revisions preserve it.
+    pub(crate) transcript_identity_epoch: u64,
     /// Per-cell revision counter, kept in lockstep with `history`.
     pub history_revisions: Vec<u64>,
+    /// Cached tool-run grouping for transcript collapse. The detector is
+    /// keyed by the same mutation generation that invalidates transcript
+    /// cells, so idle frames do not rescan the full history.
+    pub(crate) tool_run_cache: ToolRunCache,
     /// Monotonic counter used to issue fresh per-cell revisions.
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
+    pub(crate) context_token_cache: RefCell<ContextTokenCache>,
+    /// Typed account-owned browser relay for this exact TUI session.
+    pub remote_control: crate::remote_control::RemoteControlController,
+    pub start_remote_control_on_launch: bool,
     pub is_loading: bool,
+    /// Sender for spawned dispatch tasks to report completion back to the
+    /// event loop. The closure is called with `&mut App` so the async phase
+    /// never needs `&mut App` while awaiting network I/O (#4605).
+    pub dispatch_completion_tx: Option<tokio::sync::mpsc::Sender<DispatchApplyFn>>,
+    /// True while a spawned dispatch task is in flight (#4605). Set in the
+    /// sync prepare phase and cleared when the completion closure runs, so a
+    /// submit after an Esc-cancel (which clears `is_loading`) still queues
+    /// instead of spawning a second dispatch that could reorder ops.
+    pub dispatch_in_flight: bool,
     /// Timestamp of the most recent Enter while the engine was busy.
-    /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
+    /// Retained for session layout compatibility; bare-Enter double-tap
+    /// steering was removed (use Ctrl+Enter instead).
+    #[allow(dead_code)]
     pub last_enter_instant: Option<Instant>,
     /// Whether the once-per-turn provider-wait incident (#3095) has already
     /// been logged for the current turn.
@@ -1758,6 +1185,11 @@ pub struct App {
     pub status_message: Option<String>,
     /// Recent status toasts (ephemeral, newest at back).
     pub status_toasts: VecDeque<StatusToast>,
+    /// Header chip label (e.g. `↑ v0.9.5`) set once by the fire-and-forget
+    /// startup version check when a newer stable release exists. Drives the
+    /// small persistent update chip in the header so the affordance survives
+    /// the transient toast without nagging (FINISH-0.9.4 #14).
+    pub update_available: Option<String>,
     /// Sticky status toast used for important warnings/errors.
     pub sticky_status: Option<StatusToast>,
     /// Last status text already promoted from `status_message` into toast state.
@@ -1766,6 +1198,12 @@ pub struct App {
     /// Persisted model selections by provider name. Loaded from settings so
     /// `/model` and the picker can surface saved provider-specific choices.
     pub provider_models: HashMap<String, String>,
+    /// Additive provider-scoped model IDs enabled for the ordinary picker.
+    /// The catalog remains separately discoverable and selecting from it adds
+    /// to this set rather than replacing earlier enabled choices.
+    pub enabled_provider_models: HashMap<String, Vec<String>>,
+    /// Exact provider/model pins loaded from settings, in user order.
+    pub pinned_models: Vec<crate::settings::PinnedModel>,
     /// When true, the model is auto-selected based on request complexity
     /// rather than using a fixed model. The `/model auto` command sets this.
     /// `dispatch_user_message` calls `auto_model_heuristic` to resolve the
@@ -1775,9 +1213,17 @@ pub struct App {
     pub last_effective_model: Option<String>,
     /// Provider that actually served the latest auto-routed turn.
     pub last_effective_provider: Option<ApiProvider>,
+    /// Exact non-secret identity for the provider that served the latest Auto
+    /// turn. This matters for named custom providers, which all share the
+    /// `ApiProvider::Custom` enum variant.
+    pub(crate) last_effective_provider_identity: Option<String>,
+    /// Auto decision metadata for the most recently resolved Auto turn.
+    pub(crate) last_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
     /// Route selected for the next turn, retained for in-flight UI details
     /// until the engine confirms the authoritative `TurnStarted` route.
     pub pending_turn_route: Option<(ApiProvider, String, bool)>,
+    /// Auto decision metadata waiting to be paired with `pending_turn_route`.
+    pub(crate) pending_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
     /// Authoritative lifecycle metadata attached to the most recent
     /// `TurnStarted`. Kept separate from `pending_turn_route` so a preceding
     /// compaction completion cannot consume the next model turn's route.
@@ -1786,6 +1232,13 @@ pub struct App {
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
     pub api_provider: ApiProvider,
+    /// Exact configured provider key for persistence and route restoration.
+    /// Built-ins use their canonical slug; named custom providers retain the
+    /// user-owned key instead of collapsing to `custom`.
+    pub(crate) provider_identity: String,
+    /// Additive exact configured id for persistence. `None` preserves the
+    /// legacy root-level custom route even when a same-key table appears.
+    pub(crate) provider_exact_id: Option<String>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,
     /// Per-provider auth/local readiness snapshot for the fallback chain (#2574).
@@ -1808,34 +1261,76 @@ pub struct App {
     pub model_ids_passthrough: bool,
     /// Resolved provider/model route limits for the active runtime route.
     pub active_route_limits: Option<RouteLimits>,
+    /// Exact resolved endpoint for the active runtime route. This stays
+    /// separate from persisted config so endpoint-sensitive compatibility
+    /// (notably Kimi Code's bare `k3`) is never inferred from a provider name
+    /// alone.
+    pub active_route_base_url: String,
+    /// Provenance for `active_route_limits`' effective context window. This
+    /// is an operator-facing receipt, not a claim about provider billing.
+    pub active_context_window_source: crate::route_runtime::ContextWindowSource,
     /// User-configured provider context-window override for the active route.
     pub active_context_window_override: Option<u32>,
     /// Pending provider transition for transactional rollback when the next
     /// auth failure indicates the new provider cannot be used.
     pub pending_provider_switch: Option<PendingProviderSwitch>,
-    /// Current reasoning-effort tier for DeepSeek thinking mode.
-    /// Cycled via Shift+Tab; initialized from config at startup.
+    /// Current live reasoning-effort selection. Route changes may normalize
+    /// this value; the raw user choice remains in
+    /// [`Self::reasoning_effort_preference`].
     pub reasoning_effort: ReasoningEffort,
-    /// Last concrete thinking tier chosen while `reasoning_effort` is auto.
-    pub last_effective_reasoning_effort: Option<ReasoningEffort>,
+    /// Raw explicit user preference, before any fixed provider/model route
+    /// normalizes it. `None` means the current live tier is an implicit route
+    /// default or compatibility inference and must not constrain Auto routing.
+    pub(crate) reasoning_effort_preference: Option<ReasoningEffort>,
+    /// Last effective thinking receipt for the most recently accepted route.
+    pub(crate) last_effective_reasoning_effort: Option<EffectiveReasoningEffort>,
     pub workspace: PathBuf,
+    /// Effective `[workflow]` table for this session (`/workflow settings`).
+    pub workflow_config: codewhale_config::WorkflowConfigToml,
+    /// Effective `[goal] max_continuations` backstop; `0` means unlimited.
+    pub goal_max_continuations: u32,
+    /// Typed engine lifecycle state for the cancellable between-turn wait.
+    pub goal_continuation_waiting: bool,
+    /// Effective explicit/managed filesystem scope captured at startup. The
+    /// named permission posture supplies the default when this is `None`.
+    pub configured_sandbox_mode: Option<String>,
+    /// Configured `sandbox_network_access`. `None`/`Some(false)` keep the
+    /// workspace-write sandbox network-restricted.
+    pub configured_sandbox_network: Option<bool>,
+    /// The sandbox backend this platform+config can actually enforce with,
+    /// resolved once at startup. `None` means there is NO enforcement
+    /// available (default Linux without `prefer_bwrap`, and all Windows), so
+    /// surfaces must not claim the session is sandboxed (2026-08-04 audit).
+    pub sandbox_backend: Option<crate::sandbox::SandboxType>,
+    /// Off-event-loop worker for durable Lane control writes. `/lane interrupt`
+    /// submits here instead of tearing down a Runtime on the composer thread
+    /// (#4022).
+    pub lane_control: crate::lane_control::LaneControlQueue,
+    /// Immutable plugin catalogue scoped to this App's effective workspace.
+    pub plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
     pub config_path: Option<PathBuf>,
     pub config_profile: Option<String>,
+    /// Legacy executable plugin-tool directory resolved from the already
+    /// loaded configuration. Slash-command inventory must not reload the full
+    /// config (and thereby re-read credential-bearing fields) merely to find
+    /// this path.
+    pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
     pub skills_scan_codewhale_only: bool,
+    /// Whether the optional project context pack was enabled when this
+    /// session loaded its configuration. Context diagnostics consult this
+    /// source of truth even before the first system prompt is assembled.
+    pub project_context_pack_enabled: bool,
     /// Path to the user-memory file (#489). Always populated; only
     /// consulted when `use_memory` is `true`.
     pub memory_path: PathBuf,
     /// Whether the user-memory feature is enabled (#489). Mirrors
     /// `Config::memory_enabled()` at app boot. Used by the `# foo`
-    /// composer interception (also gated by `moraine_fallback`),
+    /// composer interception,
     /// the `/memory` slash command, and tool registration for
     /// `remember`.
     pub use_memory: bool,
-    /// True when legacy memory push/inject behavior should stay disabled
-    /// because Moraine pull/recall is the configured memory backend.
-    pub moraine_fallback: bool,
     pub use_alt_screen: bool,
     pub use_mouse_capture: bool,
     /// When true, plain Up/Down on an empty composer scroll the transcript
@@ -1872,10 +1367,25 @@ pub struct App {
     pub auto_compact: bool,
     pub auto_compact_user_configured: bool,
     pub auto_compact_threshold_percent: f64,
+    pub stopped_turn: bool,
     pub calm_mode: bool,
     pub low_motion: bool,
     pub constrained_frame_rate: bool,
     pub ocean_started_at: Instant,
+    /// The ambient animation clock, in clamped milliseconds. Creature and
+    /// water positions are pure functions of this value; advancing it by at
+    /// most [`App::AMBIENT_MAX_STEP_MS`] per sampled frame keeps motion
+    /// continuous when draws arrive in bursts (fast token streams previously
+    /// sampled raw wall-clock time at irregular gaps, so fish "teleported"
+    /// between frames — captains-log #16).
+    pub ambient_clock_ms: u128,
+    /// When the ambient clock last advanced; `None` until the first sample.
+    pub ambient_clock_sampled_at: Option<Instant>,
+    /// When the shell last became fully idle (no turn, no live sub-agents,
+    /// no active durable tasks, completion exhale finished). After a short
+    /// grace of gentle motion the aquarium settles to a genuinely still
+    /// scene instead of repainting an idle screen forever.
+    pub ambient_idle_since: Option<Instant>,
     /// Start of the underwater shell's one-shot successful-turn exhale.
     /// Kept separate from the ambient ocean clock so completion can settle
     /// once without restarting or repainting the transcript field.
@@ -1892,6 +1402,10 @@ pub struct App {
     /// Typed appearance treatment; appearance is independent from motion
     /// settings, and every underwater treatment keeps ambient life.
     pub ocean_treatment: crate::tui::ocean::OceanTreatment,
+    /// Focus-context texture prototype mode (#4823), parsed once from the
+    /// `focus_texture` setting. `Off` by default; while off the modal render
+    /// path is byte-identical to the pre-prototype path.
+    pub focus_texture: crate::tui::focus_texture::FocusTextureMode,
     /// Distinct pre-session menu. Once dismissed, the normal idle ocean owns
     /// the empty session and this state stays hidden.
     pub launch: LaunchState,
@@ -1913,8 +1427,16 @@ pub struct App {
     /// `/config status_indicator <cw|whale|dots|off>`.
     pub status_indicator: String,
     pub show_thinking: bool,
+    pub thinking_highlight: bool,
+    pub thinking_default_expanded: bool,
+    pub thinking_preview_lines: usize,
+    pub help_expand_groups: bool,
+    pub pin_last_prompt: bool,
     pub verbose_transcript: bool,
     pub show_tool_details: bool,
+    /// Inline presentation mode for successful structured File mutations.
+    /// Exact evidence remains attached to each mutation receipt in all modes.
+    pub inline_diff_mode: InlineDiffMode,
     pub ui_locale: Locale,
     pub cost_currency: CostCurrency,
     /// Route payment truth. Model pricing alone cannot distinguish metered
@@ -1922,6 +1444,7 @@ pub struct App {
     pub billing_presentation: crate::route_billing::BillingPresentation,
     pub composer_density: ComposerDensity,
     pub composer_border: bool,
+    pub composer_multiline_mode: bool,
     /// Voice input state — toggled by `/voice` and the voice hotbar action.
     pub voice_enabled: bool,
     /// Auto-send after transcription when the transcript ends with an
@@ -1931,14 +1454,15 @@ pub struct App {
     /// Toggled by `/voice-control`.
     pub voice_control_enabled: bool,
     pub transcript_spacing: TranscriptSpacing,
-    pub sidebar_width_percent: u16,
-    pub sidebar_focus: SidebarFocus,
+    /// Prose wrap cap from `[transcript] prose_measure` (#5436). `None`
+    /// means prose uses the full content width, like tool/status cells.
+    pub(crate) prose_measure: Option<u16>,
     /// Sidebar hover state for mouse tooltip support.
     pub sidebar_hover: SidebarHoverState,
     /// Current hover tooltip text, if any.
     pub sidebar_hover_tooltip: Option<String>,
     /// Last successfully rendered Work panel summary. Transient mutex misses
-    /// should not wipe completed checklist/strategy state from the sidebar.
+    /// should not wipe settled To-do state from the sidebar.
     pub(crate) cached_work_summary: Option<SidebarWorkSummary>,
     /// Browsing context from the last dismissed `/model` picker, so reopening
     /// restores the view mode and highlighted row instead of resetting to the
@@ -1948,28 +1472,15 @@ pub struct App {
     pub provider_picker_memory: Option<ProviderPickerMemory>,
     /// Last known mouse position for tooltip placement.
     pub last_mouse_pos: Option<(u16, u16)>,
-    /// Whether the user is currently dragging the sidebar resize handle.
-    pub sidebar_resizing: bool,
-    /// Mouse column at the start of a sidebar-resize drag.
-    pub sidebar_resize_anchor_x: u16,
-    /// Sidebar width in columns at the start of a sidebar-resize drag.
-    pub sidebar_resize_anchor_width: u16,
-    /// Last sidebar area rendered (for mouse hit-testing the resize handle).
-    pub last_sidebar_area: Option<Rect>,
-    /// Last total chat/sidebar width considered for sidebar rendering.
-    pub last_sidebar_host_width: Option<u16>,
-    /// Handle rect painted on the left edge of the sidebar (1 col).
-    pub last_sidebar_handle_area: Option<Rect>,
-    /// Total horizontal space (chat + sidebar) used to compute the percentage
-    /// during sidebar resize drag.
-    pub sidebar_resize_total_width: u16,
-    /// Sidebar width changed during this drag and needs persistence.
-    pub sidebar_width_dirty: bool,
-    /// Sidebar focus/hidden state changed and needs persistence.
-    pub sidebar_focus_dirty: bool,
     /// Whether the session-context panel is enabled (#504).
     pub context_panel: bool,
+    /// Whether the persistent Sessions rail is enabled (#2934). Opt-in.
+    pub sessions_rail: bool,
     /// Minimum number of consecutive safe tool cells needed for auto-collapse.
+    ///
+    /// Fixed at 3 for v0.9.x (#3256 decision): not a user setting. Rollups need
+    /// enough cells to be readable; exposing a knob without UX for partial
+    /// runs would just recreate the pre-collapse noise floor.
     pub tool_collapse_threshold: usize,
     /// Tool runs the user explicitly expanded. Stores original history indices.
     pub expanded_tool_runs: HashSet<usize>,
@@ -2020,6 +1531,23 @@ pub struct App {
     /// Maps raw agent_id to a stable user-facing label (#3030).
     /// Populated when `AgentSpawned` fires; read by sidebar rendering.
     pub agent_label_map: HashMap<String, String>,
+    /// The child whose full transcript currently owns the main conversation
+    /// area and whose fork the composer addresses (`None` = main session).
+    pub agent_focus: Option<crate::tui::agent_focus::AgentFocus>,
+    /// Follow-ups a running child has not yet taken at its next round
+    /// boundary (`agent_id` → count), from the latest `AgentList` refresh.
+    pub agent_queued_follow_ups: HashMap<String, usize>,
+    /// Receipts-only roster of every agent that ran this session (#5479).
+    /// Refreshed wholesale on each `AgentList` event; rendered by `/agents`
+    /// and, in a later slice, by the agents rail.
+    pub agent_roster: Vec<crate::tui::agent_roster::AgentRosterRow>,
+    /// `/agents list` asked for a one-shot transcript listing. Cleared by the
+    /// `AgentList` handler that prints it.
+    pub agent_roster_print_requested: bool,
+    /// Per-role sequence counters for unnamed children (#3030). Two concurrent
+    /// builders render as `builder · 1` and `builder · 2` instead of sharing a
+    /// bare, indistinguishable role label.
+    pub agent_role_counters: HashMap<String, u64>,
     /// Last time a sub-agent progress event triggered a redraw.
     /// Used to throttle redraws under high sub-agent concurrency (#3033).
     pub last_agent_progress_redraw: Option<Instant>,
@@ -2028,6 +1556,11 @@ pub struct App {
     /// budget-only chatter is paced under fan-out (#4095 residual).
     pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
+    /// Parsed `background_color` setting, kept separately from `ui_theme` so
+    /// an explicit override remains distinguishable even when it happens to
+    /// equal the current named theme's default surface and can still carry
+    /// into previews of other themes.
+    pub background_color_override: Option<Color>,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
     /// (Catppuccin, Tokyo Night, Dracula, Gruvbox) propagate to every
@@ -2038,15 +1571,38 @@ pub struct App {
     pub onboarding_needs_api_key: bool,
     pub onboarding_provider: ApiProvider,
     pub onboarding_workspace_trust_gate: bool,
+    /// True when onboarding opened only because a returning user's configured
+    /// provider is missing its key. Esc then exits to the offline composer
+    /// instead of walking back through first-run steps.
+    pub onboarding_missing_key_recovery: bool,
+    /// True when the user explicitly chose "Explore offline" during onboarding
+    /// (#3927). No provider was selected, no route was activated, and no secret
+    /// was saved: the session browses with queued input until a route is
+    /// activated later (`/provider`), which is the only thing that clears it.
+    pub onboarding_explore_offline: bool,
+    /// First-run route receipts: which required decisions this run contains.
+    /// The surface title counts only these ("1 of 2"), never a fixed spine.
+    pub onboarding_had_language_step: bool,
+    pub onboarding_had_provider_step: bool,
+    pub onboarding_had_trust_step: bool,
+    /// True when the active credential was discovered only through an
+    /// environment variable. Missing-key recovery and route rollback use this
+    /// provenance to decide whether a durable provider slot still exists;
+    /// credential drafts live exclusively inside `ProviderPickerView`.
     pub api_key_env_only: bool,
-    pub api_key_input: String,
-    pub api_key_cursor: usize,
     // Hooks system
     pub hooks: HookExecutor,
     #[allow(dead_code)]
     pub yolo: bool,
     /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
     yolo_compat_notified: bool,
+    /// The single serialized owner of `settings.toml` startup-default writes
+    /// (mode, thinking, model). Keeping one owner per `App` is what stops two
+    /// rapid selections from interleaving their load/modify/save transactions
+    /// and losing the newer one. Failures are drained by the event loop into a
+    /// warning toast, so a settings write that did not land is never silently
+    /// reverted on the next launch.
+    pub startup_defaults: crate::tui::startup_defaults::StartupDefaultsWriter,
     /// One-shot Shift+Tab/Ctrl+T rebinding notice for this session (#0.8.68 M3).
     keybinding_migration_notified: bool,
     /// Durable Agent-era permission baseline that Plan/YOLO derive from and
@@ -2056,9 +1612,17 @@ pub struct App {
     /// True when config/requirements supplied an approval policy. In that
     /// case the TUI-only Shift+Tab preference must not loosen it.
     approval_policy_locked: bool,
+    /// True only when the controlling policy is the user's editable root
+    /// config.toml key. An explicit Shift+Tab may migrate that key to the
+    /// durable TUI posture; higher-precedence sources remain immutable.
+    approval_policy_root_editable: bool,
     /// True only when an organization requirements file owns approval policy.
     /// Unlike a user-owned config key, this source cannot be edited in-app.
     approval_policy_requirements_managed: bool,
+    /// True when the interactive shell switch is user-owned (unset or root
+    /// config.toml). Profile / env / managed / project owners stay in charge
+    /// even when a YOLO entry point asks for Full Access.
+    shell_access_editable: bool,
     // Clipboard handler
     pub clipboard: ClipboardHandler,
     // Tool approval session allowlist
@@ -2083,6 +1647,14 @@ pub struct App {
     /// Last non-contended Work snapshot captured in this App. The outer
     /// option distinguishes "never captured" from a captured empty state.
     pub(crate) last_known_work_state: Option<Option<SessionWorkState>>,
+    /// Latest bounded runtime goal projection. Persistence stores this beside
+    /// the owning saved session so a resumed process rebuilds the same goal
+    /// control state instead of inferring it from transcript prose.
+    pub(crate) last_known_goal_state: Option<crate::session_manager::SessionGoalState>,
+    /// FIFO of accepted typed controls not yet reconciled by GoalUpdated.
+    /// The durable desired state lives in `last_known_goal_state`; this queue
+    /// preserves in-process ordering and mailbox retry state only.
+    pub(crate) pending_goal_controls: VecDeque<PendingGoalControl>,
     /// Metadata for the active session, cached in memory so automatic
     /// checkpoints never synchronously reload and parse a growing JSON file on
     /// the UI thread.
@@ -2095,25 +1667,32 @@ pub struct App {
     /// the current locale and a post-hoc translation layer replaces any
     /// remaining English output before it reaches the user.
     pub translation_enabled: bool,
+    /// Mini-window (pinned always-on-top) layout preferences, sourced from
+    /// `[mini_window]` in config.toml at startup and mutated live by
+    /// `/config mini_window.keep_*`. The renderer reads this instead of the
+    /// parsed Config so runtime changes apply without a restart.
+    pub(crate) mini_window: crate::config::MiniWindowConfig,
     /// Ordered list of footer items the user wants visible. Sourced from
     /// `tui.status_items` in `~/.deepseek/config.toml` at startup; mutated
     /// live by `/statusline`. The renderer iterates this slice; no item is
     /// hardcoded in the footer code path.
     pub status_items: Vec<crate::config::StatusItem>,
+    /// Optional header items enabled from `tui.header_items` in `config.toml`
+    /// at startup. Built-in header content remains independent of this list.
+    pub header_items: Vec<crate::config::HeaderItem>,
     /// Project documentation (AGENTS.md or CLAUDE.md)
     #[allow(dead_code)]
     pub project_doc: Option<String>,
     /// Plan state for tracking tasks
     pub plan_state: SharedPlanState,
-    /// Whether a plan follow-up prompt is waiting for user input
-    pub plan_prompt_pending: bool,
-    /// Whether update_plan was called during the current turn
-    pub plan_tool_used_in_turn: bool,
-    /// Todo list for `TodoWriteTool`. Read by the plan confirmation modal to
-    /// show the active checklist alongside the plan.
+    /// Todo list for the canonical `work_update` progress surface.
     pub todos: SharedTodoList,
     /// Durable runtime services exposed to model-visible task/automation tools.
     pub runtime_services: RuntimeToolServices,
+    /// Latest bounded coordination receipt delivered by the engine. This is
+    /// the same typed projection returned to headless inspection; the TUI does
+    /// not parse tool text to reconstruct it.
+    pub coordination_detail: Option<crate::tools::subagent::CoordinationDetailProjection>,
     /// Last MCP manager/discovery snapshot shown in the UI.
     pub mcp_snapshot: Option<crate::mcp::McpManagerSnapshot>,
     /// Number of MCP servers declared in the user's config at app boot.
@@ -2121,11 +1700,14 @@ pub struct App {
     /// the user runs `/mcp` for the first time. `0` hides the chip.
     pub mcp_configured_count: usize,
     /// Set after in-TUI MCP config edits because the engine caches its MCP pool.
-    pub mcp_restart_required: bool,
+    pub mcp_reload_required: bool,
     /// Tool execution log
     pub tool_log: Vec<String>,
     /// Active skill to apply to next user message
     pub active_skill: Option<String>,
+    /// Content-bound plugin authority carried with `active_skill`, when the
+    /// selected skill came from a reviewed plugin bundle.
+    pub active_skill_provenance: Option<crate::plugins::types::PluginAuthority>,
     /// Cached (name, description) pairs from the skill registry.
     /// Populated once at startup and refreshed on install/uninstall so
     /// the slash menu can show skills without filesystem I/O on every keystroke.
@@ -2171,6 +1753,10 @@ pub struct App {
     pub last_exec_wait_command: Option<String>,
     /// Current streaming assistant cell
     pub streaming_message_index: Option<usize>,
+    /// Provenance for append-only changes to the current streaming cell.
+    /// Revisions are raw `history_revisions`; the widget maps them through its
+    /// cache-key transform before handing the receipt to the transcript cache.
+    pub(crate) streaming_source_receipt: Option<crate::tui::transcript::StreamingSourceReceipt>,
     /// True after a local cancel key has been handled and before the engine's
     /// authoritative TurnComplete arrives. Stream events already queued for
     /// the cancelled turn are ignored so text does not keep appearing after
@@ -2193,6 +1779,13 @@ pub struct App {
     pub streaming_state: StreamingState,
     /// Live approximate output tokens for the current assistant stream.
     pub streaming_output_token_estimate: u64,
+    /// Provider-billed prompt tokens from the most recent parent model call
+    /// (per-step `TurnUsage`). The context meter takes the max of this and
+    /// the local estimate — the same rule the auto-compaction trigger uses —
+    /// so the two can never disagree about pressure (#5577). Cleared when
+    /// compaction rewrites history, since the receipt describes the
+    /// pre-compaction context.
+    pub last_billed_input_tokens: Option<u32>,
     /// Accumulated reasoning text
     pub reasoning_buffer: String,
     /// Live reasoning header extracted from bold text
@@ -2201,13 +1794,21 @@ pub struct App {
     pub last_reasoning: Option<String>,
     /// Tool calls captured for the pending assistant message
     pub pending_tool_uses: Vec<(String, String, Value)>,
+    /// One-line permission receipts (`tool_id`, text) for decisions nobody
+    /// was prompted for, held until that tool's card completes so the note
+    /// lands directly under the card instead of splitting a running tool run.
+    pub pending_gate_receipts: Vec<(String, String)>,
+    /// Permission receipts for child (sub-agent) tool calls, keyed by agent
+    /// id then `(tool_id, text)`, rendered under the matching tool card when
+    /// that child is focused. Session-resident only.
+    pub child_gate_receipts: std::collections::HashMap<String, Vec<(String, String)>>,
     /// User messages queued while a turn is running
     pub queued_messages: VecDeque<QueuedMessage>,
     /// Draft queued message being edited
     pub queued_draft: Option<QueuedMessage>,
     /// Legacy pending-steer bucket retained for session compatibility. New
-    /// in-flight input uses Enter for same-turn steering and Tab for queued
-    /// follow-ups; Esc only cancels the active turn.
+    /// in-flight input uses Ctrl+Enter for same-turn steering and Enter for
+    /// queued follow-ups; Esc only cancels the active turn.
     pub pending_steers: VecDeque<QueuedMessage>,
     /// Engine-rejected steers (e.g. a tool was already running and couldn't be
     /// cancelled cleanly). Surfaced in the pending-input preview so the user
@@ -2230,6 +1831,10 @@ pub struct App {
     /// Incremented on `TurnComplete` from the elapsed time of the
     /// just-finished turn. Resets per launch.
     pub cumulative_turn_duration: std::time::Duration,
+    /// Session metrics strip accumulators (model-call/tool timings, TTFT,
+    /// throughput). Sourced only from engine events; see
+    /// [`crate::tui::session_metrics`].
+    pub session_metrics: crate::tui::session_metrics::SessionMetrics,
     /// DeepSeek account balance, refreshed once per turn completion.
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
@@ -2297,11 +1902,17 @@ pub struct App {
     pub workspace_context_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Timestamp for cached workspace context.
     pub workspace_context_refreshed_at: Option<Instant>,
+    /// Cached size of the memory file, formatted for the Session sidebar.
+    ///
+    /// Rendered every frame the Session/Context panel is visible, so the
+    /// `stat` behind it is refreshed on the workspace-context TTL tick
+    /// instead of inside the draw closure (#3908) — tens of ms per frame on
+    /// NFS/SSHFS/cloud-synced homes otherwise.
+    pub memory_size_hint: Option<String>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
-    /// Active decision card (v0.8.43 truth-surface). When set, keyboard input
-    /// is routed through the card navigation instead of the composer.
-    pub decision_card: Option<crate::tui::widgets::decision_card::DecisionCard>,
+    /// Session-local quieting and command detectors for event-driven tips.
+    pub behavioral_tips: crate::tui::behavioral_tips::BehavioralTipState,
     /// Unified Workflow activity surface (#4121). Lives above the composer so
     /// phase/row progress does not flood the chat transcript. Preserved after
     /// completion until the next `RunStarted` replaces it.
@@ -2321,6 +1932,20 @@ pub struct App {
     pub thinking_started_at: Option<Instant>,
     /// Whether context compaction is currently in progress.
     pub is_compacting: bool,
+    /// Typed identity retained from CompactionStarted until its matching
+    /// CompactionCompleted/CompactionFailed event.
+    pub(crate) active_compaction: Option<ActiveCompaction>,
+    /// A manual compaction op accepted by the UI but waiting for the engine to
+    /// finish the active turn and emit CompactionStarted.
+    pub(crate) manual_compaction_queued: bool,
+    /// Stable identity allocated before the manual request enters the engine
+    /// mailbox, retained so Ctrl+C/Esc can cancel that exact queued pass.
+    pub(crate) manual_compaction_id: Option<String>,
+    /// A manual compaction request that found the bounded engine mailbox full.
+    /// The event loop retries the send once a slot frees; any compaction that
+    /// starts or settles in the meantime supersedes it. Inner value is the
+    /// requested focus.
+    pub(crate) deferred_manual_compaction: Option<Option<String>>,
     /// Whether context purge is currently in progress.
     pub is_purging: bool,
     /// Set when the user scrolls up/down during a streaming turn so subsequent
@@ -2355,6 +1980,14 @@ pub struct App {
     /// Updated per-turn via PrefixCacheChange events; surfaced by
     /// `/cache stats` for cache-hit debugging.
     pub last_pinned_prefix_hash: Option<String>,
+    /// Why the current KV-cache prefix pin exists (`initial`/`resume`/`change:*`).
+    pub prefix_pin_reason: Option<String>,
+    /// Explanation of the most recent expected cache miss.
+    pub prefix_last_miss_reason: Option<String>,
+    /// Undeclared prefix drifts this session (should stay 0 after the fix).
+    pub prefix_drift_count: u64,
+    /// `<context_update>` snapshots appended this session.
+    pub prefix_context_updates: u64,
 
     // === Transcript filtering (#397) ===
     /// Transcript cells the user has collapsed (hidden from view).
@@ -2383,6 +2016,17 @@ pub struct App {
     /// Updated when `EngineEvent::SessionUpdated` fires or a saved session is loaded.
     pub session_title: Option<String>,
 
+    /// User-configured tab/window title for the current session, shown as
+    /// `[title] …` in front of the terminal window title. Set with the
+    /// `/title` command and persisted on the saved session; distinct from
+    /// [`session_title`](Self::session_title), which is the session *name*
+    /// shown in the composer border and session picker.
+    pub window_title: Option<String>,
+    /// Default tab/window title from the `title` config key (or a profile
+    /// overlay). Used when the current session has no explicit
+    /// [`window_title`](Self::window_title).
+    pub title_default: Option<String>,
+
     /// Post-turn receipt rendered as transient composer chrome.
     /// Set when a turn completes; cleared when a new turn starts or after expiry.
     pub receipt_text: Option<String>,
@@ -2391,92 +2035,28 @@ pub struct App {
     pub tool_evidence: Vec<ToolEvidence>,
 }
 
-/// Message queued while the engine is busy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedMessage {
-    pub display: String,
-    pub skill_instruction: Option<String>,
+pub(crate) struct ToolRunCache {
+    pub(crate) history_version: u64,
+    pub(crate) active_cell_revision: u64,
+    pub(crate) active_len: usize,
+    pub(crate) threshold: usize,
+    pub(crate) mode: ToolCollapseMode,
+    pub(crate) calm_mode: bool,
+    pub(crate) runs: Vec<crate::tui::history::ToolRun>,
 }
 
-/// How a freshly-typed user input should be sent.
-///
-/// Picked by [`App::decide_submit_disposition`] when the user hits Enter on a
-/// non-empty composer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmitDisposition {
-    /// Engine idle and online: send immediately.
-    Immediate,
-    /// Park on `queued_messages` (offline, or engine busy — #382).
-    Queue,
-    /// Explicit steer via Ctrl+Enter (#382). Not returned by `decide_submit_disposition`.
-    #[allow(dead_code)]
-    Steer,
-    /// Park on `queued_messages` for dispatch after TurnComplete.
-    /// Legacy path; #382 unified busy states under `Queue`.
-    #[allow(dead_code)]
-    QueueFollowUp,
-}
-
-/// Detailed tool payload attached to a history cell.
-#[derive(Debug, Clone)]
-pub struct ToolDetailRecord {
-    pub tool_id: String,
-    pub tool_name: String,
-    pub input: Value,
-    pub output: Option<String>,
-}
-
-/// Lightweight task view for sidebar rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskPanelEntry {
-    pub id: String,
-    pub status: String,
-    pub prompt_summary: String,
-    pub duration_ms: Option<u64>,
-    pub kind: TaskPanelEntryKind,
-    pub stale: bool,
-    pub elapsed_since_output_ms: Option<u64>,
-    pub owner_agent_id: Option<String>,
-    pub owner_agent_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskPanelEntryKind {
-    Background,
-}
-
-impl QueuedMessage {
-    pub fn new(display: String, skill_instruction: Option<String>) -> Self {
+impl Default for ToolRunCache {
+    fn default() -> Self {
         Self {
-            display,
-            skill_instruction,
+            history_version: u64::MAX,
+            active_cell_revision: u64::MAX,
+            active_len: usize::MAX,
+            threshold: usize::MAX,
+            mode: ToolCollapseMode::Expanded,
+            calm_mode: false,
+            runs: Vec::new(),
         }
     }
-
-    #[allow(dead_code)] // Tests and queue helpers use the display-only form; send path resolves @mentions.
-    pub fn content(&self) -> String {
-        if let Some(skill_instruction) = self.skill_instruction.as_ref() {
-            format!(
-                "{skill_instruction}\n\n---\n\nUser request: {}",
-                self.display
-            )
-        } else {
-            self.display.clone()
-        }
-    }
-}
-
-// === Errors ===
-
-/// Errors that can occur while submitting API keys during onboarding.
-#[derive(Debug, Error)]
-pub enum ApiKeyError {
-    /// The provided API key was empty.
-    #[error("Failed to save API key: API key cannot be empty")]
-    Empty,
-    /// Persisting the API key failed.
-    #[error("Failed to save API key: {source}")]
-    SaveFailed { source: anyhow::Error },
 }
 
 // === Deref to ComposerState for backward compat ===
@@ -2504,7 +2084,244 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
     !use_mouse_capture
 }
 
+fn push_enabled_provider_model(
+    enabled: &mut HashMap<String, Vec<String>>,
+    provider: &str,
+    model: &str,
+) {
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
+        return;
+    }
+    let models = enabled.entry(provider.to_string()).or_default();
+    if !models
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(model))
+    {
+        models.push(model.to_string());
+    }
+}
+
 impl App {
+    /// Persist the pending session route as the explicit choice (`/fleet
+    /// save`, `/fleet save-as`, `/model save-default`). Returns the receipt
+    /// message naming the exact file written — or an error message when the
+    /// write failed. Nothing is ever written without this explicit call.
+    pub fn apply_route_save_choice(
+        &mut self,
+        choice: crate::tui::views::route_save_prompt::RouteSaveChoice,
+    ) -> String {
+        use crate::fleet::store::{FleetFile, FleetOperator, save_fleet, set_selected};
+        use crate::tui::views::route_save_prompt::RouteSaveChoice;
+        let Some(pending) = self.pending_route_save.take() else {
+            return "No pending route change to save.".to_string();
+        };
+        let route = format!("{}/{}", pending.provider_identity, pending.model);
+        match choice {
+            RouteSaveChoice::UpdateFleet => {
+                let Some((name, scope)) = pending.fleet.clone() else {
+                    return "Nothing to update — no Fleet is selected. Use /fleet save-as to \
+                             save this route as a new Fleet."
+                        .to_string();
+                };
+                match crate::fleet::store::load_fleet_in_scope(&name, scope, &self.workspace) {
+                    Ok((mut fleet, _source_path)) => {
+                        fleet.operator = Some(FleetOperator {
+                            provider: pending.provider_identity.clone(),
+                            model: pending.model.clone(),
+                            reasoning: fleet.operator.as_ref().and_then(|op| op.reasoning.clone()),
+                        });
+                        match save_fleet(&fleet, scope, &self.workspace) {
+                            Ok(path) => format!(
+                                "Fleet `{}` now runs on {route} — wrote {}",
+                                fleet.name,
+                                path.display()
+                            ),
+                            Err(err) => format!("Fleet update failed: {err}"),
+                        }
+                    }
+                    Err(err) => format!(
+                        "Fleet update failed: {err} — the saved Fleet may have moved. Use \
+                         /fleet save-as to persist the route."
+                    ),
+                }
+            }
+            RouteSaveChoice::SaveAsNewFleet => {
+                let display = format!(
+                    "{} {}",
+                    crate::config::ApiProvider::parse(&pending.provider_identity)
+                        .map(|p| p.display_name().to_string())
+                        .unwrap_or_else(|| pending.provider_identity.clone()),
+                    pending.model
+                );
+                let Ok(mut fleet) = FleetFile::new(
+                    display.clone(),
+                    Some("Saved from a session route choice.".to_string()),
+                ) else {
+                    return "Could not create the Fleet.".to_string();
+                };
+                fleet.operator = Some(FleetOperator {
+                    provider: pending.provider_identity.clone(),
+                    model: pending.model.clone(),
+                    reasoning: None,
+                });
+                match save_fleet(
+                    &fleet,
+                    crate::fleet::store::FleetScope::Personal,
+                    &self.workspace,
+                ) {
+                    Ok(path) => {
+                        let selected_note = match set_selected(
+                            &display,
+                            crate::fleet::store::FleetScope::Personal,
+                            &self.workspace,
+                        ) {
+                            Ok(sel_path) => format!(
+                                " — selected as your user-global default; wrote {}",
+                                sel_path.display()
+                            ),
+                            Err(err) => format!(" — selection failed: {err}"),
+                        };
+                        format!(
+                            "Saved route {route} as new Fleet `{}` — wrote {}{selected_note}",
+                            display,
+                            path.display()
+                        )
+                    }
+                    Err(err) => format!("Save failed: {err}"),
+                }
+            }
+            RouteSaveChoice::SaveAsDefault => {
+                persist_route_as_startup_default(&pending.provider_identity, &pending.model)
+            }
+            RouteSaveChoice::SessionOnly => {
+                format!("Model {route} kept for this session only — nothing was written.")
+            }
+        }
+    }
+
+    /// Persist the route this session is *actually* running as the startup
+    /// default.
+    ///
+    /// This reads the live route rather than [`Self::pending_route_save`] on
+    /// purpose. The pending record is bookkeeping for the save *prompt*, and it
+    /// is written by several different paths (same-provider apply, cross-
+    /// provider `switch_provider`, `/model`). Cross-checking it before an
+    /// explicit "make this my default" action meant that any ordering
+    /// disagreement dropped the write with no error shown — the user saw a
+    /// normal "Model: x → y" line and reasonably assumed it had stuck, then the
+    /// next launch reopened the old route. An explicit request now always
+    /// reports what it did.
+    pub fn save_live_route_as_startup_default(&mut self) -> String {
+        match self.try_save_live_route_as_startup_default() {
+            Ok(receipt) => receipt,
+            Err(err) => format!("Save failed: {err}"),
+        }
+    }
+
+    /// Persist the live route with a typed failure for onboarding, whose next
+    /// transition depends on knowing that the restart route actually landed.
+    pub(crate) fn try_save_live_route_as_startup_default(&mut self) -> anyhow::Result<String> {
+        let provider_identity = self.provider_identity_for_persistence().to_string();
+        let model = if self.auto_model {
+            "auto".to_string()
+        } else {
+            self.model.clone()
+        };
+        try_persist_route_as_startup_default(&provider_identity, &model)?;
+        // Resolve the prompt only after the write lands. If persistence fails,
+        // keep the retry available instead of discarding the operator's route.
+        self.pending_route_save = None;
+        Ok(format!(
+            "Remembered {provider_identity}/{model} as the startup default (settings.toml)."
+        ))
+    }
+
+    /// Record that the live session route changed to `provider_identity` /
+    /// `model`. The change is temporary until the user explicitly chooses how
+    /// to save it; nothing is written here.
+    pub fn note_session_route_change(&mut self, provider_identity: &str, model: &str) {
+        let fleet =
+            crate::fleet::store::selected_fleet(&self.workspace).map(|sel| (sel.name, sel.scope));
+        self.pending_route_save = Some(PendingRouteSave {
+            provider_identity: provider_identity.to_string(),
+            model: model.to_string(),
+            fleet,
+        });
+    }
+
+    /// One truthful chip for cumulative session cost surfaces.
+    ///
+    /// Session history wins over the *current* route: switching to an OAuth or
+    /// local route must not hide spend already accrued on a metered route, and
+    /// an unpriced turn turns a displayed amount into a subtotal rather than a
+    /// complete total.
+    #[must_use]
+    pub fn cumulative_usage_chip(&self) -> crate::route_billing::UsageChip {
+        let displayed = self.displayed_session_cost_for_currency(self.cost_currency);
+        let (priced, unpriced) = match self.cost_display_currency(self.cost_currency) {
+            CostCurrency::Usd => (
+                self.session.cost_priced_turns,
+                self.session.cost_unpriced_turns,
+            ),
+            CostCurrency::Cny => (
+                self.session.cost_cny_priced_turns,
+                self.session.cost_cny_unpriced_turns,
+            ),
+        };
+        if self.session.cost_coverage_unknown_legacy {
+            return if displayed.is_finite() && displayed > 0.0 {
+                crate::route_billing::UsageChip::PricedSubtotal {
+                    amount: self.format_cost_amount(displayed),
+                    legacy: true,
+                }
+            } else {
+                crate::route_billing::UsageChip::Unknown
+            };
+        }
+        if unpriced > 0 {
+            return if displayed.is_finite() && displayed > 0.0 {
+                crate::route_billing::UsageChip::PricedSubtotal {
+                    amount: self.format_cost_amount(displayed),
+                    legacy: false,
+                }
+            } else {
+                crate::route_billing::UsageChip::Unknown
+            };
+        }
+        if priced > 0 {
+            return if displayed.is_finite() && displayed > 0.0 {
+                crate::route_billing::UsageChip::Money(self.format_cost_amount(displayed))
+            } else {
+                crate::route_billing::UsageChip::Hidden
+            };
+        }
+        crate::route_billing::usage_chip(
+            self.billing_presentation,
+            self.api_provider,
+            &self.model,
+            displayed,
+            self.cost_display_currency(self.cost_currency),
+            None,
+        )
+    }
+
+    pub fn enable_provider_model(&mut self, provider: &str, model: &str) {
+        push_enabled_provider_model(&mut self.enabled_provider_models, provider, model);
+    }
+
+    #[must_use]
+    pub fn provider_model_is_enabled(&self, provider: &str, model: &str) -> bool {
+        self.enabled_provider_models
+            .get(provider)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|enabled| enabled.eq_ignore_ascii_case(model))
+            })
+    }
+
     /// Advance and return the model-draft generation. Call when a draft is
     /// requested or a setup/fleet wizard opens; a spawned draft that captured
     /// an older generation is dropped on delivery.
@@ -2542,711 +2359,54 @@ impl App {
         self.session.last_reasoning_replay_tokens = None;
         self.session.turn_cache_history.clear();
         self.pending_turn_route = None;
+        self.pending_auto_route_receipt = None;
         self.active_turn = None;
+        self.last_effective_model = None;
+        self.last_effective_provider = None;
+        self.last_effective_provider_identity = None;
+        self.last_auto_route_receipt = None;
         self.last_pinned_prefix_hash = None;
+        self.prefix_pin_reason = None;
+        self.prefix_last_miss_reason = None;
+        self.prefix_drift_count = 0;
+        self.prefix_context_updates = 0;
+    }
+
+    /// Invalidate facts that were accepted under the previous reasoning
+    /// request.
+    ///
+    /// A fixed model keeps the same concrete route when its reasoning tier
+    /// changes, so only its effective-reasoning receipt becomes stale. Under
+    /// Auto, reasoning is one of the classifier inputs; the previous concrete
+    /// provider/model route therefore cannot be replayed or displayed as the
+    /// route for the new request.
+    pub(crate) fn invalidate_route_receipts_for_reasoning_change(&mut self) {
+        self.last_effective_reasoning_effort = None;
+        if self.auto_model {
+            self.last_effective_model = None;
+            self.last_effective_provider = None;
+            self.last_effective_provider_identity = None;
+            self.last_auto_route_receipt = None;
+        }
     }
 
     pub fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.ui_locale, id)
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub fn new(options: TuiOptions, config: &Config) -> Self {
-        let TuiOptions {
-            model,
-            workspace,
-            config_path,
-            config_profile,
-            allow_shell,
-            use_alt_screen,
-            use_mouse_capture,
-            use_bracketed_paste,
-            max_subagents,
-            skills_dir: global_skills_dir,
-            memory_path,
-            notes_path: _,
-            mcp_config_path,
-            use_memory,
-            start_in_agent_mode,
-            skip_onboarding,
-            yolo,
-            resume_session_id,
-            initial_input,
-        } = options;
-
-        // Start from disk-only preferences so one-time migrations can never
-        // persist terminal/environment overlays such as NO_ANIMATIONS. Apply
-        // those overlays only after any normalized settings write succeeds.
-        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
-        let legacy_yolo_default = settings.legacy_yolo_default_detected();
-        let legacy_yolo_full_access = if legacy_yolo_default {
-            let control = config.approval_policy_control(
-                config_path.as_deref(),
-                config_profile.as_deref(),
-                &workspace,
-            );
-            match control {
-                crate::config::ApprovalPolicyControl::Unset => {
-                    if let Err(error) = settings.save() {
-                        tracing::warn!(
-                            "failed to normalize legacy YOLO settings; retrying next launch: {error:#}"
-                        );
-                    }
-                    true
-                }
-                crate::config::ApprovalPolicyControl::RootConfig => {
-                    let active_config_path =
-                        crate::config::resolve_load_config_path(config_path.clone());
-                    match crate::config_persistence::persist_unset_root_key(
-                        active_config_path.as_deref(),
-                        "approval_policy",
-                    ) {
-                        Ok(_) => {
-                            if let Err(error) = settings.save() {
-                                tracing::warn!(
-                                    "removed legacy approval_policy but could not normalize settings; retrying next launch: {error:#}"
-                                );
-                            }
-                            true
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "could not migrate legacy YOLO approval policy; keeping the controlling policy: {error:#}"
-                            );
-                            false
-                        }
-                    }
-                }
-                source => {
-                    tracing::warn!(
-                        "legacy YOLO setting was not allowed to override {}",
-                        source.label()
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        settings.apply_env_overrides();
-        let launch_visible =
-            settings.launch_screen && resume_session_id.is_none() && initial_input.is_none();
-        let launch = LaunchState::new(launch_visible, &workspace);
-
-        // If settings.toml exists on disk but couldn't be parsed (we fell back
-        // to defaults), surface a warning in the TUI so the user knows their
-        // file is broken instead of silently losing all settings.
-        let settings_parse_warning = crate::settings::Settings::path().ok().and_then(|p| {
-            if p.exists() {
-                std::fs::read_to_string(&p).ok().and_then(|raw| {
-                    ::toml::from_str::<::toml::Value>(&raw)
-                        .err()
-                        .map(|e| format!("⚠ settings.toml is malformed — using defaults ({e})"))
-                })
-            } else {
-                None
-            }
-        });
-        let tui_prefs_warning = crate::settings::TuiPrefs::path().ok().and_then(|p| {
-            if p.exists() {
-                std::fs::read_to_string(&p).ok().and_then(|raw| {
-                    ::toml::from_str::<::toml::Value>(&raw)
-                        .err()
-                        .map(|e| format!("⚠ tui.toml is malformed — using defaults ({e})"))
-                })
-            } else {
-                None
-            }
-        });
-
-        let mut provider = config.api_provider();
-
-        // Let settings preserve runtime switches only when config/CLI did not
-        // explicitly select a provider. A configured provider must not be
-        // pushed back to a stale saved setting on restart.
-        if config
-            .provider
-            .as_deref()
-            .and_then(ApiProvider::parse)
-            .is_none()
-            && let Some(ref provider_str) = settings.default_provider
-            && let Some(parsed) = ApiProvider::parse(provider_str)
-        {
-            provider = parsed;
-        }
-        let mut effective_auth_config = config.clone();
-        effective_auth_config.provider = Some(provider.as_str().to_string());
-        let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
-        let provider_chain = provider
-            .kind()
-            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
-            .filter(|chain| chain.providers().len() > 1);
-
-        // Snapshot per-provider readiness for the fallback chain (#2574). Uses
-        // the same `has_api_key_for` helper the provider picker uses, so hosted
-        // providers require a key and self-hosted ones (Ollama/vLLM/SGLang) are
-        // reported ready without one. Empty when there is no fallback chain.
-        let provider_readiness = provider_chain
-            .as_ref()
-            .map(|chain| {
-                chain
-                    .providers()
-                    .iter()
-                    .map(|kind| {
-                        let provider = ApiProvider::from_kind(*kind);
-                        (provider, has_api_key_for(config, provider))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Check if the effective provider has an API key. This must happen
-        // after settings.default_provider is applied; otherwise a saved
-        // third-party provider can be pushed back into DeepSeek onboarding.
-        let needs_api_key = !has_api_key(&effective_auth_config);
-        let api_key_env_only =
-            crate::config::active_provider_uses_env_only_api_key(&effective_auth_config);
-        let was_onboarded = crate::tui::onboarding::is_onboarded();
-        let settings_auto_compact = settings.auto_compact;
-        let auto_compact_user_configured = Settings::auto_compact_explicitly_configured();
-        let auto_compact_threshold_percent = settings.auto_compact_threshold_percent;
-        let calm_mode = settings.calm_mode;
-        let low_motion = settings.low_motion;
-        let constrained_frame_rate = settings.constrained_frame_rate;
-        let fancy_animations = settings.fancy_animations;
-        let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
-        let work_surface_placement =
-            crate::tui::work_surface::WorkSurfacePlacement::parse(&settings.work_surface_placement);
-        let synchronized_output_enabled = settings.synchronized_output_enabled();
-        let status_indicator = settings.status_indicator.clone();
-        let show_thinking = settings.show_thinking;
-        let show_tool_details = settings.show_tool_details;
-        let ui_locale = resolve_locale(&settings.locale);
-        let cost_currency = match (settings.cost_currency.as_str(), ui_locale.tag()) {
-            ("usd", "zh-Hans") => CostCurrency::Cny,
-            _ => CostCurrency::from_setting(&settings.cost_currency).unwrap_or(CostCurrency::Usd),
-        };
-        let composer_density = ComposerDensity::from_setting(&settings.composer_density);
-        let composer_border = settings.composer_border;
-        let composer_vim_enabled = settings
-            .composer_vim_mode
-            .trim()
-            .eq_ignore_ascii_case("vim");
-        let transcript_spacing = TranscriptSpacing::from_setting(&settings.transcript_spacing);
-        let sidebar_width_percent = settings.sidebar_width_percent;
-        let sidebar_focus = SidebarFocus::from_setting(&settings.sidebar_focus);
-        let max_input_history = settings.max_input_history;
-        let use_paste_burst_detection = settings.paste_burst_detection;
-        // Resolve the named theme from settings; unknown values were already
-        // normalised to "system" in Settings::load. The background_color
-        // setting still overlays on top.
-        let theme_id =
-            palette::ThemeId::from_name(&settings.theme).unwrap_or(palette::ThemeId::System);
-        let mut ui_theme = theme_id.ui_theme();
-        if let Some(background) = settings
-            .background_color
-            .as_deref()
-            .and_then(palette::parse_hex_rgb_color)
-        {
-            ui_theme = ui_theme.with_background_color(background);
-        }
-        let provider_models = settings.provider_models.clone().unwrap_or_default();
-        let model = provider_models
-            .get(provider.as_str())
-            .cloned()
-            .or_else(|| {
-                // default_model is a DeepSeek-centric setting; other providers
-                // get their model from config.toml / env (e.g. OPENAI_MODEL).
-                if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-                    settings.default_model.clone()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(model);
-        let auto_model = model.trim().eq_ignore_ascii_case("auto");
-        let active_context_window_override = config.context_window_for_provider_config(provider);
-        let active_route_limits = if auto_model {
-            active_context_window_override.map(|window| RouteLimits {
-                context_tokens: Some(u64::from(window)),
-                ..RouteLimits::default()
-            })
-        } else {
-            let saved_provider_model = config
-                .provider_config_for(provider)
-                .and_then(|provider| provider.model.as_deref());
-            crate::route_runtime::resolve_route_candidate(
-                provider,
-                Some(&model),
-                saved_provider_model,
-                Some(effective_auth_config.deepseek_base_url()),
-                active_context_window_override,
-            )
-            .ok()
-            .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
-        };
-        let configured_reasoning_effort = settings
-            .reasoning_effort
-            .as_deref()
-            .or_else(|| config.reasoning_effort());
-        let threshold_model = if auto_model {
-            DEFAULT_TEXT_MODEL
-        } else {
-            model.as_str()
-        };
-        let compact_threshold = crate::route_budget::compaction_threshold_for_route_at_percent(
-            provider,
-            threshold_model,
-            active_route_limits,
-            auto_compact_threshold_percent,
-        );
-        let auto_compact = if auto_compact_user_configured {
-            settings_auto_compact
-        } else {
-            crate::route_budget::auto_compact_default_for_route(
-                provider,
-                threshold_model,
-                active_route_limits,
-            )
-        };
-        let reasoning_effort = if auto_model {
-            ReasoningEffort::Auto
-        } else {
-            configured_reasoning_effort.map_or_else(ReasoningEffort::default, |s| {
-                ReasoningEffort::from_setting_for_provider(s, provider)
-            })
-        };
-
-        // Resolve the saved mode separately from the permission posture.
-        let preferred_mode = AppMode::from_setting(&settings.default_mode);
-        let yolo_compat = yolo || (preferred_mode == AppMode::Yolo && !start_in_agent_mode);
-        let initial_mode = if yolo_compat || start_in_agent_mode {
-            AppMode::Agent
-        } else {
-            preferred_mode
-        };
-        let needs_workspace_trust = !yolo_compat && crate::tui::onboarding::needs_trust(&workspace);
-        let onboarding = initial_onboarding_state(
-            skip_onboarding,
-            was_onboarded,
-            needs_api_key,
-            needs_workspace_trust,
-        );
-        let onboarding_workspace_trust_gate = onboarding_is_workspace_trust_gate(
-            skip_onboarding,
-            was_onboarded,
-            needs_api_key,
-            needs_workspace_trust,
-        );
-
-        // Durable Agent-era permission baseline (#3386). Plan/YOLO derive from
-        // and restore to this. Legacy Auto inputs parse to Agent; if an older
-        // caller still constructs `AppMode::Auto` directly, it projects through
-        // the Agent baseline instead of enabling a fourth runtime posture. When
-        // the user starts in YOLO the live shell flag is force-enabled below, so
-        // the baseline shell value is taken from the interactive default (the
-        // pre-mode Agent surface) rather than the YOLO-forced live mirror;
-        // otherwise it mirrors the resolved `allow_shell` option, which already
-        // carries that same interactive default. Using `interactive_allow_shell()`
-        // here keeps the Agent baseline identical regardless of launch mode, so
-        // a YOLO -> Agent downshift exposes shell (approval-gated) exactly as
-        // documented, while an explicit `allow_shell = false` still hides it.
-        // Trust is never part of the Agent baseline (it is YOLO-only authority).
-        // Approval mirrors the configured policy.
-        let explicit_approval_mode = (!legacy_yolo_full_access)
-            .then_some(config.approval_policy.as_deref())
-            .flatten()
-            .and_then(ApprovalMode::from_config_value);
-        let approval_policy_locked =
-            !legacy_yolo_full_access && config.approval_policy_is_managed();
-        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
-        let saved_permission_posture = if approval_policy_locked {
-            None
-        } else {
-            settings
-                .permission_posture
-                .as_deref()
-                .and_then(ApprovalMode::from_config_value)
-        };
-        let configured_approval_mode = explicit_approval_mode
-            .or(saved_permission_posture)
-            .unwrap_or_default();
-        let mode_prefs = ModeSessionPrefs {
-            agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
-                config.interactive_allow_shell()
-            } else {
-                allow_shell
-            },
-            agent_trust_mode: false,
-            // The YOLO-compat launch elevates the *live* approval mirror to
-            // Bypass below; the durable Agent baseline keeps the configured
-            // policy so a YOLO -> Agent downshift restores it.
-            agent_approval_mode: configured_approval_mode,
-        };
-        let allow_shell = allow_shell || yolo_compat || matches!(initial_mode, AppMode::Yolo);
-        let shell_manager = new_shared_shell_manager(workspace.clone());
-
-        // Initialize hooks executor from config, merged with project-local
-        // `.codewhale/hooks.toml` (#3026).
-        let hooks_config =
-            crate::hooks::HooksConfig::load_with_project(config.hooks_config(), &workspace);
-        let hooks = HookExecutor::new(hooks_config, workspace.clone());
-
-        // Initialize plan state
-        let plan_state = new_shared_plan_state();
-
-        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
-        let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
-        let cached_skills =
-            Self::discover_cached_skills(&workspace, &skills_dir, skills_scan_codewhale_only);
-
-        let input_history = crate::composer_history::load_history();
-        let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
-            match initial_input {
-                // #451: pre-populate the composer when invoked via
-                // `deepseek pr <N>` (or any future caller that wants to
-                // drop the model into a session with context already
-                // typed). Cursor lands at the end so Enter sends as-is.
-                Some(InitialInput::Prefill(text)) if !text.is_empty() => {
-                    let cursor = text.chars().count();
-                    (text, cursor, false)
-                }
-                Some(InitialInput::Submit(text)) if !text.is_empty() => {
-                    let cursor = text.chars().count();
-                    (text, cursor, true)
-                }
-                _ => (String::new(), 0, false),
-            };
-        let mcp_configured_count =
-            crate::mcp::load_config_with_workspace(&mcp_config_path, &workspace)
-                .map(|cfg| cfg.servers.len())
-                .unwrap_or(0);
-        let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
-            config,
-            provider,
-            &model,
-            &provider_models,
-        );
-        // #2069: expose the already-discovered skills as bindable hotbar
-        // actions. Reuses the startup skill cache, so no extra filesystem I/O.
-        hotbar_actions.register_skills(&cached_skills);
-        let mut app = Self {
-            mode: initial_mode,
-            hotbar_actions,
-            composer: ComposerState {
-                input: initial_input_text,
-                cursor_position: initial_input_cursor,
-                kill_buffer: String::new(),
-                paste_burst: PasteBurst::default(),
-                pending_paste_reference: None,
-                oversized_paste_full_text: None,
-                input_history,
-                draft_history: VecDeque::new(),
-                clear_undo_buffer: None,
-                history_index: None,
-                history_navigation_draft: None,
-                composer_history_search: None,
-                selected_attachment_index: None,
-                slash_menu_selected: 0,
-                slash_menu_hidden: false,
-                mention_menu_selected: 0,
-                mention_menu_hidden: false,
-                mention_completion_cache: None,
-                mention_candidate_cache: None,
-                vim_enabled: composer_vim_enabled,
-                vim_mode: VimMode::Normal,
-                vim_pending_d: false,
-                selection_anchor: None,
-            },
-            viewport: ViewportState::default(),
-            work_surface: crate::tui::work_surface::WorkSurfaceState::with_placement(
-                work_surface_placement,
-            ),
-            hunt: HuntState::default(),
-            session: SessionState::default(),
-            active_allowed_tools: None,
-            pausable: false,
-            paused: false,
-            paused_quarry: None,
-            history: Vec::new(),
-            history_version: 0,
-            history_revisions: Vec::new(),
-            next_history_revision: 1,
-            api_messages: Vec::new(),
-            is_loading: false,
-            last_enter_instant: None,
-            provider_wait_incident_logged: false,
-            prompt_suggestion: None,
-            prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
-            offline_mode: false,
-            turn_error_posted: false,
-            // Surface parse warnings so the user knows their config file is
-            // broken instead of silently losing all settings.
-            status_message: settings_parse_warning.or(tui_prefs_warning),
-            status_toasts: VecDeque::new(),
-            sticky_status: None,
-            last_status_message_seen: None,
-            model,
-            provider_models,
-            auto_model,
-            last_effective_model: None,
-            last_effective_provider: None,
-            pending_turn_route: None,
-            active_turn: None,
-            api_provider: provider,
-            provider_chain,
-            provider_readiness,
-            provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
-            last_fallback_reason: None,
-            model_ids_passthrough,
-            active_route_limits,
-            active_context_window_override,
-            pending_provider_switch: None,
-            reasoning_effort,
-            last_effective_reasoning_effort: None,
-            workspace,
-            config_path,
-            config_profile,
-            mcp_config_path: mcp_config_path.clone(),
-            skills_dir,
-            skills_scan_codewhale_only,
-            memory_path,
-            use_memory,
-            moraine_fallback: config.moraine_fallback(),
-            use_alt_screen,
-            use_mouse_capture,
-            use_bracketed_paste,
-            use_paste_burst_detection,
-            bracketed_paste_seen: false,
-            system_prompt: None,
-            auto_compact,
-            auto_compact_user_configured,
-            auto_compact_threshold_percent,
-            calm_mode,
-            low_motion,
-            constrained_frame_rate,
-            ocean_started_at: Instant::now(),
-            ocean_completion_started_at: None,
-            ocean_turn_history_start: 0,
-            ocean_receipt_settle_start: None,
-            fancy_animations,
-            ocean_treatment,
-            launch,
-            pending_launch_action: None,
-            pending_hotbar_slot: None,
-            synchronized_output_enabled,
-            status_indicator,
-            show_thinking,
-            verbose_transcript: false,
-            show_tool_details,
-            ui_locale,
-            cost_currency,
-            billing_presentation: crate::route_billing::for_route(config, provider),
-            composer_density,
-            composer_border,
-            voice_enabled: false,
-            voice_send_enabled: false,
-            voice_control_enabled: false,
-            transcript_spacing,
-            sidebar_width_percent,
-            sidebar_focus,
-            sidebar_hover: SidebarHoverState::default(),
-            sidebar_hover_tooltip: None,
-            cached_work_summary: None,
-            model_picker_memory: None,
-            provider_picker_memory: None,
-            last_mouse_pos: None,
-            sidebar_resizing: false,
-            sidebar_resize_anchor_x: 0,
-            sidebar_resize_anchor_width: 0,
-            last_sidebar_area: None,
-            last_sidebar_host_width: None,
-            last_sidebar_handle_area: None,
-            sidebar_resize_total_width: 0,
-            sidebar_width_dirty: false,
-            sidebar_focus_dirty: false,
-            context_panel: settings.context_panel,
-            tool_collapse_threshold: 3,
-            expanded_tool_runs: HashSet::new(),
-            tool_collapse_mode: ToolCollapseMode::from_setting(&settings.tool_collapse_mode),
-            file_tree: None,
-            file_tree_visible: false,
-            compact_threshold,
-            max_input_history,
-            allow_shell,
-            verbosity: config.verbosity.clone(),
-            max_subagents,
-            stream_chunk_timeout_secs: config.stream_chunk_timeout_secs(),
-            subagent_cache: Vec::new(),
-            subagent_terminal_seen_at: HashMap::new(),
-            agent_progress: HashMap::new(),
-            expanded_sidebar_agents: HashSet::new(),
-            agent_progress_meta: HashMap::new(),
-            subagent_card_index: HashMap::new(),
-            last_fanout_card_index: None,
-            pending_subagent_dispatch: None,
-            agent_activity_started_at: None,
-            agent_counter: 0,
-            agent_label_map: HashMap::new(),
-            last_agent_progress_redraw: None,
-            last_workflow_budget_redraw: None,
-            ui_theme,
-            theme_id,
-            onboarding,
-            onboarding_needs_api_key: needs_api_key,
-            onboarding_provider: provider,
-            onboarding_workspace_trust_gate,
-            api_key_env_only,
-            api_key_input: String::new(),
-            api_key_cursor: 0,
-            hooks,
-            yolo: yolo_compat,
-            yolo_compat_notified: false,
-            keybinding_migration_notified: false,
-            mode_prefs,
-            approval_policy_locked,
-            approval_policy_requirements_managed,
-            clipboard: ClipboardHandler::new(),
-            approval_session_approved: HashSet::new(),
-            approval_session_denied: HashSet::new(),
-            approval_mode: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
-                ApprovalMode::Bypass
-            } else {
-                configured_approval_mode
-            },
-            view_stack: ViewStack::new(),
-            pending_user_input_prompt: None,
-            backtrack: crate::tui::backtrack::BacktrackState::new(),
-            current_session_id: None,
-            last_known_work_state: None,
-            current_session_metadata: None,
-            session_artifacts: Vec::new(),
-            trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
-            translation_enabled: false,
-            status_items: config
-                .tui
-                .as_ref()
-                .and_then(|tui| tui.status_items.clone())
-                .unwrap_or_else(crate::config::StatusItem::default_footer),
-            project_doc: None,
-            plan_state,
-            plan_prompt_pending: false,
-            plan_tool_used_in_turn: false,
-            todos: new_shared_todo_list(),
-            runtime_services: RuntimeToolServices {
-                shell_manager: Some(shell_manager),
-                ..RuntimeToolServices::default()
-            },
-            mcp_snapshot: None,
-            // Read the MCP config once at boot to know how many servers
-            // the user has declared. The footer chip uses this even when
-            // no live snapshot is available (#502). Cheap (just reads
-            // the JSON files); errors fall through to zero so a missing
-            // or malformed config simply hides the chip.
-            mcp_configured_count,
-            mcp_restart_required: false,
-            tool_log: Vec::new(),
-            active_skill: None,
-            cached_skills,
-            tool_cells: HashMap::new(),
-            tool_details_by_cell: HashMap::new(),
-            context_references_by_cell: HashMap::new(),
-            session_context_references: Vec::new(),
-            active_cell: None,
-            active_cell_revision: 0,
-            active_tool_details: HashMap::new(),
-            active_tool_entry_completed_at: HashMap::new(),
-            exploring_cell: None,
-            exploring_entries: HashMap::new(),
-            ignored_tool_calls: HashSet::new(),
-            last_exec_wait_command: None,
-            streaming_message_index: None,
-            suppress_stream_events_until_turn_complete: false,
-            streaming_thinking_active_entry: None,
-            thinking_revision_last_bump_at: None,
-            streaming_state: StreamingState::new(),
-            streaming_output_token_estimate: 0,
-            reasoning_buffer: String::new(),
-            reasoning_header: None,
-            last_reasoning: None,
-            pending_tool_uses: Vec::new(),
-            queued_messages: VecDeque::new(),
-            queued_draft: None,
-            pending_steers: VecDeque::new(),
-            rejected_steers: VecDeque::new(),
-            submit_pending_steers_after_interrupt: false,
-            turn_started_at: None,
-            turn_last_activity_at: None,
-            cumulative_turn_duration: std::time::Duration::ZERO,
-            balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            balance_initiated: false,
-            last_balance_fetch: None,
-            runtime_turn_id: None,
-            runtime_turn_status: None,
-            turn_counter: 0,
-            dispatch_started_at: None,
-            workspace_context: None,
-            workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            workspace_context_refreshed_at: None,
-            task_panel: Vec::new(),
-            decision_card: None,
-            workflow_panel: None,
-            session_started_at: chrono::Utc::now(),
-            needs_redraw: true,
-            force_next_full_repaint: false,
-            thinking_started_at: None,
-            is_compacting: false,
-            is_purging: false,
-            user_scrolled_during_stream: false,
-            last_send_at: None,
-            last_submitted_prompt: None,
-            auto_submit_initial_input,
-            quit_armed_until: None,
-            prefix_change_count: 0,
-            prefix_checks_total: 0,
-            prefix_stability_pct: None,
-            last_prefix_change_desc: None,
-            last_pinned_prefix_hash: None,
-            collapsed_cells: HashSet::new(),
-            folded_thinking: HashSet::new(),
-            collapsed_cell_map: Vec::new(),
-            edit_in_progress: false,
-            lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),
-            lsp_repair: LspRepairState::default(),
-            composer_arrows_scroll: config
-                .tui
-                .as_ref()
-                .and_then(|tui| tui.composer_arrows_scroll)
-                .unwrap_or_else(|| default_composer_arrows_scroll(use_mouse_capture)),
-            mention_menu_limit: settings.mention_menu_limit,
-            mention_walk_depth: settings.mention_walk_depth,
-            mention_menu_behavior: settings.mention_menu_behavior.clone(),
-            workspace_follow_symlinks: settings.workspace_follow_symlinks,
-            session_title: None,
-            receipt_text: None,
-            receipt_started_at: None,
-            tool_evidence: Vec::new(),
-        };
-        if yolo_compat {
-            app.notify_yolo_compat_once();
-        }
-        app
-    }
-
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
         scan_codewhale_only: bool,
+        plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
-        crate::skills::discover_for_workspace_and_dir_with_mode(
+        crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
             crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            Some(plugins),
         )
+        .into_enabled()
         .list()
         .iter()
         .map(|s| (s.name.clone(), s.description.clone()))
@@ -3254,35 +2414,16 @@ impl App {
     }
 
     pub fn refresh_skill_cache(&mut self) {
+        crate::skills::clear_skill_discovery_cache();
         let skills_dir = self.skills_dir.clone();
-        self.cached_skills = Self::discover_cached_skills(
+        let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
             self.skills_scan_codewhale_only,
+            self.plugin_registry.as_ref(),
         );
-    }
-
-    pub fn submit_api_key(&mut self) -> Result<SavedCredential, ApiKeyError> {
-        let key = self.api_key_input.trim().to_string();
-        if key.is_empty() {
-            return Err(ApiKeyError::Empty);
-        }
-
-        let saved = if matches!(
-            self.onboarding_provider,
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        ) {
-            save_api_key(&key).map_err(|source| ApiKeyError::SaveFailed { source })?
-        } else {
-            let path = save_api_key_for(self.onboarding_provider, &key)
-                .map_err(|source| ApiKeyError::SaveFailed { source })?;
-            SavedCredential::ConfigFile(path)
-        };
-        self.api_key_input.clear();
-        self.api_key_cursor = 0;
-        self.onboarding_needs_api_key = false;
-        self.api_key_env_only = false;
-        Ok(saved)
+        self.hotbar_actions.replace_skills(&cached_skills);
+        self.cached_skills = cached_skills;
     }
 
     pub fn finish_onboarding_without_feature_intro(&mut self) {
@@ -3307,14 +2448,22 @@ impl App {
         if self.onboarding_needs_api_key {
             return;
         }
-        let mut settings = Settings::load_persisted().unwrap_or_default();
-        if settings.feature_intro_shown {
-            return;
-        }
-        settings.feature_intro_shown = true;
-        if let Err(err) = settings.save() {
-            self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
-            // Still show the nudge; the flag write may simply retry next launch.
+        // One transaction: the "already shown?" read and the flag write must not
+        // straddle another writer's whole-file save.
+        let write = Settings::transact_opt(|settings| {
+            if settings.feature_intro_shown {
+                return Ok(None);
+            }
+            settings.feature_intro_shown = true;
+            Ok(Some(()))
+        });
+        match write {
+            Ok(None) => return,
+            Ok(Some(())) => {}
+            Err(err) => {
+                self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
+                // Still show the nudge; the flag write may simply retry next launch.
+            }
         }
         self.status_message = Some(self.tr(MessageId::FleetReadyNotice).into_owned());
         self.needs_redraw = true;
@@ -3327,10 +2476,11 @@ impl App {
     /// and rewrites on exit, mirroring the pattern used by the `/config`
     /// surface.
     pub fn set_locale_from_onboarding(&mut self, tag: &str) -> anyhow::Result<()> {
-        let mut settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
-        settings.set("locale", tag)?;
-        settings.save()?;
-        self.ui_locale = crate::localization::resolve_locale(&settings.locale);
+        let locale = Settings::transact(|settings| {
+            settings.set("locale", tag)?;
+            Ok(settings.locale.clone())
+        })?;
+        self.ui_locale = crate::localization::resolve_locale(&locale);
         self.needs_redraw = true;
         Ok(())
     }
@@ -3351,7 +2501,10 @@ impl App {
             AppMode::Yolo => AppMode::Agent,
             other => other,
         };
-        let yolo_compat = requested_mode == AppMode::Yolo;
+        // YOLO is a permission change (Full Access + trust + shell), not a
+        // mode change. A locked approval policy owns that surface — every
+        // other posture route already honors the lock.
+        let yolo_compat = requested_mode == AppMode::Yolo && !self.approval_policy_locked();
         let previous_mode = self.mode;
         if previous_mode == mode && !yolo_compat && !self.yolo {
             return false;
@@ -3379,7 +2532,9 @@ impl App {
         if yolo_compat {
             // Transient full-access mirrors for legacy YOLO entry points; do not
             // persist trust/shell elevation into the durable Agent baseline.
-            self.allow_shell = true;
+            if self.shell_access_editable {
+                self.allow_shell = true;
+            }
             self.trust_mode = true;
             self.approval_mode = ApprovalMode::Bypass;
             self.yolo = true;
@@ -3392,20 +2547,145 @@ impl App {
             self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
         }
 
-        if mode != AppMode::Plan {
-            self.plan_prompt_pending = false;
-            self.plan_tool_used_in_turn = false;
-        }
-
-        // Execute mode change hooks
-        let context = HookContext::new()
+        // Execute mode change hooks. Built from `base_hook_context` so this
+        // event carries the same session id, workspace, model, and token total
+        // as every other event — it used to omit `DEEPSEEK_SESSION_ID`
+        // entirely, which made mode transitions uncorrelatable with the
+        // session they belonged to.
+        let context = self
+            .base_hook_context()
             .with_mode(mode.label())
-            .with_previous_mode(previous_mode.label())
-            .with_workspace(self.workspace.clone())
-            .with_model(&self.model);
-        let _ = self.hooks.execute(HookEvent::ModeChange, &context);
+            .with_previous_mode(previous_mode.label());
+        if let Err(error) = self.submit_hooks(HookEvent::ModeChange, context) {
+            self.surface_observer_hook_submission_failure(error);
+        }
         self.needs_redraw = true;
         true
+    }
+
+    /// Apply a *user-facing* mode selection: change the live session mode and
+    /// persist it as the startup default.
+    ///
+    /// This is the difference between [`Self::set_mode`] and this method.
+    /// `set_mode` is the session-only primitive — session restore and preset
+    /// application use it because they are re-installing a mode the user
+    /// already chose elsewhere, and re-persisting there would let a restored
+    /// session silently rewrite the startup default. Every interactive
+    /// selector (Tab/Shift+Tab cycling, the Alt+A/P/Y shortcuts, the hotbar
+    /// mode actions) goes through here instead, so "I switched to Operate"
+    /// survives a restart (reported by Hunter against v0.9.1).
+    ///
+    /// The write is queued, not performed here: it is ordered behind every
+    /// earlier selection by [`StartupDefaultsWriter`], and a failure surfaces
+    /// through [`Self::drain_startup_default_failures`] rather than being
+    /// dropped.
+    ///
+    /// What is persisted is `self.mode` — the mode `set_mode` actually
+    /// installed — not the requested enum. The legacy `Yolo` entry point installs
+    /// Act, so persisting the request would write a startup mode the user never
+    /// lands in. `AppMode::as_setting` collapses that alias too, but reading the
+    /// installed value keeps the two from having to agree.
+    ///
+    /// The outcome is typed, not a bool, because three things can happen and
+    /// only one of them means "nothing was saved":
+    ///
+    /// - [`SettingSelection::Changed`] — live mode moved *and* the startup
+    ///   default was queued.
+    /// - [`SettingSelection::PersistedSame`] — live mode was already the
+    ///   requested one, but the startup default was still queued. This is a
+    ///   real, reportable action: after a session restore the live mode and the
+    ///   startup default routinely disagree.
+    /// - [`SettingSelection::Refused`] — the #2982 turn lock rejected it and
+    ///   nothing was written anywhere.
+    ///
+    /// A bool collapsed the last two, so every caller (slash `/mode`, the
+    /// Alt+A/P/Y shortcuts, the hotbar mode rows) reported a refusal and a
+    /// successful same-mode save identically — as "already in that mode", with
+    /// no receipt for the write that did happen.
+    ///
+    /// [`StartupDefaultsWriter`]: crate::tui::startup_defaults::StartupDefaultsWriter
+    pub fn select_mode(&mut self, mode: AppMode) -> SettingSelection {
+        if self.reject_setting_change_while_busy(MessageId::SettingSubjectMode) {
+            return SettingSelection::Refused;
+        }
+        if matches!(mode, AppMode::Yolo) && self.approval_policy_locked() {
+            self.push_status_toast(
+                "Permissions are controlled by config or managed requirements".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return SettingSelection::Refused;
+        }
+        let changed = self.set_mode(mode);
+        // Persist an explicit selection even when it matches the live mode.
+        // A restored session can be Operate while the startup default remains
+        // Act; choosing Operate again is a request to make the visible state
+        // durable, not a no-op.
+        self.startup_defaults
+            .spawn(crate::tui::startup_defaults::StartupDefaults::mode(
+                self.mode,
+            ));
+        if changed {
+            SettingSelection::Changed
+        } else {
+            SettingSelection::PersistedSame
+        }
+    }
+
+    /// The receipt for an accepted selection that did not move live state.
+    ///
+    /// Without it a same-live selection is indistinguishable from a refusal on
+    /// screen, even though it wrote the file the user was trying to change.
+    #[must_use]
+    pub fn mode_startup_default_receipt(&self, mode: AppMode) -> String {
+        self.tr(MessageId::ModeAlreadyActiveSavedAsDefault)
+            .replace("{mode}", mode.display_name())
+    }
+
+    /// Surface any startup-default write that failed since the last drain.
+    /// Called once per event-loop iteration.
+    pub fn drain_startup_default_failures(&mut self) {
+        for failure in self.startup_defaults.drain_failures() {
+            let message = self.startup_default_failure_message(&failure);
+            self.push_status_toast(message, StatusToastLevel::Warning, Some(8_000));
+        }
+    }
+
+    /// Translate a typed startup-default failure at the locale boundary.
+    ///
+    /// The writer runs on a blocking pool and knows nothing about the user's
+    /// locale, so it reports `StartupDefaultSubject` values and a path-free
+    /// detail. Turning those into a sentence is this side's job.
+    #[must_use]
+    pub fn startup_default_failure_message(
+        &self,
+        failure: &crate::tui::startup_defaults::StartupDefaultFailure,
+    ) -> String {
+        use crate::tui::startup_defaults::StartupDefaultSubject;
+
+        let subject = if failure.subjects.is_empty() {
+            self.tr(MessageId::StartupDefaultSubjectAll).into_owned()
+        } else {
+            failure
+                .subjects
+                .iter()
+                .map(|subject| {
+                    self.tr(match subject {
+                        StartupDefaultSubject::Mode => MessageId::StartupDefaultSubjectMode,
+                        StartupDefaultSubject::Thinking => MessageId::StartupDefaultSubjectThinking,
+                        StartupDefaultSubject::Model => MessageId::StartupDefaultSubjectModel,
+                    })
+                    .into_owned()
+                })
+                .collect::<Vec<_>>()
+                // A separator, not a word: composed in code per the crate's
+                // localization rules.
+                .join(" + ")
+        };
+        self.tr(MessageId::StartupDefaultNotSaved)
+            .replace("{setting}", &subject)
+            .replace("{error}", &failure.detail)
     }
 
     fn notify_yolo_compat_once(&mut self) {
@@ -3422,10 +2702,10 @@ impl App {
         }
         // Persist the flag best-effort; toast still fires even if the write
         // fails (retries on the next attempt).
-        if let Ok(mut settings) = crate::settings::Settings::load_persisted() {
+        let _ = crate::settings::Settings::transact(|settings| {
             settings.yolo_deprecation_shown = true;
-            let _ = settings.save();
-        }
+            Ok(())
+        });
         self.push_status_toast(
             "Legacy full-access mode is deprecated — use Act + Full Access (Shift+Tab)".to_string(),
             StatusToastLevel::Warning,
@@ -3454,11 +2734,14 @@ impl App {
     /// are refused (#2982). Returns true (and posts a concise status message) if
     /// the change should be rejected — the caller leaves the selection unchanged
     /// so the chip "twitches" back instead of moving.
-    fn reject_setting_change_while_busy(&mut self, what: &str) -> bool {
+    ///
+    /// `subject` is a `MessageId`, not a `&str`, so the refusal is translated
+    /// as one sentence in the user's locale instead of splicing an English noun
+    /// into a translated template.
+    pub(crate) fn reject_setting_change_while_busy(&mut self, subject: MessageId) -> bool {
         if self.is_loading {
-            self.status_message = Some(format!(
-                "{what} is locked while a turn is running — press Esc to interrupt first"
-            ));
+            let message = self.setting_locked_message(subject);
+            self.status_message = Some(message);
             self.needs_redraw = true;
             true
         } else {
@@ -3466,52 +2749,136 @@ impl App {
         }
     }
 
-    /// Cycle through productive modes: Plan → Act → Plan.
+    /// The localized "locked while a turn is running" sentence for `subject`.
+    #[must_use]
+    pub(crate) fn setting_locked_message(&self, subject: MessageId) -> String {
+        self.tr(MessageId::SettingLockedDuringTurn)
+            .replace("{setting}", self.tr(subject).as_ref())
+    }
+
+    /// Cycle through productive modes: Plan → Act → Operate → Plan.
     pub fn cycle_mode(&mut self) {
-        if self.reject_setting_change_while_busy("Mode") {
-            return;
-        }
         let next = self.mode.next();
-        let _ = self.set_mode(next);
+        let outcome = self.select_mode(next);
+        self.report_mode_selection(next, outcome);
     }
 
     /// Cycle through modes in reverse.
     #[allow(dead_code)]
     pub fn cycle_mode_reverse(&mut self) {
-        if self.reject_setting_change_while_busy("Mode") {
-            return;
-        }
         let next = self.mode.previous();
-        let _ = self.set_mode(next);
+        let outcome = self.select_mode(next);
+        self.report_mode_selection(next, outcome);
     }
 
-    /// Cycle reasoning-effort through the active provider's distinct tiers.
-    pub fn cycle_effort(&mut self) {
-        if self.reject_setting_change_while_busy("Thinking") {
+    /// Show the startup-default receipt for a selection that did not move live
+    /// mode. `Changed` and `Refused` already have their own messaging (the mode
+    /// chip, and `reject_setting_change_while_busy` respectively).
+    pub(crate) fn report_mode_selection(&mut self, mode: AppMode, outcome: SettingSelection) {
+        if outcome == SettingSelection::PersistedSame {
+            let receipt = self.mode_startup_default_receipt(mode);
+            self.status_message = Some(receipt);
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Cycle reasoning-effort through the active route's distinct tiers.
+    ///
+    /// Typed for the same reason as [`Self::select_mode`]: a bool could not tell
+    /// the hotbar whether the turn lock refused the action or the provider
+    /// simply exposes a single tier.
+    pub fn cycle_effort(&mut self) -> SettingSelection {
+        if self.reject_setting_change_while_busy(MessageId::SettingSubjectThinking) {
+            return SettingSelection::Refused;
+        }
+        let previous = self.reasoning_effort;
+        self.apply_reasoning_effort_cycle();
+        if self.reasoning_effort == previous {
+            SettingSelection::PersistedSame
+        } else {
+            SettingSelection::Changed
+        }
+    }
+
+    /// Advance reasoning effort to the next tier for the active route and
+    /// surface the change: set a status message and refresh the compaction
+    /// budget. Auto routing retains the full provider-neutral vocabulary until
+    /// dispatch; a concrete model walks the same ladder as `/model` and
+    /// `/effort`. Shared by the Ctrl+T shortcut (`cycle_effort`) and the
+    /// hotbar `reasoning.cycle` action so the two paths cannot drift.
+    pub(crate) fn apply_reasoning_effort_cycle(&mut self) {
+        let requested = self.next_reasoning_effort_for_active_route();
+        self.commit_reasoning_effort(requested);
+    }
+
+    fn next_reasoning_effort_for_active_route(&self) -> ReasoningEffort {
+        if self.auto_model {
+            return self.reasoning_effort.cycle_next_for_auto_model();
+        }
+        let (provider, base_url, model) = match self.active_reasoning_route_truth() {
+            Some((provider, _, endpoint, model)) => (provider, endpoint, model),
+            None => (
+                self.api_provider,
+                self.active_route_base_url.as_str(),
+                self.model.as_str(),
+            ),
+        };
+        let efforts =
+            crate::tui::model_picker::picker_efforts_for_route(provider, base_url, model, false);
+        self.reasoning_effort.cycle_next_in(&efforts)
+    }
+
+    pub(crate) fn commit_reasoning_effort(&mut self, requested: ReasoningEffort) {
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        let route_truth = self.active_reasoning_route_truth();
+        let provider_kind = route_truth.map_or(self.api_provider, |(provider, _, _, _)| provider);
+        let provider = route_truth.map_or_else(
+            || self.provider_identity_for_persistence().to_string(),
+            |(_, provider_identity, _, _)| provider_identity.to_string(),
+        );
+        let endpoint_identity = route_truth
+            .map(|(_, _, endpoint, _)| crate::route_receipt::endpoint_identity(endpoint));
+        let model = route_truth.map(|(_, _, _, model)| model.to_string());
+        if let Some(work) = self.runtime_services.work.clone()
+            && let Err(err) = work.record_reasoning_effort_change(
+                self.current_session_id.as_deref(),
+                requested.into(),
+                effective.into(),
+                provider_kind,
+                &provider,
+                endpoint_identity.as_deref(),
+                model.as_deref(),
+            )
+        {
+            self.status_message = Some(format!(
+                "Reasoning effort unchanged: Work receipt failed ({err})"
+            ));
+            self.needs_redraw = true;
             return;
         }
-        self.reasoning_effort = self
-            .reasoning_effort
-            .cycle_next_for_provider(self.api_provider);
-        self.last_effective_reasoning_effort = None;
+        self.reasoning_effort = requested;
+        self.reasoning_effort_preference = Some(requested);
+        self.invalidate_route_receipts_for_reasoning_change();
+        // Same persistence owner as the model/effort pickers, so Ctrl+T and the
+        // hotbar `reasoning.cycle` action restore on restart exactly like a
+        // picker selection does. Only the *requested* tier is persisted — the
+        // effective tier is a per-turn route fact, not a user preference.
+        self.startup_defaults.spawn(
+            crate::tui::startup_defaults::StartupDefaults::reasoning_effort(requested.as_setting()),
+        );
+        self.update_model_compaction_budget();
+        self.status_message = Some(format!(
+            "Reasoning effort: {}",
+            Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
+        ));
         self.needs_redraw = true;
-        // Effort chip in the header is canonical — no duplicate toast.
     }
 
     /// Cycle the durable Agent permission posture: Ask → Auto-Review → Bypass.
     pub fn cycle_approval_posture(&mut self) -> bool {
-        if self.reject_setting_change_while_busy("Permissions") {
+        let Some(next) = self.next_approval_posture(false) else {
             return false;
-        }
-        if self.mode == AppMode::Plan {
-            self.push_status_toast(
-                "Plan is Read Only; switch to Act to change permissions".to_string(),
-                StatusToastLevel::Info,
-                Some(5_000),
-            );
-            self.needs_redraw = true;
-            return false;
-        }
+        };
         if self.approval_policy_locked() {
             self.push_status_toast(
                 "Permissions are controlled by config or managed requirements".to_string(),
@@ -3521,19 +2888,7 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
-        let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
-        let persisted = match next {
-            ApprovalMode::Suggest => "ask",
-            ApprovalMode::Auto => "auto-review",
-            ApprovalMode::Bypass => "full-access",
-            ApprovalMode::Never => "never",
-        };
-        let persistence_result = (|| -> anyhow::Result<()> {
-            let mut settings = Settings::load_persisted()?;
-            settings.permission_posture = Some(persisted.to_string());
-            settings.save()
-        })();
-        if let Err(err) = persistence_result {
+        if let Err(err) = Self::persist_permission_posture(next) {
             self.push_status_toast(
                 format!("Permissions were not changed: could not save TUI posture ({err})"),
                 StatusToastLevel::Warning,
@@ -3542,12 +2897,158 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
+        self.finish_approval_posture_change(next);
+        true
+    }
+
+    /// Cycle permissions when the only controlling source is the user's
+    /// editable root `config.toml` key. Shift+Tab is an explicit request to
+    /// adopt the TUI posture, so persist the next setting first, then remove
+    /// the shadowing root key. Roll back the setting if that removal fails.
+    pub fn cycle_root_approval_posture(&mut self) -> bool {
+        let Some(next) = self.next_approval_posture(true) else {
+            return false;
+        };
+        if !self.approval_policy_root_editable {
+            self.push_status_toast(
+                "Permissions are controlled by a non-editable policy source".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        if let Err(reason) = self.adopt_root_approval_posture(next) {
+            self.push_status_toast(
+                format!("Permissions were not changed: {reason}"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+
+        true
+    }
+
+    /// Save a real TUI permission posture and release the user-owned root
+    /// `approval_policy` that would otherwise shadow it. This is shared by
+    /// Shift+Tab and the config choice editor so both surfaces make the same
+    /// atomic transition from raw policy tokens to the three product postures.
+    pub(crate) fn adopt_root_approval_posture(&mut self, next: ApprovalMode) -> Result<(), String> {
+        if !self.approval_policy_root_editable {
+            return Err("the root approval policy is not editable".to_string());
+        }
+
+        let active_config_path = crate::config::resolve_load_config_path(self.config_path.clone())
+            .map_err(|error| error.to_string())?;
+        // The posture commit, the root-key release, and the rollback are one
+        // critical section. Two `Settings::transact` calls would expose the
+        // uncommitted middle state — a concurrent writer (a queued startup-default
+        // drain, say) could load the new posture, and the rollback save would then
+        // also revert whatever that writer had committed in between.
+        /// Why the critical section ended, carried out so every toast is
+        /// pushed after the settings lock is released.
+        enum RootPostureOutcome {
+            Committed,
+            Failed(String),
+        }
+
+        let posture = Self::approval_posture_setting(next).to_string();
+        let outcome = crate::settings::with_settings_transaction(|transaction| {
+            let mut settings = match transaction.load() {
+                Ok(settings) => settings,
+                Err(err) => {
+                    return Ok(RootPostureOutcome::Failed(format!(
+                        "could not load TUI settings ({err})"
+                    )));
+                }
+            };
+            let previous = settings.permission_posture.clone();
+            settings.permission_posture = Some(posture);
+            if let Err(err) = transaction.save(&settings) {
+                return Ok(RootPostureOutcome::Failed(format!(
+                    "could not save TUI posture ({err})"
+                )));
+            }
+
+            if let Err(err) = crate::config_persistence::persist_unset_root_key(
+                active_config_path.as_deref(),
+                "approval_policy",
+            ) {
+                settings.permission_posture = previous;
+                let rollback_note = transaction
+                    .save(&settings)
+                    .err()
+                    .map(|rollback| format!("; settings rollback also failed: {rollback}"))
+                    .unwrap_or_default();
+                return Ok(RootPostureOutcome::Failed(format!(
+                    "could not release root config policy ({err}){rollback_note}"
+                )));
+            }
+            Ok(RootPostureOutcome::Committed)
+        })
+        .unwrap_or_else(|err| {
+            RootPostureOutcome::Failed(format!("could not lock TUI settings ({err})"))
+        });
+        if let RootPostureOutcome::Failed(reason) = outcome {
+            return Err(reason);
+        }
+
+        self.clear_saved_approval_policy_lock();
+        self.finish_approval_posture_change(next);
+        Ok(())
+    }
+
+    fn next_approval_posture(&mut self, allow_root_policy: bool) -> Option<ApprovalMode> {
+        if self.reject_setting_change_while_busy(MessageId::SettingSubjectPermissions) {
+            return None;
+        }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return None;
+        }
+        if allow_root_policy && !self.approval_policy_root_editable {
+            return None;
+        }
+        Some(self.mode_prefs.agent_approval_mode.cycle_permission_next())
+    }
+
+    fn approval_posture_setting(mode: ApprovalMode) -> &'static str {
+        match mode {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        }
+    }
+
+    /// Persist the Shift+Tab permission posture.
+    ///
+    /// Synchronous on purpose: `cycle_approval_posture` only moves the live
+    /// posture if this succeeded, so the keystroke already required the write.
+    /// It runs inside [`Settings::transact`] so it cannot interleave with a
+    /// queued mode/thinking write — the two used to load the same bytes and the
+    /// later save reverted the other's field.
+    fn persist_permission_posture(next: ApprovalMode) -> anyhow::Result<()> {
+        Settings::transact(|settings| {
+            settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
+            Ok(())
+        })
+    }
+
+    fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
         self.set_agent_approval_posture(next);
         self.needs_redraw = true;
         // Footer permission chip is canonical — no status toast for the new
         // value, only the one-shot rebinding notice.
         self.notify_keybinding_migration_once();
-        true
     }
 
     /// Replace the complete durable Act baseline and project it onto the live
@@ -3589,14 +3090,37 @@ impl App {
         );
     }
 
-    /// Update the durable Act approval choice without changing its saved shell
-    /// or trust choices. Plan remains read-only.
+    /// Host path for `/auto`: persist Auto-Review as the TUI permission
+    /// posture without inventing a second runtime. Same write as Shift+Tab
+    /// landing on Auto-Review; Plan stays read-only and only the Act baseline
+    /// moves.
+    pub fn apply_auto_review_posture(&mut self) -> Result<(), String> {
+        if self.reject_setting_change_while_busy(MessageId::SettingSubjectPermissions) {
+            return Err(self.setting_locked_message(MessageId::SettingSubjectPermissions));
+        }
+        if self.approval_policy_locked() {
+            return Err("Permissions are controlled by config or managed requirements".to_string());
+        }
+        Self::persist_permission_posture(ApprovalMode::Auto)
+            .map_err(|err| format!("could not save TUI posture ({err})"))?;
+        self.set_agent_approval_posture(ApprovalMode::Auto);
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Update the durable Act approval choice. Entering Full Access enables
+    /// trust mode; leaving it removes that implicit elevation while preserving
+    /// an independently enabled trust baseline in other posture transitions.
+    /// Plan remains read-only.
     pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
-        self.set_agent_runtime_baseline(
-            self.mode_prefs.agent_allow_shell,
-            self.mode_prefs.agent_trust_mode,
-            next,
-        );
+        let trust_mode = if next == ApprovalMode::Bypass {
+            true
+        } else if self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass {
+            false
+        } else {
+            self.mode_prefs.agent_trust_mode
+        };
+        self.set_agent_runtime_baseline(self.mode_prefs.agent_allow_shell, trust_mode, next);
     }
 
     #[must_use]
@@ -3618,6 +3142,7 @@ impl App {
         self.is_loading
             || self.runtime_turn_status.as_deref() == Some("in_progress")
             || self.is_compacting
+            || self.manual_compaction_queued
             || self.is_purging
             || self
                 .task_panel
@@ -3632,7 +3157,6 @@ impl App {
     pub fn attention_hold_active(&self) -> bool {
         !self.view_stack.is_empty()
             || self.pending_user_input_prompt.is_some()
-            || self.plan_prompt_pending
             || self
                 .task_panel
                 .iter()
@@ -3641,17 +3165,36 @@ impl App {
 
     pub fn mark_approval_policy_locked(&mut self) {
         self.approval_policy_locked = true;
+        self.approval_policy_root_editable = true;
     }
 
     pub fn clear_saved_approval_policy_lock(&mut self) {
         if !self.approval_policy_requirements_managed {
             self.approval_policy_locked = false;
+            self.approval_policy_root_editable = false;
         }
     }
 
     /// Execute hooks for a specific event with the given context
     pub fn execute_hooks(&self, event: HookEvent, context: &HookContext) -> Vec<HookResult> {
         self.hooks.execute(event, context)
+    }
+
+    /// Submit observer hooks off the terminal event loop. Foreground in hook
+    /// configuration still means ordered/awaited within the worker; it no
+    /// longer means the UI waits on the child process.
+    pub fn submit_hooks(&self, event: HookEvent, context: HookContext) -> Result<(), String> {
+        self.hooks.submit_observer(event, context)
+    }
+
+    /// Preserve a lost observer event independently of the ordinary status
+    /// line. Agent lifecycle handlers immediately replace `status_message`
+    /// with their normal progress text, so a submission failure belongs in
+    /// the toast queue instead of that transient slot.
+    pub fn surface_observer_hook_submission_failure(&mut self, error: String) {
+        tracing::warn!(target: "hooks", %error, "observer hook was not submitted");
+        self.push_status_toast(error, StatusToastLevel::Error, Some(12_000));
+        self.needs_redraw = true;
     }
 
     /// Create a hook context with common fields pre-populated
@@ -3675,6 +3218,13 @@ impl App {
     const HISTORY_FOLD_BATCH: usize = 1_000;
 
     pub fn add_message(&mut self, msg: HistoryCell) {
+        // An in-flight tool is bound to a *virtual* index, `history.len() +
+        // entry_index`, resolved against `history.len()` at completion time.
+        // Growing history here without re-basing those bindings makes each of
+        // them silently mean a different cell, so the completion lands on the
+        // wrong one and the real row spins forever (#5478 — reproduced by
+        // `/rename` mid-turn, but every command that reports a message hits it).
+        self.rebase_active_cell_bindings(1);
         let rev = self.fresh_history_revision();
         self.history.push(msg);
         self.history_revisions.push(rev);
@@ -3692,6 +3242,14 @@ impl App {
             && !self.viewport.transcript_selection.dragging
             && !selection_has_range
             && !self.user_scrolled_during_stream
+            // While a worker's transcript owns the conversation area, its
+            // pin governs the visible viewport: main-conversation activity
+            // must not yank the user's read position in the focused
+            // transcript (same stick-to-bottom rule as the main pane).
+            && self
+                .agent_focus
+                .as_ref()
+                .is_none_or(|focus| focus.scroll_top.is_none())
         {
             self.scroll_to_bottom();
         }
@@ -3704,11 +3262,221 @@ impl App {
         self.accrue_session_cost_estimate(CostEstimate::usd_only(delta));
     }
 
+    /// Record what a turn's pricing attempt actually produced.
+    ///
+    /// Called with the same audit that feeds [`Self::accrue_session_cost_estimate`],
+    /// so the completeness counters can never drift from the running total.
+    /// Routes that do not meter money at all (OAuth, token plans, local models)
+    /// are not counted in either bucket — there is no dollar figure to be
+    /// incomplete about.
+    pub fn record_turn_cost_audit(&mut self, audit: &crate::pricing::TurnCostAudit) {
+        // Provenance is recorded for every audited turn, priced or not: knowing
+        // *which* row a total was built from is part of explaining the total.
+        if let Some(provenance) = audit.provenance.as_ref() {
+            self.session
+                .cost_pricing_provenances
+                .insert(provenance.label().to_string());
+        }
+        if let Some(defect) = audit.live_pricing_defect.as_ref() {
+            if audit.estimate.is_some() {
+                self.session
+                    .cost_live_pricing_defects
+                    .insert(defect.label().to_string());
+            } else {
+                self.session
+                    .cost_live_pricing_unusable_defects
+                    .insert(defect.label().to_string());
+            }
+        }
+        // An exactly non-metered route has no dollar figure to be incomplete
+        // about, so it joins neither coverage bucket. Everything else does,
+        // including a route whose billing basis could not be established.
+        if !audit.counts_toward_money_coverage() {
+            return;
+        }
+        for class in &audit.unpriced_classes {
+            self.session
+                .cost_unpriced_classes
+                .insert(class.label().to_string());
+        }
+        if !audit.usd_priced
+            && let Some(reason) = audit.unpriced_reason
+        {
+            self.session
+                .cost_unpriced_reasons
+                .insert(reason.label().to_string());
+        }
+        if !audit.cny_priced {
+            self.session.cost_cny_unpriced_reasons.insert(
+                audit
+                    .unpriced_reason
+                    .map_or("currency_not_published", |reason| reason.label())
+                    .to_string(),
+            );
+        }
+        if audit.usd_priced {
+            self.session.cost_priced_turns = self.session.cost_priced_turns.saturating_add(1);
+        } else {
+            self.session.cost_unpriced_turns = self.session.cost_unpriced_turns.saturating_add(1);
+        }
+        if audit.cny_priced {
+            self.session.cost_cny_priced_turns =
+                self.session.cost_cny_priced_turns.saturating_add(1);
+        } else {
+            self.session.cost_cny_unpriced_turns =
+                self.session.cost_cny_unpriced_turns.saturating_add(1);
+        }
+    }
+
+    /// Record the route a turn's cost was resolved against, redacted.
+    pub fn record_turn_cost_route_receipt(&mut self, receipt: String) {
+        // Bound the set so a session that rotates routes cannot grow it without
+        // limit; the first 32 distinct routes are more than enough to explain a
+        // total, and the cap is reported rather than silently truncating.
+        const MAX_ROUTE_RECEIPTS: usize = 32;
+        if self.session.cost_route_receipts.len() < MAX_ROUTE_RECEIPTS {
+            self.session.cost_route_receipts.insert(receipt);
+        } else {
+            self.session
+                .cost_route_receipts
+                .insert("…additional routes not recorded (receipt cap reached)".to_string());
+        }
+    }
+
+    /// Fold a drained background-cost pool's coverage into the session's.
+    ///
+    /// The caller has already added `pool.estimate` to the running total; this
+    /// adds the counters and provenance that qualify it, from the same drained
+    /// value, so the two can never disagree.
+    pub fn absorb_background_cost_coverage(
+        &mut self,
+        pool: &crate::cost_status::PendingBackgroundCost,
+    ) {
+        self.session.cost_priced_turns = self
+            .session
+            .cost_priced_turns
+            .saturating_add(pool.priced_turns);
+        self.session.cost_unpriced_turns = self
+            .session
+            .cost_unpriced_turns
+            .saturating_add(pool.unpriced_turns);
+        self.session.cost_cny_priced_turns = self
+            .session
+            .cost_cny_priced_turns
+            .saturating_add(pool.cny_priced_turns);
+        self.session.cost_cny_unpriced_turns = self
+            .session
+            .cost_cny_unpriced_turns
+            .saturating_add(pool.cny_unpriced_turns);
+        for reason in &pool.unpriced_reasons {
+            self.session
+                .cost_unpriced_reasons
+                .insert((*reason).to_string());
+        }
+        for reason in &pool.cny_unpriced_reasons {
+            self.session
+                .cost_cny_unpriced_reasons
+                .insert((*reason).to_string());
+        }
+        for class in &pool.unpriced_classes {
+            self.session
+                .cost_unpriced_classes
+                .insert((*class).to_string());
+        }
+        for provenance in &pool.pricing_provenances {
+            self.session
+                .cost_pricing_provenances
+                .insert((*provenance).to_string());
+        }
+        for defect in &pool.live_pricing_defects {
+            self.session
+                .cost_live_pricing_defects
+                .insert((*defect).to_string());
+        }
+        for defect in &pool.live_pricing_unusable_defects {
+            self.session
+                .cost_live_pricing_unusable_defects
+                .insert((*defect).to_string());
+        }
+        for receipt in &pool.route_receipts {
+            self.record_turn_cost_route_receipt(receipt.clone());
+        }
+    }
+
+    /// Fold one atomic background batch into the live session projection.
+    /// Returns whether the batch carried runtime-owned response identities and
+    /// therefore needs a fresh durable snapshot (it may have landed after the
+    /// ordinary TurnComplete save).
+    pub fn absorb_pending_background_cost(
+        &mut self,
+        pool: &crate::cost_status::PendingBackgroundCost,
+    ) -> bool {
+        let runtime_usage_arrived = !pool.usage_source_fingerprints.is_empty();
+        self.session
+            .subagent_usage_sources
+            .extend(pool.usage_source_fingerprints.iter().cloned());
+        if pool.estimate.is_positive() {
+            self.accrue_subagent_cost_estimate(pool.estimate);
+        }
+        self.absorb_background_cost_coverage(pool);
+        runtime_usage_arrived
+    }
+
+    /// Clear every live cost-coverage counter.
+    ///
+    /// Used by `/new` and by the session-load path: loading a session must not
+    /// leave the previous session's priced/unpriced turns attached to a total
+    /// that no longer contains them (#4318).
+    pub fn reset_cost_coverage(&mut self) {
+        self.session.cost_priced_turns = 0;
+        self.session.cost_unpriced_turns = 0;
+        self.session.cost_cny_priced_turns = 0;
+        self.session.cost_cny_unpriced_turns = 0;
+        self.session.cost_unpriced_reasons.clear();
+        self.session.cost_cny_unpriced_reasons.clear();
+        self.session.cost_unpriced_classes.clear();
+        self.session.cost_pricing_provenances.clear();
+        self.session.cost_live_pricing_defects.clear();
+        self.session.cost_live_pricing_unusable_defects.clear();
+        self.session.cost_route_receipts.clear();
+        self.session.cost_coverage_unknown_legacy = false;
+    }
+
     /// Add a dual-currency parent-turn cost estimate.
     pub fn accrue_session_cost_estimate(&mut self, estimate: CostEstimate) {
-        self.session.session_cost += estimate.usd;
-        self.session.session_cost_cny += estimate.cny;
+        let total = CostEstimate {
+            usd: self.session.session_cost,
+            cny: self.session.session_cost_cny,
+        }
+        .saturating_add(estimate);
+        self.session.session_cost = total.usd;
+        self.session.session_cost_cny = total.cny;
         self.refresh_displayed_cost_high_water();
+    }
+
+    /// Fold one in-flight model call's priced receipt into the pending-turn
+    /// estimate so cost surfaces move during a long agentic turn rather than
+    /// only when it completes. The turn's authoritative price still lands via
+    /// `accrue_session_cost_estimate` at `TurnComplete`; callers must
+    /// `clear_pending_turn_cost` there first so nothing counts twice.
+    pub fn accrue_pending_turn_cost_estimate(&mut self, estimate: CostEstimate) {
+        let total = CostEstimate {
+            usd: self.session.pending_turn_cost,
+            cny: self.session.pending_turn_cost_cny,
+        }
+        .saturating_add(estimate);
+        self.session.pending_turn_cost = total.usd;
+        self.session.pending_turn_cost_cny = total.cny;
+        self.refresh_displayed_cost_high_water();
+    }
+
+    /// Drop the in-flight turn's provisional estimate. Called at
+    /// `TurnComplete` (any outcome) immediately before the authoritative
+    /// cumulative price accrues; the display stays monotonic through the
+    /// swap via the high-water mark (#244).
+    pub fn clear_pending_turn_cost(&mut self) {
+        self.session.pending_turn_cost = 0.0;
+        self.session.pending_turn_cost_cny = 0.0;
     }
 
     /// Add `delta` to the running sub-agent cost and bump the displayed
@@ -3720,8 +3488,13 @@ impl App {
 
     /// Add a dual-currency sub-agent/background cost estimate.
     pub fn accrue_subagent_cost_estimate(&mut self, estimate: CostEstimate) {
-        self.session.subagent_cost += estimate.usd;
-        self.session.subagent_cost_cny += estimate.cny;
+        let total = CostEstimate {
+            usd: self.session.subagent_cost,
+            cny: self.session.subagent_cost_cny,
+        }
+        .saturating_add(estimate);
+        self.session.subagent_cost = total.usd;
+        self.session.subagent_cost_cny = total.cny;
         self.refresh_displayed_cost_high_water();
     }
 
@@ -3734,6 +3507,32 @@ impl App {
         metadata.cost.subagent_cost_cny = self.session.subagent_cost_cny;
         metadata.cost.displayed_cost_high_water_usd = self.session.displayed_cost_high_water;
         metadata.cost.displayed_cost_high_water_cny = self.session.displayed_cost_high_water_cny;
+        // Coverage travels with the money it qualifies. A restored total without
+        // these fields cannot say what it covers, and its serde defaults read as
+        // a *complete* total covering zero turns — so they are persisted together
+        // and `coverage_recorded` marks that this writer actually knew (#4318).
+        metadata.cost.priced_turns = self.session.cost_priced_turns;
+        metadata.cost.unpriced_turns = self.session.cost_unpriced_turns;
+        metadata.cost.cny_priced_turns = self.session.cost_cny_priced_turns;
+        metadata.cost.cny_unpriced_turns = self.session.cost_cny_unpriced_turns;
+        metadata.cost.unpriced_reasons = self.session.cost_unpriced_reasons.clone();
+        metadata.cost.cny_unpriced_reasons = self.session.cost_cny_unpriced_reasons.clone();
+        metadata.cost.unpriced_classes = self.session.cost_unpriced_classes.clone();
+        metadata.cost.pricing_provenances = self.session.cost_pricing_provenances.clone();
+        metadata.cost.live_pricing_defects = self.session.cost_live_pricing_defects.clone();
+        metadata.cost.live_pricing_unusable_defects =
+            self.session.cost_live_pricing_unusable_defects.clone();
+        metadata.cost.route_receipts = self.session.cost_route_receipts.clone();
+        metadata.cost.usage_source_fingerprints = self
+            .session
+            .subagent_usage_sources
+            .iter()
+            .cloned()
+            .collect();
+        // A session restored as legacy-unknown stays unknown when re-saved:
+        // re-writing it as "recorded" would launder the missing evidence into an
+        // apparently complete zero.
+        metadata.cost.coverage_recorded = !self.session.cost_coverage_unknown_legacy;
         // Persist cumulative turn duration so the footer "worked" chip
         // survives session save/restore (#2038).
         metadata.cumulative_turn_secs = self.cumulative_turn_duration.as_secs();
@@ -3742,13 +3541,23 @@ impl App {
     /// Recompute the displayed cost high-water mark. Called any time a cost
     /// counter is mutated; never decreases.
     pub fn refresh_displayed_cost_high_water(&mut self) {
-        let current = self.session.session_cost + self.session.subagent_cost;
-        if current > self.session.displayed_cost_high_water {
-            self.session.displayed_cost_high_water = current;
+        let current = CostEstimate {
+            usd: self.session.session_cost,
+            cny: self.session.session_cost_cny,
         }
-        let current_cny = self.session.session_cost_cny + self.session.subagent_cost_cny;
-        if current_cny > self.session.displayed_cost_high_water_cny {
-            self.session.displayed_cost_high_water_cny = current_cny;
+        .saturating_add(CostEstimate {
+            usd: self.session.pending_turn_cost,
+            cny: self.session.pending_turn_cost_cny,
+        })
+        .saturating_add(CostEstimate {
+            usd: self.session.subagent_cost,
+            cny: self.session.subagent_cost_cny,
+        });
+        if current.usd > self.session.displayed_cost_high_water {
+            self.session.displayed_cost_high_water = current.usd;
+        }
+        if current.cny > self.session.displayed_cost_high_water_cny {
+            self.session.displayed_cost_high_water_cny = current.cny;
         }
     }
 
@@ -3764,20 +3573,48 @@ impl App {
     pub fn displayed_session_cost_for_currency(&self, currency: CostCurrency) -> f64 {
         match self.cost_display_currency(currency) {
             CostCurrency::Usd => {
-                let current = self.session.session_cost + self.session.subagent_cost;
+                let current = CostEstimate {
+                    usd: self.session.session_cost,
+                    cny: 0.0,
+                }
+                .saturating_add(CostEstimate {
+                    usd: self.session.pending_turn_cost,
+                    cny: 0.0,
+                })
+                .saturating_add(CostEstimate {
+                    usd: self.session.subagent_cost,
+                    cny: 0.0,
+                })
+                .usd;
                 current.max(self.session.displayed_cost_high_water)
             }
             CostCurrency::Cny => {
-                let current = self.session.session_cost_cny + self.session.subagent_cost_cny;
+                let current = CostEstimate {
+                    usd: 0.0,
+                    cny: self.session.session_cost_cny,
+                }
+                .saturating_add(CostEstimate {
+                    usd: 0.0,
+                    cny: self.session.pending_turn_cost_cny,
+                })
+                .saturating_add(CostEstimate {
+                    usd: 0.0,
+                    cny: self.session.subagent_cost_cny,
+                })
+                .cny;
                 current.max(self.session.displayed_cost_high_water_cny)
             }
         }
     }
 
+    /// The session's own display share: settled turns plus the in-flight
+    /// turn's provisional estimate (the running turn's money is session
+    /// money, so the sidebar breakdown keeps summing to the displayed total
+    /// mid-turn).
     pub fn session_cost_for_currency(&self, currency: CostCurrency) -> f64 {
         match self.cost_display_currency(currency) {
-            CostCurrency::Usd => self.session.session_cost,
-            CostCurrency::Cny => self.session.session_cost_cny,
+            CostCurrency::Usd => self.session.session_cost + self.session.pending_turn_cost,
+            CostCurrency::Cny => self.session.session_cost_cny + self.session.pending_turn_cost_cny,
         }
     }
 
@@ -3801,36 +3638,13 @@ impl App {
 
     pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
-            && self.session.session_cost_cny == 0.0
-            && self.session.subagent_cost_cny == 0.0
-            && self.session.displayed_cost_high_water_cny == 0.0
-            && (self.session.session_cost > 0.0
-                || self.session.subagent_cost > 0.0
-                || self.session.displayed_cost_high_water > 0.0)
+            && self.session.cost_cny_priced_turns == 0
+            && self.session.cost_priced_turns > 0
         {
             CostCurrency::Usd
         } else {
             currency
         }
-    }
-
-    /// Estimated cost saved by the last turn's cache-hit tokens in the
-    /// configured display currency.  Returns `None` when the model's pricing
-    /// is unknown or there were no cache hits.
-    pub fn last_turn_cache_savings(&self) -> Option<f64> {
-        let hit_tokens = self.session.last_prompt_cache_hit_tokens?;
-        let estimate = crate::pricing::calculate_cache_savings_for_provider(
-            self.api_provider,
-            &self.model,
-            hit_tokens,
-        )?;
-        Some(match self.cost_currency {
-            crate::pricing::CostCurrency::Usd => estimate.usd,
-            crate::pricing::CostCurrency::Cny if estimate.cny == 0.0 && estimate.usd > 0.0 => {
-                estimate.usd
-            }
-            crate::pricing::CostCurrency::Cny => estimate.cny,
-        })
     }
 
     /// Fold the oldest [`Self::HISTORY_FOLD_BATCH`] cells into a single
@@ -3878,6 +3692,7 @@ impl App {
         let rev = self.fresh_history_revision();
         self.history.insert(0, placeholder);
         self.history_revisions.insert(0, rev);
+        self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
     }
@@ -3945,6 +3760,7 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
+        self.folded_thinking.clear();
         self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
@@ -3952,14 +3768,121 @@ impl App {
         self.collapsed_cell_map.clear();
     }
 
-    /// #3030: return the stable user-facing label for an agent id
-    /// ("Agent 3"), assigning the next sequential label on first sight.
-    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
-        if let Some(label) = self.agent_label_map.get(agent_id) {
-            return label.clone();
+    /// Resolve the dispatch/session name for an agent. `None` when the agent
+    /// is unnamed (the manager seeds `name` with the raw id) or absent from
+    /// the cache — the raw id is a lookup handle, never a display name.
+    fn agent_session_name(&self, agent_id: &str) -> Option<String> {
+        let agent = self
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        let name = agent.name.trim();
+        (!name.is_empty() && name != agent.agent_id).then(|| name.to_string())
+    }
+
+    /// Resolve the most specific member/role token for an agent, in priority
+    /// order: resolved profile id, advisory assignment role, requested alias,
+    /// canonical route role, then Fleet type. `None` only for a
+    /// progress-only agent whose dispatch metadata has not arrived yet.
+    fn agent_role_label(&self, agent_id: &str) -> Option<String> {
+        let agent = self
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        agent
+            .child_route
+            .as_ref()
+            .and_then(|route| route.resolved_profile_id.as_deref())
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                agent
+                    .assignment
+                    .role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                agent
+                    .child_route
+                    .as_ref()
+                    .and_then(|route| route.requested_profile.as_deref())
+                    .map(str::trim)
+                    .filter(|profile| !profile.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                agent
+                    .child_route
+                    .as_ref()
+                    .map(|route| route.canonical_role.trim())
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                let role = agent.agent_type.as_str().trim();
+                (!role.is_empty()).then(|| role.to_string())
+            })
+    }
+
+    /// `true` for the `Agent N` counter placeholder assigned before a child's
+    /// dispatch metadata arrives. Placeholders are the only label that may be
+    /// upgraded once the child's identity is observed.
+    fn is_agent_counter_placeholder(label: &str) -> bool {
+        label
+            .strip_prefix("Agent ")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// Resolve the identity-backed label for an agent, or `None` when no
+    /// identity field is populated (so the caller falls back to a counter
+    /// placeholder). Named children keep their name and gain a role suffix
+    /// when the role is not already part of the name; unnamed children are
+    /// disambiguated with a per-role sequence counter.
+    fn resolved_identity_label(&mut self, agent_id: &str) -> Option<String> {
+        let name = self.agent_session_name(agent_id);
+        let role = self.agent_role_label(agent_id);
+        match (name, role) {
+            (Some(name), Some(role)) if !name.contains(&role) => Some(format!("{name} · {role}")),
+            (Some(name), _) => Some(name),
+            (None, Some(role)) => {
+                let next = self.agent_role_counters.entry(role.clone()).or_insert(0);
+                *next += 1;
+                Some(format!("{role} · {next}"))
+            }
+            (None, None) => None,
         }
+    }
+
+    fn next_agent_placeholder(&mut self) -> String {
         self.agent_counter = self.agent_counter.saturating_add(1);
-        let label = format!("Agent {}", self.agent_counter);
+        format!("Agent {}", self.agent_counter)
+    }
+
+    /// #3030: return the stable user-facing label for an agent id. Labels are
+    /// resolved from the child's own identity and never downgraded once set;
+    /// only the generic `Agent N` placeholder upgrades when dispatch metadata
+    /// arrives. A raw agent id is never used as a label.
+    pub(crate) fn ensure_agent_label(&mut self, agent_id: &str) -> String {
+        let existing = self.agent_label_map.get(agent_id).cloned();
+        if let Some(existing) = existing {
+            if !Self::is_agent_counter_placeholder(&existing) {
+                return existing;
+            }
+            // Upgrade a placeholder only once identity metadata is available.
+            if let Some(label) = self.resolved_identity_label(agent_id) {
+                self.agent_label_map
+                    .insert(agent_id.to_string(), label.clone());
+                return label;
+            }
+            return existing;
+        }
+        let label = self
+            .resolved_identity_label(agent_id)
+            .unwrap_or_else(|| self.next_agent_placeholder());
         self.agent_label_map
             .insert(agent_id.to_string(), label.clone());
         label
@@ -3984,6 +3907,77 @@ impl App {
         // one — the cache will reuse those. Callers that mutate a specific
         // cell's content must call `bump_history_cell(idx)` instead.
         self.resync_history_revisions();
+        self.needs_redraw = true;
+    }
+
+    /// Invalidate only transcript rows whose visible liveness marker is
+    /// time-based. Animation redraws must not churn settled history, but they
+    /// do need fresh cache keys for running history and active-cell entries.
+    pub(crate) fn mark_live_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(true);
+    }
+
+    /// Invalidate only committed live rows. The translation placeholder path
+    /// already bumps the whole active-cell cache when it changes, so the UI
+    /// uses this narrower path to avoid bumping that revision twice.
+    pub(crate) fn mark_live_history_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(false);
+    }
+
+    fn mark_live_motion_updated_inner(&mut self, invalidate_active_cell: bool) {
+        self.resync_history_revisions();
+        let live_history_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| cell.has_live_motion().then_some(index))
+            .collect();
+        for index in live_history_indices {
+            let previous_revision = self.history_revisions.get(index).copied();
+            let streaming_content_len = (self.streaming_message_index == Some(index))
+                .then(|| match self.history.get(index) {
+                    Some(HistoryCell::Assistant {
+                        content,
+                        streaming: true,
+                    }) => Some(content.len()),
+                    _ => None,
+                })
+                .flatten();
+            let revision = self.fresh_history_revision();
+            if let Some(slot) = self.history_revisions.get_mut(index) {
+                *slot = revision;
+            }
+            if let (Some(previous_revision), Some(content_len)) =
+                (previous_revision, streaming_content_len)
+            {
+                let from_revision = self
+                    .streaming_source_receipt
+                    .filter(|receipt| {
+                        receipt.cell_index == index && receipt.to_revision == previous_revision
+                    })
+                    .map_or(previous_revision, |receipt| receipt.from_revision);
+                self.streaming_source_receipt =
+                    Some(crate::tui::transcript::StreamingSourceReceipt {
+                        cell_index: index,
+                        from_revision,
+                        to_revision: revision,
+                        content_len,
+                    });
+            }
+        }
+
+        let active_has_live_motion = self
+            .active_cell
+            .as_ref()
+            .is_some_and(|active| active.entries().iter().any(HistoryCell::has_live_motion));
+        if invalidate_active_cell && active_has_live_motion {
+            self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+            if let Some(active) = self.active_cell.as_mut() {
+                active.bump_revision();
+            }
+        }
+
+        self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
     }
 
@@ -4019,6 +4013,12 @@ impl App {
         // pushing through `add_message`. After resync, the index is valid
         // (or out of bounds — in which case there's nothing to bump).
         self.resync_history_revisions();
+        if self
+            .streaming_source_receipt
+            .is_some_and(|receipt| receipt.cell_index == idx)
+        {
+            self.streaming_source_receipt = None;
+        }
         if let Some(rev) = self.history_revisions.get_mut(idx) {
             let new_rev = self.next_history_revision;
             self.next_history_revision = self.next_history_revision.wrapping_add(1);
@@ -4064,9 +4064,7 @@ impl App {
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
-        self.collapsed_cells.clear();
-        self.expanded_tool_runs.clear();
-        self.collapsed_cell_map.clear();
+        self.prune_transcript_index_state(0);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
     }
@@ -4078,8 +4076,7 @@ impl App {
             self.history_revisions.pop();
             self.context_references_by_cell.remove(&self.history.len());
             self.rebuild_session_context_references();
-            self.expanded_tool_runs
-                .retain(|idx| *idx < self.history.len());
+            self.prune_transcript_index_state(self.history.len());
             self.history_version = self.history_version.wrapping_add(1);
             self.needs_redraw = true;
         }
@@ -4115,12 +4112,17 @@ impl App {
         {
             self.last_fanout_card_index = None;
         }
-        // Drop collapsed cells that reference indices past the new tail.
-        self.collapsed_cells.retain(|idx| *idx < new_len);
-        self.expanded_tool_runs.retain(|idx| *idx < new_len);
-        self.collapsed_cell_map.clear();
+        self.prune_transcript_index_state(new_len);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
+    }
+
+    pub(crate) fn prune_transcript_index_state(&mut self, len: usize) {
+        self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
+        self.collapsed_cells.retain(|idx| *idx < len);
+        self.folded_thinking.retain(|idx| *idx < len);
+        self.expanded_tool_runs.retain(|idx| *idx < len);
+        self.collapsed_cell_map.clear();
     }
 
     #[must_use]
@@ -4187,15 +4189,6 @@ impl App {
         self.history.len() + self.active_cell.as_ref().map_or(0, ActiveCell::entry_count)
     }
 
-    /// The next cell index a freshly-pushed entry would occupy in the virtual
-    /// transcript. Used by `register_tool_cell`-style callsites that record
-    /// cell-index metadata before the active cell flushes to history.
-    #[must_use]
-    #[allow(dead_code)] // Reserved for the eventual merged push helper.
-    pub fn next_virtual_cell_index(&self) -> usize {
-        self.virtual_cell_count()
-    }
-
     #[must_use]
     pub fn original_cell_index_for_rendered(&self, rendered_index: usize) -> usize {
         self.collapsed_cell_map
@@ -4234,14 +4227,43 @@ impl App {
 
     /// Whether a virtual transcript cell can open a meaningful `v` detail
     /// view. Thinking cells render their own raw text inline so there is no
-    /// separate "raw" target — only tool / sub-agent cells get the hint.
+    /// separate "raw" target. Error cells always get a full-message target so
+    /// recovery instructions cannot be stranded below a short terminal view.
     #[must_use]
     pub fn cell_has_detail_target(&self, index: usize) -> bool {
         self.tool_detail_record_for_cell(index).is_some()
             || matches!(
                 self.cell_at_virtual_index(index),
-                Some(HistoryCell::Tool(_) | HistoryCell::SubAgent(_))
+                Some(HistoryCell::Error { .. } | HistoryCell::Tool(_) | HistoryCell::SubAgent(_))
             )
+    }
+
+    /// Space owner: selection, newest visible cell, then latest virtual cell.
+    #[must_use]
+    pub(crate) fn transcript_action_owner(&self) -> Option<TranscriptActionOwner> {
+        let meta = self.viewport.transcript_cache.line_meta();
+        let selected = self
+            .viewport
+            .transcript_selection
+            .ordered_endpoints()
+            .and_then(|(start, _)| meta.get(start.line_index));
+        let start = self.viewport.last_transcript_top.min(meta.len());
+        let end = start
+            .saturating_add(self.viewport.last_transcript_visible)
+            .min(meta.len());
+        let cell_index = selected
+            .into_iter()
+            .chain(meta[start..end].iter().rev())
+            .find_map(|meta| {
+                meta.cell_line()
+                    .map(|(idx, _)| self.original_cell_index_for_rendered(idx))
+                    .filter(|&idx| self.cell_at_virtual_index(idx).is_some())
+            })
+            .or_else(|| self.virtual_cell_count().checked_sub(1))?;
+        Some(TranscriptActionOwner {
+            cell_index,
+            identity_epoch: self.transcript_identity_epoch,
+        })
     }
 
     /// Pick the detail target for the current viewport. This is used by the
@@ -4253,33 +4275,38 @@ impl App {
         visible: usize,
         line_meta: &[TranscriptLineMeta],
     ) -> Option<usize> {
-        let selected_cell = self
+        let original = |meta: &TranscriptLineMeta| {
+            meta.cell_line()
+                .map(|(idx, _)| self.original_cell_index_for_rendered(idx))
+        };
+        let selected = self
             .viewport
             .transcript_selection
             .ordered_endpoints()
             .and_then(|(start, _)| line_meta.get(start.line_index))
-            .and_then(TranscriptLineMeta::cell_line)
-            .map(|(cell_index, _)| self.original_cell_index_for_rendered(cell_index))
+            .and_then(original)
             .filter(|&idx| self.cell_has_detail_target(idx));
-        if selected_cell.is_some() {
-            return selected_cell;
-        }
-
         let start = top.min(line_meta.len().saturating_sub(1));
         let end = start.saturating_add(visible).min(line_meta.len());
-        for meta in line_meta.iter().take(end).skip(start) {
-            let Some((cell_index, _)) = meta.cell_line() else {
-                continue;
-            };
-            let cell_index = self.original_cell_index_for_rendered(cell_index);
-            if self.cell_has_detail_target(cell_index) {
-                return Some(cell_index);
-            }
-        }
-
-        (0..self.virtual_cell_count())
-            .rev()
-            .find(|&idx| self.cell_has_detail_target(idx))
+        let mut visible_cells = line_meta[start..end].iter().filter_map(original);
+        // A visible error is the most urgent detail target. Prefer the newest
+        // visible error over an earlier tool card so Alt+V opens the failure
+        // the user is looking at, even when both occupy the viewport.
+        selected
+            .or_else(|| {
+                visible_cells.clone().rev().find(|&idx| {
+                    matches!(
+                        self.cell_at_virtual_index(idx),
+                        Some(HistoryCell::Error { .. })
+                    )
+                })
+            })
+            .or_else(|| visible_cells.find(|&idx| self.cell_has_detail_target(idx)))
+            .or_else(|| {
+                (0..self.virtual_cell_count())
+                    .rev()
+                    .find(|&idx| self.cell_has_detail_target(idx))
+            })
     }
 
     pub fn record_context_references(
@@ -4335,6 +4362,41 @@ impl App {
     /// Mutable variant of [`Self::cell_at_virtual_index`]. Bumps the
     /// appropriate revision counter (active-cell revision when targeting an
     /// in-flight entry, history version otherwise).
+    /// Shift every binding that points *into the active cell* up by `added`,
+    /// to keep it pointing at the same entry after `added` cells are appended
+    /// to history.
+    ///
+    /// Bindings below `history.len()` address finalized cells and must not
+    /// move. Only called when an active cell exists: with no active cell there
+    /// are no virtual indices to re-base, and shifting would corrupt real ones.
+    fn rebase_active_cell_bindings(&mut self, added: usize) {
+        if added == 0 || self.active_cell.is_none() {
+            return;
+        }
+        let boundary = self.history.len();
+        for index in self.tool_cells.values_mut() {
+            if *index >= boundary {
+                *index = index.saturating_add(added);
+            }
+        }
+        for (cell_index, _) in self.exploring_entries.values_mut() {
+            if *cell_index >= boundary {
+                *cell_index = cell_index.saturating_add(added);
+            }
+        }
+        self.active_tool_entry_completed_at =
+            std::mem::take(&mut self.active_tool_entry_completed_at)
+                .into_iter()
+                .map(|(index, at)| {
+                    if index >= boundary {
+                        (index.saturating_add(added), at)
+                    } else {
+                        (index, at)
+                    }
+                })
+                .collect();
+    }
+
     pub fn cell_at_virtual_index_mut(&mut self, index: usize) -> Option<&mut HistoryCell> {
         if index < self.history.len() {
             // Bump only the targeted cell's revision; leave every other
@@ -4387,14 +4449,33 @@ impl App {
             *streaming = false;
         }
 
-        let drained = active.drain();
         let base_index = self.history.len();
+        // Completed tools are removed from `tool_cells` before the active
+        // group flushes, but `ActiveCell` deliberately keeps the stable
+        // tool-to-entry binding until drain. Capture that binding first so
+        // sequential or parallel tools in one model turn retain distinct raw
+        // detail records instead of all falling back to the first cell.
+        let detail_cell_indices: HashMap<String, usize> = self
+            .active_tool_details
+            .keys()
+            .filter_map(|tool_id| {
+                active
+                    .entry_index_for_tool(tool_id)
+                    .map(|entry_idx| (tool_id.clone(), base_index + entry_idx))
+            })
+            .collect();
+        let drained = active.drain();
 
         let mut details = std::mem::take(&mut self.active_tool_details);
         self.active_tool_entry_completed_at.clear();
         for (tool_id, detail) in details.drain() {
+            let cell_index = detail_cell_indices
+                .get(&tool_id)
+                .copied()
+                .or_else(|| self.tool_cells.get(&tool_id).copied())
+                .unwrap_or(base_index);
             self.tool_details_by_cell
-                .entry(self.tool_cells.get(&tool_id).copied().unwrap_or(base_index))
+                .entry(cell_index)
                 .or_insert(detail);
         }
 
@@ -4417,6 +4498,14 @@ impl App {
             && !self.viewport.transcript_selection.dragging
             && !selection_has_range
             && !self.user_scrolled_during_stream
+            // While a worker's transcript owns the conversation area, its
+            // pin governs the visible viewport: main-conversation activity
+            // must not yank the user's read position in the focused
+            // transcript (same stick-to-bottom rule as the main pane).
+            && self
+                .agent_focus
+                .as_ref()
+                .is_none_or(|focus| focus.scroll_top.is_none())
         {
             self.scroll_to_bottom();
         }
@@ -4437,17 +4526,38 @@ impl App {
         }
     }
 
-    /// Apply a workflow panel event, creating the panel on first `RunStarted`.
+    /// Apply a workflow panel event for one immutable workflow run, creating
+    /// the panel on first `RunStarted`.
     ///
-    /// Returns whether this event should request an immediate repaint.
-    /// Budget-only updates always mutate panel state but leave repaint to the
-    /// caller so high-frequency fan-out budget ticks can be paced (#4095).
+    /// Returns whether the event belonged to the displayed run and was
+    /// applied. Budget-only updates still return `true`, but leave repaint to
+    /// the caller so high-frequency fan-out budget ticks can be paced (#4095).
+    /// A `RunStarted` event may select a different run only when its start is
+    /// strictly newer; every other cross-run event fails closed.
     pub fn apply_workflow_panel_event(
         &mut self,
+        event_run_id: &str,
         event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
     ) -> bool {
         use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
-        let budget_only = matches!(event, WorkflowPanelEvent::BudgetUpdated { .. });
+        if event_run_id.trim().is_empty() {
+            return false;
+        }
+        if let WorkflowPanelEvent::RunStarted { run_id, .. } = &event
+            && run_id != event_run_id
+        {
+            return false;
+        }
+        if let Some(panel) = self.workflow_panel.as_ref()
+            && panel.run_id != event_run_id
+        {
+            match &event {
+                WorkflowPanelEvent::RunStarted { at_ms, .. } if *at_ms > panel.started_at_ms => {}
+                _ => return false,
+            }
+        }
+
+        let budget_only = matches!(&event, WorkflowPanelEvent::BudgetUpdated { .. });
         match (&mut self.workflow_panel, &event) {
             (
                 None,
@@ -4473,7 +4583,7 @@ impl App {
             (None, _) => {
                 // No panel yet and event is not a start — seed a shell panel
                 // so late events still surface rather than being dropped.
-                let mut panel = WorkflowPanel::new("workflow", "workflow", 0);
+                let mut panel = WorkflowPanel::new(event_run_id, event_run_id, 0);
                 panel.locale = self.ui_locale;
                 panel.apply_event(event);
                 self.workflow_panel = Some(panel);
@@ -4485,7 +4595,7 @@ impl App {
         if !budget_only {
             self.needs_redraw = true;
         }
-        !budget_only
+        true
     }
 
     /// Toggle the workflow panel expand/collapse state. Returns true when a
@@ -4497,20 +4607,6 @@ impl App {
         let _ = panel.toggle_expanded();
         self.needs_redraw = true;
         true
-    }
-
-    pub fn push_status_toast(
-        &mut self,
-        text: impl Into<String>,
-        level: StatusToastLevel,
-        ttl_ms: Option<u64>,
-    ) {
-        let toast = StatusToast::new(text, level, ttl_ms);
-        self.status_toasts.push_back(toast);
-        while self.status_toasts.len() > 24 {
-            self.status_toasts.pop_front();
-        }
-        self.needs_redraw = true;
     }
 
     /// How long the "press Ctrl+C again to quit" prompt stays armed before it
@@ -4571,12 +4667,6 @@ impl App {
         }
     }
 
-    pub fn active_receipt_text(&self) -> Option<&str> {
-        let receipt = self.receipt_text.as_deref()?;
-        let started = self.receipt_started_at?;
-        (started.elapsed() <= Self::RECEIPT_VISIBLE_DURATION).then_some(receipt)
-    }
-
     /// Tick called from the redraw loop so transient receipts leave the UI
     /// without waiting for the next keypress.
     pub fn tick_receipt(&mut self) {
@@ -4588,199 +4678,104 @@ impl App {
         }
     }
 
-    pub fn set_sticky_status(
-        &mut self,
-        text: impl Into<String>,
-        level: StatusToastLevel,
-        ttl_ms: Option<u64>,
-    ) {
-        self.sticky_status = Some(StatusToast::new(text, level, ttl_ms));
-        self.needs_redraw = true;
-    }
-
-    pub fn clear_sticky_status(&mut self) {
-        self.sticky_status = None;
-    }
-
-    pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
-        if self.sidebar_focus != focus {
-            self.sidebar_focus = focus;
-            self.sidebar_focus_dirty = true;
-        }
-        self.needs_redraw = true;
-    }
-
     pub fn close_slash_menu(&mut self) {
         self.slash_menu_hidden = true;
         self.needs_redraw = true;
     }
 
-    fn classify_status_text(text: &str) -> (StatusToastLevel, Option<u64>, bool) {
-        let lower = text.to_ascii_lowercase();
-        let has = |needle: &str| lower.contains(needle);
+    /// Ceiling on how far the ambient clock advances per sampled frame.
+    /// Bursty draw schedules (fast token streams) slow the aquarium down
+    /// instead of teleporting creatures across the gap.
+    pub const AMBIENT_MAX_STEP_MS: u128 = 160;
+    /// Gentle-motion grace before a fully idle aquarium settles still.
+    pub const AMBIENT_IDLE_SETTLE_MS: u64 = 6_000;
 
-        if has("offline mode") || has("context critical") {
-            return (StatusToastLevel::Warning, None, true);
-        }
-        if has("error")
-            || has("failed")
-            || has("denied")
-            || has("timeout")
-            || has("aborted")
-            || has("critical")
-        {
-            return (StatusToastLevel::Error, Some(15_000), true);
-        }
-        // A success keyword under a negation ("not saved", "no longer
-        // found", "could not enable") is a failure the coarse keyword match
-        // would otherwise paint green. Guard it: negated success degrades to
-        // a neutral Info toast rather than a misleading Success.
-        let negated = has("not ")
-            || has("no longer")
-            || has("no ")
-            || has("could not")
-            || has("couldn't")
-            || has("cannot")
-            || has("can't")
-            || has("unable");
-        if !negated
-            && (has("saved")
-                || has("loaded")
-                || has("queued")
-                || has("found")
-                || has("enabled")
-                || has("completed"))
-        {
-            return (StatusToastLevel::Success, Some(5_000), false);
-        }
-        if has("cancelled") || has("canceled") || has("warning") {
-            return (StatusToastLevel::Warning, Some(5_000), false);
-        }
-        (StatusToastLevel::Info, Some(4_000), false)
-    }
-
-    fn is_mode_switch_status_message(message: &str) -> bool {
-        message.starts_with("Switched to ") && message.ends_with(" mode")
-    }
-
-    pub fn sync_status_message_to_toasts(&mut self) {
-        let current = self.status_message.clone();
-        if self.last_status_message_seen == current {
-            return;
-        }
-        self.last_status_message_seen = current.clone();
-
-        let Some(message) = current else {
-            return;
-        };
-        if message.trim().is_empty() {
-            return;
-        }
-        if Self::is_mode_switch_status_message(&message) {
-            return;
-        }
-
-        let (level, ttl_ms, sticky) = Self::classify_status_text(&message);
-        if sticky {
-            self.set_sticky_status(message, level, ttl_ms);
-        } else {
-            if matches!(level, StatusToastLevel::Success)
-                && self
-                    .sticky_status
-                    .as_ref()
-                    .is_some_and(|toast| matches!(toast.level, StatusToastLevel::Error))
-            {
-                self.clear_sticky_status();
-            }
-            self.push_status_toast(message, level, ttl_ms);
-        }
-    }
-
-    /// Up to `limit` currently-active toasts, most recent last (so a stacked
-    /// renderer iterating top-to-bottom shows the freshest message at the
-    /// bottom, like a chat log). Drains expired toasts off the front as a
-    /// side effect — same cleanup as `active_status_toast` so callers see a
-    /// consistent queue. Whalescale#439.
-    pub fn active_status_toasts(&mut self, limit: usize) -> Vec<StatusToast> {
-        self.sync_status_message_to_toasts();
+    /// Advance and read the ambient animation clock. Every decorative
+    /// position derives from this value; it moves by real elapsed time
+    /// clamped to [`Self::AMBIENT_MAX_STEP_MS`] per sample, so motion stays
+    /// continuous no matter how irregular the draw schedule is.
+    pub fn sample_ambient_clock_ms(&mut self) -> u128 {
         let now = Instant::now();
-        while self
-            .status_toasts
-            .front()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.status_toasts.pop_front();
-            self.needs_redraw = true;
-        }
-        if self
-            .sticky_status
-            .as_ref()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.sticky_status = None;
-            self.needs_redraw = true;
-        }
-
-        let mut out: Vec<StatusToast> = Vec::with_capacity(limit);
-        if let Some(sticky) = self.sticky_status.clone() {
-            out.push(sticky);
-        }
-        let take = limit.saturating_sub(out.len());
-        let queued: Vec<StatusToast> = self
-            .status_toasts
-            .iter()
-            .rev()
-            .take(take)
-            .cloned()
-            .collect();
-        // Iterate in queue order (oldest of the visible window first) so the
-        // stacked renderer feels chronological — most recent at the bottom.
-        for toast in queued.into_iter().rev() {
-            out.push(toast);
-        }
-        out
+        let step = self
+            .ambient_clock_sampled_at
+            .map(|last| {
+                now.duration_since(last)
+                    .as_millis()
+                    .min(Self::AMBIENT_MAX_STEP_MS)
+            })
+            .unwrap_or(0);
+        self.ambient_clock_sampled_at = Some(now);
+        self.ambient_clock_ms = self.ambient_clock_ms.saturating_add(step);
+        self.ambient_clock_ms
     }
 
-    pub fn active_status_toast(&mut self) -> Option<StatusToast> {
-        self.sync_status_message_to_toasts();
-        let now = Instant::now();
-        let mut removed = false;
-
-        while self
-            .status_toasts
-            .front()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.status_toasts.pop_front();
-            removed = true;
+    /// Track idleness and report whether the ambient scene has settled.
+    /// `busy` is the caller's aggregation of live activity signals (running
+    /// turn, live sub-agents, active durable tasks, completion exhale, user
+    /// browsing). While busy the idle anchor clears; once quiet, motion gets
+    /// [`Self::AMBIENT_IDLE_SETTLE_MS`] of grace and then stills.
+    pub fn ambient_idle_settled(&mut self, busy: bool, now: Instant) -> bool {
+        if busy {
+            self.ambient_idle_since = None;
+            return false;
         }
+        let since = *self.ambient_idle_since.get_or_insert(now);
+        now.duration_since(since) >= Duration::from_millis(Self::AMBIENT_IDLE_SETTLE_MS)
+    }
 
-        if self
-            .sticky_status
-            .as_ref()
-            .is_some_and(|toast| toast.is_expired(now))
-        {
-            self.sticky_status = None;
-            removed = true;
-        }
+    /// Resolve one motion policy for every surface that can request or paint
+    /// animation. `fancy_animations = false` is a true still mode even when
+    /// the separate accessibility preference is left at its default.
+    #[must_use]
+    pub(crate) fn motion_policy(&self) -> MotionPolicy {
+        MotionPolicy::from_settings(
+            self.low_motion,
+            self.fancy_animations,
+            self.constrained_frame_rate,
+        )
+    }
 
-        if removed {
-            self.needs_redraw = true;
-        }
+    /// Resolve the `[title] …` window-title prefix for the terminal title.
+    ///
+    /// Precedence: the session-level `/title` override wins over the `title`
+    /// config default; neither configured means no prefix (the historical
+    /// window titles stay byte-for-byte unchanged). This is deliberately
+    /// independent of [`session_title`](Self::session_title) — the session
+    /// *name* keeps identifying the composer border and picker, while this
+    /// prefix only decorates the terminal window/tab title.
+    #[must_use]
+    pub(crate) fn window_title_prefix(&self) -> Option<&str> {
+        self.window_title
+            .as_deref()
+            .or(self.title_default.as_deref())
+            .filter(|prefix| !prefix.trim().is_empty())
+    }
 
-        self.sticky_status
-            .clone()
-            .or_else(|| self.status_toasts.back().cloned())
+    /// Bridge the centralized policy into transcript renderers that still
+    /// accept the legacy boolean motion contract.
+    #[must_use]
+    pub(crate) fn effective_low_motion_for_status(&self) -> bool {
+        self.motion_policy().as_low_motion()
     }
 
     pub fn transcript_render_options(&self) -> TranscriptRenderOptions {
         TranscriptRenderOptions {
+            locale: self.ui_locale,
             show_thinking: self.show_thinking,
+            thinking_highlight: self.thinking_highlight,
+            thinking_default_expanded: self.thinking_default_expanded,
+            thinking_preview_lines: self.thinking_preview_lines,
             verbose: self.verbose_transcript,
             show_tool_details: self.show_tool_details,
+            inline_diff_mode: self.inline_diff_mode,
             calm_mode: self.calm_mode,
-            low_motion: self.low_motion,
+            low_motion: self.effective_low_motion_for_status(),
+            motion_mode: self.motion_policy().mode(),
             spacing: self.transcript_spacing,
+            palette_mode: self.ui_theme.mode,
+            prose_measure: self.prose_measure,
+            reasoning_preview_extra_lines: 0,
+            reasoning_preview_viewport_lines: None,
         }
     }
 
@@ -4798,6 +4793,7 @@ impl App {
         self.viewport.transcript_selection.clear();
 
         self.viewport.last_transcript_area = None;
+        self.viewport.last_approval_area = None;
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
@@ -4807,260 +4803,6 @@ impl App {
         self.viewport.jump_to_latest_button_area = None;
 
         self.mark_history_updated();
-    }
-
-    pub fn cursor_byte_index(&self) -> usize {
-        byte_index_at_char(&self.input, self.cursor_position)
-    }
-
-    /// When the user starts editing a truncated oversized paste, restore the
-    /// full text so they can see and edit the complete content (#3263).
-    fn auto_expand_oversized_paste(&mut self) {
-        if let Some(full) = self.oversized_paste_full_text.take() {
-            self.input = full;
-            // Clamp cursor to the new length instead of resetting to 0,
-            // so the user's position in the truncated preview is preserved.
-            self.cursor_position = self.cursor_position.min(char_count(&self.input));
-        }
-    }
-
-    pub fn insert_str(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.auto_expand_oversized_paste();
-        self.delete_selection();
-        self.selected_attachment_index = None;
-        let cursor = self.cursor_position.min(char_count(&self.input));
-        let byte_index = byte_index_at_char(&self.input, cursor);
-        self.input.insert_str(byte_index, text);
-        self.cursor_position = cursor + char_count(text);
-        self.strip_raw_mouse_reports_from_input();
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-    }
-
-    pub fn insert_paste_text(&mut self, text: &str) {
-        if let Some(pending) = self.paste_burst.flush_before_modified_input() {
-            self.insert_str(&pending);
-        }
-        let normalized = normalize_paste_text(text);
-        if !normalized.is_empty() {
-            self.insert_str(&normalized);
-        }
-        self.paste_burst.clear_after_explicit_paste();
-        // Large pasted input stays editable and visible until submit. The
-        // submit-time safety net consolidates oversized composer content into
-        // an @paste-...md mention before dispatch, so no path silently
-        // truncates user input.
-        // self.consolidate_large_input_if_oversized(); // deferred to submit time
-    }
-
-    pub fn insert_media_attachment(&mut self, kind: &str, path: &Path, description: Option<&str>) {
-        let reference = media_attachment_reference(kind, path, description);
-        let cursor = self.cursor_position.min(char_count(&self.input));
-        let byte_index = byte_index_at_char(&self.input, cursor);
-        let needs_prefix_newline = self.input[..byte_index]
-            .chars()
-            .last()
-            .is_some_and(|ch| !ch.is_whitespace());
-        let needs_suffix_newline = self.input[byte_index..]
-            .chars()
-            .next()
-            .is_some_and(|ch| !ch.is_whitespace());
-
-        let mut inserted = String::new();
-        if needs_prefix_newline {
-            inserted.push('\n');
-        }
-        inserted.push_str(&reference);
-        if needs_suffix_newline || self.input[byte_index..].is_empty() {
-            inserted.push('\n');
-        }
-        self.insert_str(&inserted);
-        self.paste_burst.clear_after_explicit_paste();
-    }
-
-    pub fn composer_attachment_count(&self) -> usize {
-        crate::tui::file_mention::media_attachment_references(&self.input).len()
-    }
-
-    pub fn selected_composer_attachment_index(&self) -> Option<usize> {
-        let count = self.composer_attachment_count();
-        self.selected_attachment_index
-            .filter(|index| *index < count)
-    }
-
-    pub fn select_previous_composer_attachment(&mut self) -> bool {
-        let count = self.composer_attachment_count();
-        if count == 0 {
-            self.selected_attachment_index = None;
-            return false;
-        }
-
-        let next = self
-            .selected_composer_attachment_index()
-            .map_or(count.saturating_sub(1), |index| index.saturating_sub(1));
-        self.selected_attachment_index = Some(next);
-        self.cursor_position = 0;
-        self.status_message = Some("Attachment selected - Backspace/Delete removes it".to_string());
-        self.needs_redraw = true;
-        true
-    }
-
-    pub fn select_next_composer_attachment(&mut self) -> bool {
-        let count = self.composer_attachment_count();
-        let Some(index) = self.selected_composer_attachment_index() else {
-            return false;
-        };
-        if index + 1 < count {
-            self.selected_attachment_index = Some(index + 1);
-            self.status_message =
-                Some("Attachment selected - Backspace/Delete removes it".to_string());
-        } else {
-            self.selected_attachment_index = None;
-            self.status_message = Some("Composer focused".to_string());
-        }
-        self.needs_redraw = true;
-        true
-    }
-
-    pub fn clear_composer_attachment_selection(&mut self) -> bool {
-        if self.selected_attachment_index.take().is_some() {
-            self.status_message = Some("Composer focused".to_string());
-            self.needs_redraw = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn remove_selected_composer_attachment(&mut self) -> bool {
-        let references = crate::tui::file_mention::media_attachment_references(&self.input);
-        let Some(index) = self
-            .selected_composer_attachment_index()
-            .filter(|index| *index < references.len())
-        else {
-            self.selected_attachment_index = None;
-            return false;
-        };
-        let reference = references[index].clone();
-        let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
-        let new_cursor_byte = if cursor_byte <= reference.start_byte {
-            cursor_byte
-        } else if cursor_byte >= reference.end_byte {
-            cursor_byte.saturating_sub(reference.end_byte - reference.start_byte)
-        } else {
-            reference.start_byte
-        };
-
-        self.input
-            .replace_range(reference.start_byte..reference.end_byte, "");
-        self.cursor_position = self.input[..new_cursor_byte.min(self.input.len())]
-            .chars()
-            .count();
-        let remaining = self.composer_attachment_count();
-        self.selected_attachment_index = if remaining == 0 {
-            None
-        } else {
-            Some(index.min(remaining.saturating_sub(1)))
-        };
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.status_message = Some(format!("Removed attachment: {}", reference.path));
-        self.needs_redraw = true;
-        true
-    }
-
-    pub fn flush_paste_burst_if_due(&mut self, now: Instant) -> bool {
-        match self.paste_burst.flush_if_due(now) {
-            FlushResult::Paste(text) => {
-                self.insert_str(&text);
-                true
-            }
-            FlushResult::Typed(ch) => {
-                self.insert_char(ch);
-                true
-            }
-            FlushResult::None => false,
-        }
-    }
-
-    pub fn flush_paste_burst_if_enabled(&mut self, now: Instant) -> bool {
-        self.use_paste_burst_detection && self.flush_paste_burst_if_due(now)
-    }
-
-    pub fn paste_burst_next_flush_delay_if_enabled(&self, now: Instant) -> Option<Duration> {
-        if self.use_paste_burst_detection {
-            self.paste_burst.next_flush_delay(now)
-        } else {
-            None
-        }
-    }
-
-    pub fn flush_paste_burst_before_modified_input_if_enabled(&mut self) -> Option<String> {
-        if self.use_paste_burst_detection {
-            self.paste_burst.flush_before_modified_input()
-        } else {
-            None
-        }
-    }
-
-    pub fn insert_api_key_char(&mut self, c: char) {
-        let cursor = self.api_key_cursor.min(char_count(&self.api_key_input));
-        let byte_index = byte_index_at_char(&self.api_key_input, cursor);
-        self.api_key_input.insert(byte_index, c);
-        self.api_key_cursor = cursor + 1;
-    }
-
-    pub fn insert_api_key_str(&mut self, text: &str) {
-        let sanitized = sanitize_api_key_text(text);
-        if sanitized.is_empty() {
-            return;
-        }
-        let cursor = self.api_key_cursor.min(char_count(&self.api_key_input));
-        let byte_index = byte_index_at_char(&self.api_key_input, cursor);
-        self.api_key_input.insert_str(byte_index, &sanitized);
-        self.api_key_cursor = cursor + char_count(&sanitized);
-    }
-
-    pub fn delete_api_key_char(&mut self) {
-        if self.api_key_cursor == 0 {
-            return;
-        }
-        let target = self.api_key_cursor.saturating_sub(1);
-        if remove_char_at(&mut self.api_key_input, target) {
-            self.api_key_cursor = target;
-        }
-    }
-
-    /// Paste from clipboard into input
-    pub fn paste_from_clipboard(&mut self) {
-        if let Some(content) = self.clipboard.read(self.workspace.as_path()) {
-            self.apply_clipboard_content(content);
-        }
-    }
-
-    pub fn apply_clipboard_content(&mut self, content: ClipboardContent) {
-        match content {
-            ClipboardContent::Text(text) => {
-                self.insert_paste_text(&text);
-            }
-            ClipboardContent::Image(pasted) => {
-                let description = format!("{} ({})", pasted.short_label(), pasted.size_label());
-                self.insert_media_attachment("image", &pasted.path, Some(&description));
-                self.status_message = Some(format!("Attached image: {description}"));
-            }
-        }
-    }
-
-    pub fn paste_api_key_from_clipboard(&mut self) {
-        if let Some(ClipboardContent::Text(text)) = self.clipboard.read(self.workspace.as_path()) {
-            self.insert_api_key_str(&text);
-        }
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
@@ -5084,1019 +4826,15 @@ impl App {
         self.viewport.pending_scroll_delta = 0;
         self.viewport.jump_to_latest_button_area = None;
         self.user_scrolled_during_stream = false;
-        self.needs_redraw = true;
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        self.clear_input_history_navigation();
-        self.auto_expand_oversized_paste();
-        self.delete_selection();
-        self.selected_attachment_index = None;
-        let cursor = self.cursor_position.min(char_count(&self.input));
-        let byte_index = byte_index_at_char(&self.input, cursor);
-        self.input.insert(byte_index, c);
-        self.cursor_position = cursor + 1;
-        self.strip_raw_mouse_reports_from_input();
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-    }
-
-    fn strip_raw_mouse_reports_from_input(&mut self) {
-        if let Some((input, cursor_position)) =
-            strip_raw_mouse_report_runs(&self.input, self.cursor_position)
-        {
-            self.input = input;
-            self.cursor_position = cursor_position;
-        }
-    }
-
-    pub fn delete_char(&mut self) {
-        self.clear_input_history_navigation();
-        self.auto_expand_oversized_paste();
-        if self.delete_selection() {
-            return;
-        }
-        self.selected_attachment_index = None;
-        if self.cursor_position == 0 {
-            return;
-        }
-        let target = self.cursor_position.saturating_sub(1);
-        let removed = remove_char_at(&mut self.input, target);
-        if removed {
-            self.cursor_position = target;
-            self.slash_menu_hidden = false;
-            self.mention_menu_hidden = false;
-            self.mention_menu_selected = 0;
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn delete_char_forward(&mut self) {
-        self.clear_input_history_navigation();
-        self.auto_expand_oversized_paste();
-        if self.delete_selection() {
-            return;
-        }
-        self.selected_attachment_index = None;
-        if self.input.is_empty() {
-            return;
-        }
-        let target = self.cursor_position;
-        let removed = remove_char_at(&mut self.input, target);
-        if !removed {
-            self.cursor_position = char_count(&self.input);
-        }
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-    }
-
-    /// Delete the word before the cursor.
-    pub fn delete_word_backward(&mut self) {
-        self.clear_input_history_navigation();
-        if self.delete_selection() {
-            return;
-        }
-        self.selected_attachment_index = None;
-        if self.cursor_position == 0 {
-            return;
-        }
-
-        let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
-        let mut word_start = cursor_byte;
-
-        while word_start > 0 {
-            let Some((prev, ch)) = self.input[..word_start].char_indices().next_back() else {
-                break;
-            };
-            if !ch.is_whitespace() {
-                break;
-            }
-            word_start = prev;
-        }
-
-        while word_start > 0 {
-            let Some((prev, ch)) = self.input[..word_start].char_indices().next_back() else {
-                break;
-            };
-            if ch.is_whitespace() {
-                break;
-            }
-            word_start = prev;
-        }
-
-        if word_start < cursor_byte {
-            self.input.replace_range(word_start..cursor_byte, "");
-            self.cursor_position = char_count(&self.input[..word_start]);
-            self.slash_menu_hidden = false;
-            self.mention_menu_hidden = false;
-            self.mention_menu_selected = 0;
-            self.needs_redraw = true;
-        }
-    }
-
-    /// Delete from the cursor to the start of the line.
-    pub fn delete_to_start_of_line(&mut self) {
-        self.clear_input_history_navigation();
-        if self.delete_selection() {
-            return;
-        }
-        self.selected_attachment_index = None;
-        if self.cursor_position == 0 {
-            return;
-        }
-
-        let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
-        // Find the start of the current line (last newline or start of string)
-        let line_start = self.input[..cursor_byte]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-
-        if line_start < cursor_byte {
-            self.input.replace_range(line_start..cursor_byte, "");
-            self.cursor_position = char_count(&self.input[..line_start]);
-            self.slash_menu_hidden = false;
-            self.mention_menu_hidden = false;
-            self.mention_menu_selected = 0;
-            self.needs_redraw = true;
-        }
-    }
-
-    /// Delete the word after the cursor.
-    pub fn delete_word_forward(&mut self) {
-        self.clear_input_history_navigation();
-        if self.delete_selection() {
-            return;
-        }
-        self.selected_attachment_index = None;
-        let cursor_byte = byte_index_at_char(&self.input, self.cursor_position);
-        if cursor_byte >= self.input.len() {
-            return;
-        }
-
-        let mut word_end = cursor_byte;
-        while word_end < self.input.len() {
-            let Some(ch) = self.input[word_end..].chars().next() else {
-                break;
-            };
-            if !ch.is_whitespace() {
-                break;
-            }
-            word_end += ch.len_utf8();
-        }
-
-        while word_end < self.input.len() {
-            let Some(ch) = self.input[word_end..].chars().next() else {
-                break;
-            };
-            if ch.is_whitespace() {
-                break;
-            }
-            word_end += ch.len_utf8();
-        }
-
-        if cursor_byte < word_end {
-            self.input.replace_range(cursor_byte..word_end, "");
-            self.slash_menu_hidden = false;
-            self.mention_menu_hidden = false;
-            self.mention_menu_selected = 0;
-            self.needs_redraw = true;
-        }
-    }
-
-    /// Cut from the cursor to the end of the current logical line into the
-    /// kill buffer. If the cursor is already at end-of-line and a trailing
-    /// newline exists, that newline is consumed so repeated invocations
-    /// continue to make progress (matching emacs/codex semantics).
-    ///
-    /// Returns `true` when bytes were moved into the kill buffer.
-    pub fn kill_to_end_of_line(&mut self) -> bool {
-        self.clear_input_history_navigation();
-        if let Some((start, end)) = self.selection_range() {
-            let sb = byte_index_at_char(&self.input, start);
-            let eb = byte_index_at_char(&self.input, end);
-            self.kill_buffer = self.input[sb..eb].to_string();
-            self.delete_selection();
-            return true;
-        }
-        let total_chars = char_count(&self.input);
-        let cursor = self.cursor_position.min(total_chars);
-        let start_byte = byte_index_at_char(&self.input, cursor);
-
-        // Find the byte offset of the next '\n' (relative to the whole string)
-        // or the end of the buffer if no newline exists at/after the cursor.
-        let eol_byte = self.input[start_byte..]
-            .find('\n')
-            .map(|rel| start_byte + rel)
-            .unwrap_or_else(|| self.input.len());
-
-        let end_byte = if start_byte == eol_byte {
-            // Cursor is at EOL — consume the newline itself if one is there.
-            if eol_byte < self.input.len() {
-                eol_byte + 1
-            } else {
-                return false;
-            }
-        } else {
-            eol_byte
-        };
-
-        let removed: String = self.input[start_byte..end_byte].to_string();
-        if removed.is_empty() {
-            return false;
-        }
-
-        self.kill_buffer = removed;
-        self.input.replace_range(start_byte..end_byte, "");
-        // Cursor stays at the same character index (start of removed range).
-        self.cursor_position = cursor;
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-        true
-    }
-
-    /// Insert the contents of the kill buffer at the cursor, advancing it.
-    /// The kill buffer is left intact so multiple yanks duplicate the text.
-    /// Returns `true` if any text was inserted.
-    pub fn yank(&mut self) -> bool {
-        if self.kill_buffer.is_empty() {
-            return false;
-        }
-        self.delete_selection();
-        self.clear_input_history_navigation();
-        let text = self.kill_buffer.clone();
-        let cursor = self.cursor_position.min(char_count(&self.input));
-        let byte_index = byte_index_at_char(&self.input, cursor);
-        self.input.insert_str(byte_index, &text);
-        self.cursor_position = cursor + char_count(&text);
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-        true
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        self.cursor_position = self.cursor_position.saturating_sub(1);
-        self.needs_redraw = true;
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        if self.cursor_position < char_count(&self.input) {
-            self.cursor_position += 1;
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn move_cursor_start(&mut self) {
-        self.cursor_position = 0;
-        self.needs_redraw = true;
-    }
-
-    pub fn move_cursor_end(&mut self) {
-        self.cursor_position = char_count(&self.input);
-        self.needs_redraw = true;
-    }
-
-    /// In a multiline composer, jump to the start of the current line.
-    /// On single-line input this is equivalent to `move_cursor_start`.
-    pub fn move_cursor_line_start(&mut self) {
-        let byte_pos = byte_index_at_char(&self.input, self.cursor_position);
-        let before = &self.input[..byte_pos];
-        if let Some(last_nl_byte) = before.rfind('\n') {
-            // Position after the '\n' (start of the current line).
-            self.cursor_position = char_count(&self.input[..=last_nl_byte]);
-        } else {
-            self.cursor_position = 0;
+        // While a worker's transcript owns the conversation area, the
+        // jump-to-bottom affordances (Ctrl+End, Alt+G, the jump-to-latest
+        // button, sending a follow-up) must release its pin too: the two
+        // surfaces share one command set, so returning to the live tail has
+        // to mean the tail the user is actually looking at.
+        if let Some(focus) = self.agent_focus.as_mut() {
+            focus.scroll_top = None;
         }
         self.needs_redraw = true;
-    }
-
-    /// In a multiline composer, jump to the end of the current line
-    /// (just before the next `\n` or at the end of input).
-    /// On single-line input this is equivalent to `move_cursor_end`.
-    pub fn move_cursor_line_end(&mut self) {
-        let search_start = byte_index_at_char(&self.input, self.cursor_position);
-        if let Some(offset) = self.input[search_start..].find('\n') {
-            self.cursor_position = char_count(&self.input[..search_start + offset]);
-        } else {
-            self.cursor_position = char_count(&self.input);
-        }
-        self.needs_redraw = true;
-    }
-
-    /// Move forward one word. Skips over the current word then any trailing
-    /// whitespace to land on the first character of the next word.
-    pub fn move_cursor_word_forward(&mut self) {
-        let text = self.input.clone();
-        let total = char_count(&text);
-        let mut pos = self.cursor_position;
-        if pos >= total {
-            return;
-        }
-        // Skip non-whitespace (current word).
-        while pos < total {
-            let byte = byte_index_at_char(&text, pos);
-            let ch = text[byte..].chars().next().unwrap_or(' ');
-            if ch.is_whitespace() {
-                break;
-            }
-            pos += 1;
-        }
-        // Skip whitespace.
-        while pos < total {
-            let byte = byte_index_at_char(&text, pos);
-            let ch = text[byte..].chars().next().unwrap_or(' ');
-            if !ch.is_whitespace() {
-                break;
-            }
-            pos += 1;
-        }
-        self.cursor_position = pos;
-        self.needs_redraw = true;
-    }
-
-    /// Move backward one word. Skips leading whitespace then the preceding
-    /// word to land on its first character.
-    pub fn move_cursor_word_backward(&mut self) {
-        let text = self.input.clone();
-        let mut pos = self.cursor_position;
-        if pos == 0 {
-            return;
-        }
-        // Step back one so we're not already at the word start.
-        pos -= 1;
-        // Skip whitespace.
-        while pos > 0 {
-            let byte = byte_index_at_char(&text, pos);
-            let ch = text[byte..].chars().next().unwrap_or(' ');
-            if !ch.is_whitespace() {
-                break;
-            }
-            pos -= 1;
-        }
-        // Skip non-whitespace.
-        while pos > 0 {
-            let byte = byte_index_at_char(&text, pos - 1);
-            let ch = text[byte..].chars().next().unwrap_or(' ');
-            if ch.is_whitespace() {
-                break;
-            }
-            pos -= 1;
-        }
-        self.cursor_position = pos;
-        self.needs_redraw = true;
-    }
-
-    // === Selection helpers ===
-
-    /// Return the (start, end) of the active selection, or `None`.
-    /// `start` is inclusive, `end` is exclusive; both are char indices.
-    pub fn selection_range(&self) -> Option<(usize, usize)> {
-        let total = char_count(&self.input);
-        let anchor = self.selection_anchor?.min(total);
-        let cursor = self.cursor_position.min(total);
-        if anchor == cursor {
-            return None;
-        }
-        Some(if anchor < cursor {
-            (anchor, cursor)
-        } else {
-            (cursor, anchor)
-        })
-    }
-
-    /// Return the selected text, or empty string if no selection.
-    pub fn selected_text(&self) -> String {
-        self.selection_range()
-            .map(|(s, e)| {
-                let sb = byte_index_at_char(&self.input, s);
-                let eb = byte_index_at_char(&self.input, e);
-                self.input[sb..eb].to_string()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Delete the selected text, place cursor at the start of the deleted range.
-    /// Returns true if a selection was deleted.
-    pub fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection_range() else {
-            return false;
-        };
-        let sb = byte_index_at_char(&self.input, start);
-        let eb = byte_index_at_char(&self.input, end);
-        self.input.replace_range(sb..eb, "");
-        self.cursor_position = start;
-        self.selection_anchor = None;
-        self.clear_input_history_navigation();
-        self.slash_menu_hidden = false;
-        self.mention_menu_hidden = false;
-        self.mention_menu_selected = 0;
-        self.needs_redraw = true;
-        true
-    }
-
-    /// Clear the selection without moving the cursor.
-    pub fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-    }
-
-    // === Vim composer mode helpers ===
-
-    /// Move the cursor to the start of the current logical line (vim `0`).
-    pub fn vim_move_line_start(&mut self) {
-        let text = self.input.clone();
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        // Walk backward until we find a newline or the start of the string.
-        let line_start_byte = text[..cursor_byte].rfind('\n').map_or(0, |idx| idx + 1);
-        self.cursor_position = char_count(&text[..line_start_byte]);
-        self.needs_redraw = true;
-    }
-
-    /// Move the cursor to the end of the current logical line (vim `$`).
-    pub fn vim_move_line_end(&mut self) {
-        let text = self.input.clone();
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        // Walk forward to the next newline or end-of-string.
-        let line_end_char = text[cursor_byte..].find('\n').map_or_else(
-            || char_count(&text),
-            |rel| char_count(&text[..cursor_byte + rel]),
-        );
-        self.cursor_position = line_end_char;
-        self.needs_redraw = true;
-    }
-
-    /// Move forward one word (vim `w`).  Skips over the current word then any
-    /// trailing whitespace to land on the first character of the next word.
-    pub fn vim_move_word_forward(&mut self) {
-        self.move_cursor_word_forward();
-    }
-
-    /// Move backward one word (vim `b`).  Skips leading whitespace then the
-    /// preceding word to land on its first character.
-    pub fn vim_move_word_backward(&mut self) {
-        self.move_cursor_word_backward();
-    }
-
-    /// Delete the character under the cursor (vim `x`).
-    pub fn vim_delete_char_under_cursor(&mut self) {
-        self.auto_expand_oversized_paste();
-        let total = char_count(&self.input);
-        if self.cursor_position >= total {
-            return;
-        }
-        let pos = self.cursor_position;
-        remove_char_at(&mut self.input, pos);
-        // Keep cursor in bounds after deletion.
-        let new_total = char_count(&self.input);
-        if self.cursor_position > 0 && self.cursor_position >= new_total {
-            self.cursor_position = new_total.saturating_sub(1);
-        }
-        self.needs_redraw = true;
-    }
-
-    /// Delete the entire current logical line (vim `dd`).
-    pub fn vim_delete_line(&mut self) {
-        let text = self.input.clone();
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        let line_start_byte = text[..cursor_byte].rfind('\n').map_or(0, |idx| idx + 1);
-        let line_end_byte = text[cursor_byte..]
-            .find('\n')
-            .map_or(text.len(), |rel| cursor_byte + rel);
-
-        // Include the trailing newline if present, or the leading newline for the
-        // very last non-terminated line to avoid leaving a dangling newline.
-        let (remove_start, remove_end) = if line_end_byte < text.len() {
-            // There is a newline after the line — remove it too.
-            (line_start_byte, line_end_byte + 1)
-        } else if line_start_byte > 0 {
-            // Last line without trailing newline — remove the preceding newline.
-            (line_start_byte - 1, line_end_byte)
-        } else {
-            // Only line in the buffer.
-            (line_start_byte, line_end_byte)
-        };
-
-        self.input.replace_range(remove_start..remove_end, "");
-        self.cursor_position = char_count(&self.input[..remove_start]);
-        self.needs_redraw = true;
-    }
-
-    /// Enter insert mode at the cursor (vim `i`).
-    pub fn vim_enter_insert(&mut self) {
-        self.vim_mode = VimMode::Insert;
-        self.needs_redraw = true;
-    }
-
-    /// Enter insert mode after the cursor (vim `a`).
-    pub fn vim_enter_append(&mut self) {
-        let total = char_count(&self.input);
-        if self.cursor_position < total {
-            self.cursor_position += 1;
-        }
-        self.vim_mode = VimMode::Insert;
-        self.needs_redraw = true;
-    }
-
-    /// Open a new line below and enter insert mode (vim `o`).
-    pub fn vim_open_line_below(&mut self) {
-        // Move to end of line, then insert a newline.
-        self.vim_move_line_end();
-        self.insert_char('\n');
-        self.vim_mode = VimMode::Insert;
-    }
-
-    /// Return to Normal mode from Insert or Visual (vim `Esc`).
-    pub fn vim_enter_normal(&mut self) {
-        self.vim_mode = VimMode::Normal;
-        self.vim_pending_d = false;
-        // In Normal mode the cursor sits on a character, not after the last one.
-        let total = char_count(&self.input);
-        if self.cursor_position > 0 && self.cursor_position >= total {
-            self.cursor_position = total.saturating_sub(1);
-        }
-        self.needs_redraw = true;
-    }
-
-    /// Returns `true` when vim mode is active and the composer is in Normal
-    /// mode, which means character keys should NOT be inserted as text.
-    #[must_use]
-    pub fn vim_is_normal_mode(&self) -> bool {
-        self.composer.vim_enabled && self.composer.vim_mode == VimMode::Normal
-    }
-
-    /// Returns `true` when vim mode is active and the composer is in Visual mode.
-    #[must_use]
-    pub fn vim_is_visual_mode(&self) -> bool {
-        self.composer.vim_enabled && self.composer.vim_mode == VimMode::Visual
-    }
-
-    /// Move the cursor down one logical line within the buffer (vim `j`).
-    /// Falls back to history-down when already on the last line.
-    pub fn vim_move_down(&mut self) {
-        let text = self.input.clone();
-        let total = char_count(&text);
-        if self.cursor_position >= total {
-            self.history_down();
-            return;
-        }
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        let rest = &text[cursor_byte..];
-        if let Some(rel_nl) = rest.find('\n') {
-            // Column offset on the current line.
-            let line_start_byte = text[..cursor_byte].rfind('\n').map_or(0, |i| i + 1);
-            let col = char_count(&text[line_start_byte..cursor_byte]);
-            let next_line_start = cursor_byte + rel_nl + 1;
-            let next_line = &text[next_line_start..];
-            let next_line_len = next_line.find('\n').unwrap_or(next_line.len());
-            let next_line_char_len =
-                char_count(&text[next_line_start..next_line_start + next_line_len]);
-            let target_col = col.min(next_line_char_len);
-            self.cursor_position = char_count(&text[..next_line_start]) + target_col;
-            self.needs_redraw = true;
-        } else {
-            self.history_down();
-        }
-    }
-
-    /// Move the cursor up one logical line within the buffer (vim `k`).
-    /// Falls back to history-up when already on the first line.
-    pub fn vim_move_up(&mut self) {
-        let text = self.input.clone();
-        let cursor_byte = byte_index_at_char(&text, self.cursor_position);
-        if let Some(prev_nl) = text[..cursor_byte].rfind('\n') {
-            // Column on the current line.
-            let line_start_byte = prev_nl + 1;
-            let col = char_count(&text[line_start_byte..cursor_byte]);
-            // Find start of the previous line.
-            let prev_line_end = prev_nl; // byte of the newline itself
-            let prev_start = text[..prev_line_end].rfind('\n').map_or(0, |i| i + 1);
-            let prev_line_len = char_count(&text[prev_start..prev_line_end]);
-            let target_col = col.min(prev_line_len);
-            self.cursor_position = char_count(&text[..prev_start]) + target_col;
-            self.needs_redraw = true;
-        } else {
-            self.history_up();
-        }
-    }
-
-    pub fn clear_input(&mut self) {
-        self.clear_input_history_navigation();
-        self.input.clear();
-        self.cursor_position = 0;
-        // Prevent stale oversized-paste state from leaking when the user
-        // clears the composer or navigates to a different input (#3263).
-        self.pending_paste_reference = None;
-        self.oversized_paste_full_text = None;
-        self.selection_anchor = None;
-        self.selected_attachment_index = None;
-        self.slash_menu_selected = 0;
-        self.slash_menu_hidden = false;
-        self.paste_burst.clear_after_explicit_paste();
-        self.needs_redraw = true;
-    }
-
-    pub fn clear_input_recoverable(&mut self) {
-        self.stash_current_input_for_recovery();
-        self.clear_input();
-    }
-
-    pub fn stash_current_input_for_recovery(&mut self) {
-        // Before stashing, expand any truncated paste so the saved draft
-        // contains the full text, not the truncated preview (#3263).
-        self.auto_expand_oversized_paste();
-        let draft = self.input.clone();
-        if draft.trim().is_empty() {
-            self.clear_undo_buffer = None;
-            return;
-        }
-        self.clear_undo_buffer = Some(draft.clone());
-        self.remember_draft_for_recovery(draft);
-    }
-
-    fn remember_draft_for_recovery(&mut self, draft: String) {
-        if draft.trim().is_empty() {
-            return;
-        }
-        self.draft_history.retain(|existing| existing != &draft);
-        self.draft_history.push_back(draft);
-        while self.draft_history.len() > MAX_DRAFT_HISTORY {
-            let _ = self.draft_history.pop_front();
-        }
-    }
-
-    pub fn start_history_search(&mut self) {
-        if self.composer_history_search.is_some() {
-            return;
-        }
-        // Expand any truncated paste first so the history search seed
-        // contains the full text, not the truncated preview (#3263).
-        self.auto_expand_oversized_paste();
-        self.composer_history_search = Some(ComposerHistorySearch::new(
-            self.input.clone(),
-            self.cursor_position,
-        ));
-        self.slash_menu_hidden = true;
-        self.mention_menu_hidden = true;
-        self.paste_burst.clear_after_explicit_paste();
-        self.status_message = Some("History search: type to filter, Enter accepts".to_string());
-        self.needs_redraw = true;
-    }
-
-    pub fn is_history_search_active(&self) -> bool {
-        self.composer_history_search.is_some()
-    }
-
-    pub fn history_search_query(&self) -> Option<&str> {
-        self.composer_history_search
-            .as_ref()
-            .map(|search| search.query.as_str())
-    }
-
-    pub fn history_search_selected_index(&self) -> usize {
-        self.composer_history_search
-            .as_ref()
-            .map_or(0, |search| search.selected)
-    }
-
-    pub fn composer_display_input(&self) -> &str {
-        self.history_search_query().unwrap_or(&self.input)
-    }
-
-    pub fn composer_display_cursor(&self) -> usize {
-        self.composer_history_search
-            .as_ref()
-            .map_or(self.cursor_position, |search| char_count(&search.query))
-    }
-
-    pub fn history_search_matches(&self) -> Vec<String> {
-        let Some(query) = self.history_search_query() else {
-            return Vec::new();
-        };
-        self.history_search_matches_for_query(query)
-    }
-
-    fn history_search_matches_for_query(&self, query: &str) -> Vec<String> {
-        let normalized_query = query.trim().to_lowercase();
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut matches = Vec::new();
-
-        for candidate in self
-            .draft_history
-            .iter()
-            .rev()
-            .chain(self.input_history.iter().rev())
-        {
-            if candidate.trim().is_empty() || !seen.insert(candidate.as_str()) {
-                continue;
-            }
-            if normalized_query.is_empty() || candidate.to_lowercase().contains(&normalized_query) {
-                matches.push(candidate.clone());
-            }
-        }
-
-        matches
-    }
-
-    fn clamp_history_search_selection(&mut self) {
-        let Some(search) = self.composer_history_search.as_ref() else {
-            return;
-        };
-        let selected = search.selected;
-        let query = search.query.clone();
-        let match_count = self.history_search_matches_for_query(&query).len();
-        if let Some(search) = self.composer_history_search.as_mut() {
-            search.selected = if match_count == 0 {
-                0
-            } else {
-                selected.min(match_count.saturating_sub(1))
-            };
-        }
-    }
-
-    pub fn history_search_insert_char(&mut self, ch: char) {
-        if let Some(search) = self.composer_history_search.as_mut() {
-            search.query.push(ch);
-            search.selected = 0;
-            self.status_message = Some("History search: Enter accepts, Esc restores".to_string());
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn history_search_insert_str(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        if let Some(search) = self.composer_history_search.as_mut() {
-            search.query.push_str(&normalize_paste_text(text));
-            search.selected = 0;
-            self.status_message = Some("History search: Enter accepts, Esc restores".to_string());
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn history_search_backspace(&mut self) {
-        if let Some(search) = self.composer_history_search.as_mut() {
-            search.query.pop();
-            search.selected = 0;
-            self.needs_redraw = true;
-        }
-        self.clamp_history_search_selection();
-    }
-
-    pub fn history_search_select_previous(&mut self) {
-        if let Some(search) = self.composer_history_search.as_mut() {
-            search.selected = search.selected.saturating_sub(1);
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn history_search_select_next(&mut self) {
-        let Some(search) = self.composer_history_search.as_ref() else {
-            return;
-        };
-        let query = search.query.clone();
-        let selected = search.selected;
-        let match_count = self.history_search_matches_for_query(&query).len();
-        if let Some(search) = self.composer_history_search.as_mut()
-            && match_count > 0
-        {
-            search.selected = (selected + 1).min(match_count.saturating_sub(1));
-            self.needs_redraw = true;
-        }
-    }
-
-    pub fn accept_history_search(&mut self) -> bool {
-        let Some(search) = self.composer_history_search.take() else {
-            return false;
-        };
-        let matches = self.history_search_matches_for_query(&search.query);
-        if let Some(selected) = matches
-            .get(search.selected.min(matches.len().saturating_sub(1)))
-            .cloned()
-        {
-            self.input = selected;
-            self.cursor_position = char_count(&self.input);
-            self.history_index = None;
-            self.status_message = Some("History match inserted into composer".to_string());
-            self.needs_redraw = true;
-            true
-        } else {
-            self.composer_history_search = Some(search);
-            self.status_message = Some("No history matches".to_string());
-            self.needs_redraw = true;
-            false
-        }
-    }
-
-    pub fn cancel_history_search(&mut self) {
-        let Some(search) = self.composer_history_search.take() else {
-            return;
-        };
-        self.input = search.pre_search_input;
-        self.cursor_position = search.pre_search_cursor.min(char_count(&self.input));
-        self.status_message = Some("History search canceled".to_string());
-        self.needs_redraw = true;
-    }
-
-    pub fn submit_input(&mut self) -> Option<String> {
-        if self.input.trim().is_empty() {
-            self.paste_burst.clear_after_explicit_paste();
-            return None;
-        }
-        // Safety net: if any earlier path filled the buffer above the
-        // safety cap without going through `insert_paste_text`, fold it
-        // into a workspace paste file now (#553). Bracketed pastes hit
-        // the consolidation in `insert_paste_text` first, so the user
-        // sees the @mention in the composer before submission.
-        self.consolidate_large_input_if_oversized();
-        // If consolidation created a paste file, restore the full text and
-        // append the @mention so the model can read the complete content
-        // while the composer stays editable (#3263).
-        let mut input = self
-            .oversized_paste_full_text
-            .take()
-            .unwrap_or_else(|| self.input.clone());
-        if let Some(reference) = self.pending_paste_reference.take() {
-            if !input.is_empty() && !input.ends_with('\n') {
-                input.push('\n');
-            }
-            input.push_str(&reference);
-        }
-        if !looks_like_slash_command_input(&input) {
-            self.input_history.push(input.clone());
-            if self.max_input_history == 0 {
-                self.input_history.clear();
-            } else if self.input_history.len() > self.max_input_history {
-                let excess = self.input_history.len() - self.max_input_history;
-                self.input_history.drain(0..excess);
-            }
-            // Mirror to the persisted cross-session history (#366) so
-            // arrow-up recall works across restarts. Best-effort write —
-            // see `composer_history::append_history` for failure modes.
-            crate::composer_history::append_history(&input);
-        }
-        self.history_index = None;
-        self.history_navigation_draft = None;
-        self.clear_input();
-        Some(input)
-    }
-
-    pub fn restore_last_submitted_prompt_if_empty(&mut self) -> bool {
-        if !self.input.is_empty() {
-            return false;
-        }
-        let Some(prompt) = self
-            .last_submitted_prompt
-            .as_deref()
-            .filter(|prompt| !prompt.is_empty())
-        else {
-            return false;
-        };
-
-        self.input = prompt.to_string();
-        self.cursor_position = char_count(&self.input);
-        self.history_index = None;
-        self.history_navigation_draft = None;
-        self.selected_attachment_index = None;
-        self.needs_redraw = true;
-        true
-    }
-
-    /// Restore the last cleared input if the composer is empty.
-    /// Returns `true` if the input was restored.
-    pub fn restore_last_cleared_input_if_empty(&mut self) -> bool {
-        if !self.input.is_empty() {
-            return false;
-        }
-        let Some(saved) = self.clear_undo_buffer.take().filter(|s| !s.is_empty()) else {
-            return false;
-        };
-
-        self.input = saved;
-        self.cursor_position = char_count(&self.input);
-        self.history_index = None;
-        self.history_navigation_draft = None;
-        self.selected_attachment_index = None;
-        self.slash_menu_selected = 0;
-        self.slash_menu_hidden = false;
-        self.needs_redraw = true;
-        self.clear_undo_buffer = None;
-        true
-    }
-
-    /// Composer-Enter dispatch. Returns `Some(input)` when the press should
-    /// fire a submit; `None` when Enter was absorbed (paste-burst Enter
-    /// suppression — see #1073).
-    ///
-    /// Two suppression cases are handled here. Both are silent: nothing
-    /// visible happens beyond the text gaining a newline.
-    ///
-    /// 1. **Burst active.** A paste burst is currently being assembled in
-    ///    `paste_burst.buffer`. The Enter is part of the paste content;
-    ///    append `\n` to the buffer so the next flush includes it, do not
-    ///    submit, and extend the suppression window so a follow-on Enter
-    ///    (i.e. the *next* line of a multi-line paste) is also absorbed.
-    /// 2. **Window open after flush.** A burst just flushed into
-    ///    `self.input`, but the suppression window is still alive. The
-    ///    Enter is the trailing newline of that paste, not a submit gesture
-    ///    by the user. Insert `\n` directly into the composer text and
-    ///    re-arm the window.
-    ///
-    /// Outside both cases the call falls through to [`Self::submit_input`]
-    /// unchanged so normal Enter-to-send behaviour is preserved.
-    pub fn handle_composer_enter(&mut self) -> Option<String> {
-        if self.use_paste_burst_detection {
-            let now = Instant::now();
-            if self
-                .paste_burst
-                .newline_should_insert_instead_of_submit(now)
-            {
-                if !self.paste_burst.append_newline_if_active(now) {
-                    self.insert_char('\n');
-                    self.paste_burst.extend_window(now);
-                }
-                self.needs_redraw = true;
-                return None;
-            }
-        }
-        self.submit_input()
-    }
-
-    /// Public wrapper around [`Self::consolidate_large_input`] that no-ops
-    /// when the current input fits inside the safety cap. Both the paste-
-    /// insert path (visible-before-submit) and the submit-time safety net
-    /// route through here, so the cap is enforced exactly once even when
-    /// both paths fire on the same buffer.
-    fn consolidate_large_input_if_oversized(&mut self) {
-        if char_count(&self.input) > MAX_SUBMITTED_INPUT_CHARS {
-            self.consolidate_large_input();
-        }
-    }
-
-    /// When the composer input exceeds [`MAX_SUBMITTED_INPUT_CHARS`], write
-    /// the full content to a timestamped paste file under
-    /// `.codewhale/pastes/` and replace `self.input` with an `@`-mention
-    /// pointing at it so the model can read the full content via the
-    /// normal file-mention resolution path (#553).
-    fn consolidate_large_input(&mut self) {
-        let full_input = std::mem::take(&mut self.input);
-        self.cursor_position = 0;
-
-        let now = chrono::Local::now();
-        let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let filename = format!("paste-{}-{}.md", now.format("%Y-%m-%d-%H%M%S"), suffix);
-        let rel_path = format!(".codewhale/pastes/{filename}");
-
-        let pastes_dir = self.workspace.join(".codewhale/pastes");
-        if let Err(e) = std::fs::create_dir_all(&pastes_dir) {
-            // Fallback: keep a truncated version so we don't lose the
-            // user's input entirely when the filesystem is unhappy.
-            self.input = full_input.chars().take(MAX_SUBMITTED_INPUT_CHARS).collect();
-            self.cursor_position = char_count(&self.input);
-            self.push_status_toast(
-                format!("Failed to create paste directory: {e}"),
-                StatusToastLevel::Error,
-                Some(8_000),
-            );
-            return;
-        }
-
-        let file_path = self.workspace.join(&rel_path);
-        if let Err(e) = std::fs::write(&file_path, &full_input) {
-            self.input = full_input.chars().take(MAX_SUBMITTED_INPUT_CHARS).collect();
-            self.cursor_position = char_count(&self.input);
-            self.push_status_toast(
-                format!("Failed to write paste file: {e}"),
-                StatusToastLevel::Error,
-                Some(8_000),
-            );
-            return;
-        }
-
-        // Keep a truncated preview in the composer so the user can still
-        // select, copy, and edit it, while the full text is stored for
-        // model submission. The @mention is appended at submit time (#3263).
-        self.pending_paste_reference = Some(format!("@{rel_path}"));
-        self.oversized_paste_full_text = Some(full_input.clone());
-        let display_chars = char_count(&full_input).min(MAX_COMPOSER_DISPLAY_CHARS);
-        let mut truncated: String = full_input.chars().take(display_chars).collect();
-        if char_count(&full_input) > MAX_COMPOSER_DISPLAY_CHARS {
-            truncated.push_str("\n\n---\n(content truncated for display — start typing to expand; full text sent to model)");
-        }
-        self.input = truncated;
-        self.cursor_position = 0;
-        self.push_status_toast(
-            "Large paste backed up to file — the model will receive the full content.",
-            StatusToastLevel::Info,
-            Some(5_000),
-        );
     }
 
     pub fn queue_message(&mut self, message: QueuedMessage) {
@@ -6151,7 +4889,8 @@ impl App {
     }
 
     /// Park a legacy pending steer. New keyboard handling routes running-turn
-    /// drafts through Enter (same-turn steer) or Tab (next-turn follow-up).
+    /// drafts through Ctrl+Enter (same-turn steer) or Enter (next-turn
+    /// follow-up).
     #[allow(dead_code)]
     pub fn push_pending_steer(&mut self, message: QueuedMessage) {
         self.pending_steers.push_back(message);
@@ -6170,60 +4909,70 @@ impl App {
         self.pending_steers.drain(..).collect()
     }
 
-    /// Decide how to route a fresh composer submit.
+    /// Decide how to route a fresh non-empty composer submit.
     ///
-    /// v0.8.68: streaming output queues. Busy-but-waiting turns steer so
-    /// Enter can amend the active turn before output starts. A double-tap
-    /// Enter within 500 ms triggers Steer while streaming; Ctrl+Enter forces
-    /// Steer in all busy states.
+    /// Running turns always queue bare-Enter submissions. Ctrl+Enter is the
+    /// single explicit gesture for amending the active turn, regardless of
+    /// whether the provider has emitted its first token yet.
     ///
     /// Truth table:
     ///   offline=F, busy=F → Immediate
-    ///   offline=F, busy=T, streaming=F → Steer
-    ///   offline=F, busy=T, streaming=T → Queue (double-tap → Steer)
+    ///   offline=F, busy=T, streaming=* → Queue (Ctrl+Enter steers)
     ///   offline=T, busy=* → Queue
     #[must_use]
     pub fn decide_submit_disposition(&self) -> SubmitDisposition {
         if self.offline_mode {
             return SubmitDisposition::Queue;
         }
+        // A spawned dispatch is still resolving route/sending the op (#4605);
+        // queue rather than spawn a second dispatch that could reorder ops.
+        if self.dispatch_in_flight {
+            return SubmitDisposition::Queue;
+        }
         if !self.is_loading {
             return SubmitDisposition::Immediate;
         }
-        if self.streaming_message_index.is_none() {
-            return SubmitDisposition::Steer;
-        }
-        // Streaming: queue the message. Double-tap Enter within 500 ms
-        // triggers Steer via enter_with_double_tap(); see the ui.rs submit
-        // handler.
+        // Busy: queue the message. Steer is an explicit Ctrl+Enter gesture,
+        // not a timing-sensitive change in bare Enter behavior.
         SubmitDisposition::Queue
     }
 
-    /// Process an Enter keypress with double-tap steering detection.
+    /// Resolve Enter-shaped input from the same state used by composer hints.
     ///
-    /// When the engine is busy, the first Enter queues the message. A second
-    /// Enter within 500 ms triggers Steer (interrupt the current turn to
-    /// inject the new instruction immediately). When idle, Enter submits
-    /// immediately.
+    /// Bare Enter is portable across supported terminals: it sends while idle,
+    /// queues while busy, and an empty Enter promotes the oldest queued message
+    /// into the active turn. Ctrl+Enter remains accepted when a terminal can
+    /// report it distinctly, but is intentionally not advertised because many
+    /// terminals encode it exactly like Enter.
     #[must_use]
-    pub fn enter_with_double_tap(&mut self) -> Option<SubmitDisposition> {
-        let disposition = self.decide_submit_disposition();
-        match disposition {
-            SubmitDisposition::Queue => {
-                if let Some(instant) = self.last_enter_instant
-                    && instant.elapsed() < Duration::from_millis(500)
-                {
-                    self.last_enter_instant = None;
-                    return Some(SubmitDisposition::Steer);
-                }
-                self.last_enter_instant = Some(Instant::now());
-                Some(SubmitDisposition::Queue)
+    pub fn decide_composer_submit(&self, chord: ComposerSubmitChord) -> ComposerSubmitAction {
+        if self.input.is_empty() {
+            if self.is_loading && self.queued_draft.is_none() && !self.queued_messages.is_empty() {
+                return ComposerSubmitAction::SendQueuedNow;
             }
-            other => {
-                self.last_enter_instant = None;
-                Some(other)
-            }
+            return ComposerSubmitAction::Noop;
         }
+
+        let disposition = match chord {
+            ComposerSubmitChord::Enter => self.decide_submit_disposition(),
+            ComposerSubmitChord::CtrlEnter
+                if self.is_loading && !self.offline_mode && !self.dispatch_in_flight =>
+            {
+                SubmitDisposition::Steer
+            }
+            ComposerSubmitChord::CtrlEnter => self.decide_submit_disposition(),
+        };
+        ComposerSubmitAction::Submit(disposition)
+    }
+
+    /// Resolve what bare Enter should do right now.
+    ///
+    /// Kept for compatibility with older call sites and tests.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn enter_with_double_tap(&mut self) -> Option<SubmitDisposition> {
+        // Name kept for call-site stability; the double-tap window is gone.
+        Some(self.decide_submit_disposition())
     }
 
     /// Mark the in-flight streaming Assistant cell as interrupted: prepend
@@ -6249,70 +4998,6 @@ impl App {
         self.bump_history_cell(index);
     }
 
-    pub fn history_up(&mut self) {
-        if self.input_history.is_empty() {
-            return;
-        }
-        if self.history_index.is_none() {
-            // Expand truncated paste first so the saved draft contains the
-            // full text instead of the truncated preview (#3263).
-            self.auto_expand_oversized_paste();
-            self.history_navigation_draft = Some(InputHistoryDraft {
-                input: self.input.clone(),
-                cursor: self.cursor_position,
-            });
-        }
-        let new_index = match self.history_index {
-            None => self.input_history.len().saturating_sub(1),
-            Some(i) => i.saturating_sub(1),
-        };
-        self.history_index = Some(new_index);
-        self.input = self.input_history[new_index].clone();
-        self.cursor_position = char_count(&self.input);
-        self.selection_anchor = None;
-        self.selected_attachment_index = None;
-        self.slash_menu_hidden = false;
-        self.paste_burst.clear_after_explicit_paste();
-    }
-
-    pub fn history_down(&mut self) {
-        if self.input_history.is_empty() {
-            return;
-        }
-        match self.history_index {
-            None => {}
-            Some(i) => {
-                if i + 1 < self.input_history.len() {
-                    self.history_index = Some(i + 1);
-                    self.input = self.input_history[i + 1].clone();
-                    self.cursor_position = char_count(&self.input);
-                    self.selection_anchor = None;
-                    self.selected_attachment_index = None;
-                    self.slash_menu_hidden = false;
-                    self.paste_burst.clear_after_explicit_paste();
-                } else {
-                    self.history_index = None;
-                    if let Some(draft) = self.history_navigation_draft.take() {
-                        self.input = draft.input;
-                        self.cursor_position = draft.cursor.min(char_count(&self.input));
-                        self.selection_anchor = None;
-                        self.selected_attachment_index = None;
-                        self.slash_menu_hidden = false;
-                        self.paste_burst.clear_after_explicit_paste();
-                        self.needs_redraw = true;
-                    } else {
-                        self.clear_input();
-                    }
-                }
-            }
-        }
-    }
-
-    fn clear_input_history_navigation(&mut self) {
-        self.history_index = None;
-        self.history_navigation_draft = None;
-    }
-
     /// Retry a `try_lock` up to `retries` times with a 1ms pause between
     /// attempts. Returns `Some(guard)` on success, `None` if the lock
     /// remains contended after all retries.
@@ -6332,11 +5017,23 @@ impl App {
     /// Capture the durable Work state without ever converting lock contention
     /// into an empty snapshot.
     pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            return work
+                .capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                });
+        }
         let todos = Self::retry_lock(&self.todos, 100)
             .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
         let plan = Self::retry_lock(&self.plan_state, 100)
             .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6347,6 +5044,19 @@ impl App {
     /// must skip a contended first save instead of pausing the UI or writing a
     /// false empty state.
     pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let state = work
+                .try_capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                })?;
+            self.last_known_work_state = Some(state.clone());
+            return Ok(state);
+        }
         let todos = self
             .todos
             .try_lock()
@@ -6356,6 +5066,7 @@ impl App {
             .try_lock()
             .map_err(|_| "Plan state is busy".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6367,7 +5078,38 @@ impl App {
     }
 
     /// Atomically replace the live Work state from a saved session.
-    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+    pub fn restore_work_state(
+        &mut self,
+        session_id: &str,
+        workspace: &Path,
+        state: Option<&SessionWorkState>,
+    ) -> Result<(), String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let empty = SessionWorkState::default();
+            let state = state.unwrap_or(&empty);
+            work.restore_with_workspace_owner_bindings(
+                session_id,
+                workspace,
+                state.graph.as_ref(),
+                &state.todos,
+                &state.plan,
+            )?;
+            let restored = work.capture(Some(session_id))?;
+            let normalized_state = restored.map(|state| SessionWorkState {
+                graph: Some(state.graph),
+                todos: state.todos,
+                plan: state.plan,
+            });
+            self.work_surface.record_restored_session(
+                session_id,
+                normalized_state
+                    .as_ref()
+                    .and_then(|state| state.graph.as_ref()),
+            );
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(normalized_state);
+            return Ok(());
+        }
         let (restored_todos, restored_plan) = match state {
             Some(state) => (
                 TodoList::from_snapshot(&state.todos)?,
@@ -6376,6 +5118,7 @@ impl App {
             None => (TodoList::new(), PlanState::default()),
         };
         let normalized_state = SessionWorkState {
+            graph: None,
             todos: restored_todos.snapshot(),
             plan: restored_plan.snapshot(),
         };
@@ -6388,6 +5131,7 @@ impl App {
         *plan = restored_plan;
         drop(plan);
         drop(todos);
+        self.work_surface.record_restored_session(session_id, None);
         self.cached_work_summary = None;
         self.last_known_work_state =
             Some((!normalized_state.is_empty()).then_some(normalized_state));
@@ -6395,6 +5139,14 @@ impl App {
     }
 
     pub fn clear_todos(&mut self) -> bool {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            if !work.clear(self.current_session_id.as_deref()) {
+                return false;
+            }
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(None);
+            return true;
+        }
         // Acquire both stores before mutating either one. `/clear` must never
         // report success after clearing only half of the Work surface.
         let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
@@ -6410,6 +5162,20 @@ impl App {
         self.cached_work_summary = None;
         self.last_known_work_state = Some(None);
         true
+    }
+
+    /// Publish a validated Work Graph transaction after a synchronous caller
+    /// has completed its atomic session write.
+    pub fn publish_pending_work_state(&mut self) -> Result<bool, String> {
+        let published = self
+            .runtime_services
+            .work
+            .as_ref()
+            .map_or(Ok(false), |work| work.publish_pending_sync())?;
+        if published {
+            self.cached_work_summary = None;
+        }
+        Ok(published)
     }
 
     pub fn update_model_compaction_budget(&mut self) {
@@ -6433,8 +5199,25 @@ impl App {
         self.active_route_limits = crate::route_budget::known_route_limits(limits);
     }
 
+    /// Install an already-resolved runtime route receipt in one operation so
+    /// endpoint-sensitive reasoning and context reporting cannot drift apart.
+    pub fn set_active_route_resolution(
+        &mut self,
+        base_url: impl Into<String>,
+        limits: RouteLimits,
+        context_window_source: crate::route_runtime::ContextWindowSource,
+    ) {
+        self.active_route_base_url = base_url.into();
+        self.set_active_route_limits(limits);
+        self.active_context_window_source = context_window_source;
+    }
+
     pub fn set_active_context_window_override(&mut self, context_window: Option<u32>) {
         self.active_context_window_override = context_window;
+        if context_window.is_some() {
+            self.active_context_window_source =
+                crate::route_runtime::ContextWindowSource::Configured;
+        }
         if self.active_route_limits.is_none() {
             self.active_route_limits = self.context_window_override_limits();
         }
@@ -6458,13 +5241,22 @@ impl App {
         self.auto_model = auto_model;
         self.last_effective_model = None;
         self.last_effective_provider = None;
+        self.last_effective_provider_identity = None;
+        self.last_auto_route_receipt = None;
+        self.pending_auto_route_receipt = None;
         self.last_effective_reasoning_effort = None;
+        // Auto model routing is independent from an explicitly requested raw
+        // reasoning tier. Never reuse the route-normalized live value here:
+        // fixed DeepSeek can collapse low→high and Codex off→low.
         if auto_model {
-            self.reasoning_effort = ReasoningEffort::Auto;
-        } else {
             self.reasoning_effort = self
-                .reasoning_effort
-                .normalize_for_provider(self.api_provider);
+                .reasoning_effort_preference
+                .unwrap_or(ReasoningEffort::Auto);
+        } else {
+            let requested = self
+                .reasoning_effort_preference
+                .unwrap_or(self.reasoning_effort);
+            self.reasoning_effort = requested.normalize_for_provider(self.api_provider);
         }
     }
 
@@ -6476,9 +5268,106 @@ impl App {
         }
     }
 
+    /// Atomic latest Auto route metadata for session snapshots. The provider,
+    /// exact identity, model, and receipt are either persisted together or
+    /// omitted together so a resumed session cannot display a mixed route.
+    #[must_use]
+    pub(crate) fn auto_route_for_persistence(
+        &self,
+    ) -> Option<crate::session_manager::SavedAutoRouteReceipt> {
+        if !self.auto_model {
+            return None;
+        }
+        let (provider, model, receipt) = (
+            self.last_effective_provider?,
+            self.last_effective_model.as_ref()?,
+            self.last_auto_route_receipt.as_ref()?,
+        );
+        if model.trim().is_empty() {
+            return None;
+        }
+        let provider_identity = self
+            .last_effective_provider_identity
+            .clone()
+            .unwrap_or_else(|| {
+                if provider == ApiProvider::Custom {
+                    self.provider_identity_for_persistence().to_string()
+                } else {
+                    provider.as_str().to_string()
+                }
+            });
+        Some(crate::session_manager::SavedAutoRouteReceipt {
+            provider,
+            provider_identity,
+            model: model.clone(),
+            receipt: receipt.clone(),
+            effective_reasoning_effort: self.last_effective_reasoning_effort.map(Into::into),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn provider_identity_for_persistence(&self) -> &str {
+        if self.api_provider == ApiProvider::Custom {
+            &self.provider_identity
+        } else {
+            self.api_provider.as_str()
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn provider_id_for_persistence(&self) -> Option<&str> {
+        self.provider_exact_id.as_deref()
+    }
+
+    pub(crate) fn set_provider_identity(
+        &mut self,
+        provider: ApiProvider,
+        identity: impl Into<String>,
+    ) {
+        let identity = identity.into();
+        self.api_provider = provider;
+        self.provider_exact_id = (!(provider == ApiProvider::Custom
+            && identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str())))
+        .then(|| identity.clone());
+        self.provider_identity = identity;
+    }
+
+    pub(crate) fn set_provider_identity_record(
+        &mut self,
+        identity: crate::config::ProviderIdentity,
+    ) {
+        self.api_provider = identity.provider;
+        self.provider_identity = identity.key;
+        self.provider_exact_id = identity.exact_id;
+    }
+
     pub fn accepts_custom_model_ids(&self) -> bool {
         self.model_ids_passthrough
             || crate::config::provider_passes_model_through(self.api_provider)
+    }
+
+    pub(crate) fn apply_provider_switch_reasoning_effort(
+        &mut self,
+        provider: ApiProvider,
+        base_url: &str,
+        model_override: Option<&str>,
+    ) {
+        let wire_model = model_override.unwrap_or(&self.model);
+        let inferred = model_override.and_then(|model| {
+            crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
+        });
+        self.reasoning_effort = if let Some(requested) = self.reasoning_effort_preference {
+            requested.normalize_for_route(provider, base_url, wire_model)
+        } else if let Some(effort) = inferred {
+            ReasoningEffort::from_setting(effort)
+                .normalize_for_route(provider, base_url, wire_model)
+        } else if let Some(default) = ReasoningEffort::catalog_default(provider, wire_model) {
+            default
+        } else {
+            self.reasoning_effort
+                .normalize_for_route(provider, base_url, wire_model)
+        };
+        self.invalidate_route_receipts_for_reasoning_change();
     }
 
     pub fn effective_model_for_budget(&self) -> &str {
@@ -6522,30 +5411,331 @@ impl App {
         (self.api_provider, self.model_display_label())
     }
 
-    pub fn reasoning_effort_display_label(&self) -> String {
-        if self.auto_model || self.reasoning_effort == ReasoningEffort::Auto {
-            if let Some(effective) = self.last_effective_reasoning_effort {
-                return format!(
-                    "auto: {}",
-                    effective.display_label_for_provider(self.api_provider)
-                );
+    /// Exact non-secret route label for user-visible status surfaces.
+    #[must_use]
+    pub fn effective_route_identity_display(&self) -> (String, String) {
+        let (provider, model) = self.effective_route_display();
+        let identity = if provider == ApiProvider::Custom {
+            if self.pending_turn_route.is_none() && self.auto_model {
+                self.last_effective_provider_identity
+                    .as_deref()
+                    .unwrap_or_else(|| self.provider_identity_for_persistence())
+            } else {
+                self.provider_identity_for_persistence()
             }
-            return "auto".to_string();
+        } else {
+            provider.display_name()
+        };
+        (identity.to_string(), model)
+    }
+
+    fn effective_reasoning_effort_for_active_route(
+        &self,
+        requested: ReasoningEffort,
+    ) -> EffectiveReasoningEffort {
+        let route_truth = self.active_reasoning_route_truth();
+        let auto_route_has_receipt = self
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.route.as_ref())
+            .is_some_and(|route| route.receipt.is_some());
+        if self.auto_model
+            && !auto_route_has_receipt
+            && self.last_auto_route_receipt.is_some()
+            && requested == self.reasoning_effort
+            && let Some(effective) = self.last_effective_reasoning_effort
+        {
+            // Once a concrete Auto route has been accepted, its normalized
+            // tier remains the display authority until the model or requested
+            // effort changes. The configured classifier route is not evidence
+            // of what the completed turn received.
+            return effective;
         }
-        self.reasoning_effort
-            .display_label_for_provider(self.api_provider)
-            .to_string()
+        if requested == self.reasoning_effort
+            && requested == ReasoningEffort::Auto
+            && let Some(effective) = self.last_effective_reasoning_effort
+        {
+            // The accepted route receipt is already the strongest available
+            // truth. Preserve enabled-but-untiered and unavailable states
+            // instead of forcing them through the tier-only projection.
+            return effective;
+        }
+        let effective = if requested == ReasoningEffort::Auto {
+            ReasoningEffort::Auto
+        } else if self.auto_model && !auto_route_has_receipt {
+            // The configured provider is only the classifier's starting
+            // point, not the route that will receive the request.
+            requested
+        } else if let Some((provider, _, base_url, model)) = route_truth {
+            requested.normalize_for_route(provider, base_url, model)
+        } else {
+            requested.normalize_for_route(
+                self.api_provider,
+                &self.active_route_base_url,
+                &self.model,
+            )
+        };
+
+        // Prefer the immutable installed-client receipt while a turn is live.
+        // If it is unavailable, only use the configured route when no pending
+        // or active foreign route could make that identity stale.
+        if let Some((provider, _, base_url, model)) = route_truth {
+            if let Some(constrained) = crate::work_graph::constrained_effective_reasoning_for_route(
+                requested.into(),
+                provider,
+                base_url,
+                model,
+            ) {
+                return constrained.into();
+            }
+        } else if self.active_turn.as_ref().is_some_and(|turn| {
+            turn.route.as_ref().is_some_and(|route| {
+                matches!(
+                    route.provider,
+                    ApiProvider::Zai
+                        | ApiProvider::Minimax
+                        | ApiProvider::MinimaxAnthropic
+                        | ApiProvider::Custom
+                ) && route.receipt.is_none()
+            })
+        }) || self
+            .pending_turn_route
+            .as_ref()
+            .is_some_and(|(provider, _, _)| {
+                matches!(
+                    provider,
+                    ApiProvider::Zai
+                        | ApiProvider::Minimax
+                        | ApiProvider::MinimaxAnthropic
+                        | ApiProvider::Custom
+                )
+            })
+        {
+            // A route without its immutable endpoint receipt cannot prove
+            // first-party semantics from provider/model identity alone.
+            return EffectiveReasoningEffort::Unavailable;
+        }
+        EffectiveReasoningEffort::Tier(effective)
+    }
+
+    fn active_reasoning_route_truth(&self) -> Option<(ApiProvider, &str, &str, &str)> {
+        if let Some(route) = self
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.route.as_ref())
+        {
+            route.receipt.as_ref().map(|receipt| {
+                (
+                    receipt.provider(),
+                    receipt.provider_identity(),
+                    receipt.endpoint_identity(),
+                    receipt.wire_model(),
+                )
+            })
+        } else if self.pending_turn_route.is_none() {
+            Some((
+                self.api_provider,
+                self.provider_identity_for_persistence(),
+                self.active_route_base_url.as_str(),
+                self.model.as_str(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn reasoning_effort_resolution_label(
+        requested: ReasoningEffort,
+        effective: EffectiveReasoningEffort,
+        provider: ApiProvider,
+    ) -> String {
+        match effective {
+            EffectiveReasoningEffort::Tier(effective) => {
+                if requested == effective {
+                    return effective.display_label_for_provider(provider).to_string();
+                }
+                let effective = effective.display_label_for_provider(provider);
+                if requested == ReasoningEffort::Auto {
+                    format!("auto: {effective}")
+                } else {
+                    format!("{}→{effective}", requested.short_label())
+                }
+            }
+            EffectiveReasoningEffort::ThinkingEnabledGranularityUnavailable => format!(
+                "{}→thinking enabled; granularity unavailable",
+                requested.short_label()
+            ),
+            EffectiveReasoningEffort::Unavailable => {
+                format!("{}→effective unavailable", requested.short_label())
+            }
+        }
+    }
+
+    pub fn reasoning_effort_display_label(&self) -> String {
+        let requested = self.reasoning_effort;
+        let effective = self.effective_reasoning_effort_for_active_route(requested);
+        Self::reasoning_effort_resolution_label(requested, effective, self.api_provider)
+    }
+
+    /// Return the concrete provider/model route whose current prompt may be
+    /// inspected or replayed.
+    ///
+    /// For a fixed selection, the active route is authoritative. For Auto,
+    /// `self.model` is only the selector sentinel, so the latest completed
+    /// turn supplies provider/model/endpoint truth. A restored Auto session
+    /// retains provider/model but not a raw endpoint; warmup may re-resolve
+    /// that route from live config, while inspect fails honestly until a new
+    /// turn captures the endpoint.
+    #[must_use]
+    pub(crate) fn cache_replay_target(&self) -> Option<CacheReplayTarget> {
+        if !self.auto_model {
+            let model = self.model.trim();
+            if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+                return None;
+            }
+            let base_url = (!self.active_route_base_url.trim().is_empty())
+                .then(|| self.active_route_base_url.clone());
+            return Some(CacheReplayTarget {
+                provider: self.api_provider,
+                provider_identity: self.provider_identity_for_persistence().to_string(),
+                provider_id: self.provider_id_for_persistence().map(str::to_string),
+                model: model.to_string(),
+                base_url,
+            });
+        }
+
+        let provider = self.last_effective_provider?;
+        let model = self.last_effective_model.as_deref()?.trim();
+        if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        let provider_identity = self
+            .last_effective_provider_identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_string)
+            .or_else(|| (provider != ApiProvider::Custom).then(|| provider.as_str().to_string()))?;
+        let provider_id = if provider != ApiProvider::Custom {
+            Some(provider.as_str().to_string())
+        } else if !provider_identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str()) {
+            Some(provider_identity.clone())
+        } else if self.api_provider == ApiProvider::Custom
+            && self
+                .provider_identity_for_persistence()
+                .eq_ignore_ascii_case(&provider_identity)
+        {
+            self.provider_id_for_persistence().map(str::to_string)
+        } else {
+            None
+        };
+
+        let latest_matches_route = self
+            .session
+            .turn_cache_history
+            .back()
+            .is_some_and(|record| {
+                record.auto_model
+                    && record.provider == Some(provider)
+                    && record
+                        .model
+                        .as_deref()
+                        .is_some_and(|record_model| record_model.eq_ignore_ascii_case(model))
+                    && record
+                        .provider_identity
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|identity| !identity.is_empty())
+                        .map_or(provider != ApiProvider::Custom, |identity| {
+                            identity == provider_identity
+                        })
+            });
+        let warmup_base_url = self
+            .session
+            .last_warmup_key
+            .as_ref()
+            .filter(|key| {
+                key.provider == provider_identity
+                    && key.model.eq_ignore_ascii_case(model)
+                    && !key.base_url.trim().is_empty()
+            })
+            .map(|key| key.base_url.clone());
+        let base_url = latest_matches_route
+            .then(|| self.session.last_base_url.clone())
+            .flatten()
+            .or(warmup_base_url)
+            .filter(|base_url| !base_url.trim().is_empty());
+
+        Some(CacheReplayTarget {
+            provider,
+            provider_identity,
+            provider_id,
+            model: model.to_string(),
+            base_url,
+        })
+    }
+
+    /// Provider-facing effort used when replaying the current prompt for cache
+    /// inspection or warmup on one exact route.
+    #[must_use]
+    pub(crate) fn reasoning_effort_api_value_for_replay(
+        &self,
+        provider: ApiProvider,
+        base_url: &str,
+        model: &str,
+    ) -> Option<&'static str> {
+        let requested = if self.reasoning_effort == ReasoningEffort::Auto {
+            self.last_effective_reasoning_effort?
+                .request_tier_for_replay()?
+        } else {
+            self.reasoning_effort
+        };
+        requested.api_value_for_route(provider, base_url, model)
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {
+        let mut config = self.compaction_config_for_route(
+            self.api_provider,
+            self.effective_model_for_budget(),
+            self.active_route_limits,
+        );
+        // These cached fields are the active-route compatibility authority and
+        // are updated together by `update_model_compaction_budget`. Commands
+        // and embedders may also adjust them directly between route updates.
+        config.enabled = self.auto_compact;
+        config.token_threshold = self.compact_threshold;
+        config
+    }
+
+    /// Build compaction policy from one already-resolved provider route.
+    ///
+    /// Auto routing can select a provider/model whose context limits differ
+    /// from the route currently displayed by the app. Callers dispatching that
+    /// turn must derive every compaction input from the selected descriptor,
+    /// not from the previous route cached in `App`.
+    pub(crate) fn compaction_config_for_route(
+        &self,
+        provider: ApiProvider,
+        model: &str,
+        route_limits: Option<RouteLimits>,
+    ) -> CompactionConfig {
         CompactionConfig {
-            enabled: self.auto_compact,
-            token_threshold: self.compact_threshold,
-            model: self.effective_model_for_budget().to_string(),
+            enabled: if self.auto_compact_user_configured {
+                self.auto_compact
+            } else {
+                crate::route_budget::auto_compact_default_for_route(provider, model, route_limits)
+            },
+            token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
+                provider,
+                model,
+                route_limits,
+                self.auto_compact_threshold_percent,
+            ),
+            model: model.to_string(),
             effective_context_window: Some(crate::route_budget::route_context_window_tokens(
-                self.api_provider,
-                self.effective_model_for_budget(),
-                self.active_route_limits,
+                provider,
+                model,
+                route_limits,
             )),
             ..Default::default()
         }
@@ -6657,7 +5847,7 @@ impl App {
             return None;
         };
 
-        self.api_provider = next_provider;
+        self.set_provider_identity(next_provider, next_provider.as_str());
         self.last_fallback_reason = Some(format!(
             "Fell back to {} after recoverable provider error: {reason}{skipped}",
             next_provider.as_str()
@@ -6683,213 +5873,6 @@ pub fn media_attachment_reference(kind: &str, path: &Path, description: Option<&
         }
         _ => format!("[Attached {kind}: {}]", path.display()),
     }
-}
-
-// === Actions ===
-
-/// Actions emitted by the UI event loop.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppAction {
-    Quit,
-    #[allow(dead_code)] // For explicit /save command
-    SaveSession(PathBuf),
-    #[allow(dead_code)] // For explicit /load command
-    LoadSession(PathBuf),
-    SyncSession {
-        session_id: Option<String>,
-        messages: Vec<Message>,
-        system_prompt: Option<SystemPrompt>,
-        model: String,
-        workspace: PathBuf,
-        mode: AppMode,
-    },
-    OpenConfigEditor(ConfigUiMode),
-    OpenConfigView,
-    /// Open the `/model` two-pane picker (Pro/Flash + Off/High/Max).
-    OpenModelPicker,
-    /// Open the `/provider` picker modal — DeepSeek / NVIDIA NIM / OpenRouter
-    /// / Novita with inline API-key prompt for un-configured providers (#52).
-    OpenProviderPicker,
-    /// Open the `/provider` picker in setup/catalog mode, optionally focused on
-    /// a built-in provider that needs credentials before first use.
-    OpenProviderSetup {
-        provider: Option<ApiProvider>,
-    },
-    /// Run the xAI/Grok device-code flow with the TUI temporarily suspended.
-    StartXaiDeviceLogin,
-    /// Open the `/mode` picker modal for Act / Plan / Operate.
-    OpenModePicker,
-    /// Refresh the engine prompt after the UI operating mode changes.
-    ModeChanged(AppMode),
-    /// Synchronize a saved top-level approval policy into the live Config,
-    /// then refresh the engine prompt from the App's updated permission mode.
-    ApprovalPolicyPersisted {
-        policy: Option<String>,
-    },
-    /// Open the `/statusline` multi-select picker for footer items.
-    OpenStatusPicker,
-    /// Open the `/feedback` picker for GitHub issue/security destinations.
-    OpenFeedbackPicker,
-    /// Open the `/theme` picker modal with live preview of every preset.
-    OpenThemePicker,
-    /// Open the `/fleet` roster — the saved-party view of the agent team.
-    OpenFleetRoster,
-    /// Open the `/fleet` profile authoring wizard.
-    OpenFleetSetup,
-    /// Open the `/hotbar` setup wizard.
-    OpenHotbarSetup,
-    /// Open the constitution-first `/setup` wizard shell.
-    OpenSetupWizard,
-    /// Open the constitution-first `/setup` wizard at a specific step.
-    OpenSetupWizardAt {
-        step: codewhale_config::SetupStep,
-    },
-    /// Record that the bundled/default constitution should be used.
-    UseBundledConstitution,
-    /// Disable the Hotbar: persist `hotbar = []` and clear the live slots.
-    DisableHotbar,
-    /// Restore the default recommended Hotbar slots: remove the `hotbar` key so
-    /// the resolver falls back to the built-in defaults.
-    RestoreHotbarDefaults,
-    /// Open an external URL in the system browser.
-    OpenExternalUrl {
-        url: String,
-        label: String,
-    },
-    /// Send a message to the AI (normal chat mode).
-    SendMessage(String),
-    /// Cancel a running sub-agent through the engine manager.
-    CancelSubAgent {
-        agent_id: String,
-    },
-    /// Update the runtime goal status (`/goal pause|resume|clear|…`) without
-    /// dispatching a model turn. The UI layer translates this into
-    /// `Op::SetGoalStatus`.
-    SetGoalStatus {
-        status: crate::tools::goal::GoalStatus,
-        clear: bool,
-    },
-    ListSubAgents,
-    FetchModels,
-    /// Force a Models.dev live-catalog refresh into ProviderLake (#4187).
-    RefreshModelsDevCatalog,
-    CacheWarmup,
-    /// Switch the active LLM backend (DeepSeek vs NVIDIA NIM) without
-    /// restarting the process. The runtime rebuilds its API client from
-    /// the updated config. `model` overrides the post-switch model
-    /// (already normalized but not yet provider-prefixed).
-    SwitchProvider {
-        provider: ApiProvider,
-        model: Option<String>,
-    },
-    /// Switch provider+model through the same apply path as a `/model` route
-    /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
-    SwitchModelRoute {
-        provider: ApiProvider,
-        model: String,
-    },
-    UpdateCompaction(CompactionConfig),
-    UpdateStreamChunkTimeout(u64),
-    UpdateSubagentRuntimeConfig {
-        enabled: bool,
-        max_subagents: usize,
-        launch_concurrency: usize,
-        max_spawn_depth: u32,
-        api_timeout_secs: u64,
-        heartbeat_timeout_secs: u64,
-    },
-    OpenContextInspector,
-    CompactContext,
-    PurgeContext,
-    TaskAdd {
-        prompt: String,
-    },
-    TaskList,
-    TaskShow {
-        id: String,
-    },
-    TaskCancel {
-        id: String,
-    },
-    ShellJob(ShellJobAction),
-    Mcp(McpUiAction),
-    /// Switch to a different config profile without restarting.
-    SwitchProfile {
-        /// Profile name to load.
-        profile: String,
-    },
-    /// Switch the workspace used by tools, hooks, tasks, and session metadata.
-    SwitchWorkspace {
-        workspace: PathBuf,
-    },
-    /// Record from the microphone and route the transcription into the
-    /// composer (or auto-send it). Emitted by `/voice` and the voice hotbar
-    /// action; handled in the UI event loop where the live `Config` supplies
-    /// provider credentials.
-    VoiceCapture,
-    /// Export and share the current session as a web URL.
-    ShareSession {
-        history_len: usize,
-        model: String,
-        mode: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellJobAction {
-    List,
-    Show {
-        id: String,
-    },
-    Poll {
-        id: String,
-        wait: bool,
-    },
-    SendStdin {
-        id: String,
-        input: String,
-        close: bool,
-    },
-    Cancel {
-        id: String,
-    },
-    CancelAll,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpUiAction {
-    Show,
-    Init {
-        force: bool,
-    },
-    AddStdio {
-        name: String,
-        command: String,
-        args: Vec<String>,
-    },
-    AddHttp {
-        name: String,
-        url: String,
-        transport: Option<String>,
-    },
-    Enable {
-        name: String,
-    },
-    Disable {
-        name: String,
-    },
-    Remove {
-        name: String,
-    },
-    Login {
-        name: String,
-        scopes: Vec<String>,
-    },
-    Logout {
-        name: String,
-    },
-    Validate,
-    Reload,
 }
 
 #[cfg(test)]

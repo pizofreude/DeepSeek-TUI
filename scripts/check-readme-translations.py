@@ -26,9 +26,21 @@ TRANSLATIONS = [
     "README.zh-CN.md",
     "README.ja-JP.md",
     "README.vi.md",
+    "README.id.md",
     "README.ko-KR.md",
     "README.es-419.md",
     "README.pt-BR.md",
+    "README.ru.md",
+    "README.uk.md",
+    "README.fr.md",
+    "README.de.md",
+    "README.zh-TW.md",
+    "README.hi.md",
+    "README.tr.md",
+    "README.it.md",
+    "README.pl.md",
+    "README.ar.md",
+    "README.ca.md",
 ]
 STAMP_RE = re.compile(r"<!--\s*source:\s*README\.md\s+sha256:([0-9a-f]{12})\s*-->")
 FENCE_RE = re.compile(r"```[a-z]*\n(.*?)```", re.DOTALL)
@@ -40,9 +52,21 @@ LANGUAGE_LINKS = {
     "README.zh-CN.md",
     "README.ja-JP.md",
     "README.vi.md",
+    "README.id.md",
     "README.ko-KR.md",
     "README.es-419.md",
     "README.pt-BR.md",
+    "README.ru.md",
+    "README.uk.md",
+    "README.fr.md",
+    "README.de.md",
+    "README.zh-TW.md",
+    "README.hi.md",
+    "README.tr.md",
+    "README.it.md",
+    "README.pl.md",
+    "README.ar.md",
+    "README.ca.md",
 }
 
 

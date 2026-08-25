@@ -3,6 +3,7 @@
 
 #[cfg(all(test, feature = "long-running-tests"))]
 mod acceptance;
+mod branch;
 mod compact;
 mod export;
 mod fork;
@@ -10,11 +11,17 @@ mod load;
 mod new;
 mod purge;
 mod relay;
+mod remote_control;
+mod remote_env;
 mod rename;
 #[cfg(test)]
 pub(crate) use rename::rename_with_manager;
+mod resume;
 mod save;
 mod sessions;
+mod structcopy;
+mod title;
+mod tree;
 // This group dir intentionally has a `session.rs` child module with the same
 // name. The module_inception allow is a permanent structure rationale, not
 // migration scaffolding; see docs/architecture/command-dispatch.md.
@@ -32,6 +39,10 @@ impl CommandGroup for SessionCommands {
             Box::new(FunctionCommand::new(
                 rename::RenameCmd::info(),
                 rename::RenameCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                title::TitleCmd::info(),
+                title::TitleCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 save::SaveCmd::info(),
@@ -54,6 +65,18 @@ impl CommandGroup for SessionCommands {
                 load::LoadCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                resume::ResumeCmd::info(),
+                resume::ResumeCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                tree::TreeCmd::info(),
+                tree::TreeCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                branch::BranchCmd::info(),
+                branch::BranchCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 compact::CompactCmd::info(),
                 compact::CompactCmd::execute,
             )),
@@ -66,8 +89,20 @@ impl CommandGroup for SessionCommands {
                 relay::RelayCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                remote_control::RemoteControlCmd::info(),
+                remote_control::RemoteControlCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                remote_env::RemoteEnvCmd::info(),
+                remote_env::RemoteEnvCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 export::ExportCmd::info(),
                 export::ExportCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                structcopy::StructcopyCmd::info(),
+                structcopy::StructcopyCmd::execute,
             )),
         ])
     }

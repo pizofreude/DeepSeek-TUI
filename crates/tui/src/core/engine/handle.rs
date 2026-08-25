@@ -9,14 +9,31 @@
 //! so the agent loop's mailbox API is reviewable on its own.
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 
 use super::approval::{ApprovalDecision, UserInputDecision};
-use super::{CancelReason, EngineHandle, Op, UserInputResponse};
+use super::{
+    CancelReason, EngineHandle, LiveRuntimeAuthority, Op, RuntimePermissionAuthority,
+    UserInputResponse,
+};
 
 impl EngineHandle {
+    /// True when the caller must preflight a concrete provider client before
+    /// committing UI/runtime turn state. Test and embedding handles with an
+    /// injected model client return false because that client owns model I/O.
+    #[must_use]
+    pub(crate) fn client_preflight_required(&self) -> bool {
+        self.client_preflight_required
+    }
+
     /// Send an operation to the engine
     pub async fn send(&self, op: Op) -> Result<()> {
-        self.tx_op.send(op).await?;
+        let authority = Self::change_mode_authority(&op);
+        let permit = self.tx_op.reserve().await?;
+        if let Some(authority) = authority {
+            self.publish_runtime_authority(authority);
+        }
+        permit.send(op);
         Ok(())
     }
 
@@ -26,8 +43,88 @@ impl EngineHandle {
     /// non-critical, refresh-type ops (e.g. `Op::ListSubAgents`) that can
     /// safely be dropped and re-requested on the next drain cycle.
     pub fn try_send(&self, op: Op) -> Result<()> {
-        self.tx_op.try_send(op)?;
+        let authority = Self::change_mode_authority(&op);
+        let result = self.tx_op.try_send(op);
+        // A full channel already guarantees that the engine will wake and
+        // drain an operation. Publish the typed authority anyway: the drain
+        // applies pending authority before handling that queued operation, so
+        // a posture edit never blocks behind refresh traffic. A closed
+        // channel has no engine left to observe the update.
+        if !matches!(&result, Err(mpsc::error::TrySendError::Closed(_)))
+            && let Some(authority) = authority
+        {
+            self.publish_runtime_authority(authority);
+        }
+        result?;
         Ok(())
+    }
+
+    fn change_mode_authority(op: &Op) -> Option<LiveRuntimeAuthority> {
+        let Op::ChangeMode {
+            mode,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+            configured_sandbox_mode,
+        } = op
+        else {
+            return None;
+        };
+        Some(LiveRuntimeAuthority::from_fields(
+            *mode,
+            *allow_shell,
+            *trust_mode,
+            *auto_approve,
+            *approval_mode,
+            configured_sandbox_mode.clone(),
+        ))
+    }
+
+    fn publish_runtime_authority(&self, authority: LiveRuntimeAuthority) {
+        let mut state = self
+            .live_runtime_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revision = state.revision.wrapping_add(1).max(1);
+        state.authority = authority;
+    }
+
+    pub(crate) fn publish_turn_authority(
+        &self,
+        mode: crate::tui::app::AppMode,
+        allow_shell: bool,
+        trust_mode: bool,
+        auto_approve: bool,
+        approval_mode: crate::tui::approval::ApprovalMode,
+        configured_sandbox_mode: Option<String>,
+    ) {
+        self.publish_runtime_authority(LiveRuntimeAuthority::from_fields(
+            mode,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+            configured_sandbox_mode,
+        ));
+    }
+
+    /// Exact live permission authority for runtime approval and elevation
+    /// gates. This is the same typed state the active engine turn drains.
+    #[must_use]
+    pub(crate) fn runtime_permission_authority(&self) -> RuntimePermissionAuthority {
+        self.live_runtime_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authority
+            .permission_snapshot()
+    }
+
+    /// Reserve capacity for a runtime steer before it mutates durable state.
+    /// The owned permit lets the caller persist and dispatch synchronously,
+    /// without a cancellation point between those two operations.
+    pub(crate) async fn reserve_steer(&self) -> Result<mpsc::OwnedPermit<String>> {
+        Ok(self.tx_steer.clone().reserve_owned().await?)
     }
 
     /// Cancel the current request (user-initiated path — keeps the
@@ -159,5 +256,19 @@ impl EngineHandle {
         self.send(Op::GetProviderRuntimeStatus { tx }).await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped provider runtime status oneshot"))
+    }
+
+    /// Force the engine-owned MCP pool to reload and reconnect, returning a
+    /// snapshot from the exact live pool that supplies the next model turn.
+    pub async fn reload_mcp(
+        &self,
+        config_path: std::path::PathBuf,
+    ) -> Result<crate::mcp::McpManagerSnapshot> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::ReloadMcp { config_path, tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped MCP reload oneshot"))?
+            .map_err(anyhow::Error::msg)
     }
 }

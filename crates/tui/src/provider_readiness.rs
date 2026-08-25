@@ -14,7 +14,12 @@ use codewhale_config::route::{LogicalModelRef, RouteRequest, RouteResolver};
 pub(crate) enum CredentialState {
     MissingKey,
     MissingLogin,
+    /// Structurally valid read-only consent exists for another CLI's file,
+    /// but the provider is not active so no read capability has been minted.
+    ExternalConsent,
     Saved,
+    ImportedToken,
+    NoAuth,
     Local,
     Legacy,
 }
@@ -22,11 +27,13 @@ pub(crate) enum CredentialState {
 /// Credential route whose observed health may be reused. A provider can
 /// expose more than one auth route (notably xAI and Moonshot), so provider id
 /// alone is not a safe cache key: a successful API-key request must not make a
-/// newly selected OAuth login appear verified.
+/// newly selected imported-token or OAuth route appear verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderAuthClass {
     ApiKey,
     OAuth,
+    ImportedToken,
+    NoAuth,
     Local,
     Legacy,
 }
@@ -59,25 +66,36 @@ pub(crate) fn route_identity_for_model(
     } else {
         provider.as_str()
     };
-    let endpoint = configured
-        .and_then(|entry| entry.base_url.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-                .then(|| config.base_url.as_deref())
-                .flatten()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or_else(|| provider.default_base_url())
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
+    let endpoint = if provider == config.api_provider() {
+        config.deepseek_base_url()
+    } else {
+        configured
+            .and_then(|entry| entry.base_url.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                if provider == ApiProvider::Moonshot
+                    && configured.is_some_and(|entry| {
+                        entry
+                            .auth_mode
+                            .as_deref()
+                            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token)
+                    })
+                {
+                    crate::config::DEFAULT_KIMI_CODE_BASE_URL
+                } else {
+                    provider.default_base_url()
+                }
+            })
+            .to_string()
+    }
+    .trim_end_matches('/')
+    .to_string();
     ProviderRouteIdentity {
         provider,
-        provider_id: provider_id.to_ascii_lowercase(),
+        provider_id: provider_id.to_string(),
         endpoint,
-        model: model.trim().to_ascii_lowercase(),
+        model: model.trim().to_string(),
         auth_class: auth_class_for_provider(config, provider),
     }
 }
@@ -86,21 +104,24 @@ pub(crate) fn auth_class_for_provider(
     config: &crate::config::Config,
     provider: ApiProvider,
 ) -> ProviderAuthClass {
-    if provider == ApiProvider::OpenaiCodex {
+    let auth_mode = config.auth_mode_for_provider(provider);
+    if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
+        return ProviderAuthClass::NoAuth;
+    }
+    let official_endpoint = !config.provider_uses_custom_endpoint(provider);
+    if provider == ApiProvider::OpenaiCodex && official_endpoint {
         return ProviderAuthClass::OAuth;
     }
-    let auth_mode = config
-        .provider_config_for(provider)
-        .and_then(|entry| entry.auth_mode.as_deref())
-        .map(|mode| mode.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
     if provider == ApiProvider::Moonshot
+        && official_endpoint
         && auth_mode
             .as_deref()
-            .is_some_and(|mode| matches!(mode, "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"))
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token)
     {
-        return ProviderAuthClass::OAuth;
+        return ProviderAuthClass::ImportedToken;
     }
     if provider == ApiProvider::Xai
+        && official_endpoint
         && auth_mode
             .as_deref()
             .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
@@ -108,8 +129,10 @@ pub(crate) fn auth_class_for_provider(
         return ProviderAuthClass::OAuth;
     }
     match credential_state_for_provider(config, provider) {
+        CredentialState::NoAuth => ProviderAuthClass::NoAuth,
         CredentialState::Local => ProviderAuthClass::Local,
         CredentialState::Legacy => ProviderAuthClass::Legacy,
+        CredentialState::ExternalConsent => ProviderAuthClass::OAuth,
         _ => ProviderAuthClass::ApiKey,
     }
 }
@@ -118,6 +141,34 @@ pub(crate) fn credential_state_for_provider(
     config: &crate::config::Config,
     provider: ApiProvider,
 ) -> CredentialState {
+    let auth_mode = config.auth_mode_for_provider(provider);
+    if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
+        return CredentialState::NoAuth;
+    }
+    let api_key_required = crate::config::auth_mode_requires_api_key(auth_mode.as_deref());
+    let official_endpoint = !config.provider_uses_custom_endpoint(provider);
+
+    // A built-in provider can intentionally target a local OpenAI-compatible
+    // runtime. That route is keyless unless the operator explicitly declares
+    // an API-key auth contract. Classify it before provider-specific hosted
+    // branches (including the DeepSeek-CN compatibility alias) so readiness
+    // and cache identity describe the effective endpoint, not just the
+    // provider enum.
+    if provider == config.api_provider()
+        && !official_endpoint
+        && crate::config::base_url_uses_local_host(&config.deepseek_base_url())
+    {
+        return if api_key_required {
+            if crate::config::has_api_key_for(config, provider) {
+                CredentialState::Saved
+            } else {
+                CredentialState::MissingKey
+            }
+        } else {
+            CredentialState::Local
+        };
+    }
+
     // DeepSeek CN is a TUI compatibility alias without a shared
     // `ProviderKind`, but it is still a live route handled by the runtime.
     // Treating it as `Legacy` makes setup claim it cannot run at all.
@@ -132,30 +183,38 @@ pub(crate) fn credential_state_for_provider(
         return CredentialState::Legacy;
     }
     if provider == ApiProvider::Custom {
+        if config.uses_legacy_literal_custom_route() {
+            if config
+                .base_url
+                .as_deref()
+                .is_some_and(crate::config::base_url_uses_local_host)
+                && !api_key_required
+            {
+                return CredentialState::Local;
+            }
+            return if crate::config::has_api_key_for(config, provider) {
+                CredentialState::Saved
+            } else {
+                CredentialState::MissingKey
+            };
+        }
         let Some(configured) = config.provider_config_for(provider) else {
             return CredentialState::MissingKey;
         };
-        let auth_optional = configured.auth_mode.as_deref().is_some_and(|mode| {
-            matches!(
-                mode.trim()
-                    .to_ascii_lowercase()
-                    .replace(['-', ' '], "_")
-                    .as_str(),
-                "none" | "off" | "disabled" | "no_auth" | "noapi" | "no_api_key" | "anonymous"
-            )
-        }) || configured
+        let auth_optional = configured
             .base_url
             .as_deref()
-            .is_some_and(crate::config::base_url_uses_local_host);
+            .is_some_and(crate::config::base_url_uses_local_host)
+            && !api_key_required;
         if auth_optional {
             return CredentialState::Local;
         }
         let has_auth = (provider == config.api_provider()
             && crate::config::explicit_cli_api_key_override().is_some())
-            || configured
-                .api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
+            || configured.api_key.as_deref().is_some_and(|value| {
+                crate::config::classify_config_api_key_value(value)
+                    == crate::config::ConfigApiKeyValueKind::Literal
+            })
             || configured
                 .api_key_env
                 .as_deref()
@@ -163,50 +222,69 @@ pub(crate) fn credential_state_for_provider(
                 .filter(|name| !name.is_empty())
                 .is_some_and(|name| {
                     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
-                })
-            || configured
-                .auth
-                .as_ref()
-                .is_some_and(|auth| auth.validate().is_ok());
+                });
         return if has_auth {
             CredentialState::Saved
         } else {
             CredentialState::MissingKey
         };
     }
-    if provider.is_self_hosted() {
-        return CredentialState::Local;
-    }
-
-    let configured = config.provider_config_for(provider);
-    let auth_mode = configured
-        .and_then(|entry| entry.auth_mode.as_deref())
-        .map(|mode| mode.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
-    let uses_kimi_oauth = provider == ApiProvider::Moonshot
-        && auth_mode
-            .as_deref()
-            .is_some_and(|mode| matches!(mode, "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"));
-    if uses_kimi_oauth {
-        return if crate::config::kimi_cli_credentials_valid() {
-            CredentialState::Saved
+    if crate::config::provider_route_is_keyless_self_hosted(
+        provider,
+        &config.base_url_for_route(provider),
+    ) {
+        return if api_key_required {
+            if crate::config::has_api_key_for(config, provider) {
+                CredentialState::Saved
+            } else {
+                CredentialState::MissingKey
+            }
         } else {
-            CredentialState::MissingLogin
+            CredentialState::Local
         };
     }
-    if provider == ApiProvider::OpenaiCodex {
+
+    let uses_kimi_imported_token = provider == ApiProvider::Moonshot
+        && official_endpoint
+        && auth_mode
+            .as_deref()
+            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token);
+    if uses_kimi_imported_token {
+        // Kimi remains API-key-only until Codewhale has its own registered
+        // OAuth client identity. Never inspect Kimi CLI storage here.
+        return CredentialState::MissingKey;
+    }
+    if provider == ApiProvider::OpenaiCodex && official_endpoint {
         return if crate::config::has_api_key_for(config, provider) {
             CredentialState::Saved
+        } else if provider != config.api_provider()
+            && config.external_credential_read_consent_configured(
+                provider,
+                codewhale_config::ExternalCredentialSource::CodexCli,
+            )
+        {
+            CredentialState::ExternalConsent
         } else {
             CredentialState::MissingLogin
         };
     }
     let xai_oauth_selected = provider == ApiProvider::Xai
+        && official_endpoint
         && auth_mode
             .as_deref()
             .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth);
     if xai_oauth_selected {
-        return if crate::xai_oauth::credentials_valid() {
+        return if crate::xai_oauth::credentials_valid(config)
+            || explicit_provider_credential_present(config, provider)
+        {
             CredentialState::Saved
+        } else if provider != config.api_provider()
+            && config.external_credential_read_consent_configured(
+                provider,
+                codewhale_config::ExternalCredentialSource::GrokCli,
+            )
+        {
+            CredentialState::ExternalConsent
         } else {
             CredentialState::MissingLogin
         };
@@ -218,8 +296,34 @@ pub(crate) fn credential_state_for_provider(
         return CredentialState::MissingKey;
     }
 
+    if provider == ApiProvider::Antigravity {
+        if crate::config::has_api_key_for(config, provider) {
+            return CredentialState::Saved;
+        }
+        if provider != config.api_provider()
+            && config.external_credential_read_consent_configured(
+                provider,
+                codewhale_config::ExternalCredentialSource::AgyCli,
+            )
+        {
+            return CredentialState::ExternalConsent;
+        }
+        return CredentialState::MissingKey;
+    }
+
     if crate::config::has_api_key_for(config, provider) {
         CredentialState::Saved
+    } else if matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekAnthropic
+    ) && official_endpoint
+        && provider != config.api_provider()
+        && config.external_credential_read_consent_configured(
+            provider,
+            codewhale_config::ExternalCredentialSource::DshCli,
+        )
+    {
+        CredentialState::ExternalConsent
     } else {
         CredentialState::MissingKey
     }
@@ -230,20 +334,25 @@ fn explicit_provider_credential_present(
     provider: ApiProvider,
 ) -> bool {
     (provider == config.api_provider() && crate::config::explicit_cli_api_key_override().is_some())
-        || provider
-            .env_vars()
-            .iter()
-            .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-        || config.provider_config_for(provider).is_some_and(|entry| {
-            entry
-                .api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                || entry
-                    .auth
-                    .as_ref()
-                    .is_some_and(|auth| auth.validate().is_ok())
-        })
+        || (!config.provider_uses_custom_endpoint(provider)
+            && provider
+                .env_vars()
+                .iter()
+                .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
+        || (config.config_credentials_are_bound_to_provider_endpoint(provider)
+            && config.provider_config_for(provider).is_some_and(|entry| {
+                entry.api_key.as_deref().is_some_and(|value| {
+                    crate::config::classify_config_api_key_value(value)
+                        == crate::config::ConfigApiKeyValueKind::Literal
+                }) || entry
+                    .api_key_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .is_some_and(|name| {
+                        std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+                    })
+            }))
 }
 
 /// Validate the configured provider/model/endpoint route without making a
@@ -278,8 +387,15 @@ pub(crate) fn route_is_valid_for_model(
         explicit_provider: Some(kind),
         model_selector: configured_model.or(active_model).map(LogicalModelRef::from),
         saved_provider_model: None,
-        base_url_override: if provider == ApiProvider::DeepseekCN {
-            None
+        base_url_override: if provider == config.api_provider() {
+            Some(config.deepseek_base_url())
+        } else if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
+            config
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
         } else {
             configured
                 .and_then(|entry| entry.base_url.as_deref())
@@ -287,15 +403,18 @@ pub(crate) fn route_is_valid_for_model(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         },
+        limit_overrides: Vec::new(),
     };
     RouteResolver::new()
         .resolve(&request)
-        .is_ok_and(|candidate| candidate.validation.ok)
+        .is_ok_and(|candidate| candidate.validation().ok)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LastProviderCheck {
     Passed,
+    /// A 2xx `/models` response proves reachability only — never model readiness.
+    ModelsEndpointPassed,
     Failed {
         category: ErrorCategory,
         message: String,
@@ -307,9 +426,13 @@ pub(crate) enum LastProviderCheck {
 pub(crate) enum ResolvedProviderReadiness {
     MissingKey,
     MissingLogin,
+    ExternalConsentPendingSelection,
     SavedUnchecked,
+    ImportedTokenUnchecked,
+    NoAuthUnchecked,
     LocalUnchecked,
     Ready,
+    ConnectionCheckedModelUnchecked,
     SavedLastCheckFailed {
         category: ErrorCategory,
         message: String,
@@ -323,9 +446,17 @@ impl ResolvedProviderReadiness {
         match self {
             Self::MissingKey => Cow::Borrowed("missing key"),
             Self::MissingLogin => Cow::Borrowed("missing login"),
+            Self::ExternalConsentPendingSelection => {
+                Cow::Borrowed("external consent · select to check")
+            }
             Self::SavedUnchecked => Cow::Borrowed("key saved · not checked"),
+            Self::ImportedTokenUnchecked => Cow::Borrowed("imported token · not checked"),
+            Self::NoAuthUnchecked => Cow::Borrowed("no auth · not checked"),
             Self::LocalUnchecked => Cow::Borrowed("local · not checked"),
             Self::Ready => Cow::Borrowed("ready"),
+            Self::ConnectionCheckedModelUnchecked => {
+                Cow::Borrowed("models endpoint 2xx · model not checked")
+            }
             Self::SavedLastCheckFailed { category, .. } => {
                 Cow::Owned(format!("last check failed ({category})"))
             }
@@ -345,10 +476,38 @@ impl ResolvedProviderReadiness {
         matches!(
             self,
             Self::SavedUnchecked
+                | Self::NoAuthUnchecked
                 | Self::LocalUnchecked
+                | Self::ImportedTokenUnchecked
                 | Self::Ready
                 | Self::SavedLastCheckFailed { .. }
         )
+    }
+
+    /// Whether the provider needs an explicit human activation step before it
+    /// can be used. Fleet uses this to turn a dormant external-consent route
+    /// into a real selection without weakening the global readiness boundary.
+    pub(crate) fn requires_explicit_activation(&self) -> bool {
+        matches!(self, Self::ExternalConsentPendingSelection)
+    }
+
+    /// A short, non-sensitive reason this row cannot be activated. `None`
+    /// means the row is either ready or requires explicit activation.
+    pub(crate) fn blocked_reason(&self) -> Option<Cow<'static, str>> {
+        match self {
+            Self::MissingKey => Some(Cow::Borrowed("missing API key")),
+            Self::MissingLogin => Some(Cow::Borrowed("missing login")),
+            Self::InvalidRoute => Some(Cow::Borrowed("invalid route")),
+            Self::Legacy => Some(Cow::Borrowed("legacy route")),
+            Self::ConnectionCheckedModelUnchecked => Some(Cow::Borrowed("model not checked")),
+            Self::SavedLastCheckFailed { message, .. } => Some(Cow::Owned(message.clone())),
+            Self::SavedUnchecked
+            | Self::ImportedTokenUnchecked
+            | Self::NoAuthUnchecked
+            | Self::LocalUnchecked
+            | Self::Ready
+            | Self::ExternalConsentPendingSelection => None,
+        }
     }
 }
 
@@ -359,10 +518,29 @@ pub(crate) struct ProviderReadinessSnapshot {
 
 impl ProviderReadinessSnapshot {
     fn last(&self, identity: &ProviderRouteIdentity) -> Option<&LastProviderCheck> {
-        self.checks
+        if let Some(check) = self
+            .checks
             .iter()
             .rev()
             .find_map(|(candidate, check)| (candidate == identity).then_some(check))
+        {
+            return Some(check);
+        }
+        // The auto model route never records under the literal "auto" —
+        // successes and failures are recorded against the concrete model
+        // the router actually ran. Without this fallback every auto-mode
+        // read would report "not checked" forever, even after hundreds of
+        // successful turns on that route.
+        if identity.model != "auto" {
+            return None;
+        }
+        self.checks.iter().rev().find_map(|(candidate, check)| {
+            (candidate.provider == identity.provider
+                && candidate.provider_id == identity.provider_id
+                && candidate.endpoint == identity.endpoint
+                && candidate.auth_class == identity.auth_class)
+                .then_some(check)
+        })
     }
 
     pub(crate) fn record_success(
@@ -374,6 +552,39 @@ impl ProviderReadinessSnapshot {
         self.replace(
             route_identity_for_model(config, provider, model),
             LastProviderCheck::Passed,
+        );
+    }
+
+    /// Records a failed `/models` probe. Unlike [`Self::record_failure`],
+    /// this always stores the result so Test Connection can refresh a
+    /// stuck `not checked` row.
+    pub(crate) fn record_models_probe_failure(
+        &mut self,
+        config: &crate::config::Config,
+        provider: ApiProvider,
+        model: &str,
+        category: ErrorCategory,
+        message: &str,
+    ) {
+        self.replace(
+            route_identity_for_model(config, provider, model),
+            LastProviderCheck::Failed {
+                category,
+                message: sanitize_message(message),
+            },
+        );
+    }
+
+    /// Records a 2xx `/models` probe as connection-checked, never `Ready`.
+    pub(crate) fn record_models_probe_success(
+        &mut self,
+        config: &crate::config::Config,
+        provider: ApiProvider,
+        model: &str,
+    ) {
+        self.replace(
+            route_identity_for_model(config, provider, model),
+            LastProviderCheck::ModelsEndpointPassed,
         );
     }
 
@@ -433,16 +644,41 @@ pub(crate) fn resolve_with_identity(
         CredentialState::Legacy => ResolvedProviderReadiness::Legacy,
         CredentialState::MissingKey => ResolvedProviderReadiness::MissingKey,
         CredentialState::MissingLogin => ResolvedProviderReadiness::MissingLogin,
-        CredentialState::Saved | CredentialState::Local => match checks.last(identity) {
+        CredentialState::ExternalConsent => match checks.last(identity) {
             Some(LastProviderCheck::Passed) => ResolvedProviderReadiness::Ready,
+            Some(LastProviderCheck::ModelsEndpointPassed) => {
+                ResolvedProviderReadiness::ConnectionCheckedModelUnchecked
+            }
             Some(LastProviderCheck::Failed { category, message }) => {
                 ResolvedProviderReadiness::SavedLastCheckFailed {
                     category: *category,
                     message: message.clone(),
                 }
             }
+            None => ResolvedProviderReadiness::ExternalConsentPendingSelection,
+        },
+        CredentialState::Saved
+        | CredentialState::ImportedToken
+        | CredentialState::NoAuth
+        | CredentialState::Local => match checks.last(identity) {
+            Some(LastProviderCheck::Passed) => ResolvedProviderReadiness::Ready,
+            Some(LastProviderCheck::ModelsEndpointPassed) => {
+                ResolvedProviderReadiness::ConnectionCheckedModelUnchecked
+            }
+            Some(LastProviderCheck::Failed { category, message }) => {
+                ResolvedProviderReadiness::SavedLastCheckFailed {
+                    category: *category,
+                    message: message.clone(),
+                }
+            }
+            None if credentials == CredentialState::NoAuth => {
+                ResolvedProviderReadiness::NoAuthUnchecked
+            }
             None if credentials == CredentialState::Local => {
                 ResolvedProviderReadiness::LocalUnchecked
+            }
+            None if credentials == CredentialState::ImportedToken => {
+                ResolvedProviderReadiness::ImportedTokenUnchecked
             }
             None => ResolvedProviderReadiness::SavedUnchecked,
         },
@@ -544,6 +780,152 @@ mod tests {
             credential_state_for_provider(&configured, ApiProvider::DeepseekCN),
             CredentialState::Saved
         );
+    }
+
+    #[test]
+    fn custom_readiness_identity_preserves_case_sensitive_route_parts() {
+        let custom = std::collections::HashMap::from([
+            (
+                "CUSTOM".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("https://example.test/TenantA/v1".to_string()),
+                    model: Some("Vendor/ModelA".to_string()),
+                    api_key: Some("test-key-a".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom".to_string(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some("https://example.test/tenanta/v1".to_string()),
+                    model: Some("vendor/modela".to_string()),
+                    api_key: Some("test-key-b".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let upper = crate::config::Config {
+            provider: Some("CUSTOM".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: custom.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lower = crate::config::Config {
+            provider: Some("custom".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let upper_identity = route_identity_for_model(&upper, ApiProvider::Custom, "Vendor/ModelA");
+        let lower_identity = route_identity_for_model(&lower, ApiProvider::Custom, "vendor/modela");
+
+        assert_ne!(upper_identity, lower_identity);
+        assert_eq!(upper_identity.provider_id, "CUSTOM");
+        assert_eq!(upper_identity.endpoint, "https://example.test/TenantA/v1");
+        assert_eq!(upper_identity.model, "Vendor/ModelA");
+
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&upper, ApiProvider::Custom, "Vendor/ModelA");
+        assert_eq!(
+            resolve_for_model(&lower, ApiProvider::Custom, "vendor/modela", &checks),
+            ResolvedProviderReadiness::SavedUnchecked
+        );
+    }
+
+    #[test]
+    fn external_consent_with_passed_check_becomes_ready() {
+        let config = crate::config::Config::default();
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(
+            &config,
+            ApiProvider::OpenaiCodex,
+            crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+        );
+        assert_eq!(
+            resolve_test_route(
+                &config,
+                ApiProvider::OpenaiCodex,
+                crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+                CredentialState::ExternalConsent,
+                true,
+                &checks,
+            ),
+            ResolvedProviderReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn external_consent_with_failed_check_surfaces_reason() {
+        let config = crate::config::Config::default();
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_failure_message(
+            &config,
+            ApiProvider::Xai,
+            "grok-4.5",
+            ErrorCategory::Authentication,
+            "consent revoked",
+        );
+        assert!(
+            matches!(
+                resolve_test_route(
+                    &config,
+                    ApiProvider::Xai,
+                    "grok-4.5",
+                    CredentialState::ExternalConsent,
+                    true,
+                    &checks,
+                ),
+                ResolvedProviderReadiness::SavedLastCheckFailed { category, .. }
+                    if category == ErrorCategory::Authentication
+            ),
+            "failed activation should surface the sanitized reason"
+        );
+    }
+
+    #[test]
+    fn external_consent_without_check_stays_pending_selection() {
+        let config = crate::config::Config::default();
+        let checks = ProviderReadinessSnapshot::default();
+        assert_eq!(
+            resolve_test_route(
+                &config,
+                ApiProvider::OpenaiCodex,
+                crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+                CredentialState::ExternalConsent,
+                true,
+                &checks,
+            ),
+            ResolvedProviderReadiness::ExternalConsentPendingSelection
+        );
+    }
+
+    #[test]
+    fn models_probe_success_marks_connection_checked_not_ready() {
+        let config = crate::config::Config::default();
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_models_probe_success(&config, ApiProvider::Deepseek, "deepseek-v4-pro");
+        assert_eq!(
+            resolve_test_route(
+                &config,
+                ApiProvider::Deepseek,
+                "deepseek-v4-pro",
+                CredentialState::Saved,
+                true,
+                &checks,
+            ),
+            ResolvedProviderReadiness::ConnectionCheckedModelUnchecked
+        );
+        assert_eq!(
+            ResolvedProviderReadiness::ConnectionCheckedModelUnchecked.label(),
+            "models endpoint 2xx · model not checked"
+        );
+        assert!(!ResolvedProviderReadiness::ConnectionCheckedModelUnchecked.can_attempt());
     }
 
     #[test]
@@ -766,9 +1148,91 @@ mod tests {
     }
 
     #[test]
-    fn malformed_oauth_files_are_missing_login_not_ready() {
+    fn auto_model_readiness_follows_the_route_not_the_literal_identity() {
+        let config = crate::config::Config {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let mut checks = ProviderReadinessSnapshot::default();
+
+        // Before any observed turn, auto honestly reports unchecked.
+        assert_eq!(
+            resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+            ResolvedProviderReadiness::SavedUnchecked,
+            "auto with no observed history must stay unchecked"
+        );
+
+        // A successful concrete-model turn on the route verifies auto too —
+        // the router picks the model, so per-model scoping cannot apply.
+        checks.record_success(&config, ApiProvider::Deepseek, "deepseek-v4-flash");
+        assert_eq!(
+            resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+            ResolvedProviderReadiness::Ready,
+            "a passed turn on the route must clear auto's not-checked badge"
+        );
+
+        // A later failure on the same route must surface for auto as well.
+        checks.record_failure_message(
+            &config,
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            crate::error_taxonomy::ErrorCategory::Authentication,
+            "401 unauthorized",
+        );
+        assert!(
+            matches!(
+                resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+                ResolvedProviderReadiness::SavedLastCheckFailed { .. }
+            ),
+            "the most recent route check must win for auto, including failures"
+        );
+    }
+
+    #[test]
+    fn auto_readiness_does_not_leak_across_providers_or_endpoints() {
+        let custom_config = |id: &str, endpoint: &str| crate::config::Config {
+            provider: Some(id.to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    id.to_string(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        base_url: Some(endpoint.to_string()),
+                        model: Some("private-coder".to_string()),
+                        api_key: Some("test-key".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut checks = ProviderReadinessSnapshot::default();
+        let alpha = custom_config("alpha", "https://alpha.example/v1");
+        checks.record_success(&alpha, ApiProvider::Custom, "private-coder");
+
+        // Same endpoint, different named provider: no leak.
+        let beta = custom_config("beta", "https://alpha.example/v1");
+        assert_eq!(
+            resolve_for_model(&beta, ApiProvider::Custom, "auto", &checks),
+            ResolvedProviderReadiness::SavedUnchecked,
+            "auto fallback is scoped to the route, not the workspace"
+        );
+
+        // Same named provider, different endpoint: no leak.
+        let alpha_moved = custom_config("alpha", "https://other.example/v1");
+        assert_eq!(
+            resolve_for_model(&alpha_moved, ApiProvider::Custom, "auto", &checks),
+            ResolvedProviderReadiness::SavedUnchecked,
+            "changing endpoints must invalidate the auto fallback too"
+        );
+    }
+
+    #[test]
+    fn disabled_external_imports_are_not_probed_by_readiness() {
         let _lock = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("oauth fixture root");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
         let kimi_home = temp.path().join("kimi");
         std::fs::create_dir_all(kimi_home.join("credentials")).expect("kimi credentials dir");
         std::fs::write(kimi_home.join("credentials/kimi-code.json"), "{not-json")
@@ -799,13 +1263,29 @@ mod tests {
             ..Default::default()
         };
 
+        crate::external_credentials::reset_side_effect_trap();
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Moonshot),
-            CredentialState::MissingLogin
+            CredentialState::MissingKey,
+            "an unusable Kimi import must recover through the supported API-key route"
         );
         assert_eq!(
             credential_state_for_provider(&config, ApiProvider::Xai),
             CredentialState::MissingLogin
+        );
+        assert_eq!(
+            crate::external_credentials::side_effect_trap_counts(),
+            (0, 0),
+            "readiness must not inspect external OAuth files without consent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kimi_home.join("credentials/kimi-code.json"))
+                .expect("Kimi fixture unchanged"),
+            "{not-json"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&grok_path).expect("Grok fixture unchanged"),
+            "{}"
         );
 
         let api_key_config = crate::config::Config {
@@ -898,6 +1378,475 @@ mod tests {
         };
         assert_eq!(
             credential_state_for_provider(&local, ApiProvider::Custom),
+            CredentialState::NoAuth
+        );
+        assert_eq!(
+            resolve_for_model(
+                &local,
+                ApiProvider::Custom,
+                "local-model",
+                &ProviderReadinessSnapshot::default(),
+            ),
+            ResolvedProviderReadiness::NoAuthUnchecked
+        );
+    }
+
+    #[test]
+    fn no_auth_has_distinct_readiness_and_cache_identity_from_implicit_local() {
+        let local = crate::config::Config {
+            provider: Some("vllm".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                vllm: crate::config::ProviderConfig {
+                    base_url: Some("http://127.0.0.1:8000/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut no_auth = local.clone();
+        no_auth
+            .providers
+            .as_mut()
+            .expect("providers")
+            .vllm
+            .auth_mode = Some("no-auth".to_string());
+
+        assert_eq!(
+            credential_state_for_provider(&local, ApiProvider::Vllm),
+            CredentialState::Local
+        );
+        assert_eq!(
+            credential_state_for_provider(&no_auth, ApiProvider::Vllm),
+            CredentialState::NoAuth
+        );
+        assert_eq!(
+            auth_class_for_provider(&local, ApiProvider::Vllm),
+            ProviderAuthClass::Local
+        );
+        assert_eq!(
+            auth_class_for_provider(&no_auth, ApiProvider::Vllm),
+            ProviderAuthClass::NoAuth
+        );
+
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&local, ApiProvider::Vllm, "local-model");
+        assert_eq!(
+            resolve_for_model(&no_auth, ApiProvider::Vllm, "local-model", &checks),
+            ResolvedProviderReadiness::NoAuthUnchecked,
+            "implicit-local success must not verify an explicitly no-auth route"
+        );
+        assert!(ResolvedProviderReadiness::NoAuthUnchecked.can_attempt());
+        assert_eq!(
+            ResolvedProviderReadiness::NoAuthUnchecked.label(),
+            "no auth · not checked"
+        );
+    }
+
+    #[test]
+    fn ollama_readiness_distinguishes_local_from_cloud_credentials() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _ollama_cloud_key = crate::test_support::EnvVarGuard::remove("OLLAMA_CLOUD_API_KEY");
+        let _ollama_key = crate::test_support::EnvVarGuard::remove("OLLAMA_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+        let local = crate::config::Config {
+            provider: Some("ollama".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&local, ApiProvider::Ollama),
+            CredentialState::Local
+        );
+        assert_eq!(
+            auth_class_for_provider(&local, ApiProvider::Ollama),
+            ProviderAuthClass::Local
+        );
+
+        let mut cloud = crate::config::Config {
+            provider: Some("ollama".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                ollama: crate::config::ProviderConfig {
+                    base_url: Some(codewhale_config::provider::OLLAMA_CLOUD_BASE_URL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(cloud.api_provider(), ApiProvider::OllamaCloud);
+        assert_eq!(
+            credential_state_for_provider(&cloud, ApiProvider::OllamaCloud),
+            CredentialState::MissingKey
+        );
+        assert_eq!(
+            auth_class_for_provider(&cloud, ApiProvider::OllamaCloud),
+            ProviderAuthClass::ApiKey
+        );
+
+        cloud.providers.as_mut().expect("providers").ollama.api_key =
+            Some("ollama-cloud-key".to_string());
+        assert_eq!(
+            credential_state_for_provider(&cloud, ApiProvider::OllamaCloud),
+            CredentialState::Saved
+        );
+    }
+
+    #[test]
+    fn explicit_api_key_mode_on_loopback_requires_a_real_credential() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _vllm_key = crate::test_support::EnvVarGuard::remove("VLLM_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+        let missing = crate::config::Config {
+            provider: Some("vllm".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                vllm: crate::config::ProviderConfig {
+                    base_url: Some("http://127.0.0.1:8000/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    auth_mode: Some("api_key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&missing, ApiProvider::Vllm),
+            CredentialState::MissingKey
+        );
+        assert!(missing.deepseek_api_key().is_err());
+
+        let mut configured = missing.clone();
+        configured
+            .providers
+            .as_mut()
+            .expect("providers")
+            .vllm
+            .api_key = Some("protected-local-key".to_string());
+        assert_eq!(
+            credential_state_for_provider(&configured, ApiProvider::Vllm),
+            CredentialState::Saved
+        );
+        assert_eq!(
+            configured.deepseek_api_key().expect("configured key"),
+            "protected-local-key"
+        );
+
+        let named_custom = crate::config::Config {
+            provider: Some("protected-local".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: std::collections::HashMap::from([(
+                    "protected-local".to_string(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        base_url: Some("http://127.0.0.1:9000/v1".to_string()),
+                        model: Some("private-model".to_string()),
+                        auth_mode: Some("bearer".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&named_custom, ApiProvider::Custom),
+            CredentialState::MissingKey
+        );
+        assert!(named_custom.deepseek_api_key().is_err());
+    }
+
+    #[test]
+    fn provider_auth_metadata_is_not_a_runtime_credential() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _openai_key = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let _xai_key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _cli_source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+
+        let command = crate::config::Config {
+            provider: Some("openai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai: crate::config::ProviderConfig {
+                    auth: Some(codewhale_config::ProviderAuthSourceToml {
+                        source: codewhale_config::AuthSourceKind::Command,
+                        command: vec!["secret-tool".to_string(), "lookup".to_string()],
+                        timeout_ms: Some(2_000),
+                        secret_id: None,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&command, ApiProvider::Openai),
+            CredentialState::MissingKey
+        );
+
+        let secret = crate::config::Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth: Some(codewhale_config::ProviderAuthSourceToml {
+                        source: codewhale_config::AuthSourceKind::Secret,
+                        command: Vec::new(),
+                        timeout_ms: None,
+                        secret_id: Some("codewhale/xai".to_string()),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&secret, ApiProvider::Xai),
+            CredentialState::MissingKey
+        );
+    }
+
+    #[test]
+    fn oauth_readiness_is_limited_to_official_endpoints() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated oauth home");
+        let missing_grok_auth = temp.path().join("missing-grok-auth.json");
+        let _grok_auth =
+            crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &missing_grok_auth);
+        let _xai_key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _codex_key = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _legacy_codex_key = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+
+        let custom_xai = crate::config::Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    base_url: Some("https://gateway.example.test/v1".to_string()),
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            auth_class_for_provider(&custom_xai, ApiProvider::Xai),
+            ProviderAuthClass::ApiKey
+        );
+        assert_eq!(
+            credential_state_for_provider(&custom_xai, ApiProvider::Xai),
+            CredentialState::MissingKey
+        );
+
+        let official_xai = crate::config::Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            auth_class_for_provider(&official_xai, ApiProvider::Xai),
+            ProviderAuthClass::OAuth
+        );
+        assert_eq!(
+            credential_state_for_provider(&official_xai, ApiProvider::Xai),
+            CredentialState::MissingLogin
+        );
+
+        let custom_codex = crate::config::Config {
+            provider: Some("openai-codex".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai_codex: crate::config::ProviderConfig {
+                    base_url: Some("https://gateway.example.test/v1".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            auth_class_for_provider(&custom_codex, ApiProvider::OpenaiCodex),
+            ProviderAuthClass::ApiKey
+        );
+        assert_eq!(
+            credential_state_for_provider(&custom_codex, ApiProvider::OpenaiCodex),
+            CredentialState::MissingKey
+        );
+    }
+
+    #[test]
+    fn xai_custom_endpoint_does_not_count_ambient_official_key() {
+        let _lock = crate::test_support::lock_test_env();
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _ambient = crate::test_support::EnvVarGuard::set("XAI_API_KEY", "ambient-xai-key");
+        let config = crate::config::Config {
+            provider: Some("xai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                xai: crate::config::ProviderConfig {
+                    base_url: Some("https://unrelated-gateway.example.test/v1".to_string()),
+                    model: Some("private-grok-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!crate::config::has_api_key_for(&config, ApiProvider::Xai));
+        assert_eq!(
+            credential_state_for_provider(&config, ApiProvider::Xai),
+            CredentialState::MissingKey
+        );
+    }
+
+    #[test]
+    fn active_deepseek_routes_validate_models_against_effective_custom_base_url() {
+        let official = crate::config::Config::default();
+        assert!(!route_is_valid_for_model(
+            &official,
+            ApiProvider::Deepseek,
+            Some("anthropic/private-model")
+        ));
+
+        for provider_name in ["deepseek", "deepseek-cn"] {
+            let config = crate::config::Config {
+                provider: Some(provider_name.to_string()),
+                base_url: Some("https://tenant-gateway.example.test/v1".to_string()),
+                default_text_model: Some("anthropic/private-model".to_string()),
+                ..Default::default()
+            };
+            let provider = config.api_provider();
+            assert!(matches!(
+                provider,
+                ApiProvider::Deepseek | ApiProvider::DeepseekCN
+            ));
+            assert!(route_is_valid_for_model(
+                &config,
+                provider,
+                Some("anthropic/private-model")
+            ));
+        }
+    }
+
+    #[test]
+    fn cli_forwarded_deepseek_custom_route_validates_prefixed_model() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated config home");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"api_key = "saved-file-key"
+base_url = "https://api.deepseek.com/v1"
+default_text_model = "deepseek-chat"
+"#,
+        )
+        .expect("write config");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _provider = crate::test_support::EnvVarGuard::set("CODEWHALE_PROVIDER", "deepseek");
+        let _legacy_provider = crate::test_support::EnvVarGuard::remove("DEEPSEEK_PROVIDER");
+        let _base = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_BASE_URL",
+            "https://tenant-gateway.example.test/v1",
+        );
+        let _legacy_base = crate::test_support::EnvVarGuard::remove("DEEPSEEK_BASE_URL");
+        let _model =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_MODEL", "anthropic/private-model");
+        let _source = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY_SOURCE", "cli");
+        let _cli_key =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_CLI_API_KEY", "explicit-cli-key");
+
+        let config = crate::config::Config::load(Some(config_path), None).expect("load config");
+        assert_eq!(config.default_model(), "anthropic/private-model");
+        assert_eq!(
+            config.deepseek_api_key().expect("explicit CLI key"),
+            "explicit-cli-key"
+        );
+        assert!(route_is_valid_for_model(
+            &config,
+            ApiProvider::Deepseek,
+            Some("anthropic/private-model")
+        ));
+    }
+
+    #[test]
+    fn builtin_loopback_local_and_api_key_routes_have_distinct_cache_identity() {
+        let _lock = crate::test_support::lock_test_env();
+        let _openai_key = crate::test_support::EnvVarGuard::remove("OPENAI_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let local = crate::config::Config {
+            provider: Some("openai".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openai: crate::config::ProviderConfig {
+                    base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut protected = local.clone();
+        let protected_route = &mut protected.providers.as_mut().expect("providers").openai;
+        protected_route.auth_mode = Some("api_key".to_string());
+        protected_route.api_key = Some("protected-local-key".to_string());
+
+        assert_eq!(
+            credential_state_for_provider(&local, ApiProvider::Openai),
+            CredentialState::Local
+        );
+        assert_eq!(
+            auth_class_for_provider(&local, ApiProvider::Openai),
+            ProviderAuthClass::Local
+        );
+        assert_eq!(
+            credential_state_for_provider(&protected, ApiProvider::Openai),
+            CredentialState::Saved
+        );
+        assert_eq!(
+            auth_class_for_provider(&protected, ApiProvider::Openai),
+            ProviderAuthClass::ApiKey
+        );
+        assert_ne!(
+            route_identity_for_model(&local, ApiProvider::Openai, "local-model"),
+            route_identity_for_model(&protected, ApiProvider::Openai, "local-model")
+        );
+
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&local, ApiProvider::Openai, "local-model");
+        assert_eq!(
+            resolve_for_model(&protected, ApiProvider::Openai, "local-model", &checks),
+            ResolvedProviderReadiness::SavedUnchecked
+        );
+
+        let deepseek_cn_local = crate::config::Config {
+            provider: Some("deepseek-cn".to_string()),
+            base_url: Some("http://127.0.0.1:9090/v1".to_string()),
+            default_text_model: Some("local-cn-model".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            credential_state_for_provider(&deepseek_cn_local, ApiProvider::DeepseekCN),
             CredentialState::Local
         );
     }

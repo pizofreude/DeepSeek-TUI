@@ -8,7 +8,6 @@
 //! ordering, and formatting survive, and the result is replaced atomically
 //! (same-directory temp file + rename) with owner-only permissions.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -25,68 +24,14 @@ pub(crate) fn mutate_config_document<F>(path: &Path, mutate: F) -> anyhow::Resul
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
 {
-    let raw = if path.exists() {
-        Some(
-            fs::read_to_string(path)
-                .with_context(|| format!("failed to read config at {}", path.display()))?,
-        )
-    } else {
-        None
-    };
-    let mut document = match raw.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => raw
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("failed to parse config at {}", path.display()))?,
-        _ => toml_edit::DocumentMut::new(),
-    };
-    mutate(&mut document)?;
-    write_config_toml_atomic(path, &document.to_string())
+    codewhale_config::mutate_config_document(path, mutate)
 }
 
 /// Atomically replace `path` with `body` via a same-directory temp file and
 /// rename. On Unix the file lands with 0o600 permissions: config.toml can
 /// hold API keys, so this matches `ConfigStore::save` and the auth save path.
 pub(crate) fn write_config_toml_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "failed to create temporary config file in {}",
-            parent.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed to secure temporary config file for {}",
-                    path.display()
-                )
-            })?;
-    }
-    temporary
-        .write_all(body.as_bytes())
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync config at {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace config at {}", path.display()))?;
-    Ok(())
+    codewhale_config::create_config_document(path, body)
 }
 
 /// Set the value at `segments` (parent tables plus the final key), creating
@@ -100,24 +45,7 @@ pub(crate) fn set_document_value(
     segments: &[&str],
     value: impl Into<toml_edit::Value>,
 ) -> anyhow::Result<()> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let table = table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Create)?
-        .expect("Create lookups always yield a table");
-    match table.get_mut(key) {
-        Some(item) => {
-            let mut value = value.into();
-            if let Some(existing) = item.as_value() {
-                *value.decor_mut() = existing.decor().clone();
-            }
-            *item = toml_edit::Item::Value(value);
-        }
-        None => {
-            table.insert(key, toml_edit::value(value));
-        }
-    }
-    Ok(())
+    codewhale_config::set_config_document_value(doc, segments, value)
 }
 
 /// Remove the value at `segments`. Returns `Ok(true)` when an entry was
@@ -126,32 +54,7 @@ pub(crate) fn unset_document_value(
     doc: &mut toml_edit::DocumentMut,
     segments: &[&str],
 ) -> anyhow::Result<bool> {
-    let (key, parents) = segments
-        .split_last()
-        .context("config value path must not be empty")?;
-    let orphaned_root_prefix = (parents.is_empty() && doc.as_table().len() == 1)
-        .then(|| leading_prefix_for_key(doc.as_table(), key))
-        .flatten();
-    let removed = {
-        let Some(table) =
-            table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Existing)?
-        else {
-            return Ok(false);
-        };
-        remove_key_preserving_leading_decor(table, key)
-    };
-    if removed
-        && let Some(prefix) = orphaned_root_prefix
-        && prefix.as_str().is_some_and(|prefix| !prefix.is_empty())
-    {
-        let trailing = format!(
-            "{}{}",
-            prefix.as_str().unwrap_or_default(),
-            doc.trailing().as_str().unwrap_or_default()
-        );
-        doc.set_trailing(trailing);
-    }
-    Ok(removed)
+    codewhale_config::unset_config_document_value(doc, segments)
 }
 
 /// Remove every entry named `key` from `table` and, recursively, from nested
@@ -223,50 +126,6 @@ fn leading_prefix_for_key(
         })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PathLookup {
-    /// Create missing intermediate tables; error when a segment exists but is
-    /// not table-like.
-    Create,
-    /// Return `None` when a segment is missing or not table-like.
-    Existing,
-}
-
-fn table_like_at_path_mut<'a>(
-    root: &'a mut toml_edit::Table,
-    segments: &[&str],
-    lookup: PathLookup,
-) -> anyhow::Result<Option<&'a mut dyn toml_edit::TableLike>> {
-    let mut current: &mut dyn toml_edit::TableLike = root;
-    for segment in segments {
-        if current.get(segment).is_none() {
-            match lookup {
-                PathLookup::Create => {
-                    // Implicit, so creating `providers.foo.base_url` does not
-                    // emit an empty `[providers]` header.
-                    let mut table = toml_edit::Table::new();
-                    table.set_implicit(true);
-                    current.insert(segment, toml_edit::Item::Table(table));
-                }
-                PathLookup::Existing => return Ok(None),
-            }
-        }
-        let item = current
-            .get_mut(segment)
-            .expect("segment exists or was inserted above");
-        match item.as_table_like_mut() {
-            Some(table) => current = table,
-            None => match lookup {
-                PathLookup::Create => {
-                    anyhow::bail!("`{segment}` in config.toml must be a table")
-                }
-                PathLookup::Existing => return Ok(None),
-            },
-        }
-    }
-    Ok(Some(current))
-}
-
 pub(crate) fn persist_status_items(items: &[StatusItem]) -> anyhow::Result<PathBuf> {
     let path = config_toml_path(None)?;
     let items: toml_edit::Array = items.iter().map(|item| item.key()).collect();
@@ -322,6 +181,14 @@ pub(crate) fn persist_subagents_bool_key(
     persist_table_value_key(config_path, "subagents", key, value.into())
 }
 
+pub(crate) fn persist_mini_window_bool_key(
+    config_path: Option<&Path>,
+    key: &str,
+    value: bool,
+) -> anyhow::Result<PathBuf> {
+    persist_table_value_key(config_path, "mini_window", key, value.into())
+}
+
 pub(crate) fn persist_subagents_integer_key(
     config_path: Option<&Path>,
     key: &str,
@@ -346,6 +213,16 @@ pub(crate) fn persist_table_string_key(
     key: &str,
     value: &str,
 ) -> anyhow::Result<PathBuf> {
+    persist_table_value_key(config_path, table_name, key, value.into())
+}
+
+pub(crate) fn persist_table_integer_key(
+    config_path: Option<&Path>,
+    table_name: &str,
+    key: &str,
+    value: u64,
+) -> anyhow::Result<PathBuf> {
+    let value = i64::try_from(value).context("integer value is too large for TOML")?;
     persist_table_value_key(config_path, table_name, key, value.into())
 }
 
@@ -375,6 +252,38 @@ pub(crate) fn persist_provider_base_url_key(
     Ok(path)
 }
 
+/// Persist the model for one exact provider route without rewriting the
+/// legacy root DeepSeek fallback used by unrelated providers.
+///
+/// First-party DeepSeek retains its historical `default_text_model` root key.
+/// Every other built-in provider writes to its typed `[providers.<name>]`
+/// table, while named custom routes use their exact user-owned table id.
+pub(crate) fn persist_provider_model_key(
+    config_path: Option<&Path>,
+    provider: ApiProvider,
+    provider_identity: &str,
+    value: &str,
+) -> anyhow::Result<PathBuf> {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return persist_root_string_key(config_path, "default_text_model", value);
+    }
+
+    let provider_key = if provider == ApiProvider::Custom {
+        normalize_custom_provider_id(provider_identity)?
+    } else {
+        provider
+            .metadata()
+            .context("provider config metadata")?
+            .provider_config_key()
+            .to_string()
+    };
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["providers", &provider_key, "model"], value)
+    })?;
+    Ok(path)
+}
+
 fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static str> {
     match provider {
         ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
@@ -388,6 +297,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::WanjieArk => Ok("wanjie_ark"),
         ApiProvider::Volcengine => Ok("volcengine"),
         ApiProvider::Openrouter => Ok("openrouter"),
+        ApiProvider::Orcarouter => Ok("orcarouter"),
         ApiProvider::XiaomiMimo => Ok("xiaomi_mimo"),
         ApiProvider::Novita => Ok("novita"),
         ApiProvider::Fireworks => Ok("fireworks"),
@@ -399,6 +309,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Sglang => Ok("sglang"),
         ApiProvider::Vllm => Ok("vllm"),
         ApiProvider::Ollama => Ok("ollama"),
+        ApiProvider::OllamaCloud => Ok("ollama_cloud"),
         ApiProvider::Together => Ok("together"),
         ApiProvider::Qianfan => Ok("qianfan"),
         ApiProvider::OpenaiCodex => Ok("openai_codex"),
@@ -409,8 +320,19 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::MinimaxAnthropic => Ok("minimax_anthropic"),
         ApiProvider::Sakana => Ok("sakana"),
         ApiProvider::LongCat => Ok("longcat"),
+        ApiProvider::OpencodeGo => Ok("opencode_go"),
+        ApiProvider::OpencodeZen => Ok("opencode_zen"),
         ApiProvider::Meta => Ok("meta"),
         ApiProvider::Xai => Ok("xai"),
+        ApiProvider::Mistral => Ok("mistral"),
+        ApiProvider::Google => Ok("google"),
+        ApiProvider::Antigravity => Ok("antigravity"),
+        ApiProvider::Telecomjs => Ok("telecomjs"),
+        ApiProvider::Edenai => Ok("edenai"),
+        ApiProvider::ModelstudioTokenPlan => Ok("modelstudio_token_plan"),
+        ApiProvider::ModelstudioTokenPlanAnthropic => Ok("modelstudio_token_plan_anthropic"),
+        ApiProvider::ModelstudioCodingPlan => Ok("modelstudio_coding_plan"),
+        ApiProvider::ModelstudioCodingPlanAnthropic => Ok("modelstudio_coding_plan_anthropic"),
         // Custom providers live under a user-chosen `[providers.<name>]` table,
         // not a fixed key. Persisting base_url through this static-key path is
         // out of scope for the #1519 constrained slice; users edit the named
@@ -439,6 +361,11 @@ pub(crate) fn persist_custom_provider(
         set_document_value(doc, &["provider"], provider_id.as_str())?;
         set_document_value(doc, &[entry[0], entry[1], "kind"], "openai-compatible")?;
         set_document_value(doc, &[entry[0], entry[1], "base_url"], base_url.as_str())?;
+        if provider_id == "ds4" && crate::config::base_url_uses_local_host(&base_url) {
+            // Match the documented starter server. DS4 explicitly requires
+            // clients not to budget beyond the server's --ctx value.
+            set_document_value(doc, &[entry[0], entry[1], "context_window"], 100_000)?;
+        }
         match model.as_deref() {
             Some(model) => set_document_value(doc, &[entry[0], entry[1], "model"], model)?,
             None => {
@@ -446,9 +373,17 @@ pub(crate) fn persist_custom_provider(
             }
         }
         match api_key_env.as_deref() {
-            Some(env) => set_document_value(doc, &[entry[0], entry[1], "api_key_env"], env)?,
+            Some(env) => {
+                set_document_value(doc, &[entry[0], entry[1], "api_key_env"], env)?;
+                unset_document_value(doc, &[entry[0], entry[1], "auth_mode"])?;
+            }
             None => {
                 unset_document_value(doc, &[entry[0], entry[1], "api_key_env"])?;
+                if provider_id == "ds4" && crate::config::base_url_uses_local_host(&base_url) {
+                    set_document_value(doc, &[entry[0], entry[1], "auth_mode"], "none")?;
+                } else {
+                    unset_document_value(doc, &[entry[0], entry[1], "auth_mode"])?;
+                }
             }
         }
         Ok(())
@@ -533,7 +468,7 @@ pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<Pat
     if let Some(path) = config_path {
         return Ok(expand_path(path.to_string_lossy().as_ref()));
     }
-    crate::config::resolve_load_config_path(None)
+    crate::config::resolve_load_config_path(None)?
         .context("failed to resolve the active config.toml path")
 }
 
@@ -547,106 +482,30 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        codewhale_home: Option<OsString>,
-        codewhale_config_path: Option<OsString>,
-        deepseek_config_path: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _home: crate::test_support::EnvVarGuard,
+        _userprofile: crate::test_support::EnvVarGuard,
+        _codewhale_home: crate::test_support::EnvVarGuard,
+        _codewhale_config_path: crate::test_support::EnvVarGuard,
+        _deepseek_config_path: crate::test_support::EnvVarGuard,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {
         fn new(home: &Path) -> Self {
             let lock = crate::test_support::lock_test_env();
-            let home_str = OsString::from(home.as_os_str());
             let config_path = home.join(".deepseek").join("config.toml");
-            let config_str = OsString::from(config_path.as_os_str());
-            let home_prev = env::var_os("HOME");
-            let userprofile_prev = env::var_os("USERPROFILE");
-            let codewhale_home_prev = env::var_os("CODEWHALE_HOME");
-            let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
-            let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
-
-            // Safety: test-only environment mutation guarded by process-wide mutex.
-            unsafe {
-                env::set_var("HOME", &home_str);
-                env::set_var("USERPROFILE", &home_str);
-                env::remove_var("CODEWHALE_HOME");
-                env::remove_var("CODEWHALE_CONFIG_PATH");
-                env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
-            }
-
             Self {
-                home: home_prev,
-                userprofile: userprofile_prev,
-                codewhale_home: codewhale_home_prev,
-                codewhale_config_path: codewhale_config_prev,
-                deepseek_config_path: deepseek_config_prev,
+                _home: crate::test_support::EnvVarGuard::set("HOME", home),
+                _userprofile: crate::test_support::EnvVarGuard::set("USERPROFILE", home),
+                _codewhale_home: crate::test_support::EnvVarGuard::remove("CODEWHALE_HOME"),
+                _codewhale_config_path: crate::test_support::EnvVarGuard::remove(
+                    "CODEWHALE_CONFIG_PATH",
+                ),
+                _deepseek_config_path: crate::test_support::EnvVarGuard::set(
+                    "DEEPSEEK_CONFIG_PATH",
+                    &config_path,
+                ),
                 _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = self.home.take() {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::set_var("HOME", value);
-                }
-            } else {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::remove_var("HOME");
-                }
-            }
-
-            if let Some(value) = self.userprofile.take() {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::set_var("USERPROFILE", value);
-                }
-            } else {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::remove_var("USERPROFILE");
-                }
-            }
-
-            if let Some(value) = self.codewhale_home.take() {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::set_var("CODEWHALE_HOME", value);
-                }
-            } else {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::remove_var("CODEWHALE_HOME");
-                }
-            }
-
-            if let Some(value) = self.codewhale_config_path.take() {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::set_var("CODEWHALE_CONFIG_PATH", value);
-                }
-            } else {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::remove_var("CODEWHALE_CONFIG_PATH");
-                }
-            }
-
-            if let Some(value) = self.deepseek_config_path.take() {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::set_var("DEEPSEEK_CONFIG_PATH", value);
-                }
-            } else {
-                // Safety: test-only environment mutation guarded by a global mutex.
-                unsafe {
-                    env::remove_var("DEEPSEEK_CONFIG_PATH");
-                }
             }
         }
     }
@@ -746,11 +605,17 @@ mod tests {
             env::set_var("DEEPSEEK_CONFIG_PATH", &legacy);
         }
 
-        assert_eq!(config_toml_path(None).unwrap(), preferred);
+        let expected = preferred
+            .parent()
+            .expect("preferred path has a parent")
+            .canonicalize()
+            .expect("preferred parent should canonicalize")
+            .join("preferred.toml");
+        assert_eq!(config_toml_path(None).unwrap(), expected);
     }
 
     #[test]
-    fn config_toml_path_uses_existing_home_fallback_when_env_target_is_missing() {
+    fn config_toml_path_keeps_missing_env_target_authoritative() {
         let temp_root = temp_root("codewhale-config-path-missing-env-fallback");
         let home_config = temp_root.join(".codewhale").join("config.toml");
         fs::create_dir_all(home_config.parent().unwrap()).unwrap();
@@ -762,7 +627,8 @@ mod tests {
             env::set_var("DEEPSEEK_CONFIG_PATH", &missing_env);
         }
 
-        assert_eq!(config_toml_path(None).unwrap(), home_config);
+        assert_eq!(config_toml_path(None).unwrap(), missing_env);
+        assert!(home_config.exists());
         assert!(!missing_env.exists());
     }
 
@@ -924,6 +790,14 @@ mod tests {
         );
         assert_eq!(entry.model.as_deref(), Some("acme/code-1"));
         assert_eq!(entry.api_key_env.as_deref(), Some("ACME_API_KEY"));
+
+        let dispatcher = codewhale_config::ConfigStore::load(Some(written))
+            .expect("the dispatcher must parse the exact config written by the TUI");
+        assert_eq!(
+            dispatcher.config.provider,
+            codewhale_config::ProviderKind::Custom
+        );
+        assert_eq!(dispatcher.config.provider_id(), "acme_ai");
     }
 
     #[test]
@@ -952,6 +826,29 @@ mod tests {
         )
         .expect_err("space in name should be rejected");
         assert!(bad_chars.to_string().contains("letters, numbers"));
+    }
+
+    #[test]
+    fn persist_local_custom_provider_records_keyless_auth() {
+        let temp_root = temp_root("codewhale-custom-provider-local-keyless");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".codewhale").join("config.toml");
+
+        let written = persist_custom_provider(
+            Some(&path),
+            "ds4",
+            "http://127.0.0.1:8000/v1",
+            Some("deepseek-v4-flash"),
+            None,
+        )
+        .expect("DS4 preset should persist");
+        let body = fs::read_to_string(&written).expect("written config");
+
+        assert!(body.contains("provider = \"ds4\""), "{body}");
+        assert!(body.contains("auth_mode = \"none\""), "{body}");
+        assert!(body.contains("context_window = 100000"), "{body}");
+        assert!(!body.contains("api_key"), "{body}");
     }
 
     #[test]
@@ -1365,5 +1262,154 @@ slot = 1
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config.toml can hold api keys");
+    }
+
+    /// Clears every model override the dispatcher's env layer reads for the
+    /// providers exercised below, so the assertion is about config precedence
+    /// and cannot be flipped by an ambient variable on a developer machine.
+    struct ModelEnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ModelEnvGuard {
+        const VARS: &'static [&'static str] = &[
+            "CODEWHALE_MODEL",
+            "DEEPSEEK_MODEL",
+            "DEEPSEEK_DEFAULT_TEXT_MODEL",
+            "GLM_MODEL",
+            "BIGMODEL_MODEL",
+            "ZAI_MODEL",
+            "XAI_MODEL",
+            "GROK_MODEL",
+            "OPENROUTER_MODEL",
+            "OLLAMA_MODEL",
+        ];
+
+        fn new() -> Self {
+            let saved = Self::VARS
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            // Safety: test-only environment mutation; the caller holds the
+            // process-wide test-env lock via `EnvGuard`.
+            unsafe {
+                for name in Self::VARS {
+                    env::remove_var(name);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ModelEnvGuard {
+        fn drop(&mut self) {
+            // Safety: test-only environment restoration under the same lock.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The active model must be one answer, not two.
+    ///
+    /// The TUI resolves it with `Config::default_model()`, which is what
+    /// `client.rs` puts on the wire and what `doctor` reports. The dispatcher
+    /// resolves it independently in `codewhale-config`'s
+    /// `resolve_runtime_options`, which is what `codewhale model resolve`
+    /// reports and what the app-server and route descriptors consume. The two
+    /// silently disagreed for every non-DeepSeek provider (#4832, #4838): the
+    /// dispatcher gated root `default_text_model` behind `provider == Deepseek`
+    /// and so reported a provider default while the wire carried the user's
+    /// chosen model.
+    ///
+    /// A diagnostic that contradicts the request it is diagnosing is worse than
+    /// no diagnostic, so this pins the two chains together by construction
+    /// rather than asserting either one's internals.
+    #[test]
+    fn the_dispatcher_and_the_tui_resolve_the_same_active_model() {
+        // (case, config body, what both chains must answer)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a non-DeepSeek provider honours the user's chosen model",
+                "provider = \"zai\"\ndefault_text_model = \"GLM-4.6\"\n\n[providers.zai]\napi_key = \"k\"\n",
+                "GLM-4.6",
+            ),
+            (
+                "a stale DeepSeek id must not be forwarded to a native non-DeepSeek endpoint",
+                "provider = \"zai\"\ndefault_text_model = \"deepseek-chat\"\n\n[providers.zai]\napi_key = \"k\"\n",
+                crate::config::DEFAULT_ZAI_MODEL,
+            ),
+            (
+                "no root default falls through to the provider default",
+                "provider = \"zai\"\n\n[providers.zai]\napi_key = \"k\"\n",
+                crate::config::DEFAULT_ZAI_MODEL,
+            ),
+            (
+                "a provider-scoped model outranks the root default",
+                "provider = \"zai\"\ndefault_text_model = \"GLM-4.6\"\n\n[providers.zai]\napi_key = \"k\"\nmodel = \"GLM-4.5-Air\"\n",
+                "GLM-4.5-Air",
+            ),
+            (
+                "DeepSeek itself keeps honouring the root default",
+                "provider = \"deepseek\"\ndefault_text_model = \"deepseek-v4-pro\"\n\n[providers.deepseek]\napi_key = \"k\"\n",
+                "deepseek-v4-pro",
+            ),
+            (
+                "a vendor-locked endpoint refuses a DeepSeek id (#3227)",
+                "provider = \"xai\"\ndefault_text_model = \"deepseek-v4-pro\"\n\n[providers.xai]\napi_key = \"k\"\n",
+                crate::config::DEFAULT_XAI_MODEL,
+            ),
+            (
+                "an aggregator legitimately serves DeepSeek ids",
+                "provider = \"openrouter\"\ndefault_text_model = \"deepseek/deepseek-v4-pro\"\n\n[providers.openrouter]\napi_key = \"k\"\n",
+                "deepseek/deepseek-v4-pro",
+            ),
+            (
+                "a local runtime passes its own tag through",
+                "provider = \"ollama\"\ndefault_text_model = \"qwen3-coder:30b\"\n",
+                "qwen3-coder:30b",
+            ),
+            (
+                "a custom base URL keeps full pass-through (#1519)",
+                "provider = \"zai\"\ndefault_text_model = \"deepseek-chat\"\n\n[providers.zai]\napi_key = \"k\"\nbase_url = \"https://proxy.example.invalid/v1\"\n",
+                "deepseek-chat",
+            ),
+        ];
+
+        for (case, body, expected) in cases {
+            let temp_root = temp_root("codewhale-model-chain-agreement");
+            fs::create_dir_all(&temp_root).unwrap();
+            let _guard = EnvGuard::new(&temp_root);
+            let _model_guard = ModelEnvGuard::new();
+            let path = temp_root.join(".deepseek").join("config.toml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+
+            let tui = crate::config::Config::load(Some(path.clone()), None)
+                .expect("the TUI must parse this config");
+            let tui_model = tui.default_model();
+
+            let dispatcher = codewhale_config::ConfigStore::load(Some(path.clone()))
+                .expect("the dispatcher must parse the same config");
+            let runtime = dispatcher
+                .config
+                .resolve_runtime_options(&codewhale_config::CliRuntimeOverrides::default());
+
+            assert_eq!(
+                tui_model, *expected,
+                "{case}: the TUI chain (what actually reaches the provider) is wrong"
+            );
+            assert_eq!(
+                runtime.model, *expected,
+                "{case}: the dispatcher chain (what `model resolve` reports) is wrong"
+            );
+
+            let _ = fs::remove_dir_all(&temp_root);
+        }
     }
 }

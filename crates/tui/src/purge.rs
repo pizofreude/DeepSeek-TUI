@@ -14,6 +14,7 @@ use crate::config::ApiProvider;
 use crate::core::events::Event;
 use crate::fast_hash::{FastHashMap, FastHashSet};
 use crate::llm_client::LlmClient;
+use crate::models::Role;
 use crate::models::{ContentBlock, Message, MessageRequest, Tool};
 use crate::regex_cache::compile_user_regex;
 
@@ -533,7 +534,7 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
-    provider: ApiProvider,
+    _provider: ApiProvider,
     messages: &[Message],
     model: &str,
     reasoning_effort: Option<String>,
@@ -545,7 +546,7 @@ pub async fn run_purge(
     // 2. Clone messages and inject the prompt as a user message.
     let mut request_messages = messages.to_vec();
     request_messages.push(Message {
-        role: "user".to_string(),
+        role: Role::User,
         content: vec![ContentBlock::Text {
             text: prompt,
             cache_control: None,
@@ -565,17 +566,31 @@ pub async fn run_purge(
         thinking: None,
         reasoning_effort,
         stream: Some(false),
-        temperature: Some(0.2),
+        temperature: None,
         top_p: None,
     };
 
-    // 4. Send to the model.
+    // 4. Send to the model. Capture the session scope before awaiting so a
+    // late response cannot accrue into a subsequently loaded/new session.
+    let cost_scope = crate::cost_status::scope_token();
+    let cost_route = client.effective_route_envelope(model, chrono::Utc::now());
     let response = client
         .create_message(request)
         .await
         .map_err(|e| format!("Purge API error: {e}"))?;
 
-    crate::cost_status::report(provider, &response.model, &response.usage);
+    // Report the route, not just the provider name: the endpoint decides
+    // whether this is a metered public API, a plan quota, or a local runtime.
+    crate::cost_status::report_effective_route(cost_scope, &cost_route, &response.usage);
+
+    // A truncated response can still carry a complete-looking `purge_context`
+    // call; executing it would mutate the session from incomplete output.
+    if crate::models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+        return Err(format!(
+            "Purge model response incomplete: provider stop reason `{}`; no purge was applied.",
+            crate::models::stop_reason_detail(response.stop_reason.as_deref())
+        ));
+    }
 
     // 5. Find the `purge_context` tool call in the response.
     let tool_input = response.content.iter().find_map(|block| {
@@ -606,7 +621,7 @@ mod tests {
 
     fn msg_text(role: &str, text: &str) -> Message {
         Message {
-            role: role.to_string(),
+            role: Role::from(role),
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
@@ -616,19 +631,20 @@ mod tests {
 
     fn msg_tool_use(id: &str, name: &str, input: serde_json::Value) -> Message {
         Message {
-            role: "assistant".to_string(),
+            role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
                 caller: None,
+                thought_signature: None,
             }],
         }
     }
 
     fn msg_tool_result(id: &str, content: &str) -> Message {
         Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
@@ -768,10 +784,11 @@ mod tests {
     #[test]
     fn prompt_omits_thinking_blocks() {
         let msgs = vec![Message {
-            role: "assistant".to_string(),
+            role: Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
                     signature: None,
+                    state: None,
                     thinking: "let me think...".to_string(),
                 },
                 ContentBlock::Text {
@@ -812,6 +829,7 @@ mod tests {
                 name: "purge_context".to_string(),
                 input: json!({"operations": operations}),
                 caller: None,
+                thought_signature: None,
             }],
             model: "mock-model".to_string(),
             stop_reason: None,
@@ -840,6 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_removes_message() {
+        let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_with_tool_call(json!([
             {"op": "remove", "msg": 2}
@@ -878,6 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_replace_condenses_text() {
+        let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_with_tool_call(json!([
             {"op": "replace", "msg": 1, "block": 0, "pattern": "very long and verbose", "with": "short"}
@@ -903,6 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_errors_when_no_tool_call() {
+        let _cost_guard = crate::cost_status::test_scope();
         let mock = MockLlmClient::new(vec![]);
         mock.push_message_response(msg_response_without_tool_call("nothing to clean up"));
 
@@ -915,6 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_purge_errors_on_api_failure() {
+        let _cost_guard = crate::cost_status::test_scope();
         // No canned response — MockLlmClient returns an error.
         let mock = MockLlmClient::new(vec![]);
         let messages = vec![msg_text("user", "hi")];

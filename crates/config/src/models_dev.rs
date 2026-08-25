@@ -17,7 +17,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, WireModelId};
+use crate::route::{
+    CapabilityState, ModelId, ProviderId, ProviderModelOffering, RouteCapabilities, RouteLimits,
+    WireModelId,
+};
 
 /// Provider catalog endpoint used by Models.dev.
 pub const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
@@ -84,7 +87,7 @@ impl ModelsDevCatalog {
         let model = provider.models.get(wire_model_id.trim())?;
         let provider_id = provider.effective_id(provider_key);
         Some(ProviderModelOffering {
-            provider: ProviderId::from(provider_id),
+            provider: ProviderId::from(provider_id.clone()),
             canonical_model: model.base_model.clone().map(ModelId::from),
             wire_model_id: WireModelId::from(model.id.clone()),
             endpoint_key: "chat".to_string(),
@@ -94,6 +97,7 @@ impl ModelsDevCatalog {
                 .as_ref()
                 .map(RouteLimits::from)
                 .unwrap_or_default(),
+            capabilities: route_capabilities(&provider_id, model),
             pricing: crate::pricing::route_pricing_sku_from_cost(model.cost.as_ref()),
         })
     }
@@ -124,11 +128,46 @@ impl ModelsDevCatalog {
                         .as_ref()
                         .map(RouteLimits::from)
                         .unwrap_or_default(),
+                    capabilities: route_capabilities(&provider_id, model),
                     pricing: crate::pricing::route_pricing_sku_from_cost(model.cost.as_ref()),
                 })
                 .collect(),
         )
     }
+}
+
+fn route_capabilities(provider_id: &str, model: &ModelsDevProviderModel) -> RouteCapabilities {
+    RouteCapabilities {
+        attachments: CapabilityState::from_optional_bool(model.attachment),
+        image_input: image_input_support(model.modalities.as_ref()),
+        reasoning: CapabilityState::from_optional_bool(model.reasoning),
+        native_tool_calls: CapabilityState::from_optional_bool(model.tool_call),
+        structured_output: CapabilityState::from_optional_bool(model.structured_output),
+        server_side_web_search: crate::route::documented_server_side_web_search(
+            provider_id,
+            &model.id,
+        ),
+        ..RouteCapabilities::default()
+    }
+}
+
+/// Resolve the exact image-input fact from a provider-owned modality block.
+/// Missing or empty input metadata remains unknown; stated text-only input is
+/// unsupported rather than silently treated as unknown.
+#[must_use]
+pub fn image_input_support(modalities: Option<&ModelsDevModalities>) -> CapabilityState {
+    let Some(modalities) = modalities else {
+        return CapabilityState::Unknown;
+    };
+    if modalities.input.is_empty() {
+        return CapabilityState::Unknown;
+    }
+    CapabilityState::from_optional_bool(Some(
+        modalities
+            .input
+            .iter()
+            .any(|modality| modality.trim().eq_ignore_ascii_case("image")),
+    ))
 }
 
 /// Provider-agnostic model facts from `models.json` / `catalog.models`.
@@ -504,6 +543,22 @@ mod tests {
             .expect("route offering");
         assert_eq!(route_offering.limits.context_tokens, Some(1_000_000));
         assert_eq!(route_offering.limits.output_tokens, Some(131_072));
+        assert_eq!(
+            route_offering.capabilities.reasoning,
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            route_offering.capabilities.native_tool_calls,
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            route_offering.capabilities.structured_output,
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            route_offering.capabilities.streaming,
+            CapabilityState::Unknown
+        );
     }
 
     #[test]
@@ -621,6 +676,29 @@ mod tests {
             ..Default::default()
         };
         assert!(!audio_only.supports_text_chat());
+    }
+
+    #[test]
+    fn image_input_support_preserves_unknown_and_text_only_facts() {
+        assert_eq!(image_input_support(None), CapabilityState::Unknown);
+        assert_eq!(
+            image_input_support(Some(&ModelsDevModalities::default())),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            image_input_support(Some(&ModelsDevModalities {
+                input: vec!["text".to_string()],
+                output: vec!["text".to_string()],
+            })),
+            CapabilityState::Unsupported
+        );
+        assert_eq!(
+            image_input_support(Some(&ModelsDevModalities {
+                input: vec!["text".to_string(), "image".to_string()],
+                output: vec!["text".to_string()],
+            })),
+            CapabilityState::Supported
+        );
     }
 
     #[test]

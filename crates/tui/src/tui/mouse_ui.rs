@@ -1,5 +1,101 @@
 use std::time::{Duration, Instant};
 
+/// Timing trace of the last left-click in the composer. crossterm never
+/// decodes click counts, so double/triple-click detection keeps the prior
+/// click's time and position; a fast click within the slop window increments
+/// the count, anything else resets it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ComposerClickTrace {
+    at: Instant,
+    column: u16,
+    row: u16,
+    count: u8,
+}
+
+const COMPOSER_DOUBLE_CLICK_MS: u128 = 400;
+const COMPOSER_CLICK_SLOP_CELLS: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerClickGesture {
+    Caret,
+    Word,
+    Line,
+}
+
+fn classify_composer_click(
+    trace: &mut Option<ComposerClickTrace>,
+    column: u16,
+    row: u16,
+) -> ComposerClickGesture {
+    let at = Instant::now();
+    let next = match trace.as_ref() {
+        Some(prev)
+            if at.duration_since(prev.at).as_millis() <= COMPOSER_DOUBLE_CLICK_MS
+                && prev.row.abs_diff(row) <= COMPOSER_CLICK_SLOP_CELLS
+                && prev.column.abs_diff(column) <= COMPOSER_CLICK_SLOP_CELLS =>
+        {
+            ComposerClickTrace {
+                at,
+                column,
+                row,
+                count: prev.count.saturating_add(1),
+            }
+        }
+        _ => ComposerClickTrace {
+            at,
+            column,
+            row,
+            count: 1,
+        },
+    };
+    let count = next.count;
+    *trace = Some(next);
+    match count {
+        2 => ComposerClickGesture::Word,
+        n if n >= 3 => ComposerClickGesture::Line,
+        _ => ComposerClickGesture::Caret,
+    }
+}
+
+/// Byte bounds of the word (or CJK run) containing `pos`.
+fn composer_word_bounds(text: &str, pos: usize) -> (usize, usize) {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let is_word = |ch: char| ch.is_alphanumeric() || (ch as u32) >= 0x80;
+    let idx = chars.partition_point(|(byte, _)| *byte < pos);
+    let idx = idx.min(chars.len().saturating_sub(1));
+    if !is_word(chars[idx].1) {
+        return (chars[idx].0, chars[idx].0 + chars[idx].1.len_utf8());
+    }
+    let mut start = idx;
+    while start > 0 && is_word(chars[start - 1].1) {
+        start -= 1;
+    }
+    let mut end = idx + 1;
+    while end < chars.len() && is_word(chars[end].1) {
+        end += 1;
+    }
+    let start_byte = chars[start].0;
+    let end_byte = if end < chars.len() {
+        chars[end].0
+    } else {
+        text.len()
+    };
+    (start_byte, end_byte)
+}
+
+/// Byte bounds of the logical line containing `pos` (excluding the newline).
+fn composer_line_bounds(text: &str, pos: usize) -> (usize, usize) {
+    let pos = pos.min(text.len());
+    let start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[pos..]
+        .find('\n')
+        .map_or(text.len(), |offset| pos + offset);
+    (start, end)
+}
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,7 +109,6 @@ use crate::tui::command_palette::{
 };
 use crate::tui::context_menu::{ContextMenuEntry, ContextMenuView};
 use crate::tui::history::HistoryCell;
-use crate::tui::pager::PagerView;
 use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::ui_text::{
@@ -35,19 +130,16 @@ pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> 
     }
 
     match mouse.kind {
-        MouseEventKind::Moved => {
-            let over_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
-            let was_over_sidebar = app.last_mouse_pos.is_some_and(|(column, row)| {
-                point_hits_rect(column, row, app.viewport.last_sidebar_area)
-            });
-            !(over_sidebar || was_over_sidebar || app.sidebar_hover_tooltip.is_some())
-        }
+        // v0.9.1: keep a cheap hover hit-test alive while streaming. Motion
+        // events are no longer dropped wholesale — the frame limiter bounds
+        // redraw cost. Only expensive transcript reflow stays deferred.
+        MouseEventKind::Moved => false,
         MouseEventKind::Drag(_) => {
-            // Sidebar drag-to-resize must stay live during active turns —
-            // dropping these events wedges the resize state mid-drag (#3063).
+            // Divider drags must stay live during active turns — dropping
+            // these events wedges the resize state mid-drag (#3063).
             !app.viewport.transcript_selection.dragging
                 && !app.viewport.transcript_scrollbar_dragging
-                && !app.sidebar_resizing
+                && !app.work_surface.is_resizing()
         }
         _ => false,
     }
@@ -65,47 +157,6 @@ fn toggle_tool_run_expand(app: &mut App, mouse: MouseEvent) -> bool {
         return false;
     }
     app.toggle_tool_run_expansion_at(original_idx)
-}
-
-/// Handle mouse events on the sidebar resize handle (the 1-col vertical bar
-/// between the chat area and the sidebar). Returns true when the event was
-/// consumed so other handlers skip it.
-fn handle_sidebar_resize_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    let Some(handle) = app.last_sidebar_handle_area else {
-        return false;
-    };
-
-    let hit = mouse.column == handle.x
-        && mouse.row >= handle.y
-        && mouse.row < handle.y.saturating_add(handle.height);
-
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) if hit => {
-            app.sidebar_resizing = true;
-            app.sidebar_resize_anchor_x = mouse.column;
-            app.sidebar_resize_anchor_width = app.last_sidebar_area.map(|a| a.width).unwrap_or(28);
-            app.needs_redraw = true;
-            true
-        }
-        MouseEventKind::Drag(MouseButton::Left) if app.sidebar_resizing => {
-            let delta = app.sidebar_resize_anchor_x as i32 - mouse.column as i32;
-            let new_width = (app.sidebar_resize_anchor_width as i32 + delta).max(24) as u16;
-            let total = app.sidebar_resize_total_width.max(1);
-            let new_pct = ((new_width as u32 * 100) / total as u32).clamp(10, 50) as u16;
-            if new_pct != app.sidebar_width_percent {
-                app.sidebar_width_percent = new_pct;
-                app.needs_redraw = true;
-            }
-            true
-        }
-        MouseEventKind::Up(MouseButton::Left) if app.sidebar_resizing => {
-            app.sidebar_resizing = false;
-            app.sidebar_width_dirty = true;
-            app.needs_redraw = true;
-            true
-        }
-        _ => false,
-    }
 }
 
 /// Map a mouse (column, row) within the composer area to a char index
@@ -175,15 +226,19 @@ fn composer_wrapped_cursor_row_col(
     (row, col)
 }
 
-fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: isize) {
+/// Move the composer caret by wrapped rows. Returns whether the caret actually
+/// moved: a draft that is empty, unwrapped, or already at the boundary in this
+/// direction reports `false` so the wheel can reach the transcript instead of
+/// dying in the composer (#5223).
+fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: isize) -> bool {
     if app.input.is_empty() || rows == 0 {
-        return;
+        return false;
     }
 
     let width = text_area.width.max(1) as usize;
     let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
     if wrapped.len() <= 1 {
-        return;
+        return false;
     }
 
     let (current_row, current_col) =
@@ -196,7 +251,7 @@ fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: is
     };
 
     if target_row == current_row {
-        return;
+        return false;
     }
 
     let (target_start, target_text) = &wrapped[target_row];
@@ -207,6 +262,7 @@ fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: is
         .saturating_add(current_col.min(target_len))
         .min(total);
     app.needs_redraw = true;
+    true
 }
 
 /// Click the WorkflowPanel header to toggle expand/collapse, or the trailing
@@ -280,26 +336,42 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             .text_area;
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            move_composer_cursor_by_wrapped_rows(
-                app,
-                text_area,
-                -(COMPOSER_MOUSE_SCROLL_LINES as isize),
-            );
-            true
-        }
-        MouseEventKind::ScrollDown => {
-            move_composer_cursor_by_wrapped_rows(
-                app,
-                text_area,
-                COMPOSER_MOUSE_SCROLL_LINES as isize,
-            );
-            true
-        }
+        // Only claim the wheel while the caret still has somewhere to go. At
+        // the top or bottom of the draft — or with no wrapped draft at all —
+        // fall through so the transcript scrolls instead of the event being
+        // silently swallowed by the composer rect (#5223).
+        MouseEventKind::ScrollUp => move_composer_cursor_by_wrapped_rows(
+            app,
+            text_area,
+            -(COMPOSER_MOUSE_SCROLL_LINES as isize),
+        ),
+        MouseEventKind::ScrollDown => move_composer_cursor_by_wrapped_rows(
+            app,
+            text_area,
+            COMPOSER_MOUSE_SCROLL_LINES as isize,
+        ),
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pos) = mouse_pos_to_char_index(app, mouse.column, mouse.row, text_area) {
-                app.cursor_position = pos;
-                app.selection_anchor = None;
+                match classify_composer_click(
+                    &mut app.viewport.composer_click_trace,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    ComposerClickGesture::Word => {
+                        let (start, end) = composer_word_bounds(&app.input, pos);
+                        app.selection_anchor = Some(start);
+                        app.cursor_position = end;
+                    }
+                    ComposerClickGesture::Line => {
+                        let (start, end) = composer_line_bounds(&app.input, pos);
+                        app.selection_anchor = Some(start);
+                        app.cursor_position = end;
+                    }
+                    ComposerClickGesture::Caret => {
+                        app.cursor_position = pos;
+                        app.selection_anchor = None;
+                    }
+                }
                 app.needs_redraw = true;
             }
             true
@@ -332,6 +404,31 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
             return Vec::new();
         }
         return app.view_stack.handle_mouse(mouse);
+    }
+
+    // The approval prompt is intentionally inline: its card stays focused,
+    // but the wheel reviews the transcript that remains visible above it.
+    // Preserve ownership of visible side surfaces, though: wheeling over the
+    // sidebar or Ocean work surface must not move an unrelated transcript.
+    // Other modals still own their wheel input exclusively (#4371).
+    if app.view_stack.top_kind() == Some(ModalKind::Approval) {
+        let over_approval = mouse_hits_rect(mouse, app.viewport.last_approval_area);
+        let over_side_surface = mouse_hits_rect(mouse, app.work_surface.last_area);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if over_approval || !over_side_surface {
+                    scroll_transcript_with_mouse(app, ScrollDirection::Up);
+                }
+                return Vec::new();
+            }
+            MouseEventKind::ScrollDown => {
+                if over_approval || !over_side_surface {
+                    scroll_transcript_with_mouse(app, ScrollDirection::Down);
+                }
+                return Vec::new();
+            }
+            _ => {}
+        }
     }
 
     if !app.view_stack.is_empty() {
@@ -380,12 +477,6 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return Vec::new();
     }
 
-    // Sidebar resize handle — check before composer so it doesn't compete
-    // with text selection / scrolling.
-    if handle_sidebar_resize_mouse(app, mouse) {
-        return Vec::new();
-    }
-
     // Ocean work surface owns its rect, scrolling, focus, and row actions.
     // Route it before workflow/composer/transcript so wheel events never leak
     // into an unrelated viewport.
@@ -408,26 +499,16 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return Vec::new();
     }
 
-    // Scroll events while the cursor is over the right-hand sidebar must not
-    // drive the transcript scroll. The sidebar is a fixed dashboard with no
-    // scroll state of its own, so consume the wheel event instead of leaking
-    // it into the transcript viewport behind it.
-    if matches!(
-        mouse.kind,
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-    ) && app.viewport.last_sidebar_area.is_some_and(|area| {
-        mouse.column >= area.x
-            && mouse.column < area.x.saturating_add(area.width)
-            && mouse.row >= area.y
-            && mouse.row < area.y.saturating_add(area.height)
-    }) {
-        return Vec::new();
-    }
-
     match mouse.kind {
         MouseEventKind::Moved => {
-            // Update last mouse position for tooltip rendering.
+            // Update last mouse position for tooltip rendering + hover layer.
             app.last_mouse_pos = Some((mouse.column, mouse.row));
+            let previous_hover = crate::tui::hover_layer::current_hover();
+            crate::tui::hover_layer::set_pointer(mouse.column, mouse.row);
+            crate::tui::hover_layer::resolve_hover();
+            if crate::tui::hover_layer::current_hover() != previous_hover {
+                app.needs_redraw = true;
+            }
 
             // Check sidebar sections for hover popovers. Only surface a
             // popover when the hovered row lost information in the compact
@@ -485,26 +566,10 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
             }
         }
         MouseEventKind::ScrollUp => {
-            let update = app.viewport.mouse_scroll.on_scroll(ScrollDirection::Up);
-            app.viewport.pending_scroll_delta = app
-                .viewport
-                .pending_scroll_delta
-                .saturating_add(update.delta_lines);
-            if update.delta_lines != 0 {
-                app.user_scrolled_during_stream = true;
-                app.needs_redraw = true;
-            }
+            scroll_transcript_with_mouse(app, ScrollDirection::Up);
         }
         MouseEventKind::ScrollDown => {
-            let update = app.viewport.mouse_scroll.on_scroll(ScrollDirection::Down);
-            app.viewport.pending_scroll_delta = app
-                .viewport
-                .pending_scroll_delta
-                .saturating_add(update.delta_lines);
-            if update.delta_lines != 0 {
-                app.user_scrolled_during_stream = true;
-                app.needs_redraw = true;
-            }
+            scroll_transcript_with_mouse(app, ScrollDirection::Down);
         }
         MouseEventKind::Down(MouseButton::Left) => {
             app.viewport.transcript_scrollbar_dragging = false;
@@ -538,6 +603,7 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                 app.viewport.transcript_selection.anchor = Some(point);
                 app.viewport.transcript_selection.head = Some(point);
                 app.viewport.transcript_selection.dragging = true;
+                app.needs_redraw = true;
 
                 if app.is_loading
                     && app.viewport.transcript_scroll.is_at_tail()
@@ -548,8 +614,8 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
                 {
                     app.viewport.transcript_scroll = anchor;
                 }
-            } else if app.viewport.transcript_selection.is_active() {
-                app.viewport.transcript_selection.clear();
+            } else {
+                clear_transcript_selection(app);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -581,6 +647,18 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     }
 
     Vec::new()
+}
+
+fn scroll_transcript_with_mouse(app: &mut App, direction: ScrollDirection) {
+    let update = app.viewport.mouse_scroll.on_scroll(direction);
+    app.viewport.pending_scroll_delta = app
+        .viewport
+        .pending_scroll_delta
+        .saturating_add(update.delta_lines);
+    if update.delta_lines != 0 {
+        app.user_scrolled_during_stream = true;
+        app.needs_redraw = true;
+    }
 }
 
 /// Resolve a right-click in the sidebar to the hovered row's full copyable
@@ -639,20 +717,7 @@ fn sidebar_click_action(app: &App, mouse: MouseEvent) -> Option<SidebarRowAction
             {
                 return Some(action.clone());
             }
-            return row.click_action.as_ref().map(|action| match action {
-                SidebarRowAction::HotbarSlot(first_slot) => {
-                    let cell_width = section
-                        .content_area
-                        .width
-                        .saturating_sub(3)
-                        .saturating_div(4)
-                        .max(1);
-                    let column = mouse.column.saturating_sub(section.content_area.x);
-                    let cell = (column / (cell_width + 1)).min(3);
-                    SidebarRowAction::HotbarSlot(first_slot.saturating_add(cell as u8))
-                }
-                _ => action.clone(),
-            });
+            return row.click_action.clone();
         }
     }
     None
@@ -673,10 +738,6 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             app.needs_redraw = true;
             Vec::new()
         }
-        SidebarRowAction::HotbarSlot(slot) => {
-            app.pending_hotbar_slot = Some(slot);
-            Vec::new()
-        }
         SidebarRowAction::ToggleAgentDetails { agent_id } => {
             if !app.expanded_sidebar_agents.insert(agent_id.clone()) {
                 app.expanded_sidebar_agents.remove(&agent_id);
@@ -687,72 +748,86 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             app.needs_redraw = true;
             Vec::new()
         }
+        SidebarRowAction::ShowSubagentsPanel => {
+            use crate::tui::work_surface::RailPanel;
+            // The register header is a two-way door: opening the Agents panel
+            // from anywhere, and returning to Tasks when it is already open,
+            // so the to-do list is never one click away with no way back.
+            let target = match app.work_surface.panel {
+                RailPanel::Agents => RailPanel::Tasks,
+                _ => RailPanel::Agents,
+            };
+            app.work_surface.panel = target;
+            app.work_surface.focused = true;
+            app.status_message = Some(
+                match target {
+                    RailPanel::Agents => "Showing subagents",
+                    _ => "Showing tasks",
+                }
+                .to_string(),
+            );
+            app.needs_redraw = true;
+            Vec::new()
+        }
         SidebarRowAction::OpenAgentDetail { agent_id } => {
-            // Prefer the worker's actual message transcript over the compact
-            // status card. The card intentionally keeps only a few activity
-            // lines; Open must show the conversation the worker had.
-            if open_agent_chat_pager(app, &agent_id) {
-                app.needs_redraw = true;
-                return Vec::new();
+            if !crate::tui::agent_details::open_agent_details(app, &agent_id) {
+                crate::tui::work_surface::agent_details_closed(app, &agent_id);
+                app.status_message = Some("Agent details are unavailable".to_string());
             }
-            let cell_index = app.history.iter().position(|cell| {
-                matches!(
-                    cell,
-                    HistoryCell::SubAgent(crate::tui::history::SubAgentCell::Delegate(card))
-                        if card.agent_id == agent_id
-                )
-            });
-            match cell_index {
-                Some(cell_index) => {
-                    open_details_pager_for_cell(app, cell_index);
-                }
-                None => {
-                    // Open failed — do not leave a stale detail-open owner.
-                    if app
-                        .work_surface
-                        .opened
-                        .as_ref()
-                        .is_some_and(|id| id.0 == format!("worker:{agent_id}"))
-                    {
-                        app.work_surface.opened = None;
-                    }
-                    app.status_message = Some(format!(
-                        "No transcript card for {agent_id} yet — use handle_read agent:{agent_id}/full_transcript"
-                    ));
-                }
-            }
+            app.needs_redraw = true;
+            Vec::new()
+        }
+        SidebarRowAction::OpenAgentTranscript { agent_id } => {
+            // The primary agent destination: focus the worker in place. The
+            // focused view explains a missing capture instead of dead-ending.
+            crate::tui::agent_focus::focus_agent(app, &agent_id);
             app.needs_redraw = true;
             Vec::new()
         }
         SidebarRowAction::CancelAgent { agent_id } => {
             vec![ViewEvent::SidebarAgentCancel { agent_id }]
         }
-        SidebarRowAction::InspectText { label, detail } => {
-            // Truthful To-do/Plan detail destination (TUI-DOG-005): open a pager
-            // with the full item text instead of a status-line-only fake Open.
+        SidebarRowAction::InspectWork {
+            title,
+            body,
+            stop_action,
+        } => {
             let width = app
                 .viewport
                 .last_transcript_area
                 .map(|area| area.width)
                 .unwrap_or(80);
-            let title = app.tr(MessageId::SidebarTodoLabel).into_owned();
-            let body = if detail.trim().is_empty() {
-                label
-            } else {
-                format!("{label}\n\n{detail}")
-            };
-            app.view_stack.push(crate::tui::pager::PagerView::from_text(
-                title,
-                &body,
-                width.saturating_sub(2),
-            ));
+            let mut pager =
+                crate::tui::pager::PagerView::from_text(title, &body, width.saturating_sub(2))
+                    .with_copy_text(body);
+            let stop_event = stop_action.and_then(|action| match *action {
+                SidebarRowAction::Command(command) => {
+                    use crate::tui::views::CommandPaletteAction;
+                    Some(ViewEvent::CommandPaletteSelected {
+                        action: CommandPaletteAction::ExecuteCommand { command },
+                    })
+                }
+                SidebarRowAction::CancelAgent { agent_id } => {
+                    Some(ViewEvent::SidebarAgentCancel { agent_id })
+                }
+                _ => None,
+            });
+            if let Some(event) = stop_event {
+                pager = pager.with_destructive_action(
+                    's',
+                    app.tr(MessageId::SidebarStopControl),
+                    app.tr(MessageId::WorkSurfaceStopConfirmHint),
+                    event,
+                );
+            }
+            app.view_stack.push(pager);
             app.needs_redraw = true;
             Vec::new()
         }
     }
 }
 
-fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+pub(crate) fn resolve_agent_transcript_text(app: &App, agent_id: &str) -> Option<String> {
     use crate::tools::handle::{HandleValue, VarHandle};
 
     let lookup = VarHandle {
@@ -772,7 +847,7 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
             },
             None => None,
         },
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     // The handle is a deliberately bounded live projection. Prefer the private
@@ -800,34 +875,45 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
         if matches_resident_count {
             let text = agent_messages_text(&messages);
             if !text.trim().is_empty() {
-                push_agent_chat_pager(app, agent_id, &text);
-                return true;
+                return Some(text);
             }
         }
     }
 
-    let Some(payload) = payload else {
-        return false;
-    };
+    let payload = payload?;
     let text = agent_transcript_text(&payload);
     if text.trim().is_empty() {
-        return false;
+        return None;
     }
-    push_agent_chat_pager(app, agent_id, &text);
-    true
+    Some(text)
 }
 
-fn push_agent_chat_pager(app: &mut App, agent_id: &str, text: &str) {
-    let width = app
-        .viewport
-        .last_transcript_area
-        .map(|area| area.width)
-        .unwrap_or(80);
-    app.view_stack.push(PagerView::from_text(
-        format!("Agent chat — {agent_id}"),
-        text,
-        width.saturating_sub(2),
-    ));
+pub(crate) fn resident_agent_transcript_available(app: &App, agent_id: &str) -> bool {
+    use crate::tools::handle::{HandleValue, VarHandle};
+
+    let lookup = VarHandle {
+        kind: "var_handle".to_string(),
+        session_id: format!("agent:{agent_id}"),
+        name: "full_transcript".to_string(),
+        type_name: String::new(),
+        length: 0,
+        repr_preview: String::new(),
+        sha256: String::new(),
+    };
+    let Ok(store) = app.runtime_services.handle_store.try_lock() else {
+        return false;
+    };
+    let Some(record) = store.get(&lookup) else {
+        return false;
+    };
+    match &record.value {
+        HandleValue::Json(payload) => !agent_transcript_text(payload).trim().is_empty(),
+        HandleValue::Text(_) => false,
+    }
+}
+
+pub(crate) fn agent_transcript_evidence_available(app: &App, agent_id: &str) -> bool {
+    resolve_agent_transcript_text(app, agent_id).is_some()
 }
 
 /// Turn the agent transcript handle into a readable conversation. The worker
@@ -988,6 +1074,7 @@ pub(crate) fn update_selection_drag(app: &mut App, mouse: MouseEvent) {
     if let Some(point) = selection_point_from_mouse(app, mouse) {
         app.viewport.transcript_selection.head = Some(point);
         app.viewport.selection_autoscroll = None;
+        app.needs_redraw = true;
         return;
     }
 
@@ -1093,100 +1180,145 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
         return;
     }
     let title = app.tr(MessageId::CtxMenuTitle).to_string();
-    app.view_stack.push(ContextMenuView::new(
+    let reduced = app.motion_policy().as_low_motion();
+    app.view_stack.push(ContextMenuView::new_with_motion(
         entries,
         mouse.column,
         mouse.row,
         title,
+        reduced,
     ));
     app.needs_redraw = true;
 }
 
 pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<ContextMenuEntry> {
     let mut entries = Vec::new();
-    let on_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
+    let mut git_path = None;
+    let on_sidebar = mouse_hits_rect(mouse, app.work_surface.last_area);
 
     if on_sidebar {
         if let Some(command) = sidebar_click_action(app, mouse)
             .and_then(|action| action.as_command().map(str::to_string))
         {
-            entries.push(ContextMenuEntry {
-                label: "Run".to_string(),
-                description: command.clone(),
-                action: ContextMenuAction::ExecuteCommand { command },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Run",
+                    command.clone(),
+                    ContextMenuAction::ExecuteCommand { command },
+                )
+                .with_glyph("▶")
+                .primary(),
+            );
         }
         // Copy the hovered row's full text (sidebar rows can't be
         // mouse-selected, so the menu is the only copy path).
         if let Some(text) = sidebar_row_copy_text(app, mouse) {
-            entries.push(ContextMenuEntry {
-                label: "Copy".to_string(),
-                description: truncate_line_to_width(first_line(&text), 28),
-                action: ContextMenuAction::CopyText { text },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Copy",
+                    truncate_line_to_width(first_line(&text), 28),
+                    ContextMenuAction::CopyText { text },
+                )
+                .with_glyph("⎘")
+                .with_hint("y"),
+            );
         }
     } else {
         // Paste first — the most common action when right-clicking in the
         // composer or transcript after copying text from the output area.
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuPaste).to_string(),
-            description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
-            action: ContextMenuAction::Paste,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuPaste),
+                app.tr(MessageId::CtxMenuPasteDesc),
+                ContextMenuAction::Paste,
+            )
+            .with_glyph("📋")
+            .with_hint("p")
+            .primary(),
+        );
     }
 
     if selection_has_content(app) {
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopySelection).to_string(),
-            description: app.tr(MessageId::CtxMenuCopySelectionDesc).to_string(),
-            action: ContextMenuAction::CopySelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenSelection).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenSelectionDesc).to_string(),
-            action: ContextMenuAction::OpenSelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuClearSelection).to_string(),
-            description: String::new(),
-            action: ContextMenuAction::ClearSelection,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopySelection),
+                app.tr(MessageId::CtxMenuCopySelectionDesc),
+                ContextMenuAction::CopySelection,
+            )
+            .with_glyph("⎘")
+            .with_hint("y")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenSelection),
+                app.tr(MessageId::CtxMenuOpenSelectionDesc),
+                ContextMenuAction::OpenSelection,
+            )
+            .with_glyph("↗"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuClearSelection),
+                "",
+                ContextMenuAction::ClearSelection,
+            )
+            .with_glyph("×"),
+        );
     }
 
     if !on_sidebar && let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse) {
         let cell_index = app.original_cell_index_for_rendered(filtered_cell_index);
+        git_path = context_menu_git_path(app, cell_index);
 
         let target = detail_target_label(app, cell_index)
             .map(|label| truncate_line_to_width(label.as_str(), 28))
             .unwrap_or_else(|| "message".to_string());
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenDetails).to_string(),
-            description: target,
-            action: ContextMenuAction::OpenDetails { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopyMessage).to_string(),
-            description: app.tr(MessageId::CtxMenuCopyMessageDesc).to_string(),
-            action: ContextMenuAction::CopyCell { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenInEditor).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenInEditorDesc).to_string(),
-            action: ContextMenuAction::OpenFileAtLine { cell_index },
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenDetails),
+                target,
+                ContextMenuAction::OpenDetails { cell_index },
+            )
+            .with_glyph("▣")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopyMessage),
+                app.tr(MessageId::CtxMenuCopyMessageDesc),
+                ContextMenuAction::CopyCell { cell_index },
+            )
+            .with_glyph("⎘"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenInEditor),
+                app.tr(MessageId::CtxMenuOpenInEditorDesc),
+                ContextMenuAction::OpenFileAtLine { cell_index },
+            )
+            .with_glyph("↗")
+            .with_hint("e"),
+        );
         // Hide/show cell toggle.
         if app.collapsed_cells.contains(&cell_index) {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuShowCell).to_string(),
-                description: app.tr(MessageId::CtxMenuShowCellDesc).to_string(),
-                action: ContextMenuAction::ShowCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuShowCell),
+                    app.tr(MessageId::CtxMenuShowCellDesc),
+                    ContextMenuAction::ShowCell { cell_index },
+                )
+                .with_glyph("◇"),
+            );
         } else {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuHideCell).to_string(),
-                description: app.tr(MessageId::CtxMenuHideCellDesc).to_string(),
-                action: ContextMenuAction::HideCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuHideCell),
+                    app.tr(MessageId::CtxMenuHideCellDesc),
+                    ContextMenuAction::HideCell { cell_index },
+                )
+                .with_glyph("○"),
+            );
         }
     }
 
@@ -1194,30 +1326,79 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     if !app.collapsed_cells.is_empty() {
         let count = app.collapsed_cells.len();
         let label = app.tr(MessageId::CtxMenuShowHidden).to_string();
-        entries.push(ContextMenuEntry {
-            label: format!("{label} ({count})"),
-            description: app.tr(MessageId::CtxMenuShowHiddenDesc).to_string(),
-            action: ContextMenuAction::ShowAllHidden,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                format!("{label} ({count})"),
+                app.tr(MessageId::CtxMenuShowHiddenDesc),
+                ContextMenuAction::ShowAllHidden,
+            )
+            .with_glyph("◇")
+            .section_start(),
+        );
     }
 
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuCmdPalette).to_string(),
-        description: app.tr(MessageId::CtxMenuCmdPaletteDesc).to_string(),
-        action: ContextMenuAction::OpenCommandPalette,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuContextInspector).to_string(),
-        description: app.tr(MessageId::CtxMenuContextInspectorDesc).to_string(),
-        action: ContextMenuAction::OpenContextInspector,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuHelp).to_string(),
-        description: app.tr(MessageId::CtxMenuHelpDesc).to_string(),
-        action: ContextMenuAction::OpenHelp,
-    });
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuCmdPalette),
+            app.tr(MessageId::CtxMenuCmdPaletteDesc),
+            ContextMenuAction::OpenCommandPalette,
+        )
+        .with_glyph("⌘")
+        .section_start(),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuContextInspector),
+            app.tr(MessageId::CtxMenuContextInspectorDesc),
+            ContextMenuAction::OpenContextInspector,
+        )
+        .with_glyph("ⓘ"),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuHelp),
+            app.tr(MessageId::CtxMenuHelpDesc),
+            ContextMenuAction::OpenHelp,
+        )
+        .with_glyph("?"),
+    );
 
-    entries
+    // Host window control (Windows only): pin/unpin the terminal window into
+    // an always-on-top mini window. Global action, listed after the app
+    // chrome entries. The label flips while pinned ("还原窗口" instead of
+    // "弹出置顶小窗") so the entry always describes what the click will do.
+    if crate::tui::window_control::available() {
+        let pinned = crate::tui::window_control::pinned();
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(if pinned {
+                    MessageId::CtxMenuWindowUnpin
+                } else {
+                    MessageId::CtxMenuWindowPin
+                }),
+                app.tr(MessageId::CtxMenuWindowPinDesc),
+                ContextMenuAction::ToggleWindowPin,
+            )
+            .with_glyph(if pinned { "↩" } else { "📌" }),
+        );
+    }
+
+    let branch = git_path
+        .as_deref()
+        .and_then(|_| crate::tui::workspace_context::branch(&app.workspace));
+    crate::tui::context_menu::with_git_actions(entries, git_path.as_deref(), branch.as_deref())
+}
+
+fn context_menu_git_path(app: &App, cell_index: usize) -> Option<String> {
+    use crate::tui::history::ToolCell;
+
+    match app.cell_at_virtual_index(cell_index)? {
+        HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(patch.path.clone()),
+        HistoryCell::Tool(ToolCell::ViewImage(image)) => {
+            Some(image.path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> Option<usize> {
@@ -1241,7 +1422,7 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
             }
         }
         ContextMenuAction::ClearSelection => {
-            app.viewport.transcript_selection.clear();
+            clear_transcript_selection(app);
             app.status_message = Some("Selection cleared".to_string());
         }
         ContextMenuAction::CopyCell { cell_index } => {
@@ -1267,7 +1448,21 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
                 app.status_message = Some("Copy failed".to_string());
             }
         }
+        ContextMenuAction::ToggleWindowPin => {
+            let pinned = crate::tui::window_control::toggle_pin();
+            app.status_message = Some(
+                app.tr(if pinned {
+                    MessageId::WindowPinActive
+                } else {
+                    MessageId::WindowPinReleased
+                })
+                .into_owned(),
+            );
+            app.needs_redraw = true;
+        }
         ContextMenuAction::OpenCommandPalette => {
+            codewhale_telemetry::session_counters()
+                .bump(codewhale_telemetry::Counter::CommandPaletteOpen);
             app.view_stack.push(CommandPaletteView::new_for_locale(
                 app.ui_locale,
                 build_command_palette_entries(
@@ -1284,7 +1479,10 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
             open_context_inspector(app);
         }
         ContextMenuAction::OpenHelp => {
-            app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+            let help =
+                HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
+                    .with_groups_expanded(app.help_expand_groups);
+            app.view_stack.push(help);
         }
         ContextMenuAction::OpenFileAtLine { cell_index } => {
             let width = app
@@ -1396,7 +1594,11 @@ pub(crate) enum CtrlCDisposition {
 pub(crate) fn ctrl_c_disposition(app: &App) -> CtrlCDisposition {
     if selection_has_content(app) {
         CtrlCDisposition::CopySelection
-    } else if app.is_loading {
+    } else if app.is_loading
+        || app.is_compacting
+        || app.manual_compaction_queued
+        || app.goal_continuation_waiting
+    {
         CtrlCDisposition::CancelTurn
     } else if app.quit_is_armed() {
         CtrlCDisposition::ConfirmExit
@@ -1444,11 +1646,14 @@ pub(crate) fn copy_active_selection(app: &mut App) {
             app.status_message = Some("Copy failed".to_string());
         }
     } else {
-        app.viewport.transcript_selection.clear();
+        clear_transcript_selection(app);
         app.status_message = Some("No selection to copy".to_string());
     }
 }
-
+pub(crate) fn clear_transcript_selection(app: &mut App) {
+    app.needs_redraw |= app.viewport.transcript_selection.is_active();
+    app.viewport.transcript_selection.clear();
+}
 pub(crate) fn selection_to_text(app: &App) -> Option<String> {
     let (start, end) = app.viewport.transcript_selection.ordered_endpoints()?;
     let lines = app.viewport.transcript_cache.lines();
@@ -1525,15 +1730,14 @@ pub(crate) fn selection_to_text(app: &App) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_transcript_text, build_context_menu_entries, open_agent_chat_pager,
-        sidebar_click_action,
+        agent_transcript_text, build_context_menu_entries, handle_mouse_event, sidebar_click_action,
     };
     use crate::config::Config;
+    use crate::models::Role;
     use crate::models::{ContentBlock, Message};
     use crate::tui::app::{
         App, SidebarHoverRow, SidebarHoverSection, SidebarRowAction, TuiOptions,
     };
-    use crate::tui::pager::PagerView;
     use crate::tui::views::ContextMenuAction;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
@@ -1543,25 +1747,7 @@ mod tests {
 
     fn create_test_app() -> App {
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -1619,10 +1805,73 @@ mod tests {
         }
     }
 
+    fn mouse_move(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn idle_pointer_enter_and_leave_request_hover_redraws() {
+        let _guard = crate::tui::hover_layer::HOVER_TEST_LOCK.lock().unwrap();
+        crate::tui::hover_layer::clear_pointer();
+        crate::tui::hover_layer::begin_frame();
+        crate::tui::hover_layer::register_rect(
+            crate::tui::hover_hit::HoverTargetKind::TruncatedText,
+            Rect::new(10, 5, 20, 1),
+            "full clipped row",
+            false,
+        );
+
+        let mut app = create_test_app();
+        app.launch.visible = false;
+        app.needs_redraw = false;
+        handle_mouse_event(&mut app, mouse_move(12, 5));
+        assert!(
+            app.needs_redraw,
+            "entering a target must repaint while idle"
+        );
+        assert_eq!(
+            crate::tui::hover_layer::current_hover().map(|hit| hit.kind),
+            Some(crate::tui::hover_hit::HoverTargetKind::TruncatedText)
+        );
+
+        app.needs_redraw = false;
+        handle_mouse_event(&mut app, mouse_move(40, 5));
+        assert!(app.needs_redraw, "leaving a target must clear its popover");
+        assert!(crate::tui::hover_layer::current_hover().is_none());
+        crate::tui::hover_layer::clear_pointer();
+    }
+
+    #[test]
+    fn launch_mouse_rows_dispatch_the_same_work_and_chat_actions_as_keyboard() {
+        let mut app = create_test_app();
+        app.launch.visible = true;
+        app.launch.worktree_available = true;
+        crate::tui::underwater::record_launch_row_areas(Rect::new(0, 0, 80, 24), &mut app.launch);
+
+        handle_mouse_event(&mut app, left_click(10, 10));
+        assert_eq!(app.launch.selected, 1);
+        assert_eq!(
+            app.pending_launch_action.take(),
+            Some(crate::tui::underwater::LaunchAction::NewChat)
+        );
+
+        handle_mouse_event(&mut app, left_click(10, 7));
+        assert_eq!(app.launch.selected, 0);
+        assert_eq!(
+            app.pending_launch_action.take(),
+            Some(crate::tui::underwater::LaunchAction::NewSession)
+        );
+    }
+
     #[test]
     fn context_menu_keeps_paste_first_outside_sidebar() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 6));
 
         let entries = build_context_menu_entries(&app, right_click(10, 4));
 
@@ -1635,7 +1884,7 @@ mod tests {
     #[test]
     fn sidebar_context_menu_omits_paste_without_row_action() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 6));
         app.sidebar_hover.sections.push(SidebarHoverSection {
             content_area: Rect::new(60, 4, 20, 6),
             lines: vec!["header".to_string()],
@@ -1655,7 +1904,7 @@ mod tests {
     #[test]
     fn sidebar_context_menu_runs_clickable_row_action() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 6));
         app.sidebar_hover.sections.push(SidebarHoverSection {
             content_area: Rect::new(60, 4, 20, 6),
             lines: vec!["job row".to_string()],
@@ -1735,7 +1984,7 @@ mod tests {
     #[test]
     fn sidebar_click_routes_inline_stop_zone_before_row_action() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 4));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 4));
         app.sidebar_hover.sections.push(SidebarHoverSection {
             content_area: Rect::new(60, 4, 20, 4),
             lines: vec!["job row [x]".to_string()],
@@ -1761,7 +2010,7 @@ mod tests {
     #[test]
     fn sidebar_click_routes_agent_inline_stop_zone_before_peek_action() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 24, 4));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 24, 4));
         app.sidebar_hover.sections.push(SidebarHoverSection {
             content_area: Rect::new(60, 4, 24, 4),
             lines: vec!["[~] worker Agent 1 [x]".to_string()],
@@ -1796,7 +2045,7 @@ mod tests {
     #[test]
     fn sidebar_context_menu_offers_copy_of_hovered_row() {
         let mut app = create_test_app();
-        app.viewport.last_sidebar_area = Some(Rect::new(60, 4, 20, 6));
+        app.work_surface.last_area = Some(Rect::new(60, 4, 20, 6));
         app.sidebar_hover.sections.push(SidebarHoverSection {
             content_area: Rect::new(60, 4, 20, 6),
             lines: vec!["agent row".to_string()],
@@ -1871,14 +2120,14 @@ mod tests {
         let early = format!("EARLY-OPEN-MARKER\n{}", "a".repeat(1_100_000));
         let messages = vec![
             Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: early,
                     cache_control: None,
                 }],
             },
             Message {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: vec![ContentBlock::Text {
                     text: "LAST-OPEN-MARKER".to_string(),
                     cache_control: None,
@@ -1920,18 +2169,78 @@ mod tests {
             );
         }
 
-        assert!(open_agent_chat_pager(&mut app, agent_id));
-        let mut view = app.view_stack.pop().expect("agent chat pager");
-        let pager = view
-            .as_any_mut()
-            .downcast_mut::<PagerView>()
-            .expect("Open should push a pager");
-        let body = pager.body_text();
-        assert!(body.contains("EARLY-OPEN-MARKER"));
-        assert!(body.contains("LAST-OPEN-MARKER"));
-        assert!(
-            !body.contains("Earlier messages were omitted"),
+        crate::tui::agent_focus::focus_agent(&mut app, agent_id);
+        let focus = app.agent_focus.as_ref().expect("Open focuses the worker");
+        let body = focus
+            .cells
+            .iter()
+            .flat_map(|cell| cell.transcript_lines(120))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("EARLY-OPEN-MARKER"), "{body}");
+        assert!(body.contains("LAST-OPEN-MARKER"), "{body}");
+        assert_eq!(
+            focus.omitted_messages, 0,
             "Open must use the complete artifact, not the compacted resident tail"
         );
+    }
+
+    #[cfg(test)]
+    mod composer_selection_tests {
+        use super::super::*;
+
+        #[test]
+        fn word_bounds_select_words_and_respect_cjk() {
+            // Bytes: fix(0-2) sp(3) the(4-6) sp(7) 深=3B(8-10) 海=3B(11-13) sp(14) test.rs(15-21)
+            let text = "fix the 深海 test.rs";
+            assert_eq!(composer_word_bounds(text, 2), (0, 3)); // 'fix'
+            assert_eq!(composer_word_bounds(text, 5), (4, 7)); // 'the'
+            assert_eq!(composer_word_bounds(text, 10), (8, 14)); // '深海' (space at 14)
+            assert_eq!(composer_word_bounds(text, 15), (15, 19)); // 'test' (stops at '.')
+            assert_eq!(composer_word_bounds(text, 19), (19, 20)); // '.'
+            assert_eq!(composer_word_bounds(text, 20), (20, 22)); // 'rs'
+        }
+
+        #[test]
+        fn word_bounds_at_punctuation_returns_the_single_char() {
+            let text = "a, b";
+            assert_eq!(composer_word_bounds(text, 1), (1, 2)); // ','
+        }
+
+        #[test]
+        fn line_bounds_exclude_the_newline() {
+            let text = "first\nsecond third\nfourth";
+            assert_eq!(composer_line_bounds(text, 2), (0, 5));
+            assert_eq!(composer_line_bounds(text, 9), (6, 18));
+            assert_eq!(composer_line_bounds(text, 20), (19, 25));
+            assert_eq!(composer_line_bounds(text, 0), (0, 5));
+        }
+
+        #[test]
+        fn click_classification_resets_outside_the_window_or_slop() {
+            let mut trace = None;
+            assert_eq!(
+                classify_composer_click(&mut trace, 10, 4),
+                ComposerClickGesture::Caret
+            );
+            assert_eq!(
+                classify_composer_click(&mut trace, 10, 4),
+                ComposerClickGesture::Word
+            );
+            assert_eq!(
+                classify_composer_click(&mut trace, 10, 4),
+                ComposerClickGesture::Line
+            );
+            // A click far away resets the chain back to a caret.
+            assert_eq!(
+                classify_composer_click(&mut trace, 10, 40),
+                ComposerClickGesture::Caret
+            );
+            assert_eq!(
+                classify_composer_click(&mut trace, 10, 40),
+                ComposerClickGesture::Word
+            );
+        }
     }
 }

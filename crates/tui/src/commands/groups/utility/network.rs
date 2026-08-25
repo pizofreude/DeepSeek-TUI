@@ -1,37 +1,36 @@
 //! Slash commands for the persistent network allow/deny list.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use toml::Value;
 
+use codewhale_command_contract::handler::CommandHandler;
+use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+
 use crate::commands::CommandResult;
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::network_policy::host_from_url;
-use crate::tui::app::App;
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "network",
     aliases: &[],
     usage: "/network [list|allow <host>|deny <host>|remove <host>|default <allow|deny|prompt>]",
-    description_id: MessageId::CmdNetworkDescription,
+    description_key: "cmd_network_description",
 };
 
 pub(in crate::commands) struct NetworkCmd;
 
-impl RegisterCommand for NetworkCmd {
+impl RegisterCommand<CommandResult> for NetworkCmd {
     fn info() -> &'static CommandInfo {
         &COMMAND_INFO
     }
 
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        network(app, arg)
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Pure(network)
     }
 }
 
-fn network(_app: &mut App, arg: Option<&str>) -> CommandResult {
+fn network(arg: Option<&str>) -> CommandResult {
     match network_inner(arg) {
         Ok(message) => CommandResult::message(message),
         Err(err) => CommandResult::error(err.to_string()),
@@ -90,8 +89,14 @@ enum NetworkEdit {
     Remove,
 }
 
+/// Resolve the active config document path through the leaf configuration
+/// crate (acyclic; no TUI persistence helper).
+fn config_toml_path() -> anyhow::Result<PathBuf> {
+    codewhale_config::resolve_config_path(None)
+}
+
 fn list_policy() -> anyhow::Result<String> {
-    let path = crate::config_persistence::config_toml_path(None)?;
+    let path = config_toml_path()?;
     let doc = load_config_doc(&path)?;
     let network = doc.get("network").and_then(Value::as_table);
     let default = network
@@ -118,26 +123,36 @@ fn list_policy() -> anyhow::Result<String> {
 }
 
 fn update_host(edit: NetworkEdit, host: &str) -> anyhow::Result<String> {
-    let path = crate::config_persistence::config_toml_path(None)?;
-    let mut doc = load_config_doc(&path)?;
-    let network = network_table_mut(&mut doc)?;
-
-    match edit {
-        NetworkEdit::Allow => {
-            remove_host(network, "deny", host)?;
-            add_host(network, "allow", host)?;
+    let path = config_toml_path()?;
+    codewhale_config::mutate_config_document(&path, |doc| {
+        ensure_network_defaults(doc)?;
+        let mut allow = document_string_array(doc, "allow")?;
+        let mut deny = document_string_array(doc, "deny")?;
+        match edit {
+            NetworkEdit::Allow => {
+                remove_host(&mut deny, host);
+                add_host(&mut allow, host);
+            }
+            NetworkEdit::Deny => {
+                remove_host(&mut allow, host);
+                add_host(&mut deny, host);
+            }
+            NetworkEdit::Remove => {
+                remove_host(&mut allow, host);
+                remove_host(&mut deny, host);
+            }
         }
-        NetworkEdit::Deny => {
-            remove_host(network, "allow", host)?;
-            add_host(network, "deny", host)?;
-        }
-        NetworkEdit::Remove => {
-            remove_host(network, "allow", host)?;
-            remove_host(network, "deny", host)?;
-        }
-    }
-
-    save_config_doc(&path, &doc)?;
+        codewhale_config::set_config_document_value(
+            doc,
+            &["network", "allow"],
+            string_array_value(&allow),
+        )?;
+        codewhale_config::set_config_document_value(
+            doc,
+            &["network", "deny"],
+            string_array_value(&deny),
+        )
+    })?;
     let action = match edit {
         NetworkEdit::Allow => "allowed",
         NetworkEdit::Deny => "denied",
@@ -157,11 +172,11 @@ fn update_default(value: &str) -> anyhow::Result<String> {
         _ => bail!("Usage: /network default <allow|deny|prompt>"),
     };
 
-    let path = crate::config_persistence::config_toml_path(None)?;
-    let mut doc = load_config_doc(&path)?;
-    let network = network_table_mut(&mut doc)?;
-    network.insert("default".to_string(), Value::String(normalized.to_string()));
-    save_config_doc(&path, &doc)?;
+    let path = config_toml_path()?;
+    codewhale_config::mutate_config_document(&path, |doc| {
+        ensure_network_defaults(doc)?;
+        codewhale_config::set_config_document_value(doc, &["network", "default"], normalized)
+    })?;
 
     Ok(format!(
         "Network default set to {normalized}\nSaved to {}.",
@@ -175,35 +190,58 @@ fn load_config_doc(path: &Path) -> anyhow::Result<Value> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse config at {}", path.display()))
+    toml::from_str(&raw).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse config at {}; file contents were omitted",
+            codewhale_config::quote_os_path(path)
+        )
+    })
 }
 
-fn save_config_doc(path: &Path, doc: &Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+fn ensure_network_defaults(doc: &mut toml_edit::DocumentMut) -> anyhow::Result<()> {
+    if doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get("default"))
+        .is_none()
+    {
+        codewhale_config::set_config_document_value(doc, &["network", "default"], "prompt")?;
     }
-    let body = toml::to_string_pretty(doc).context("failed to serialize config.toml")?;
-    fs::write(path, body).with_context(|| format!("failed to write config at {}", path.display()))
+    if doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get("audit"))
+        .is_none()
+    {
+        codewhale_config::set_config_document_value(doc, &["network", "audit"], true)?;
+    }
+    Ok(())
 }
 
-fn network_table_mut(doc: &mut Value) -> anyhow::Result<&mut toml::value::Table> {
-    let root = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let entry = root
-        .entry("network".to_string())
-        .or_insert_with(|| Value::Table(toml::value::Table::new()));
-    let table = entry
-        .as_table_mut()
-        .context("`network` section in config.toml must be a table")?;
-    table
-        .entry("default".to_string())
-        .or_insert_with(|| Value::String("prompt".to_string()));
-    table
-        .entry("audit".to_string())
-        .or_insert_with(|| Value::Boolean(true));
-    Ok(table)
+fn document_string_array(doc: &toml_edit::DocumentMut, key: &str) -> anyhow::Result<Vec<String>> {
+    let Some(item) = doc
+        .get("network")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|table| table.get(key))
+    else {
+        return Ok(Vec::new());
+    };
+    let array = item
+        .as_array()
+        .with_context(|| format!("`network.{key}` must be an array of strings"))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .with_context(|| format!("`network.{key}` must be an array of strings"))
+        })
+        .collect()
+}
+
+fn string_array_value(values: &[String]) -> toml_edit::Array {
+    values.iter().map(String::as_str).collect()
 }
 
 fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
@@ -217,38 +255,17 @@ fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
         .collect()
 }
 
-fn string_array_mut<'a>(
-    table: &'a mut toml::value::Table,
-    key: &str,
-) -> anyhow::Result<&'a mut Vec<Value>> {
-    let value = table
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    value
-        .as_array_mut()
-        .with_context(|| format!("`network.{key}` must be an array of strings"))
-}
-
-fn add_host(table: &mut toml::value::Table, key: &str, host: &str) -> anyhow::Result<()> {
-    let list = string_array_mut(table, key)?;
+fn add_host(list: &mut Vec<String>, host: &str) {
     if !list
         .iter()
-        .filter_map(Value::as_str)
         .any(|existing| normalize_host_for_compare(existing) == host)
     {
-        list.push(Value::String(host.to_string()));
+        list.push(host.to_string());
     }
-    Ok(())
 }
 
-fn remove_host(table: &mut toml::value::Table, key: &str, host: &str) -> anyhow::Result<()> {
-    let list = string_array_mut(table, key)?;
-    list.retain(|value| {
-        value
-            .as_str()
-            .is_none_or(|existing| normalize_host_for_compare(existing) != host)
-    });
-    Ok(())
+fn remove_host(list: &mut Vec<String>, host: &str) {
+    list.retain(|existing| normalize_host_for_compare(existing) != host);
 }
 
 fn normalize_host_arg(input: &str) -> anyhow::Result<String> {
@@ -267,6 +284,13 @@ fn normalize_host_arg(input: &str) -> anyhow::Result<String> {
         bail!("host cannot be empty");
     }
     Ok(normalized)
+}
+
+/// Extract the host portion of a URL, lowercased (leaf `reqwest::Url` parse;
+/// no TUI helper dependency).
+fn host_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    parsed.host_str().map(str::to_ascii_lowercase)
 }
 
 fn normalize_host_for_compare(host: &str) -> String {
@@ -289,59 +313,33 @@ fn display_list(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::tui::app::{App, TuiOptions};
     use std::env;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvGuard {
-        home: Option<OsString>,
-        userprofile: Option<OsString>,
-        deepseek_config_path: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _home: crate::test_support::EnvVarGuard,
+        _userprofile: crate::test_support::EnvVarGuard,
+        _codewhale_config_path: crate::test_support::EnvVarGuard,
+        _deepseek_config_path: crate::test_support::EnvVarGuard,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {
         fn new(home: &Path) -> Self {
             let lock = crate::test_support::lock_test_env();
             let config_path = home.join(".deepseek").join("config.toml");
-            let home_prev = env::var_os("HOME");
-            let userprofile_prev = env::var_os("USERPROFILE");
-            let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
-
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                env::set_var("HOME", home.as_os_str());
-                env::set_var("USERPROFILE", home.as_os_str());
-                env::set_var("DEEPSEEK_CONFIG_PATH", config_path.as_os_str());
-            }
-
             Self {
-                home: home_prev,
-                userprofile: userprofile_prev,
-                deepseek_config_path: deepseek_config_prev,
+                _home: crate::test_support::EnvVarGuard::set("HOME", home),
+                _userprofile: crate::test_support::EnvVarGuard::set("USERPROFILE", home),
+                _codewhale_config_path: crate::test_support::EnvVarGuard::set(
+                    "CODEWHALE_CONFIG_PATH",
+                    &config_path,
+                ),
+                _deepseek_config_path: crate::test_support::EnvVarGuard::set(
+                    "DEEPSEEK_CONFIG_PATH",
+                    &config_path,
+                ),
                 _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            restore_env("HOME", self.home.take());
-            restore_env("USERPROFILE", self.userprofile.take());
-            restore_env("DEEPSEEK_CONFIG_PATH", self.deepseek_config_path.take());
-        }
-    }
-
-    fn restore_env(key: &str, value: Option<OsString>) {
-        // Safety: test-only environment mutation guarded by a global mutex.
-        unsafe {
-            if let Some(value) = value {
-                env::set_var(key, value);
-            } else {
-                env::remove_var(key);
             }
         }
     }
@@ -359,31 +357,6 @@ mod tests {
         path
     }
 
-    fn create_test_app(home: &Path) -> App {
-        let options = TuiOptions {
-            model: "test-model".to_string(),
-            workspace: home.to_path_buf(),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: home.join("skills"),
-            memory_path: home.join("memory.md"),
-            notes_path: home.join("notes.txt"),
-            mcp_config_path: home.join("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
-        };
-        App::new(options, &Config::default())
-    }
-
     #[test]
     fn network_allow_persists_host_and_removes_exact_deny() {
         let home = temp_home("allow");
@@ -396,8 +369,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut app = create_test_app(&home);
-        let result = network(&mut app, Some("allow GitHub.COM"));
+        let result = network(Some("allow GitHub.COM"));
 
         assert!(!result.is_error, "{:?}", result.message);
         let body = fs::read_to_string(config_path).unwrap();
@@ -410,8 +382,7 @@ mod tests {
         let home = temp_home("url");
         let _guard = EnvGuard::new(&home);
 
-        let mut app = create_test_app(&home);
-        let result = network(&mut app, Some("allow https://github.com/obra/superpowers"));
+        let result = network(Some("allow https://github.com/obra/superpowers"));
 
         assert!(!result.is_error, "{:?}", result.message);
         let body = fs::read_to_string(home.join(".deepseek").join("config.toml")).unwrap();
@@ -423,8 +394,7 @@ mod tests {
         let home = temp_home("default");
         let _guard = EnvGuard::new(&home);
 
-        let mut app = create_test_app(&home);
-        let result = network(&mut app, Some("default maybe"));
+        let result = network(Some("default maybe"));
 
         assert!(result.is_error);
         assert!(
@@ -434,5 +404,79 @@ mod tests {
                 .unwrap_or_default()
                 .contains("/network default <allow|deny|prompt>")
         );
+    }
+
+    #[test]
+    fn network_config_parse_error_omits_secret_contents_and_keys() {
+        let home = temp_home("parse-redaction");
+        let path = home.join("config.toml");
+        let secret = "cw-secret-network-config-4507";
+        fs::write(
+            &path,
+            format!("[providers.xai]\napi_key = \"{secret}\" trailing-junk\n"),
+        )
+        .unwrap();
+
+        let error = load_config_doc(&path).expect_err("malformed config must fail");
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(secret), "{diagnostic}");
+        assert!(!diagnostic.contains("api_key"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("file contents were omitted"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn handler_is_pure_and_argument_only() {
+        assert!(matches!(NetworkCmd::handler(), CommandHandler::Pure(_)));
+        assert_eq!(
+            NetworkCmd::info().description_key,
+            "cmd_network_description"
+        );
+        assert_eq!(NetworkCmd::info().aliases, &[] as &[&str]);
+    }
+
+    #[test]
+    fn host_normalization_handles_wildcard_trailing_dot_and_url_paths() {
+        // Wildcard prefix normalizes to a leading-dot suffix form.
+        assert_eq!(normalize_host_for_compare("*.example.com"), ".example.com");
+        // Trailing dot and case are normalized away.
+        assert_eq!(normalize_host_for_compare("Example.COM."), "example.com");
+        // A bare wildcard suffix compares equal to its explicit form.
+        assert_eq!(normalize_host_for_compare("*.github.com"), ".github.com");
+
+        // URL input extracts the host; a URL path is rejected.
+        assert_eq!(
+            host_from_url("https://API.Github.com/path").as_deref(),
+            Some("api.github.com")
+        );
+        assert_eq!(host_from_url("not a url"), None);
+        assert!(normalize_host_arg("https://github.com/path").is_ok());
+        assert!(normalize_host_arg("a/b").is_err(), "URL path rejected");
+        assert!(
+            normalize_host_arg("https://").is_err(),
+            "hostless URL rejected"
+        );
+    }
+
+    #[test]
+    fn exact_conflict_removal_is_case_and_wildcard_aware() {
+        let mut allow = vec!["github.com".to_string()];
+        let mut deny = vec!["GitHub.COM".to_string(), "*.example.com".to_string()];
+        // Production normalizes the host argument before update_host; the
+        // normalized form then removes the exact deny entry (case-insensitive).
+        let host = normalize_host_arg("GitHub.COM").expect("normalize");
+        assert_eq!(host, "github.com");
+        remove_host(&mut deny, &host);
+        assert_eq!(deny, vec!["*.example.com".to_string()]);
+        // Denying removes the exact allow entry.
+        remove_host(&mut allow, &host);
+        assert!(allow.is_empty());
+        // Adding an existing normalized host is a no-op (production passes
+        // the already-normalized host into add_host).
+        add_host(&mut allow, "github.com");
+        add_host(&mut allow, "github.com");
+        assert_eq!(allow, vec!["github.com".to_string()]);
     }
 }

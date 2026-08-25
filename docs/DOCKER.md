@@ -1,6 +1,6 @@
 # Docker
 
-CodeWhale publishes a multi-arch Linux image to GitHub Container Registry
+Codewhale publishes a multi-arch Linux image to GitHub Container Registry
 for each release.
 
 ```bash
@@ -43,7 +43,7 @@ images:
 
 - the container runs as the non-root `codewhale` user with UID/GID `1000:1000`
 - the image does not grant passwordless `sudo`
-- the image is meant to run CodeWhale against mounted workspaces, not to mutate
+- the image is meant to run Codewhale against mounted workspaces, not to mutate
   the base operating system at runtime
 - user state belongs in a volume mounted at `/home/codewhale/.codewhale`
 
@@ -57,7 +57,7 @@ explicit toolbox image instead of changing the default image contract.
 The repository includes an example
 [`docs/examples/Dockerfile.toolbox`](examples/Dockerfile.toolbox) that extends
 the official image with passwordless `sudo` and common development packages.
-Build it with a pinned CodeWhale tag when you want repeatable project
+Build it with a pinned Codewhale tag when you want repeatable project
 environments:
 
 ```bash
@@ -84,7 +84,7 @@ docker run --rm -it \
   codewhale-toolbox:my-project
 ```
 
-Inside this opt-in image, CodeWhale can use commands such as
+Inside this opt-in image, Codewhale can use commands such as
 `sudo apt-get update` and `sudo apt-get install -y <package>`. For repeatable
 containers, prefer baking those packages into the toolbox Dockerfile instead of
 letting a long-lived container drift.
@@ -139,12 +139,12 @@ it is intentionally outside the core Docker image.
 
 ## Project bootstrap scripts
 
-CodeWhale does not automatically execute `.codewhale/setup.sh` or legacy
+Codewhale does not automatically execute `.codewhale/setup.sh` or legacy
 `.deepseek/setup.sh`. If you keep one of those files as a local project recipe,
 run it explicitly. For shared team setup, prefer a committed project script or
 the toolbox Dockerfile so the environment can be reviewed and rebuilt.
 
-For example, to run a committed bootstrap script before starting CodeWhale:
+For example, to run a committed bootstrap script before starting Codewhale:
 
 ```bash
 docker run --rm -it \
@@ -281,9 +281,16 @@ docker buildx build --platform linux/amd64,linux/arm64 -t codewhale .
 ## Devcontainer
 
 The repository includes a [`.devcontainer/devcontainer.json`](../.devcontainer/devcontainer.json)
-configuration for VS Code / GitHub Codespaces. It pre-installs the Rust toolchain,
-rust-analyzer, and the `codewhale` binary. Open the repo in a devcontainer to get a
-ready-to-use development environment.
+configuration for VS Code / GitHub Codespaces. It builds a dedicated development
+image with the Rust toolchain, Git, `pkg-config`, and the DBus development headers
+required by the workspace. The first open runs `cargo build --locked` and installs
+rust-analyzer and the other editor extensions.
+
+The source checkout remains mounted from the host. CodeWhale state and Cargo build
+artifacts use Docker named volumes instead, so the configuration works when VS Code
+cannot provide a POSIX-style `HOME` variable (notably on Windows), and builds do not
+write thousands of small files through a Windows bind mount. Rebuild the container
+after changing the Dev Container configuration.
 
 ## Release status
 

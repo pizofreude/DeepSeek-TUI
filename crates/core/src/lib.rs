@@ -1,12 +1,20 @@
-use std::collections::HashMap;
+pub mod fragments;
+pub mod ids;
+pub mod journal;
+pub mod request;
+pub mod role;
+pub mod session;
+pub mod tool_parser;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use codewhale_agent::ModelRegistry;
-use codewhale_config::{CliRuntimeOverrides, ConfigToml, ProviderKind};
+use codewhale_config::{ConfigToml, ProviderKind};
 use codewhale_execpolicy::{
     AskForApproval, ExecApprovalRequirement, ExecPolicyContext, ExecPolicyDecision,
     ExecPolicyEngine,
@@ -16,11 +24,11 @@ use codewhale_mcp::{
     McpManager, McpStartupCompleteEvent, McpStartupStatus as McpManagerStartupStatus,
 };
 use codewhale_protocol::{
-    AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ResponseChannel, ReviewDecision, Status, Thread, ThreadForkParams, ThreadGoal,
-    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams,
-    ThreadGoalStatus, ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse,
-    ThreadResumeParams, ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
+    AppResponse, EventFrame, ExecApprovalRequestEvent, ResponseChannel, ReviewDecision, Status,
+    Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams, ThreadGoalGetParams,
+    ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus, ThreadListParams,
+    ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams, ThreadSetNameParams,
+    ThreadStatus, ToolPayload, UserInputRequestEvent,
 };
 use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
@@ -181,6 +189,53 @@ pub struct JobRecord {
     pub created_at: i64,
     /// Timestamp of the last state change.
     pub updated_at: i64,
+}
+
+/// Map a durable [`JobRecord`] to the dependency-neutral run read model.
+///
+/// Pure projection of the record as persisted: unknown budgets stay unset and
+/// nothing is fabricated. `updated_at` (epoch seconds) provides the terminal
+/// timestamp because the job manager records no separate end time. The
+/// free-form job detail is intentionally omitted because this owner does not
+/// classify it as safe for a cross-surface read model.
+#[must_use]
+pub fn job_record_to_agent_run(
+    record: &JobRecord,
+) -> codewhale_protocol::agent_run::AgentRunSnapshot {
+    use codewhale_protocol::agent_run::{
+        AgentRunSnapshot, BudgetSummary, RunSource, RunState, TerminalOutcome, TerminalSummary,
+    };
+
+    let (state, terminal) = match record.status {
+        JobStatus::Queued => (RunState::Queued, None),
+        JobStatus::Running => (RunState::Running, None),
+        JobStatus::Paused => (RunState::Paused, None),
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
+            let outcome = match record.status {
+                JobStatus::Completed => TerminalOutcome::Completed,
+                JobStatus::Failed => TerminalOutcome::Failed,
+                _ => TerminalOutcome::Cancelled,
+            };
+            (
+                RunState::Terminal,
+                Some(TerminalSummary {
+                    outcome,
+                    ended_at_ms: record.updated_at.checked_mul(1000),
+                    detail: None,
+                }),
+            )
+        }
+    };
+
+    AgentRunSnapshot {
+        run_id: record.id.clone(),
+        parent: None,
+        source: RunSource::CoreJob,
+        state,
+        budget: BudgetSummary::default(),
+        terminal,
+        refs: Vec::new(),
+    }
 }
 
 /// Manages background jobs with retry logic and persistence.
@@ -591,11 +646,32 @@ impl ThreadManager {
         self.running_threads
             .insert(thread.id.clone(), thread.clone());
         if let Some(history) = params.history.as_ref() {
+            // A read→resume flow hands back items that are already on the
+            // persisted chain; appending them again would double the
+            // conversation on every resume, compounding. Dedup by content
+            // fingerprint (the item's JSON, matching what append_message
+            // stores as content) against the persisted chain and against
+            // items already appended in this loop.
+            let mut seen: HashSet<String> = self
+                .store
+                .list_messages(&thread.id, None)?
+                .into_iter()
+                .map(|message| {
+                    message
+                        .item
+                        .as_ref()
+                        .map_or(message.content.clone(), |item| item.to_string())
+                })
+                .collect();
             for item in history {
+                let fingerprint = item.to_string();
+                if !seen.insert(fingerprint.clone()) {
+                    continue;
+                }
                 self.store.append_message(
                     &thread.id,
                     "history",
-                    &item.to_string(),
+                    &fingerprint,
                     Some(item.clone()),
                 )?;
             }
@@ -787,6 +863,10 @@ impl ThreadManager {
     }
 
     fn persist_thread(&self, thread: &Thread, rollout_path: Option<PathBuf>) -> Result<()> {
+        // This update payload carries no per-thread policy, so preserve any
+        // policy already stored for the thread rather than erasing it with
+        // NULLs on every persist/resume.
+        let existing = self.store.get_thread(&thread.id)?;
         self.store.upsert_thread(&ThreadMetadata {
             id: thread.id.clone(),
             rollout_path,
@@ -801,8 +881,12 @@ impl ThreadManager {
             cli_version: thread.cli_version.clone(),
             source: to_persisted_source(&thread.source),
             name: thread.name.clone(),
-            sandbox_policy: None,
-            approval_mode: None,
+            sandbox_policy: existing
+                .as_ref()
+                .and_then(|metadata| metadata.sandbox_policy.clone()),
+            approval_mode: existing
+                .as_ref()
+                .and_then(|metadata| metadata.approval_mode.clone()),
             archived: matches!(thread.status, ThreadStatus::Archived),
             archived_at: None,
             git_sha: None,
@@ -892,8 +976,8 @@ impl Runtime {
     /// **Not** refreshed by this call:
     /// * `mcp_manager` — MCP server connections are loaded once at
     ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
-    ///   referenced `mcp.json` still requires a restart, exactly as the
-    ///   TUI flags via `mcp_restart_required`.
+    ///   referenced `mcp.json` still requires a headless-runtime restart;
+    ///   the TUI owns a separate explicit `/mcp reload` operation.
     /// * `tool_registry` — built once at startup.
     /// * `model_registry` — static catalog.
     pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
@@ -941,18 +1025,6 @@ impl Runtime {
             "checkpoint": checkpoint,
             "goal": goal
         }))
-    }
-
-    fn persist_latest_checkpoint(&self, thread_id: &str, reason: &str, state: Value) -> Result<()> {
-        self.thread_manager.state_store().save_checkpoint(
-            thread_id,
-            "latest",
-            &json!({
-                "reason": reason,
-                "saved_at": chrono::Utc::now().timestamp(),
-                "state": state
-            }),
-        )
     }
 
     /// Dispatches a thread request (create, start, resume, fork, list, read, etc.).
@@ -1226,124 +1298,19 @@ impl Runtime {
                     data: json!({}),
                 })
             }
-            ThreadRequest::Message { thread_id, input } => {
-                self.thread_manager.touch_message(&thread_id, &input)?;
-                let response_id = format!("{thread_id}:{}", input.len());
-                self.hooks
-                    .emit(HookEvent::ResponseStart {
-                        response_id: response_id.clone(),
-                    })
-                    .await;
-                self.hooks
-                    .emit(HookEvent::ResponseEnd {
-                        response_id: response_id.clone(),
-                    })
-                    .await;
-
-                Ok(ThreadResponse {
-                    thread_id,
-                    status: "accepted".to_string(),
-                    thread: None,
-                    threads: Vec::new(),
-                    goal: None,
-                    model: None,
-                    model_provider: None,
-                    cwd: None,
-                    approval_policy: None,
-                    sandbox: None,
-                    events: vec![
-                        EventFrame::ResponseStart {
-                            response_id: response_id.clone(),
-                        },
-                        EventFrame::ResponseDelta {
-                            response_id: response_id.clone(),
-                            delta: "queued".to_string(),
-                            channel: ResponseChannel::Text,
-                        },
-                        EventFrame::ResponseEnd { response_id },
-                    ],
-                    data: json!({}),
-                })
-            }
+            // A thread message is a *turn*, and this type is not the turn
+            // engine — it owns thread bookkeeping and persistence only. The
+            // app-server routes messages through its runtime bridge
+            // (`POST /v1/threads/{id}/turns` on the runtime API) and never
+            // reaches this arm. Returning an error rather than a canned
+            // "accepted" keeps any other caller from mistaking bookkeeping
+            // for execution.
+            ThreadRequest::Message { thread_id, .. } => Err(anyhow!(
+                "thread message for {thread_id} cannot be executed here: \
+                 Runtime::handle_thread does not run turns. Send it through the \
+                 app-server runtime bridge (POST /v1/threads/{{id}}/turns)."
+            )),
         }
-    }
-
-    /// Resolves the model for a prompt, records the message, and returns the response.
-    pub async fn handle_prompt(
-        &mut self,
-        req: PromptRequest,
-        cli_overrides: &CliRuntimeOverrides,
-    ) -> Result<PromptResponse> {
-        let resolved = self.config.resolve_runtime_options(cli_overrides);
-        let requested_model = req.model.clone().unwrap_or_else(|| resolved.model.clone());
-        let selection = self
-            .model_registry
-            .resolve(Some(&requested_model), Some(resolved.provider));
-        let resolved_model = selection.resolved.id.clone();
-        let response_id = format!("resp-{}", Uuid::new_v4());
-
-        self.hooks
-            .emit(HookEvent::ResponseStart {
-                response_id: response_id.clone(),
-            })
-            .await;
-        self.hooks
-            .emit(HookEvent::ResponseDelta {
-                response_id: response_id.clone(),
-                delta: "model-selected".to_string(),
-            })
-            .await;
-        self.hooks
-            .emit(HookEvent::ResponseEnd {
-                response_id: response_id.clone(),
-            })
-            .await;
-
-        let payload = json!({
-            "provider": resolved.provider.as_str(),
-            "model": resolved_model.clone(),
-            "prompt": req.prompt,
-            "telemetry": resolved.telemetry,
-            "base_url": resolved.base_url,
-            "has_api_key": resolved.api_key.as_ref().is_some_and(|k| !k.trim().is_empty()),
-            "approval_policy": resolved.approval_policy,
-            "sandbox_mode": resolved.sandbox_mode
-        });
-        if let Some(thread_id) = req.thread_id.as_ref() {
-            self.thread_manager.touch_message(thread_id, &req.prompt)?;
-            let assistant_message_id = self.thread_manager.store.append_message(
-                thread_id,
-                "assistant",
-                &payload.to_string(),
-                Some(payload.clone()),
-            )?;
-            self.persist_latest_checkpoint(
-                thread_id,
-                "prompt_response",
-                json!({
-                    "response_id": response_id.clone(),
-                    "model": resolved_model.clone(),
-                    "provider": resolved.provider.as_str(),
-                    "assistant_message_id": assistant_message_id
-                }),
-            )?;
-        }
-
-        Ok(PromptResponse {
-            output: payload.to_string(),
-            model: resolved_model,
-            events: vec![
-                EventFrame::ResponseStart {
-                    response_id: response_id.clone(),
-                },
-                EventFrame::ResponseDelta {
-                    response_id: response_id.clone(),
-                    delta: "model-selected".to_string(),
-                    channel: ResponseChannel::Text,
-                },
-                EventFrame::ResponseEnd { response_id },
-            ],
-        })
     }
 
     /// Evaluates execution policy and dispatches a tool call.
@@ -1457,10 +1424,17 @@ impl Runtime {
         // branch (issue #3102). The TUI intercepts this tool by name before
         // dispatch and blocks on a reply channel; the headless runtime instead
         // emits a typed `UserInputRequest` frame and returns a
-        // `user_input_required` status so the client can render the question
-        // and POST answers back via `AppRequest::SubmitUserInput`. It does NOT
-        // block — consistent with the headless approval model, which has no
-        // resume channel either.
+        // `user_input_required` status so the client can render the question.
+        // It does NOT block — consistent with the headless approval model,
+        // which has no resume channel either.
+        //
+        // The reply goes to the runtime API
+        // (`POST /v1/user-input/{thread_id}/{request_id}`), which owns the
+        // pending request and can resume the turn. The app-server control
+        // transport cannot: it executes only `thread/interrupt` mid-turn, so
+        // an answer sent over it would queue behind the very turn that is
+        // waiting for it. `AppRequest::SubmitUserInput` therefore refuses
+        // explicitly instead of pretending to have delivered the answer.
         if call.name == REQUEST_USER_INPUT_TOOL_NAME {
             let request_id = format!("user-input-{}", Uuid::new_v4());
             let arguments = match &call.payload {
@@ -1524,6 +1498,8 @@ impl Runtime {
         .await
         {
             Ok(Ok(tool_output)) => {
+                let success = tool_output.success();
+                let status = if success { "completed" } else { "failed" };
                 let result_frame = EventFrame::ToolCallResult {
                     response_id: response_id.clone(),
                     tool_name: call.name.clone(),
@@ -1538,13 +1514,13 @@ impl Runtime {
                     .emit(HookEvent::ToolLifecycle {
                         response_id: response_id.clone(),
                         tool_name: call.name,
-                        phase: "completed".to_string(),
-                        payload: json!({ "ok": true }),
+                        phase: status.to_string(),
+                        payload: json!({ "ok": success }),
                     })
                     .await;
                 Ok(json!({
-                    "ok": true,
-                    "status": "completed",
+                    "ok": success,
+                    "status": status,
                     "execution_kind": execution_kind,
                     "response_id": response_id,
                     "precheck": precheck,
@@ -2901,6 +2877,106 @@ mod tests {
         assert_eq!(reloaded_job.status, JobStatus::Paused);
     }
 
+    // ── O1: JobRecord → AgentRunSnapshot adapter ────────────────────────
+
+    fn sample_job_record(status: JobStatus, detail: Option<&str>) -> JobRecord {
+        JobRecord {
+            id: "job-o1-1".to_string(),
+            name: "sample".to_string(),
+            status,
+            progress: None,
+            detail: detail.map(str::to_string),
+            retry: JobRetryMetadata {
+                attempt: 0,
+                max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+                backoff_base_ms: DEFAULT_JOB_BACKOFF_BASE_MS,
+                next_backoff_ms: 0,
+                next_retry_at: None,
+            },
+            history: Vec::new(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_042,
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_maps_non_terminal_states() {
+        use codewhale_protocol::agent_run::RunState;
+
+        for (status, expected) in [
+            (JobStatus::Queued, RunState::Queued),
+            (JobStatus::Running, RunState::Running),
+            (JobStatus::Paused, RunState::Paused),
+        ] {
+            let snapshot = job_record_to_agent_run(&sample_job_record(status, None));
+            assert!(snapshot.is_coherent());
+            assert_eq!(snapshot.run_id, "job-o1-1");
+            assert_eq!(snapshot.parent, None);
+            assert_eq!(
+                snapshot.source,
+                codewhale_protocol::agent_run::RunSource::CoreJob
+            );
+            assert_eq!(snapshot.state, expected);
+            assert!(snapshot.terminal.is_none());
+            assert!(snapshot.refs.is_empty());
+            assert_eq!(
+                snapshot.budget,
+                codewhale_protocol::agent_run::BudgetSummary::default()
+            );
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_maps_terminal_states_without_fabricating_fields() {
+        use codewhale_protocol::agent_run::{RunState, TerminalOutcome};
+
+        let cases = [
+            (
+                JobStatus::Completed,
+                TerminalOutcome::Completed,
+                Some("done"),
+            ),
+            (JobStatus::Failed, TerminalOutcome::Failed, Some("boom")),
+            (JobStatus::Cancelled, TerminalOutcome::Cancelled, None),
+        ];
+
+        for (status, outcome, detail) in cases {
+            let snapshot = job_record_to_agent_run(&sample_job_record(status, detail));
+            assert!(snapshot.is_coherent());
+            assert_eq!(snapshot.state, RunState::Terminal);
+            let terminal = snapshot.terminal.expect("terminal summary");
+            assert_eq!(terminal.outcome, outcome);
+            assert_eq!(terminal.ended_at_ms, Some(1_700_000_042_000));
+            assert_eq!(terminal.detail, None);
+            assert_eq!(
+                snapshot.budget,
+                codewhale_protocol::agent_run::BudgetSummary::default()
+            );
+            assert!(snapshot.refs.is_empty());
+            assert_eq!(snapshot.parent, None);
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_does_not_export_unclassified_detail() {
+        let record = sample_job_record(JobStatus::Failed, Some("owner-private diagnostic"));
+        let snapshot = job_record_to_agent_run(&record);
+        let terminal = snapshot.terminal.as_ref().expect("terminal summary");
+        assert_eq!(terminal.detail, None);
+        let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(!serialized.contains("owner-private diagnostic"));
+    }
+
+    #[test]
+    fn job_record_to_agent_run_omits_ended_at_on_updated_at_overflow() {
+        let mut record = sample_job_record(JobStatus::Completed, Some("ok"));
+        record.updated_at = i64::MAX;
+        let snapshot = job_record_to_agent_run(&record);
+        assert!(snapshot.is_coherent());
+        let terminal = snapshot.terminal.expect("terminal summary");
+        assert_eq!(terminal.ended_at_ms, None);
+    }
+
     #[test]
     fn unarchive_thread_updates_running_threads_cache() {
         let store = temp_core_state("unarchive-cache");
@@ -2953,6 +3029,133 @@ mod tests {
             .expect("resume unarchived thread")
             .expect("thread in cache");
         assert_eq!(restored.thread.status, ThreadStatus::Idle);
+    }
+
+    #[test]
+    fn resume_with_history_does_not_reappend_persisted_messages() {
+        // A read→resume flow hands the thread's own history back to
+        // `thread/resume`; appending it verbatim doubled the conversation on
+        // every resume, compounding.
+        let store = temp_core_state("resume-history-dedup");
+        let mut manager = ThreadManager::new(store);
+        let history = vec![
+            json!({"type": "user_message", "message": "hello"}),
+            json!({"type": "assistant_message", "message": "hi there"}),
+        ];
+        let spawned = manager
+            .spawn_thread_with_history(
+                "deepseek".to_string(),
+                PathBuf::from("/tmp/codewhale"),
+                InitialHistory::Forked(history.clone()),
+                true,
+            )
+            .expect("spawn thread");
+        let thread_id = spawned.thread.id.clone();
+        let message_count = |manager: &ThreadManager| {
+            manager
+                .state_store()
+                .list_messages(&thread_id, None)
+                .expect("list messages")
+                .len()
+        };
+        assert_eq!(message_count(&manager), 2);
+
+        let resume_params = ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            history: Some(history.clone()),
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+
+        // Resuming twice with the same history must be idempotent.
+        for _ in 0..2 {
+            manager
+                .resume_thread_with_history(
+                    &resume_params,
+                    Path::new("/tmp/codewhale"),
+                    "deepseek".to_string(),
+                )
+                .expect("resume thread")
+                .expect("thread found");
+        }
+        assert_eq!(
+            message_count(&manager),
+            2,
+            "resume re-appended messages already on the persisted chain"
+        );
+
+        // A genuinely new history item is still appended, exactly once.
+        let mut extended = history.clone();
+        extended.push(json!({"type": "user_message", "message": "something new"}));
+        let resume_params = ThreadResumeParams {
+            history: Some(extended),
+            ..resume_params
+        };
+        manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume thread")
+            .expect("thread found");
+        assert_eq!(message_count(&manager), 3);
+    }
+
+    #[test]
+    fn persist_thread_preserves_stored_policy() {
+        // persist_thread's update payload carries no per-thread policy;
+        // writing NULLs unconditionally erased any policy stored earlier
+        // (e.g. on every resume).
+        let store = temp_core_state("persist-policy");
+        let mut metadata = test_thread_metadata("thread-policy");
+        metadata.sandbox_policy = Some("workspace-write".to_string());
+        metadata.approval_mode = Some("on-request".to_string());
+        store.upsert_thread(&metadata).expect("seed thread");
+
+        // A fresh manager has an empty running-thread cache, so resume goes
+        // through the persisted path, which calls persist_thread.
+        let mut manager = ThreadManager::new(store);
+        let resume_params = ThreadResumeParams {
+            thread_id: "thread-policy".to_string(),
+            history: None,
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+        manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume thread")
+            .expect("thread found");
+
+        let persisted = manager
+            .state_store()
+            .get_thread("thread-policy")
+            .expect("read thread")
+            .expect("thread persisted");
+        assert_eq!(persisted.sandbox_policy.as_deref(), Some("workspace-write"));
+        assert_eq!(persisted.approval_mode.as_deref(), Some("on-request"));
     }
 
     #[tokio::test]
@@ -3027,5 +3230,56 @@ mod tests {
 
         assert_eq!(result["status"], "timeout");
         assert_eq!(result["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn thread_message_is_refused_rather_than_faked() {
+        // This arm used to record the user message, emit canned
+        // ResponseStart/ResponseDelta("queued")/ResponseEnd frames and report
+        // status "accepted" — with no worker, no model, and nothing queued.
+        // `Runtime` owns thread bookkeeping, not the turn engine, so the only
+        // honest answer here is a refusal that names where turns actually run.
+        let mut runtime = Runtime::new(
+            ConfigToml::default(),
+            ModelRegistry::default(),
+            temp_core_state("message-refused"),
+            Arc::new(ToolRegistry::default()),
+            Arc::new(McpManager::default()),
+            ExecPolicyEngine::new(vec![], vec![]),
+            HookDispatcher::default(),
+        );
+        let spawned = runtime
+            .thread_manager
+            .spawn_thread_with_history(
+                "deepseek".to_string(),
+                PathBuf::from("/tmp/codewhale"),
+                InitialHistory::New,
+                true,
+            )
+            .expect("spawn thread");
+        let thread_id = spawned.thread.id.clone();
+
+        let err = runtime
+            .handle_thread(ThreadRequest::Message {
+                thread_id: thread_id.clone(),
+                input: "run this".to_string(),
+            })
+            .await
+            .expect_err("handle_thread must not pretend to execute a turn");
+        assert!(
+            err.to_string().contains("/v1/threads/{id}/turns"),
+            "the refusal must name the surface that does run turns: {err}"
+        );
+
+        // Nothing was written to history on the way out.
+        let history = runtime
+            .thread_manager
+            .store
+            .list_messages(&thread_id, None)
+            .expect("list messages");
+        assert!(
+            history.is_empty(),
+            "a refused message must leave no history rows: {history:?}"
+        );
     }
 }

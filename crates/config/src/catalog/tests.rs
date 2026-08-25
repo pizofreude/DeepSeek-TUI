@@ -27,8 +27,11 @@ const FIXTURE: &str = r#"{
           "id": "glm-5.2",
           "family": "glm",
           "default": true,
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }],
+          "tool_call": true,
+          "structured_output": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 1000000, "output": 131072 },
           "cost": { "input": 1.4, "output": 4.4, "cache_read": 0.26 }
@@ -76,6 +79,9 @@ fn hydrates_models_dev_offerings_preserving_offering_facts() {
     assert!(glm.default_for_provider);
     assert_eq!(glm.family.as_deref(), Some("glm"));
     assert_eq!(glm.reasoning, Some(true));
+    assert_eq!(glm.attachment, Some(false));
+    assert_eq!(glm.tool_call, Some(true));
+    assert_eq!(glm.structured_output, Some(true));
     // Provider-scoped reasoning options are preserved, not collapsed.
     assert_eq!(glm.reasoning_options.len(), 1);
     assert_eq!(glm.limit.as_ref().and_then(|l| l.context), Some(1_000_000));
@@ -109,6 +115,26 @@ fn to_offering_projects_routing_identity_and_limits() {
     assert_eq!(glm.endpoint_key, "chat");
     assert_eq!(glm.limits.context_tokens, Some(1_000_000));
     assert_eq!(glm.limits.output_tokens, Some(131_072));
+    assert_eq!(
+        glm.capabilities.attachments,
+        crate::route::CapabilityState::Unsupported
+    );
+    assert_eq!(
+        glm.capabilities.reasoning,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.native_tool_calls,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.structured_output,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.streaming,
+        crate::route::CapabilityState::Unknown
+    );
 }
 
 #[test]
@@ -237,6 +263,7 @@ fn cache_scopes_by_provider_and_base_url_fingerprint() {
 #[test]
 fn fingerprint_folds_cosmetic_base_url_differences() {
     let canonical = base_url_fingerprint("https://API.Example.com/v1");
+    assert_eq!(canonical.len(), 64, "endpoint fingerprints use SHA-256");
     assert_eq!(
         canonical,
         base_url_fingerprint("https://api.example.com/v1/"),
@@ -265,6 +292,85 @@ fn fingerprint_folds_cosmetic_base_url_differences() {
         base_url_fingerprint("http://h.example.com/v1"),
         ":443 is not http's default port and must not fold"
     );
+}
+
+#[test]
+fn fingerprint_never_hashes_secret_bearing_url_text() {
+    let expected = base_url_fingerprint("https://api.example.com/v1");
+    for url in [
+        "https://user:secret@api.example.com/v1",
+        "https://api.example.com/v1?api_key=secret",
+        "https://api.example.com/v1#secret",
+    ] {
+        assert_eq!(base_url_fingerprint(url), expected, "{url}");
+    }
+}
+
+#[test]
+fn fingerprint_strips_userinfo_from_a_scheme_less_base_url() {
+    // A base_url typed without a scheme took the fall-through branch, which
+    // only split off `?`/`#` — so `user:pass@host` went into SHA-256 verbatim,
+    // against the documented "userinfo never enters the digest function".
+    let expected = base_url_fingerprint("api.example.com/v1");
+    for url in [
+        "user:secret@api.example.com/v1",
+        "user:other-secret@api.example.com/v1",
+        "token@api.example.com/v1",
+    ] {
+        assert_eq!(base_url_fingerprint(url), expected, "{url}");
+    }
+}
+
+#[test]
+fn fingerprint_of_an_empty_base_url_is_the_redacted_constant() {
+    // The fall-through's `unwrap_or(REDACTED)` never fired — `split` always
+    // yields at least one (possibly empty) piece — so an empty base URL
+    // fingerprinted the empty string instead of the redacted sentinel.
+    let redacted = base_url_fingerprint("ftp://api.example.com");
+    for url in ["", "   ", "?api_key=secret"] {
+        assert_eq!(base_url_fingerprint(url), redacted, "{url:?}");
+    }
+    // SHA-256("") is what empty/whitespace hashed to before the sentinel
+    // mapping. That digest is a persisted cache/receipt key, so flipping it
+    // back would be another undeclared persisted-key change.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    assert_ne!(redacted, EMPTY_SHA256);
+}
+
+#[test]
+fn changelog_declares_fingerprint_persisted_key_change() {
+    // `base_url_fingerprint` is serde-serialized (catalog cache, LiveOffering,
+    // pricing receipts, TurnRecord.routed_usage_source_ids). Empty input and
+    // scheme-less URLs with `@` hash differently than they did before
+    // 388125491. Before a release cut, Unreleased must say so; after the
+    // coordinated version bump, the current-version section owns the same
+    // declaration. An older release cannot satisfy this check, because stale
+    // caches would then look like corruption without a note for this build.
+    let changelog = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"));
+    let unreleased = changelog
+        .split_once("## [Unreleased]")
+        .expect("CHANGELOG has an Unreleased section")
+        .1
+        .split_once("\n## [")
+        .expect("Unreleased is followed by a released section")
+        .0;
+    let current_heading = format!("## [{}]", env!("CARGO_PKG_VERSION"));
+    let current_release = changelog
+        .split_once(&current_heading)
+        .map(|(_, tail)| tail.split("\n## [").next().unwrap_or(tail))
+        .unwrap_or_default();
+    let declared_change = format!("{unreleased}\n{current_release}");
+    for needle in [
+        "base_url_fingerprint",
+        "persisted-key",
+        "scheme-less",
+        "routed_usage_source_ids",
+    ] {
+        assert!(
+            declared_change.contains(needle),
+            "Unreleased or the current release section must declare the {needle} persisted-key change:\n{declared_change}"
+        );
+    }
 }
 
 #[test]
@@ -582,10 +688,48 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
     // proving real facts flow rather than `RouteLimits::default()` (unknown).
     let glm = find(&rows, "zai", "GLM-5.2");
     assert_eq!(glm.limit.as_ref().and_then(|l| l.context), Some(1_000_000));
-    assert!(glm.default_for_provider);
+    assert!(
+        !glm.default_for_provider,
+        "GLM-5.2 is no longer the Z.ai default"
+    );
 
-    let kimi = find(&rows, "moonshot", "kimi-k2.7-code");
-    assert_eq!(kimi.limit.as_ref().and_then(|l| l.context), Some(262_144));
+    // GLM-5.3 is the Z.ai default (matching DEFAULT_ZAI_MODEL); its limits
+    // still inherit from glm-5.2 until Z.ai publishes distinct 5.3 numbers.
+    let glm53 = find(&rows, "zai", "GLM-5.3");
+    assert_eq!(
+        glm53.limit.as_ref().and_then(|l| l.context),
+        glm.limit.as_ref().and_then(|l| l.context)
+    );
+    assert_eq!(
+        glm53.limit.as_ref().and_then(|l| l.output),
+        glm.limit.as_ref().and_then(|l| l.output)
+    );
+    assert!(
+        glm53.default_for_provider,
+        "GLM-5.3 must be the Z.ai default"
+    );
+
+    let kimi_k27 = find(&rows, "moonshot", "kimi-k2.7-code");
+    assert_eq!(
+        kimi_k27.limit.as_ref().and_then(|l| l.context),
+        Some(262_144)
+    );
+
+    let kimi_k3 = find(&rows, "moonshot", "kimi-k3");
+    assert_eq!(
+        kimi_k3.limit.as_ref().and_then(|l| l.context),
+        Some(1_048_576)
+    );
+    assert_eq!(kimi_k3.limit.as_ref().and_then(|l| l.output), Some(131_072));
+    let kimi_k3_input_modalities = kimi_k3
+        .modalities
+        .as_ref()
+        .expect("K3 modalities")
+        .input
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(kimi_k3_input_modalities, ["text", "image", "video"]);
 
     let minimax_m3 = find(&rows, "minimax-anthropic", "MiniMax-M3");
     assert_eq!(
@@ -606,6 +750,48 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
             .get("default")
             .and_then(serde_json::Value::as_str),
         Some("disabled")
+    );
+
+    let grok_46 = find(&rows, "xai", "grok-4.6");
+    assert!(grok_46.default_for_provider);
+    assert_eq!(
+        grok_46.limit.as_ref().and_then(|limit| limit.context),
+        Some(500_000)
+    );
+    assert_eq!(grok_46.attachment, Some(true));
+    assert_eq!(grok_46.structured_output, Some(true));
+    let grok_input_modalities = grok_46
+        .modalities
+        .as_ref()
+        .expect("Grok 4.6 modalities")
+        .input
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(grok_input_modalities, ["text", "image"]);
+    assert_eq!(
+        grok_46.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
+    let grok_45 = find(&rows, "xai", "grok-4.5");
+    assert_eq!(
+        grok_45.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("high")
+    );
+    let grok_45_values = grok_45.reasoning_options[0]
+        .get("values")
+        .and_then(serde_json::Value::as_array)
+        .expect("Grok 4.5 effort values");
+    assert_eq!(
+        grok_45_values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high"]
     );
 
     let minimax_m2_7 = find(&rows, "minimax-anthropic", "MiniMax-M2.7");
@@ -663,10 +849,29 @@ fn bundled_asset_pricing_is_honest() {
     assert_eq!(cost.output, Some(4.40));
     assert_eq!(cost.cache_read, Some(0.26));
 
+    // GLM-5.3 is live on the Coding Plan, but Z.ai has published no USD PAYG
+    // rate for it. Coding Plan credit multipliers are not USD, so every
+    // glm-5.3 row stays unpriced rather than inheriting glm-5.2's rates.
+    for row in &rows {
+        if row.wire_model_id.to_ascii_lowercase().contains("glm-5.3") {
+            assert!(
+                row.cost.is_none(),
+                "{}/{}: glm-5.3 must stay unpriced until Z.ai publishes rates",
+                row.provider,
+                row.wire_model_id
+            );
+        }
+    }
+
     // M3 has input-length and service tiers that the flat catalog cost shape
     // cannot represent, so the bundled route row stays honestly unpriced.
     let minimax_m3 = find(&rows, "minimax-anthropic", "MiniMax-M3");
     assert!(minimax_m3.cost.is_none());
+
+    // Grok 4.6 also has a prompt-length tier, starting at 200K input tokens.
+    // The usage-aware TUI table prices it; a flat catalog row would underbill.
+    let grok_46 = find(&rows, "xai", "grok-4.6");
+    assert!(grok_46.cost.is_none());
 
     let minimax_m2_7 = find(&rows, "minimax-anthropic", "MiniMax-M2.7");
     let cost = minimax_m2_7.cost.as_ref().expect("M2.7 is priced");

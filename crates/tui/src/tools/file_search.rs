@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tools::search::matches_glob;
 
+use super::file::{PATH_ALIASES, SEARCH_NAME_ALIASES, SEARCH_NAME_PARAMS, apply_param_aliases};
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, optional_u64, required_str,
@@ -34,8 +35,12 @@ impl ToolSpec for FileSearchTool {
         "file_search"
     }
 
+    fn model_visible(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &'static str {
-        "Find files by name using fuzzy matching with score-based ranking. Use this instead of `find -name` or `fd` in `exec_shell` for filename search. Pass `extensions` to filter by suffix."
+        "Find workspace files by name using fuzzy matching with score-based ranking. Pass extensions to filter by suffix."
     }
 
     fn input_schema(&self) -> Value {
@@ -62,7 +67,7 @@ impl ToolSpec for FileSearchTool {
                 "exclude": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional glob patterns to exclude, matching grep_files' convention (e.g. [\"target/**\", \"*.lock\"])."
+                    "description": "Optional glob patterns to exclude (e.g. [\"target/**\", \"*.lock\"])."
                 }
             },
             "required": ["query"]
@@ -78,13 +83,18 @@ impl ToolSpec for FileSearchTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let mut input = input;
+        apply_param_aliases(&mut input, PATH_ALIASES, "File search_name")?;
+        apply_param_aliases(&mut input, SEARCH_NAME_ALIASES, "File search_name")?;
+        SEARCH_NAME_PARAMS.reject_unknown(&input)?;
+
         let query = required_str(&input, "query")?.trim();
         if query.is_empty() {
             return Err(ToolError::invalid_input("query cannot be empty"));
         }
 
-        let limit = optional_u64(&input, "limit", 20).clamp(1, 200) as usize;
-        let base_path = match optional_str(&input, "path") {
+        let limit = optional_u64(&input, "limit", 20)?.clamp(1, 200) as usize;
+        let base_path = match optional_str(&input, "path")? {
             Some(path) if !path.trim().is_empty() => context.resolve_path(path)?,
             _ => context.workspace.clone(),
         };
@@ -168,7 +178,7 @@ where
 }
 
 fn file_search_cancelled() -> ToolError {
-    ToolError::execution_failed("file_search cancelled before completion")
+    ToolError::cancelled("file_search cancelled before completion")
 }
 
 fn file_search_timeout(timeout: Duration) -> ToolError {

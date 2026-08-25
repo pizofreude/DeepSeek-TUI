@@ -37,19 +37,16 @@ cargo test -p codewhale-config -p codewhale-protocol -p codewhale-cli \
 # 3. TUI test binaries, locked
 cargo test -p codewhale-tui --bins --locked
 
-# 4. Real-PTY release runtime QA (sealed HOME + loopback providers)
-cargo test -p codewhale-tui --test release_runtime_qa --locked -- --test-threads=1
-
-# 5. TUI debug build, locked
+# 4. TUI debug build, locked
 cargo build -p codewhale-tui --locked
 
-# 6. Release build for the shipped binaries, locked
+# 5. Release build for the shipped binaries, locked
 cargo build --release --locked -p codewhale-cli -p codewhale-tui
 
-# 7. Version-drift gate (workspace ↔ npm ↔ Cargo.lock ↔ changelog ↔ README)
+# 6. Version-drift gate (workspace ↔ npm ↔ Cargo.lock ↔ changelog ↔ README)
 ./scripts/release/check-versions.sh
 
-# 8. Binary smoke
+# 7. Binary smoke
 ./target/release/codewhale --version
 ```
 
@@ -66,10 +63,10 @@ A PR that is clean against `main` can still conflict with the release branch.
 
 Unit/build gates do not cover the live TUI. Exercise all three and record what you saw:
 
-The repeatable local baseline is `release_runtime_qa`: it boots real TUI
-processes in pseudo-terminals with sealed homes and loopback mock providers,
-then asserts each scenario below. Run it even when doing a separate hands-on
-visual pass; the test leaves no provider traffic or credentials behind.
+Use the built binary with a sealed local home and loopback fixtures, then
+exercise the relevant scenarios below in an actual terminal. Record dimensions,
+inputs, visible state, and side effects. Do not substitute a full-screen
+assertion harness for looking at and using the product.
 
 1. **Six-worker fanout liveness (#3216/#2211).** Spawn 6 sub-agents. Confirm
    typing, render, cancel, and the sidebar stay live throughout, and that **Esc
@@ -81,9 +78,11 @@ visual pass; the test leaves no provider traffic or credentials behind.
 2. **Multi-terminal route isolation (#3227).** Open multiple terminals on
    distinct provider/model routes. Confirm zero cross-terminal contamination and
    no provider+model mismatch — each terminal honors its own route.
-3. **Queued steering + Ctrl+S (#3203).** Queue a steering message into a busy
-   turn; confirm Ctrl+S sends the queued/draft message and queued-steering
-   status reads clearly.
+3. **Running-turn input contract (#3203).** During a busy turn, confirm Enter
+   queues a typed follow-up, the preview advertises **Enter send now**, and an
+   empty Enter promotes the oldest queued follow-up. Confirm Ctrl+Enter steers
+   typed text directly, Shift+Enter inserts a newline, and Ctrl+G/Ctrl+S only
+   stash drafts.
 
 ## Reporting format
 

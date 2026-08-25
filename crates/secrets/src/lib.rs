@@ -11,11 +11,15 @@
 //! explicit at the call site.
 #![deny(missing_docs)]
 
+/// Shared secure-storage contract for the Codewhale account session.
+pub mod account;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use codewhale_paths::codewhale_home_is_explicit;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +54,9 @@ pub enum SecretsError {
         /// Observed unix permission mode.
         mode: u32,
     },
+    /// A caller attempted to modify a diagnostic-only secret store.
+    #[error("secret store is read-only")]
+    ReadOnly,
 }
 
 /// Abstract secret store trait.
@@ -123,6 +130,16 @@ impl DefaultKeyringStore {
 
     /// Probe the OS keyring without writing anything. Returns `Ok(())` if
     /// a backend is reachable, otherwise an error describing why not.
+    ///
+    /// The probe reads a deliberately-nonexistent entry: reaching the
+    /// backend and learning the entry is absent *is* the reachability
+    /// signal. This does not prompt on any supported platform — macOS only
+    /// surfaces Keychain UI when accessing an *existing* item owned by
+    /// another application, and Windows Credential Manager never prompts
+    /// for a missing target — so `__probe__` under our own service name is
+    /// safe to read. `Entry::new` alone validates only argument shapes,
+    /// which left this probe a no-op on macOS/Windows and the documented
+    /// file-store fallback unreachable there (#5172).
     pub fn probe(&self) -> Result<(), SecretsError> {
         #[cfg(any(
             target_os = "macos",
@@ -134,18 +151,8 @@ impl DefaultKeyringStore {
             )
         ))]
         {
-            // `Entry::new` is enough to validate the native macOS/Windows
-            // backend path. Avoid a dummy read there because it can trigger
-            // a second user-visible Keychain/Credential Manager access before
-            // the real provider key lookup.
             let entry = keyring::Entry::new(&self.service, "__probe__")
                 .map_err(|err| SecretsError::Keyring(err.to_string()))?;
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            {
-                let _ = entry;
-                Ok(())
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             match entry.get_password() {
                 Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(keyring::Error::PlatformFailure(err)) => {
@@ -358,6 +365,22 @@ pub struct FileKeyringStore {
     path: PathBuf,
 }
 
+/// File-backed secret lookup that never migrates or changes either store.
+///
+/// Normal runtime credential resolution keeps its additive legacy migration:
+/// older entries under `~/.deepseek/secrets/` are copied into the Codewhale
+/// location before use. Diagnostic commands need the same read precedence
+/// without creating that destination, so this store reads the primary file
+/// first and falls back to the legacy file only when the primary has no entry
+/// and the Codewhale home is not explicitly isolated.
+#[derive(Debug, Clone)]
+struct ReadOnlyFileKeyringStore {
+    primary: FileKeyringStore,
+    /// The ambient legacy store is unavailable when `CODEWHALE_HOME` is an
+    /// explicit isolation boundary.
+    legacy: Option<FileKeyringStore>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileSecretsBlob {
     #[serde(default)]
@@ -375,18 +398,43 @@ impl FileKeyringStore {
     /// `CODEWHALE_HOME`, then `HOME`, `USERPROFILE`, and finally the platform
     /// home directory from the `dirs` crate. On first use, non-conflicting
     /// entries from the legacy `<home>/.deepseek/secrets/secrets.json` file are
-    /// copied into the CodeWhale store.
+    /// copied into the CodeWhale store — unless `CODEWHALE_HOME` is explicit,
+    /// in which case ambient `$HOME/.deepseek` credentials are never imported.
     pub fn default_path() -> Result<PathBuf, SecretsError> {
         let primary = default_codewhale_secrets_path()?;
-        let legacy = legacy_deepseek_secrets_path()?;
-        if let Err(err) = Self::migrate_legacy_file_if_needed(&primary, &legacy) {
-            tracing::warn!(
-                "could not migrate legacy secret store from {} to {}: {err}",
-                legacy.display(),
-                primary.display()
-            );
+        // Match the diagnostic isolation boundary: an explicit Codewhale home
+        // must not silently pull ambient legacy DeepSeek credentials.
+        if !codewhale_home_is_explicit() {
+            match legacy_deepseek_secrets_path() {
+                Ok(legacy) => {
+                    if let Err(err) = Self::migrate_legacy_file_if_needed(&primary, &legacy) {
+                        tracing::warn!(
+                            "could not migrate legacy secret store from {} to {}: {err}",
+                            legacy.display(),
+                            primary.display()
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("could not resolve legacy secret store path: {err}");
+                }
+            }
         }
         Ok(primary)
+    }
+
+    /// Resolve the primary and legacy secret paths without performing legacy
+    /// migration.
+    ///
+    /// This is intended for diagnostic-only lookup. Runtime and authentication
+    /// flows must keep using [`Self::default_path`] so their existing additive
+    /// migration behavior remains unchanged.
+    pub fn default_paths_read_only() -> Result<(PathBuf, Option<PathBuf>), SecretsError> {
+        let primary = default_codewhale_secrets_path()?;
+        let legacy = (!codewhale_home_is_explicit())
+            .then(legacy_deepseek_secrets_path)
+            .transpose()?;
+        Ok((primary, legacy))
     }
 
     fn migrate_legacy_file_if_needed(primary: &Path, legacy: &Path) -> Result<(), SecretsError> {
@@ -415,24 +463,6 @@ impl FileKeyringStore {
             primary_store.store_unlocked(&primary_blob)?;
         }
         Ok(())
-    }
-
-    fn home_dir() -> Result<PathBuf, SecretsError> {
-        for var in ["HOME", "USERPROFILE"] {
-            if let Ok(value) = std::env::var(var) {
-                let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    return Ok(PathBuf::from(trimmed));
-                }
-            }
-        }
-
-        dirs::home_dir().ok_or_else(|| {
-            SecretsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "could not resolve home directory for FileKeyringStore",
-            ))
-        })
     }
 
     /// Path used for storage.
@@ -500,6 +530,73 @@ impl FileKeyringStore {
     }
 }
 
+impl ReadOnlyFileKeyringStore {
+    fn default_for_diagnostics() -> Result<Self, SecretsError> {
+        let (primary, legacy) = FileKeyringStore::default_paths_read_only()?;
+        Ok(Self::new(primary, legacy))
+    }
+
+    fn new(primary: impl Into<PathBuf>, legacy: Option<PathBuf>) -> Self {
+        Self {
+            primary: FileKeyringStore::new(primary),
+            legacy: legacy.map(FileKeyringStore::new),
+        }
+    }
+}
+
+impl KeyringStore for ReadOnlyFileKeyringStore {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+        match self.primary.get(key)? {
+            Some(value) => Ok(Some(value)),
+            None => self
+                .legacy
+                .as_ref()
+                .map_or(Ok(None), |legacy| legacy.get(key)),
+        }
+    }
+
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+        Err(SecretsError::ReadOnly)
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+        Err(SecretsError::ReadOnly)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        FILE_BACKEND_LABEL
+    }
+}
+
+#[derive(Clone)]
+struct ReadOnlyKeyringStore {
+    inner: Arc<dyn KeyringStore>,
+}
+
+impl ReadOnlyKeyringStore {
+    fn new(inner: Arc<dyn KeyringStore>) -> Self {
+        Self { inner }
+    }
+}
+
+impl KeyringStore for ReadOnlyKeyringStore {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+        self.inner.get(key)
+    }
+
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+        Err(SecretsError::ReadOnly)
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+        Err(SecretsError::ReadOnly)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+}
+
 fn write_private_file(path: &Path, body: &[u8]) -> Result<(), SecretsError> {
     atomic_write_private_file(path, body)
 }
@@ -560,23 +657,27 @@ impl KeyringStore for FileKeyringStore {
 }
 
 fn default_codewhale_secrets_path() -> Result<PathBuf, SecretsError> {
-    if let Ok(value) = std::env::var("CODEWHALE_HOME") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed).join("secrets").join("secrets.json"));
-        }
-    }
-    Ok(FileKeyringStore::home_dir()?
-        .join(".codewhale")
+    Ok(codewhale_paths::codewhale_home()
+        .map_err(|error| {
+            SecretsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+        })?
+        .ok_or_else(home_resolution_error)?
         .join("secrets")
         .join("secrets.json"))
 }
 
 fn legacy_deepseek_secrets_path() -> Result<PathBuf, SecretsError> {
-    Ok(FileKeyringStore::home_dir()?
-        .join(".deepseek")
+    Ok(codewhale_paths::legacy_deepseek_home()
+        .ok_or_else(home_resolution_error)?
         .join("secrets")
         .join("secrets.json"))
+}
+
+fn home_resolution_error() -> SecretsError {
+    SecretsError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "could not resolve home directory for FileKeyringStore",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,6 +685,137 @@ enum SecretBackendSelection {
     File,
     System,
     Unknown,
+}
+
+/// Secret-store backend selected by configuration for a structural diagnostic.
+///
+/// This type deliberately describes only configuration and filesystem shape.
+/// It never implies that a provider credential exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretBackendDiagnosticKind {
+    /// The JSON file store is selected.
+    File,
+    /// The operating-system credential store is selected.
+    System,
+    /// The configured backend value is unsupported.
+    Unknown,
+}
+
+/// Whether a secret-store path is present according to metadata only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretBackendPresence {
+    /// A regular file exists at the resolved path.
+    Present,
+    /// No filesystem entry exists at the resolved path.
+    Absent,
+    /// Presence is unavailable or the entry is not a regular file.
+    Unknown,
+}
+
+/// Scope of inspection performed for a structural secret-backend diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretBackendInspection {
+    /// Only filesystem metadata was inspected; file contents were not opened.
+    MetadataOnly,
+    /// The backend was not constructed, probed, or read.
+    NotProbed,
+}
+
+/// Secret-safe structural description of the configured credential backend.
+///
+/// File-backed diagnostics expose resolved paths and regular-file presence from
+/// metadata without opening either store. System backends intentionally report
+/// `unknown` / `not_probed`: constructing or probing an OS keyring can show a
+/// user prompt even when no credential value is requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SecretBackendDiagnostic {
+    /// Configured backend family.
+    pub backend: SecretBackendDiagnosticKind,
+    /// Inspection performed to produce this report.
+    pub inspection: SecretBackendInspection,
+    /// Canonical file-store path, when the file backend is selected.
+    pub path: Option<PathBuf>,
+    /// Metadata-only presence of the canonical file-store path.
+    pub presence: SecretBackendPresence,
+    /// Ambient legacy file-store path, suppressed by explicit `CODEWHALE_HOME`.
+    pub legacy_path: Option<PathBuf>,
+    /// Metadata-only presence of the legacy file-store path.
+    pub legacy_presence: SecretBackendPresence,
+}
+
+/// Describe the configured credential backend without probing or reading it.
+///
+/// This function never constructs [`DefaultKeyringStore`], calls
+/// [`KeyringStore::get`], opens a secret file, performs legacy migration, or
+/// creates filesystem state. It is suitable for ordinary status and doctor
+/// commands.
+#[must_use]
+pub fn diagnose_secret_backend() -> SecretBackendDiagnostic {
+    match secret_backend_selection(configured_secret_backend().as_deref()) {
+        SecretBackendSelection::File => {
+            let (path, legacy_path) = FileKeyringStore::default_paths_read_only()
+                .map(|(path, legacy)| (Some(path), legacy))
+                .unwrap_or((None, None));
+            SecretBackendDiagnostic {
+                backend: SecretBackendDiagnosticKind::File,
+                inspection: SecretBackendInspection::MetadataOnly,
+                presence: metadata_presence(path.as_deref()),
+                legacy_presence: metadata_presence(legacy_path.as_deref()),
+                path,
+                legacy_path,
+            }
+        }
+        SecretBackendSelection::System => SecretBackendDiagnostic {
+            backend: SecretBackendDiagnosticKind::System,
+            inspection: SecretBackendInspection::NotProbed,
+            path: None,
+            presence: SecretBackendPresence::Unknown,
+            legacy_path: None,
+            legacy_presence: SecretBackendPresence::Unknown,
+        },
+        SecretBackendSelection::Unknown => SecretBackendDiagnostic {
+            backend: SecretBackendDiagnosticKind::Unknown,
+            inspection: SecretBackendInspection::NotProbed,
+            path: None,
+            presence: SecretBackendPresence::Unknown,
+            legacy_path: None,
+            legacy_presence: SecretBackendPresence::Unknown,
+        },
+    }
+}
+
+fn metadata_presence(path: Option<&Path>) -> SecretBackendPresence {
+    let Some(path) = path else {
+        return SecretBackendPresence::Unknown;
+    };
+    if let Some(parent) = path.parent() {
+        for ancestor in parent.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() =>
+                {
+                    return SecretBackendPresence::Unknown;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return SecretBackendPresence::Absent;
+                }
+                Err(_) => return SecretBackendPresence::Unknown,
+            }
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => SecretBackendPresence::Present,
+        Ok(_) => SecretBackendPresence::Unknown,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SecretBackendPresence::Absent,
+        Err(_) => SecretBackendPresence::Unknown,
+    }
 }
 
 fn secret_backend_selection(value: Option<&str>) -> SecretBackendSelection {
@@ -698,10 +930,105 @@ impl Secrets {
         }
     }
 
+    /// Auto-detect a secret backend for diagnostics without permitting writes
+    /// or legacy migration.
+    ///
+    /// The selected backend and lookup precedence match [`Self::auto_detect`],
+    /// but file-backed lookup reads the Codewhale location first and the legacy
+    /// location second instead of copying legacy entries into a new file. This
+    /// lets status and doctor reports label a saved credential without changing
+    /// user state.
+    #[must_use]
+    pub fn auto_detect_read_only() -> Self {
+        match secret_backend_selection(configured_secret_backend().as_deref()) {
+            SecretBackendSelection::File => Self::file_backed_read_only(),
+            SecretBackendSelection::Unknown => {
+                tracing::warn!(
+                    "{SECRET_BACKEND_ENV}/{LEGACY_SECRET_BACKEND_ENV} has an unsupported value; using file-backed secret store"
+                );
+                Self::file_backed_read_only()
+            }
+            SecretBackendSelection::System => {
+                let default_store = DefaultKeyringStore::default();
+                match default_store.probe() {
+                    Ok(()) => {
+                        Self::new(Arc::new(ReadOnlyKeyringStore::new(Arc::new(default_store))))
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "OS keyring unavailable ({err}); falling back to file-backed secret store"
+                        );
+                        Self::file_backed_read_only()
+                    }
+                }
+            }
+        }
+    }
+
     fn file_backed_default() -> Self {
-        let path = FileKeyringStore::default_path()
-            .unwrap_or_else(|_| PathBuf::from(".codewhale-secrets.json"));
-        Self::new(Arc::new(FileKeyringStore::new(path)))
+        Self::file_backed_from_default_path(FileKeyringStore::default_path())
+    }
+
+    /// Build the writable default store only when the resolved path is safe.
+    ///
+    /// Keeping the resolution result as an argument gives the no-home and
+    /// relative-path branches direct regression coverage. Both must refuse
+    /// writes rather than placing credentials in the caller's workspace.
+    fn file_backed_from_default_path(path_result: Result<PathBuf, SecretsError>) -> Self {
+        // Never fall back to a workspace-relative secrets path. Writing
+        // credential material beside the cwd is readable by tools and easy to
+        // commit. If home resolution fails, use a write-refusing store.
+        match path_result {
+            Ok(path) if path.is_absolute() => Self::new(Arc::new(FileKeyringStore::new(path))),
+            Ok(path) => {
+                tracing::error!(
+                    "refusing relative file-backed secret path {}; credentials will not be read or persisted",
+                    path.display()
+                );
+                Self::read_only_empty_store()
+            }
+            Err(err) => {
+                tracing::error!(
+                    "could not resolve file-backed secret path ({err}); credentials will not be read or persisted"
+                );
+                Self::read_only_empty_store()
+            }
+        }
+    }
+
+    /// An unavailable default path must be hermetic: neither inspect an
+    /// accidental workspace file nor create one.  The read-only wrapper keeps
+    /// the public API's write failure explicit while reads safely report empty.
+    fn read_only_empty_store() -> Self {
+        Self::new(Arc::new(ReadOnlyKeyringStore::new(Arc::new(
+            InMemoryKeyringStore::new(),
+        ))))
+    }
+
+    /// Construct a file-backed diagnostic store without migration or write
+    /// capability.
+    ///
+    /// This reads the Codewhale file first and the legacy file second (unless
+    /// `CODEWHALE_HOME` is explicit), but never copies legacy entries into a
+    /// primary store. It intentionally bypasses an opted-in OS keyring so
+    /// callers that only need non-secret diagnostics do not cause a platform
+    /// credential prompt.
+    #[must_use]
+    pub fn file_backed_read_only() -> Self {
+        // Fail closed like the writable path in `file_backed_from_default_path`:
+        // never fall back to a cwd-relative credential path. A planted
+        // `.codewhale-secrets.json` beside the working directory must not
+        // become the credential store when home resolution fails.
+        match ReadOnlyFileKeyringStore::default_for_diagnostics() {
+            Ok(store) => Self::new(Arc::new(store)),
+            Err(err) => {
+                tracing::error!(
+                    "could not resolve the file-backed secret path ({err}); credentials will not be read. \
+                     Fix: set CODEWHALE_HOME to an absolute path or make HOME/USERPROFILE resolvable"
+                );
+                Self::read_only_empty_store()
+            }
+        }
     }
 
     /// Construct the file-backed default backend directly.
@@ -818,7 +1145,7 @@ impl Secrets {
 /// | `openrouter` | `OPENROUTER_API_KEY` |
 /// | `xiaomi-mimo` / `mimo` | `XIAOMI_MIMO_API_KEY`, `XIAOMI_API_KEY`, `MIMO_API_KEY` |
 /// | `novita` / `novita-ai` | `NOVITA_API_KEY` |
-/// | `nvidia` / `nvidia-nim` / `nim` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY`, `DEEPSEEK_API_KEY` |
+/// | `nvidia` / `nvidia-nim` / `nim` | `NVIDIA_API_KEY`, `NVIDIA_NIM_API_KEY` |
 /// | `fireworks` / `fireworks-ai` | `FIREWORKS_API_KEY` |
 /// | `together` / `togetherai` | `TOGETHER_API_KEY` |
 /// | `deepinfra` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` |
@@ -828,12 +1155,15 @@ impl Secrets {
 /// | `sglang` | `SGLANG_API_KEY` |
 /// | `vllm` | `VLLM_API_KEY` |
 /// | `ollama` | `OLLAMA_API_KEY` |
+/// | `ollama-cloud` | `OLLAMA_CLOUD_API_KEY`, `OLLAMA_API_KEY` |
 /// | `openai` | `OPENAI_API_KEY` |
 /// | `atlascloud` / `atlas` | `ATLASCLOUD_API_KEY` |
 /// | `volcengine` / `ark` | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` |
 /// | `wanjie` / `wanjie-ark` | `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, `WANJIE_MAAS_API_KEY` |
 /// | `meta` / `muse-spark` | `META_MODEL_API_KEY`, `MODEL_API_KEY` |
 /// | `xai` / `grok` | `XAI_API_KEY` |
+/// | `telecomjs` / `tokenhub` | `TELECOMJS_API_KEY` |
+/// | `edenai` / `eden-ai` | `EDENAI_API_KEY` |
 ///
 /// Returns `None` if the provider is not recognised or none of its
 /// candidate environment variables are set to a non-empty value.
@@ -848,12 +1178,7 @@ pub fn env_for(name: &str) -> Option<String> {
         "novita" | "novita-ai" | "novita_ai" => &["NOVITA_API_KEY"],
         "together" | "together-ai" | "together_ai" | "togetherai" => &["TOGETHER_API_KEY"],
         "deepinfra" | "deep-infra" | "deep_infra" => &["DEEPINFRA_API_KEY", "DEEPINFRA_TOKEN"],
-        // NVIDIA NIM falls back to `DEEPSEEK_API_KEY` last because the
-        // catalog endpoint accepts the same DeepSeek-issued key when no
-        // dedicated NVIDIA token is set. This mirrors pre-v0.7 behaviour.
-        "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => {
-            &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY", "DEEPSEEK_API_KEY"]
-        }
+        "nvidia" | "nvidia-nim" | "nvidia_nim" | "nim" => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
         "fireworks" | "fireworks-ai" => &["FIREWORKS_API_KEY"],
         "siliconflow" | "silicon-flow" | "silicon_flow" | "siliconflow-cn" | "siliconflow_cn"
         | "silicon-flow-cn" | "silicon_flow_cn" | "siliconflow-china" => &["SILICONFLOW_API_KEY"],
@@ -862,6 +1187,7 @@ pub fn env_for(name: &str) -> Option<String> {
         "sglang" | "sg-lang" => &["SGLANG_API_KEY"],
         "vllm" | "v-llm" => &["VLLM_API_KEY"],
         "ollama" | "ollama-local" => &["OLLAMA_API_KEY"],
+        "ollama-cloud" | "ollama_cloud" => &["OLLAMA_CLOUD_API_KEY", "OLLAMA_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
         "anthropic" | "claude" => &["ANTHROPIC_API_KEY"],
         "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => &["ATLASCLOUD_API_KEY"],
@@ -879,9 +1205,31 @@ pub fn env_for(name: &str) -> Option<String> {
         ],
         "sakana" | "sakana-ai" | "sakana_ai" | "fugu" => &["FUGU_API_KEY", "SAKANA_API_KEY"],
         "longcat" | "long-cat" | "meituan-longcat" | "meituan" => &["LONGCAT_API_KEY"],
+        "opencode-go" | "opencode_go" | "opencodego" => &["OPENCODE_GO_API_KEY"],
+        "opencode-zen" | "opencode_zen" | "opencodezen" | "zen" | "opencode" => {
+            &["OPENCODE_ZEN_API_KEY", "OPENCODE_API_KEY"]
+        }
         "meta" | "meta-ai" | "meta_ai" | "meta-model-api" | "meta_model_api" | "muse"
         | "muse-spark" => &["META_MODEL_API_KEY", "MODEL_API_KEY"],
         "xai" | "x-ai" | "x_ai" | "grok" => &["XAI_API_KEY"],
+        "telecomjs" | "telecom-js" | "telecom_js" | "telecomjs-cn" | "tokenhub" => {
+            &["TELECOMJS_API_KEY"]
+        }
+        "edenai" | "eden-ai" | "eden_ai" => &["EDENAI_API_KEY"],
+        // One Alibaba Cloud Model Studio account authenticates every plan /
+        // dialect variant; all four names share one env convention.
+        "modelstudio-token-plan"
+        | "modelstudio_token_plan"
+        | "modelstudio-token-plan-anthropic"
+        | "modelstudio_token_plan_anthropic"
+        | "modelstudio-coding-plan"
+        | "modelstudio_coding_plan"
+        | "modelstudio-coding-plan-anthropic"
+        | "modelstudio_coding_plan_anthropic"
+        | "modelstudio"
+        | "dashscope"
+        | "alibaba-token-plan"
+        | "alibaba-coding-plan" => &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"],
         _ => return None,
     };
     for var in candidates {
@@ -901,7 +1249,7 @@ mod tests {
 
     /// Serialise env-mutating tests: tests in this module poke
     /// `DEEPSEEK_API_KEY` etc., which is process-global.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -925,6 +1273,7 @@ mod tests {
             "SGLANG_API_KEY",
             "VLLM_API_KEY",
             "OLLAMA_API_KEY",
+            "OLLAMA_CLOUD_API_KEY",
             "OPENAI_API_KEY",
             "ATLASCLOUD_API_KEY",
             "WANJIE_ARK_API_KEY",
@@ -936,9 +1285,16 @@ mod tests {
             "FUGU_API_KEY",
             "SAKANA_API_KEY",
             "LONGCAT_API_KEY",
+            "OPENCODE_GO_API_KEY",
+            "OPENCODE_ZEN_API_KEY",
+            "OPENCODE_API_KEY",
             "META_MODEL_API_KEY",
             "MODEL_API_KEY",
             "XAI_API_KEY",
+            "TELECOMJS_API_KEY",
+            "EDENAI_API_KEY",
+            "MODELSTUDIO_API_KEY",
+            "DASHSCOPE_API_KEY",
             SECRET_BACKEND_ENV,
             LEGACY_SECRET_BACKEND_ENV,
         ] {
@@ -968,6 +1324,20 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.name) },
             }
         }
+    }
+
+    /// Live check for #5172: on macOS/Windows the probe used to return Ok
+    /// without touching the backend at all. Run explicitly with
+    /// `cargo test -p codewhale-secrets -- --ignored` on a desktop machine:
+    /// a healthy native keyring answers a read of the deliberately absent
+    /// `__probe__` entry with NoEntry, silently, and the probe succeeds.
+    #[test]
+    #[ignore = "touches the real OS keyring; run on a desktop machine"]
+    fn probe_performs_a_real_backend_read() {
+        let store = DefaultKeyringStore::new("codewhale-probe-live-check");
+        store
+            .probe()
+            .expect("the native keyring backend should be reachable on this machine");
     }
 
     #[test]
@@ -1027,6 +1397,170 @@ mod tests {
         assert_eq!(secrets.backend_name(), FILE_BACKEND_LABEL);
         // Safety: env mutation guarded by env_lock().
         unsafe { std::env::remove_var(SECRET_BACKEND_ENV) };
+    }
+
+    #[test]
+    fn read_only_auto_detect_reads_legacy_without_migrating_or_allowing_writes() {
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _backend = EnvVarGuard::set(SECRET_BACKEND_ENV, "file");
+        let legacy = tmp
+            .path()
+            .join(".deepseek")
+            .join("secrets")
+            .join("secrets.json");
+        let primary = tmp
+            .path()
+            .join(".codewhale")
+            .join("secrets")
+            .join("secrets.json");
+        FileKeyringStore::new(&legacy)
+            .set("moonshot", "fixture-legacy-value")
+            .unwrap();
+
+        let secrets = Secrets::auto_detect_read_only();
+
+        assert_eq!(
+            secrets.get("moonshot").unwrap().as_deref(),
+            Some("fixture-legacy-value")
+        );
+        assert!(
+            !primary.exists(),
+            "diagnostic lookup must not migrate the legacy store"
+        );
+        assert!(
+            matches!(
+                secrets.set("moonshot", "replacement"),
+                Err(SecretsError::ReadOnly)
+            ),
+            "the diagnostic secret facade must refuse writes"
+        );
+        assert!(
+            !primary.exists(),
+            "a refused diagnostic write must not create the primary store"
+        );
+    }
+
+    #[test]
+    fn read_only_auto_detect_respects_explicit_codewhale_home_isolation() {
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        let codewhale_home = tmp.path().join("isolated-codewhale-home");
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _backend = EnvVarGuard::set(SECRET_BACKEND_ENV, "file");
+        let legacy = tmp
+            .path()
+            .join(".deepseek")
+            .join("secrets")
+            .join("secrets.json");
+        let primary = codewhale_home.join("secrets").join("secrets.json");
+        FileKeyringStore::new(&legacy)
+            .set("deepseek", "synthetic-ambient-legacy-value")
+            .unwrap();
+
+        let secrets = Secrets::auto_detect_read_only();
+
+        assert_eq!(
+            secrets.get("deepseek").unwrap(),
+            None,
+            "an explicit CODEWHALE_HOME must not read ambient legacy secrets"
+        );
+        assert!(
+            !primary.exists(),
+            "diagnostic lookup must not create an isolated primary store"
+        );
+        assert!(
+            matches!(
+                secrets.set("deepseek", "replacement"),
+                Err(SecretsError::ReadOnly)
+            ),
+            "the isolated diagnostic facade must refuse writes"
+        );
+        assert!(
+            !primary.exists(),
+            "a refused isolated diagnostic write must not create the primary store"
+        );
+    }
+
+    /// Cwd is process-global, so tests that move it serialise on `env_lock`
+    /// like the env-mutating tests and restore on drop.
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).unwrap();
+        }
+    }
+
+    #[test]
+    fn file_backed_read_only_never_reads_a_cwd_relative_store() {
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        // A relative override fails home resolution deterministically, which
+        // used to fall back to a planted `.codewhale-secrets.json` in the cwd.
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", "relative-codewhale-home");
+        let planted = tmp.path().join(".codewhale-secrets.json");
+        std::fs::write(
+            &planted,
+            r#"{"entries":{"deepseek":"planted-cwd-credential"}}"#,
+        )
+        .unwrap();
+        let _cwd = CwdGuard::enter(tmp.path());
+
+        let secrets = Secrets::file_backed_read_only();
+
+        assert_eq!(
+            secrets.get("deepseek").unwrap(),
+            None,
+            "a failed home resolution must not turn a planted cwd file into the credential store"
+        );
+        assert!(
+            matches!(
+                secrets.set("deepseek", "replacement"),
+                Err(SecretsError::ReadOnly)
+            ),
+            "the failed-resolution diagnostic facade must still refuse writes"
+        );
+    }
+
+    #[test]
+    fn read_only_auto_detect_reads_the_explicit_primary_store() {
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        let codewhale_home = tmp.path().join("isolated-codewhale-home");
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _backend = EnvVarGuard::set(SECRET_BACKEND_ENV, "file");
+        let primary = codewhale_home.join("secrets").join("secrets.json");
+        FileKeyringStore::new(&primary)
+            .set("deepseek", "synthetic-isolated-primary-value")
+            .unwrap();
+
+        let secrets = Secrets::auto_detect_read_only();
+
+        assert_eq!(
+            secrets.get("deepseek").unwrap().as_deref(),
+            Some("synthetic-isolated-primary-value")
+        );
     }
 
     #[test]
@@ -1230,12 +1764,48 @@ mod tests {
         let _lock = env_lock();
         clear_known_envs();
         // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::set_var("NVIDIA_NIM_API_KEY", "nim-key") };
+        unsafe {
+            std::env::set_var("NVIDIA_API_KEY", "nvidia-key");
+            std::env::set_var("NVIDIA_NIM_API_KEY", "nim-key");
+        }
         let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
-        assert_eq!(secrets.resolve("nvidia-nim").as_deref(), Some("nim-key"));
-        assert_eq!(secrets.resolve("nvidia").as_deref(), Some("nim-key"));
+        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
+            assert_eq!(
+                secrets.resolve(alias).as_deref(),
+                Some("nvidia-key"),
+                "NVIDIA_API_KEY should take precedence for {alias}"
+            );
+        }
+
         // Safety: env mutation guarded by env_lock().
-        unsafe { std::env::remove_var("NVIDIA_NIM_API_KEY") };
+        unsafe { std::env::remove_var("NVIDIA_API_KEY") };
+        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
+            assert_eq!(
+                secrets.resolve(alias).as_deref(),
+                Some("nim-key"),
+                "NVIDIA_NIM_API_KEY should resolve for {alias}"
+            );
+        }
+        clear_known_envs();
+    }
+
+    #[test]
+    fn nvidia_env_aliases_do_not_consume_deepseek_credentials() {
+        let _lock = env_lock();
+        clear_known_envs();
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "deepseek-key") };
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        for alias in ["nvidia", "nvidia-nim", "nvidia_nim", "nim"] {
+            assert_eq!(
+                secrets.resolve(alias),
+                None,
+                "DeepSeek credentials must stay isolated from {alias}"
+            );
+        }
+        assert_eq!(secrets.resolve("deepseek").as_deref(), Some("deepseek-key"));
+        clear_known_envs();
     }
 
     #[test]
@@ -1292,6 +1862,100 @@ mod tests {
         assert_eq!(env_for("x-ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("x_ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("grok").as_deref(), Some("xai-key"));
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn telecomjs_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("TELECOMJS_API_KEY", "telecom-key") };
+
+        for alias in [
+            "telecomjs",
+            "telecom-js",
+            "telecom_js",
+            "telecomjs-cn",
+            "tokenhub",
+        ] {
+            assert_eq!(env_for(alias).as_deref(), Some("telecom-key"), "{alias}");
+        }
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn edenai_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("EDENAI_API_KEY", "eden-key") };
+
+        for alias in ["edenai", "eden-ai", "eden_ai"] {
+            assert_eq!(env_for(alias).as_deref(), Some("eden-key"), "{alias}");
+        }
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn opencode_go_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("OPENCODE_GO_API_KEY", "go-key") };
+
+        for alias in ["opencode-go", "opencode_go", "opencodego"] {
+            assert_eq!(env_for(alias).as_deref(), Some("go-key"), "{alias}");
+        }
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn modelstudio_variants_share_one_env_convention() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("MODELSTUDIO_API_KEY", "ms-key") };
+
+        for alias in [
+            "modelstudio-token-plan",
+            "modelstudio-token-plan-anthropic",
+            "modelstudio-coding-plan",
+            "modelstudio-coding-plan-anthropic",
+            "modelstudio",
+            "dashscope",
+            "alibaba-token-plan",
+            "alibaba-coding-plan",
+        ] {
+            assert_eq!(env_for(alias).as_deref(), Some("ms-key"), "{alias}");
+        }
+
+        clear_known_envs();
+        unsafe { std::env::set_var("DASHSCOPE_API_KEY", "dashscope-key") };
+        assert_eq!(
+            env_for("modelstudio-token-plan").as_deref(),
+            Some("dashscope-key"),
+            "DASHSCOPE_API_KEY is the fallback for the same account"
+        );
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn opencode_zen_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("OPENCODE_ZEN_API_KEY", "zen-key") };
+
+        for alias in [
+            "opencode-zen",
+            "opencode_zen",
+            "opencodezen",
+            "zen",
+            "opencode",
+        ] {
+            assert_eq!(env_for(alias).as_deref(), Some("zen-key"), "{alias}");
+        }
 
         clear_known_envs();
     }
@@ -1489,6 +2153,37 @@ mod tests {
         unsafe { std::env::remove_var("OLLAMA_API_KEY") };
     }
 
+    #[test]
+    fn ollama_cloud_env_prefers_pi_name_then_official_name() {
+        let _lock = env_lock();
+        clear_known_envs();
+        // Safety: env mutation guarded by env_lock().
+        unsafe {
+            std::env::set_var("OLLAMA_CLOUD_API_KEY", "cloud-specific-key");
+            std::env::set_var("OLLAMA_API_KEY", "official-fallback-key");
+        }
+
+        assert_eq!(
+            env_for("ollama-cloud").as_deref(),
+            Some("cloud-specific-key")
+        );
+        assert_eq!(
+            env_for("ollama_cloud").as_deref(),
+            Some("cloud-specific-key")
+        );
+        // The local identity stays on its original, keyless-provider env
+        // contract and never consumes the cloud-specific compatibility name.
+        assert_eq!(env_for("ollama").as_deref(), Some("official-fallback-key"));
+
+        // Safety: env mutation guarded by env_lock().
+        unsafe { std::env::remove_var("OLLAMA_CLOUD_API_KEY") };
+        assert_eq!(
+            env_for("ollama-cloud").as_deref(),
+            Some("official-fallback-key")
+        );
+        clear_known_envs();
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_store_round_trips_with_secure_perms() {
@@ -1644,4 +2339,75 @@ mod tests {
                 .join("secrets.json")
         );
     }
+
+    #[test]
+    fn default_path_with_explicit_codewhale_home_does_not_migrate_ambient_legacy() {
+        // FR003-C001: explicit CODEWHALE_HOME must not silently import ambient
+        // `$HOME/.deepseek/secrets` credentials into the isolated home.
+        let _lock = env_lock();
+        clear_known_envs();
+        let tmp = tempfile::tempdir().unwrap();
+        let codewhale_home = tmp.path().join("isolated-codewhale-home");
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let legacy = tmp
+            .path()
+            .join(".deepseek")
+            .join("secrets")
+            .join("secrets.json");
+        FileKeyringStore::new(&legacy)
+            .set("deepseek", "synthetic-ambient-legacy-value")
+            .unwrap();
+
+        let path = FileKeyringStore::default_path().unwrap();
+        assert_eq!(path, codewhale_home.join("secrets").join("secrets.json"));
+        assert!(
+            !path.exists(),
+            "explicit CODEWHALE_HOME must not create/migrate a primary store from ambient legacy"
+        );
+
+        let secrets = Secrets::auto_detect();
+        assert_eq!(
+            secrets.get("deepseek").unwrap(),
+            None,
+            "explicit CODEWHALE_HOME must not surface ambient legacy credentials"
+        );
+    }
+
+    #[test]
+    fn file_backed_default_refuses_relative_secret_path() {
+        // FR003-C002: a relative fallback would resolve against the workspace
+        // and risk committing credentials. It must be write-refusing instead.
+        let secrets =
+            Secrets::file_backed_from_default_path(Ok(PathBuf::from(".codewhale-secrets.json")));
+        assert!(matches!(
+            secrets.set("deepseek", "must-not-land-relative"),
+            Err(SecretsError::ReadOnly)
+        ));
+        assert_eq!(
+            secrets.get("deepseek").unwrap(),
+            None,
+            "unsafe relative fallback must not read a workspace secret file"
+        );
+    }
+
+    #[test]
+    fn file_backed_default_refuses_writes_when_home_resolution_fails() {
+        // Force the exact fallback branch instead of relying on the shared
+        // platform-home resolver, which normally succeeds with HOME unset.
+        let err = SecretsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "synthetic unresolved home",
+        ));
+        let secrets = Secrets::file_backed_from_default_path(Err(err));
+        assert!(matches!(
+            secrets.set("deepseek", "must-not-persist"),
+            Err(SecretsError::ReadOnly)
+        ));
+        assert_eq!(secrets.get("deepseek").unwrap(), None);
+    }
+
+    #[path = "diagnostic_tests.rs"]
+    mod diagnostic_tests;
 }

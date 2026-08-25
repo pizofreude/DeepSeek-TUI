@@ -9,11 +9,14 @@ pub(crate) const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_DEEPSEEK_ANTHROPIC_MODEL: &str = DEFAULT_DEEPSEEK_MODEL;
 pub(crate) const DEFAULT_NVIDIA_NIM_MODEL: &str = "deepseek-ai/deepseek-v4-pro";
 pub(crate) const DEFAULT_NVIDIA_NIM_FLASH_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
-pub(crate) const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-pro";
+// A DeepSeek id here guaranteed a 404 against the default OpenAI endpoint:
+// unlike the hosted-aggregator rows below, api.openai.com serves no DeepSeek
+// models. Default to OpenAI's own flagship instead (#5588).
+pub(crate) const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6";
 pub(crate) const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/beta";
 pub(crate) const DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL: &str = "https://api.deepseek.com/anthropic";
 pub(crate) const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
-pub(crate) const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
+pub(crate) const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.6";
 pub(crate) const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub(crate) const DEFAULT_OPENMODEL_MODEL: &str = "deepseek-v4-flash";
@@ -29,12 +32,23 @@ pub(crate) const DEFAULT_VOLCENGINE_BASE_URL: &str =
     "https://ark.cn-beijing.volces.com/api/coding/v3";
 pub(crate) const DEFAULT_OPENROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub(crate) const DEFAULT_OPENROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
+pub(crate) const DEFAULT_ORCAROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
+pub(crate) const DEFAULT_ORCAROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
+/// OrcaRouter's own auto-routing model: picks the best upstream model per
+/// request. Resolved from the bare `auto` alias on the OrcaRouter provider.
+pub(crate) const ORCAROUTER_AUTO_MODEL: &str = "orcarouter/auto";
 pub(crate) const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str =
     "arcee-ai/trinity-large-thinking";
 pub(crate) const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 pub(crate) const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 pub(crate) const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
 pub(crate) const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
+// GLM-5.3 is live on the Z.ai Coding Plan (2026-08-13). Capability/limit
+// metadata still inherits from glm-5.2 until Z.ai publishes distinct 5.3
+// numbers. No USD price. The OpenRouter id is registered so the alias
+// resolves to OpenRouter rather than another vendor. See
+// models_dev.bundled.json `_meta.pending_release_metadata`.
+pub(crate) const OPENROUTER_GLM_5_3_MODEL: &str = "z-ai/glm-5.3";
 pub(crate) const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 pub(crate) const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
 pub(crate) const OPENROUTER_MINIMAX_M3_MODEL: &str = "minimax/minimax-m3";
@@ -46,6 +60,7 @@ pub(crate) const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b
 pub(crate) const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
 pub(crate) const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
 pub(crate) const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
+pub(crate) const OPENROUTER_QWEN_3_7_PLUS_MODEL: &str = "qwen/qwen3.7-plus";
 pub(crate) const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
 pub(crate) const OPENROUTER_TENCENT_HY3_PREVIEW_MODEL: &str = "tencent/hy3-preview";
 pub(crate) const OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL: &str = "xiaomi/mimo-v2.5-pro";
@@ -74,6 +89,7 @@ pub(crate) const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding
 pub(crate) const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub(crate) const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub(crate) const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub(crate) const DEFAULT_ORCAROUTER_BASE_URL: &str = "https://api.orcarouter.ai/v1";
 pub(crate) const XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 pub(crate) const DEFAULT_XIAOMI_MIMO_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
 pub(crate) const XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL: &str =
@@ -100,15 +116,19 @@ pub(crate) const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash
 pub(crate) const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
 pub(crate) const DEFAULT_OLLAMA_MODEL: &str = "deepseek-v4-flash";
 pub(crate) const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+pub(crate) const DEFAULT_OLLAMA_CLOUD_MODEL: &str = "gpt-oss:120b";
+pub(crate) const DEFAULT_OLLAMA_CLOUD_BASE_URL: &str = "https://ollama.com/v1";
 
-// Z.ai (GLM Coding Plan) defaults
-pub(crate) const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
-pub(crate) const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
-// GLM-5.2 is both the default and a named tier; the alias arm resolves the
-// `glm-5.2` spelling to DEFAULT_ZAI_MODEL directly, so this constant is
-// referenced only in cfg(test) assertions (see tests.rs).
-#[allow(dead_code)]
+// Z.ai (GLM Coding Plan) defaults. GLM-5.3 is live on the Z.ai Coding Plan
+// (2026-08-13) and is the default for new Z.ai routes. Capability/limit
+// metadata still inherits from glm-5.2 until Z.ai publishes distinct 5.3
+// numbers; no USD price is claimed. See models_dev.bundled.json
+// `_meta.pending_release_metadata`. Explicit GLM-5.2 selections keep their
+// own id: only the default moved.
+pub(crate) const DEFAULT_ZAI_MODEL: &str = ZAI_GLM_5_3_MODEL;
+pub(crate) const ZAI_GLM_5_3_MODEL: &str = "GLM-5.3";
 pub(crate) const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+pub(crate) const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
 pub(crate) const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
 pub(crate) const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 // StepFun / StepFlash defaults
@@ -134,9 +154,62 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
+// OpenCode Go Chat Completions defaults. The Go catalog also contains models
+// served only through Anthropic Messages; those are deliberately not listed by
+// this provider until Codewhale can route wire formats per model.
+pub(crate) const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
+pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+pub(crate) const OPENCODE_GO_GROK_4_5_MODEL: &str = "grok-4.5";
+pub(crate) const OPENCODE_GO_GLM_5_2_MODEL: &str = "glm-5.2";
+pub(crate) const OPENCODE_GO_GLM_5_1_MODEL: &str = "glm-5.1";
+pub(crate) const OPENCODE_GO_KIMI_K3_MODEL: &str = "kimi-k3";
+pub(crate) const OPENCODE_GO_KIMI_K2_7_CODE_MODEL: &str = "kimi-k2.7-code";
+pub(crate) const OPENCODE_GO_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
+pub(crate) const OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
+pub(crate) const OPENCODE_GO_MIMO_V2_5_MODEL: &str = "mimo-v2.5";
+pub(crate) const OPENCODE_GO_MIMO_V2_5_PRO_MODEL: &str = "mimo-v2.5-pro";
+
+// OpenCode Zen is a model-aware gateway. The default is a documented
+// Responses model, but every executable route must still obtain its protocol
+// from a provider-scoped catalog offering.
+pub(crate) const DEFAULT_OPENCODE_ZEN_MODEL: &str = "gpt-5.6";
+pub(crate) const DEFAULT_OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
 // Meta Model API / Muse Spark defaults
-pub(crate) const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
+pub(crate) const DEFAULT_META_MODEL: &str = "muse-spark-1.2";
 pub(crate) const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
 // xAI / Grok API-key route defaults
-pub(crate) const DEFAULT_XAI_MODEL: &str = "grok-4.5";
+pub(crate) const DEFAULT_XAI_MODEL: &str = "grok-4.6";
 pub(crate) const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+// Mistral AI (la Plateforme) defaults
+pub(crate) const DEFAULT_MISTRAL_MODEL: &str = "mistral-code-latest";
+pub(crate) const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
+// TelecomJS (Jiangsu Telecom TokenHub) defaults
+pub(crate) const DEFAULT_TELECOMJS_MODEL: &str = "deepseek-v4-pro";
+pub(crate) const DEFAULT_TELECOMJS_BASE_URL: &str = "https://aigw.telecomjs.com/v1";
+// Eden AI (OpenAI-compatible AI gateway) defaults
+pub(crate) const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
+pub(crate) const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
+// Alibaba Cloud Model Studio (DashScope) defaults
+// Token Plan (Personal / Team): shared endpoint, OpenAI + Anthropic dialects
+pub(crate) const DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL: &str = "qwen3.8-max";
+pub(crate) const DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+pub(crate) const MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+// Coding Plan: separate endpoint, OpenAI + Anthropic dialects
+pub(crate) const DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL: &str =
+    "https://coding-intl.dashscope.aliyuncs.com/v1";
+pub(crate) const MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL: &str =
+    "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic";
+
+/// Google Gemini OpenAI-compatible Chat Completions base URL.
+pub const DEFAULT_GOOGLE_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/";
+/// Default Gemini model for the Google provider (preview flagship, 2026-08).
+pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-3.1-pro-preview";
+
+/// Antigravity cloud-code internal endpoint (credential plane only; the
+/// wire protocol is not implemented and sends fail closed).
+pub const DEFAULT_ANTIGRAVITY_BASE_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+/// Placeholder model id; never sent — the route fails closed before transport.
+pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3-pro-preview";

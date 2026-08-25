@@ -10,8 +10,9 @@
 //!
 //! - Law can only ADD holds. There is no allow/widen shape in the schema, so
 //!   a crafted constitution cannot grant authority.
-//! - `ask` force-prompts in every mode, including YOLO — like the built-in
-//!   safety floor, law is not bypassable by mode. `block` denies outright.
+//! - `ask` force-prompts only in Ask posture. Auto-Review, Full Access, and
+//!   Never never open tool-approval prompts, so the same law fails closed
+//!   there. `block` denies outright in every posture.
 //! - Any failure (missing file, parse error, bad glob) degrades to fewer or
 //!   zero rules — never a poisoned gate, never a hold on unprotected paths.
 //! - Only the repo-local constitution participates. The user-global
@@ -22,17 +23,17 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::project_context::{RepoLawAction, RepoLawRule, load_repo_law_rules};
+use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 
-/// Tools whose inputs name filesystem write targets we can hold. Any
-/// write-capable tool MUST be listed here — the gate fails open for tools it
-/// does not recognize, so a new write tool without an entry silently evades
-/// repo law. `fim_edit` was such a hole (it declares WritesFiles, takes a
-/// `path`, and `fs::write`s to it) until it was added here.
-const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "apply_patch", "fim_edit"];
+/// Semantic write actions whose inputs name filesystem targets we can hold.
+/// Canonical action families are resolved to this policy vocabulary before the
+/// check, so removing callable compatibility aliases cannot open a law bypass.
+const WRITE_POLICY_ACTIONS: &[&str] = &["write_file", "edit_file", "apply_patch", "fim_edit"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepoLawPlanDecision {
-    /// Force an approval prompt naming the law, in every mode.
+    /// Request a policy-forced approval naming the law. The engine converts
+    /// this to a hard block in non-interactive Full Access.
     ForcePrompt(String),
     /// Deny the call outright, naming the law.
     Block(String),
@@ -46,7 +47,9 @@ pub(crate) fn repo_law_plan_decision(
     tool_name: &str,
     tool_input: &Value,
 ) -> Option<RepoLawPlanDecision> {
-    if !WRITE_TOOLS.contains(&tool_name) {
+    let policy_action =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    if !WRITE_POLICY_ACTIONS.contains(&policy_action) {
         return None;
     }
     let targets = write_target_paths(workspace, tool_input);
@@ -86,7 +89,8 @@ pub(crate) fn repo_law_plan_decision(
 }
 
 /// Extract workspace-relative write targets from a tool input. Covers the
-/// `path`/`target`/`destination`/`file_path` params, `changes[].path`, and
+/// `path`/`target`/`destination`/`file_path` params, canonical
+/// `replace[].path`, legacy `changes[].path`, and
 /// every unified-diff / codex-envelope header shape the patch tools accept —
 /// old (`--- `) and new (`+++ `) paths, with or without an `a/`/`b/` prefix,
 /// tab-timestamp suffixes stripped, and `/dev/null` (deletion) falling back
@@ -99,41 +103,44 @@ fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
             push_normalized(&mut targets, workspace, path);
         }
     }
-    if let Some(changes) = input.get("changes").and_then(Value::as_array) {
-        for change in changes {
-            if let Some(path) = change.get("path").and_then(Value::as_str) {
-                push_normalized(&mut targets, workspace, path);
+    match normalize_apply_patch_input(input) {
+        Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
+            for change in entries {
+                if let Some(path) = change.get("path").and_then(Value::as_str) {
+                    push_normalized(&mut targets, workspace, path);
+                }
             }
         }
-    }
-    if let Some(patch) = input.get("patch").and_then(Value::as_str) {
-        let mut pending_old: Option<String> = None;
-        for line in patch.lines() {
-            if let Some(rest) = line.strip_prefix("*** Update File: ") {
-                push_normalized(&mut targets, workspace, rest.trim());
-            } else if let Some(rest) = line.strip_prefix("*** Add File: ") {
-                push_normalized(&mut targets, workspace, rest.trim());
-            } else if let Some(rest) = line.strip_prefix("*** Delete File: ") {
-                push_normalized(&mut targets, workspace, rest.trim());
-            } else if let Some(rest) = line.strip_prefix("--- ") {
-                // Old path: remember it so a `+++ /dev/null` deletion still
-                // holds the file being removed.
-                pending_old = diff_header_path(rest);
-                if let Some(ref p) = pending_old {
-                    push_normalized(&mut targets, workspace, p);
-                }
-            } else if let Some(rest) = line.strip_prefix("+++ ") {
-                match diff_header_path(rest) {
-                    Some(new_path) => push_normalized(&mut targets, workspace, &new_path),
-                    // `+++ /dev/null` → deletion; the target is the old path.
-                    None => {
-                        if let Some(old) = pending_old.take() {
-                            push_normalized(&mut targets, workspace, &old);
+        Ok(NormalizedApplyPatchInput::Patch(patch)) => {
+            let mut pending_old: Option<String> = None;
+            for line in patch.lines() {
+                if let Some(rest) = line.strip_prefix("*** Update File: ") {
+                    push_normalized(&mut targets, workspace, rest.trim());
+                } else if let Some(rest) = line.strip_prefix("*** Add File: ") {
+                    push_normalized(&mut targets, workspace, rest.trim());
+                } else if let Some(rest) = line.strip_prefix("*** Delete File: ") {
+                    push_normalized(&mut targets, workspace, rest.trim());
+                } else if let Some(rest) = line.strip_prefix("--- ") {
+                    // Old path: remember it so a `+++ /dev/null` deletion still
+                    // holds the file being removed.
+                    pending_old = diff_header_path(rest);
+                    if let Some(ref p) = pending_old {
+                        push_normalized(&mut targets, workspace, p);
+                    }
+                } else if let Some(rest) = line.strip_prefix("+++ ") {
+                    match diff_header_path(rest) {
+                        Some(new_path) => push_normalized(&mut targets, workspace, &new_path),
+                        // `+++ /dev/null` → deletion; the target is the old path.
+                        None => {
+                            if let Some(old) = pending_old.take() {
+                                push_normalized(&mut targets, workspace, &old);
+                            }
                         }
                     }
                 }
             }
         }
+        Err(_) => {}
     }
     targets.sort();
     targets.dedup();
@@ -269,6 +276,35 @@ mod tests {
     }
 
     #[test]
+    fn canonical_file_write_and_edit_actions_receive_the_same_holds() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+
+        let blocked = repo_law_plan_decision(
+            tmp.path(),
+            "File",
+            &json!({
+                "action": "write",
+                "path": "crates/protocol/wire.rs",
+                "content": "x"
+            }),
+        );
+        assert!(matches!(blocked, Some(RepoLawPlanDecision::Block(_))));
+
+        let held = repo_law_plan_decision(
+            tmp.path(),
+            "File",
+            &json!({
+                "action": "edit",
+                "path": "CHANGELOG.md",
+                "search": "before",
+                "replace": "after"
+            }),
+        );
+        assert!(matches!(held, Some(RepoLawPlanDecision::ForcePrompt(_))));
+    }
+
+    #[test]
     fn unprotected_writes_and_non_write_tools_pass() {
         let tmp = TempDir::new().unwrap();
         write_law(tmp.path(), LAW);
@@ -294,7 +330,14 @@ mod tests {
     fn apply_patch_targets_are_extracted_from_all_shapes() {
         let tmp = TempDir::new().unwrap();
         write_law(tmp.path(), LAW);
-        // changes[].path shape
+        // Canonical replace[].path shape.
+        let decision = repo_law_plan_decision(
+            tmp.path(),
+            "apply_patch",
+            &json!({"replace": [{"path": "crates/protocol/msg.rs"}]}),
+        );
+        assert!(matches!(decision, Some(RepoLawPlanDecision::Block(_))));
+        // Legacy changes[].path shape must receive the same hold.
         let decision = repo_law_plan_decision(
             tmp.path(),
             "apply_patch",

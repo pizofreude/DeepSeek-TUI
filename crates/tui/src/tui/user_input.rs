@@ -9,13 +9,14 @@ use crate::palette;
 use crate::tools::user_input::{
     UserInputAnswer, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
+use crate::tui::menu_style;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent, render_modal_surface};
 
 fn modal_block(title: &str) -> Block<'static> {
     Block::default()
         .title(Line::from(vec![Span::styled(
             title.to_string(),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+            Style::default().fg(palette::WHALE_HUMAN).bold(),
         )]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
@@ -36,10 +37,7 @@ fn push_option_lines(
     ticked: bool,
 ) {
     let row_style = if selected {
-        Style::default()
-            .fg(palette::SELECTION_TEXT)
-            .bg(palette::SELECTION_BG)
-            .bold()
+        menu_style::selected_row_style()
     } else {
         Style::default().fg(palette::TEXT_PRIMARY)
     };
@@ -48,7 +46,7 @@ fn push_option_lines(
     } else {
         Style::default().fg(palette::TEXT_MUTED)
     };
-    let prefix = if selected { ">" } else { " " };
+    let prefix = crate::tui::glyphs::selection_marker(selected);
     // Multi-select rows get a check-mark gutter when toggled into the pending
     // set, mirroring the affordance used in other multi-option pickers.
     let mark = if ticked { "✔ " } else { "  " };
@@ -102,8 +100,12 @@ impl UserInputView {
     }
 
     /// Whether the "Other" free-text row is offered for the current question.
+    /// Free text is ALWAYS available so the user can answer with their own
+    /// words even when the model did not offer it. `allow_free_text` remains
+    /// part of the wire request (backward-compatible) but no longer gates the
+    /// row: a custom response must always be reachable alongside the options.
     fn offers_other(&self) -> bool {
-        self.current_question().allow_free_text
+        true
     }
 
     fn option_count(&self) -> usize {
@@ -127,11 +129,38 @@ impl UserInputView {
 
     /// True when the multi-select "Confirm selection" row is highlighted.
     fn is_confirm_selected(&self) -> bool {
-        self.is_multi_select() && self.selected + 1 == self.option_count()
+        self.confirm_index() == Some(self.selected)
+    }
+
+    fn confirm_index(&self) -> Option<usize> {
+        self.is_multi_select()
+            .then(|| self.option_count().saturating_sub(1))
     }
 
     fn is_multi_select(&self) -> bool {
         self.current_question().multi_select
+    }
+
+    /// Number of content lines the render path emits for the current state.
+    /// Drives the content-sized popup height so the dialog hugs what it
+    /// shows instead of claiming a fixed share of the screen.
+    fn content_line_count(&self) -> usize {
+        let question = self.current_question();
+        // "Action required" banner, header line, blank, question, blank.
+        let mut count = 5;
+        count += question.options.len() * 2;
+        if self.offers_other() {
+            count += 2;
+        }
+        if self.is_multi_select() {
+            count += 2;
+        }
+        if self.mode == InputMode::OtherInput {
+            count += 2;
+        }
+        // Trailing blank line + controls hint.
+        count += 2;
+        count
     }
 
     fn toggle_pending(&mut self, index: usize) {
@@ -200,7 +229,10 @@ impl UserInputView {
             KeyCode::Char(' ') if self.is_multi_select() => {
                 // Space toggles the highlighted option in the pending set
                 // without leaving the picker (standard multi-select affordance).
-                if !self.is_other_selected() {
+                // The Other row and the Confirm row are not options: toggling
+                // them would corrupt the pending set.
+                let is_confirm = self.confirm_index() == Some(self.selected);
+                if !self.is_other_selected() && !is_confirm {
                     self.toggle_pending(self.selected);
                 }
                 ViewAction::None
@@ -216,8 +248,11 @@ impl UserInputView {
     /// Resolve a digit/Enter activation for the currently highlighted row.
     ///
     /// - "Other" row → enter free-text input mode.
-    /// - multi-select option → toggle into the pending set (Enter confirms on
-    ///   the dedicated "Confirm" step; here it just toggles, like Space).
+    /// - multi-select option → add to the pending set (never remove — that is
+    ///   Space's job) and move focus to the Confirm row, so the single-select
+    ///   muscle memory of Enter-then-Enter submits the highlighted option
+    ///   instead of toggling it back out and submitting an empty set.
+    /// - multi-select Confirm row → submit the pending set.
     /// - single-select option → submit immediately (legacy behavior).
     fn activate_or_confirm_selection(&mut self) -> ViewAction {
         if self.is_other_selected() {
@@ -243,8 +278,15 @@ impl UserInputView {
                     .collect();
                 return self.advance_question(answers);
             }
-            // Enter/Space on a real option toggles it into the pending set.
-            self.toggle_pending(self.selected);
+            // Enter on a real option selects it and moves to Confirm. It
+            // never toggles out: double-Enter must submit the highlighted
+            // option, matching single-select on the same view.
+            if !self.multi_pending.contains(&self.selected) {
+                self.multi_pending.push(self.selected);
+            }
+            if let Some(confirm) = self.confirm_index() {
+                self.selected = confirm;
+            }
             return ViewAction::None;
         }
         // Single-select: submit immediately.
@@ -382,8 +424,7 @@ impl ModalView for UserInputView {
         // Multi-select gets a dedicated "Confirm selection" row after the
         // options (and after "Other" when present). Selecting and pressing
         // Enter on it flushes the pending set as the question's answers.
-        if self.is_multi_select() {
-            let confirm_index = self.option_count();
+        if let Some(confirm_index) = self.confirm_index() {
             let confirm_number = confirm_index + 1;
             push_option_lines(
                 &mut lines,
@@ -409,7 +450,7 @@ impl ModalView for UserInputView {
                     } else {
                         self.other_input.clone()
                     },
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                    Style::default().fg(palette::WHALE_HUMAN),
                 ),
             ]));
         }
@@ -442,7 +483,7 @@ impl ModalView for UserInputView {
                     Span::styled(" toggle", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
                     Span::styled("Enter", Style::default().fg(palette::WHALE_INFO).bold()),
-                    Span::styled(" toggle/confirm", Style::default().fg(palette::TEXT_MUTED)),
+                    Span::styled(" select/confirm", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
                     Span::styled("Esc", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" cancel", Style::default().fg(palette::TEXT_MUTED)),
@@ -455,7 +496,7 @@ impl ModalView for UserInputView {
                     ),
                     Span::styled(" quick pick", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Up/Down", Style::default().fg(palette::WHALE_INFO).bold()),
+                    Span::styled("↑/↓", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" move", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
                     Span::styled("Enter", Style::default().fg(palette::WHALE_INFO).bold()),
@@ -472,27 +513,54 @@ impl ModalView for UserInputView {
             .wrap(Wrap { trim: true })
             .block(modal_block(&header));
 
-        let popup_area = centered_rect(82, 68, area);
+        let popup_area = compact_popup_rect(area, self.content_line_count());
         render_modal_chrome(area, popup_area, buf);
         paragraph.render(popup_area, buf);
     }
+
+    fn occupied_region(&self, area: Rect) -> Rect {
+        // The dialog only occupies its compact centered card; blanking the
+        // whole frame (the default) hid the live conversation the user is
+        // being asked about (v0.9.4, FINISH-0.9.4 #13). Cover the card plus
+        // the one-cell drop shadow `render_modal_surface` draws at +1/+1.
+        let popup = compact_popup_rect(area, self.content_line_count());
+        Rect {
+            x: popup.x,
+            y: popup.y,
+            width: (popup.width.saturating_add(1)).min(area.right().saturating_sub(popup.x)),
+            height: (popup.height.saturating_add(1)).min(area.bottom().saturating_sub(popup.y)),
+        }
+    }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+/// Compact centered overlay: bounded width (max 110 columns) and a height
+/// sized to the content (border + padding around `content_lines`, never more
+/// than 22 rows or 60% of the screen) so the live conversation stays visible
+/// behind the modal instead of being covered edge-to-edge.
+fn compact_popup_rect(r: Rect, content_lines: usize) -> Rect {
+    let width = r.width.min(110);
+    // Border (2 rows) + uniform padding (2 rows) around the content lines.
+    let desired = u16::try_from(content_lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(4);
+    let height = desired
+        .clamp(6, 22)
+        .min((r.height.saturating_mul(60) / 100).clamp(6, 22))
+        .min(r.height);
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Min(0),
+            Constraint::Length(height),
+            Constraint::Min(0),
         ])
         .split(r);
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Min(0),
+            Constraint::Length(width),
+            Constraint::Min(0),
         ])
         .split(popup_layout[1]);
     horizontal[1]
@@ -566,27 +634,35 @@ mod tests {
     }
 
     #[test]
-    fn user_input_modal_hides_other_row_when_free_text_disabled() {
-        // Issue #3102: allow_free_text=false must NOT render the hardcoded
-        // "Other" pseudo-option. Previously "Other" was always appended.
+    fn user_input_modal_keeps_other_row_when_free_text_disabled() {
+        // v0.9.4: a custom free-text response is ALWAYS available alongside
+        // the options, even when the model did not offer it. The wire field
+        // `allow_free_text` stays for backward compatibility but no longer
+        // gates the row (#3102 originally hid it).
         let mut view = sample_view();
         view.request.questions[0].allow_free_text = false;
-        // Reset selection to a valid option index (no Other row to land on).
         view.selected = 0;
 
         let rendered = render_view(&view, 110, 36);
         assert!(
-            !rendered.contains("Type a custom response"),
-            "Other row should be hidden when allow_free_text is false"
+            rendered.contains("Type a custom response"),
+            "Other row must stay reachable even when allow_free_text is false"
         );
-        assert!(!rendered.contains("\nOther\n"));
+        assert!(rendered.contains("Other"));
+
+        // Entering the row switches to free-text input mode regardless.
+        view.selected = view.option_count() - 1;
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.mode, InputMode::OtherInput);
     }
 
     #[test]
     fn user_input_modal_renders_multi_select_ticks_and_confirm() {
         // Issue #3102: multi_select=true renders a check-mark gutter on
         // toggled options plus a trailing "Confirm selection" row, and the
-        // controls hint advertises Space/Enter toggle semantics.
+        // controls hint advertises Space/Enter toggle semantics. With the
+        // v0.9.4 always-available Other row, confirm sits at index 3.
         let mut view = sample_view();
         view.request.questions[0].multi_select = true;
         view.request.questions[0].allow_free_text = false;
@@ -603,5 +679,185 @@ mod tests {
         );
         assert!(rendered.contains("Submit 1 selected"));
         assert!(rendered.contains("toggle"));
+        assert!(
+            rendered.contains("▸  4) Confirm selection"),
+            "confirm row should display selected focus at its real quick-pick index"
+        );
+        assert!(
+            !rendered.contains("5) Confirm selection"),
+            "confirm row must not advertise an unreachable quick-pick number"
+        );
+    }
+
+    #[test]
+    fn user_input_modal_space_toggles_and_enter_confirms_multi_select() {
+        // Keyboard-first multi-select: Space toggles the highlighted option
+        // into the pending set without leaving the picker; Enter on the
+        // confirm row flushes the set.
+        let mut view = sample_view();
+        view.request.questions[0].multi_select = true;
+        view.selected = 0;
+
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.multi_pending, vec![0], "Space toggles option 0 in");
+
+        let _action = view.handle_selecting_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(view.multi_pending.is_empty(), "Space toggles option 0 out");
+
+        // Space on the confirm row must not toggle it (it is not an option).
+        view.selected = view.confirm_index().expect("confirm row present");
+        let before = view.multi_pending.clone();
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.multi_pending, before, "Space on confirm is a no-op");
+
+        // Enter on the confirm row flushes the pending set as answers.
+        view.multi_pending.push(0);
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, ViewAction::EmitAndClose(ViewEvent::UserInputSubmitted { tool_id, response })
+                if tool_id == "tool-1" && response.answers.first().is_some_and(|a| a.value == "Ship it")),
+            "Enter on confirm submits the toggled options"
+        );
+    }
+
+    #[test]
+    fn user_input_modal_double_enter_never_submits_empty_multi_select() {
+        // Enter on a multi-select option used to toggle it into the pending
+        // set, so a second Enter (single-select muscle memory) toggled it
+        // back out — and Confirm then submitted an empty answer set.
+        let mut view = sample_view();
+        view.request.questions[0].multi_select = true;
+        view.selected = 0;
+
+        // First Enter: option 0 joins the pending set, focus moves to Confirm.
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(
+            view.multi_pending,
+            vec![0],
+            "Enter selects the highlighted option"
+        );
+        assert!(
+            view.is_confirm_selected(),
+            "focus moves to the Confirm row after Enter"
+        );
+
+        // Second Enter submits exactly that option — never an empty set.
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, ViewAction::EmitAndClose(ViewEvent::UserInputSubmitted { tool_id, response })
+                if tool_id == "tool-1"
+                    && response.answers.len() == 1
+                    && response.answers[0].value == "Ship it"),
+            "double-Enter must submit the highlighted option, not an empty set"
+        );
+    }
+
+    #[test]
+    fn user_input_modal_enter_never_deselects_multi_select_option() {
+        // Deselecting remains Space's job: Enter on an already-toggled option
+        // keeps it in the pending set.
+        let mut view = sample_view();
+        view.request.questions[0].multi_select = true;
+        view.selected = 0;
+
+        let _ = view.handle_selecting_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert_eq!(view.multi_pending, vec![0], "Space toggles option 0 in");
+
+        let action = view.handle_selecting_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(
+            view.multi_pending,
+            vec![0],
+            "Enter must not toggle the option back out"
+        );
+
+        // Space still toggles both ways.
+        view.selected = 0;
+        let _ = view.handle_selecting_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(view.multi_pending.is_empty(), "Space toggles option 0 out");
+    }
+
+    #[test]
+    fn user_input_modal_popup_is_centered_and_sized_to_content() {
+        let area = Rect::new(0, 0, 120, 40);
+        let view = sample_view();
+        let content = view.content_line_count();
+        let popup = compact_popup_rect(area, content);
+
+        // Height hugs the content (border + padding = 4 chrome rows), well
+        // under the 22-row / 60% cap for a 40-row screen.
+        assert_eq!(popup.height, u16::try_from(content).unwrap() + 4);
+        assert!(popup.height < area.height / 2);
+        assert_eq!(popup.width, 110);
+        // Centered: breathing room above and below.
+        assert!(popup.y > 0);
+        assert!(popup.y + popup.height < area.height);
+
+        // Long content is still bounded by the 22-row cap.
+        let capped = compact_popup_rect(area, 100);
+        assert_eq!(capped.height, 22);
+    }
+
+    #[test]
+    fn user_input_modal_occupied_region_matches_painted_card_plus_shadow() {
+        let area = Rect::new(0, 0, 120, 40);
+        let view = sample_view();
+        let popup = compact_popup_rect(area, view.content_line_count());
+        let occupied = view.occupied_region(area);
+
+        assert_eq!(occupied.x, popup.x);
+        assert_eq!(occupied.y, popup.y);
+        assert_eq!(occupied.width, popup.width + 1);
+        assert_eq!(occupied.height, popup.height + 1);
+        assert!(area.right() >= occupied.right());
+        assert!(area.bottom() >= occupied.bottom());
+    }
+
+    #[test]
+    fn user_input_modal_leaves_surrounding_frame_visible() {
+        use crate::tui::views::ViewStack;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        // Pre-fill the frame as if the live transcript had painted it.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                buf[(x, y)].set_symbol("·");
+            }
+        }
+
+        let mut stack = ViewStack::default();
+        stack.push(sample_view());
+        stack.render(area, &mut buf);
+
+        // Cells outside the compact card survive untouched: the conversation
+        // stays visible around the dialog (FINISH-0.9.4 #13).
+        assert_eq!(buf[(0, 0)].symbol(), "·");
+        assert_eq!(buf[(119, 0)].symbol(), "·");
+        assert_eq!(buf[(0, 39)].symbol(), "·");
+        assert_eq!(buf[(119, 39)].symbol(), "·");
+        assert_eq!(buf[(60, 0)].symbol(), "·");
+        assert_eq!(buf[(60, 39)].symbol(), "·");
+        // The card itself is blanked + repainted by the modal surface.
+        assert_ne!(buf[(60, 20)].symbol(), "·");
+    }
+
+    #[test]
+    fn user_input_modal_numbers_confirm_after_other_row() {
+        let mut view = sample_view();
+        view.request.questions[0].multi_select = true;
+        view.request.questions[0].allow_free_text = true;
+        view.selected = view.option_count() - 1;
+
+        let rendered = render_view(&view, 120, 40);
+        assert!(rendered.contains("3) Other"));
+        assert!(
+            rendered.contains("▸  4) Confirm selection"),
+            "confirm should follow the optional Other row with selected focus"
+        );
+        assert!(!rendered.contains("5) Confirm selection"));
     }
 }

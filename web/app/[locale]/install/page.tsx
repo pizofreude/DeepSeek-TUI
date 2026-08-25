@@ -2,8 +2,11 @@ import Link from "next/link";
 import { Seal } from "@/components/seal";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { InstallBinary } from "@/components/install-binary";
+import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
+
+export const revalidate = 300;
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -21,30 +24,24 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 const SHELL_INSTALL = `curl -fsSL https://codewhale.net/install.sh | sh`;
 const SHELL_INSPECT = `curl -fsSL https://codewhale.net/install.sh`;
 const NPM_INSTALL = `npm install -g codewhale`;
-const CARGO_INSTALL = `cargo install codewhale-cli --locked
-cargo install codewhale-tui --locked`;
+const CARGO_INSTALL = `cargo install codewhale-cli --locked`;
 const FIRST_RUN = `codewhale`;
-
 const UPDATE = `codewhale update`;
-
-const SET_KEY_BASH = `export DEEPSEEK_API_KEY=sk-...`;
-const SET_KEY_AUTH = `codewhale auth set --provider deepseek --api-key sk-...`;
 
 const RELEASE_DOWNLOAD = `# Download your platform archive:
 https://github.com/Hmbown/CodeWhale/releases/latest`;
-const cnbInstall = (tag: string) => `cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${tag} codewhale-cli --locked --force
-cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${tag} codewhale-tui --locked --force`;
+const cnbInstall = (tag: string) =>
+  `cargo install --git https://cnb.cool/codewhale.net/codewhale --tag ${tag} codewhale-cli --locked --force`;
 const TUNA_CONFIG = `# ~/.cargo/config.toml
 [source.crates-io]
 replace-with = "tuna"
 
 [source.tuna]
 registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`;
-const TUNA_INSTALL = `cargo install codewhale-cli --locked
-cargo install codewhale-tui --locked`;
+const TUNA_INSTALL = `cargo install codewhale-cli --locked`;
 
 const BREW = `brew tap Hmbown/deepseek-tui
-brew install deepseek-tui`;
+brew install codewhale`;
 
 const DOCKER = `docker volume create codewhale-home
 docker run --rm -it \\
@@ -57,27 +54,26 @@ const FROM_SOURCE = `git clone https://github.com/Hmbown/CodeWhale
 cd CodeWhale
 cargo build --release --locked
 
-# Install both binaries from the local checkout
-cargo install --path crates/cli --locked   # codewhale
-cargo install --path crates/tui --locked   # codewhale-tui`;
+# Install the compiled runtime as codewhale
+cargo install --path crates/cli --locked`;
 
-const CONFIG_TREE = `~/.codewhale/
+const CONFIG_TREE = `$CODEWHALE_HOME/ (default: ~/.codewhale/)
 ├── config.toml      api keys, model, hooks, profiles
 ├── mcp.json         MCP server definitions
 ├── skills/          user skills (each with SKILL.md)
 ├── sessions/        checkpoints + offline queue
 ├── tasks/           background task store
-└── audit.log        credential / approval / elevation audit trail
+└── audit.log        best-effort credential / approval / elevation events
 
 ./.codewhale/        project-scoped config (optional, per-repo)`;
 
-const CONFIG_TREE_ZH = `~/.codewhale/
+const CONFIG_TREE_ZH = `$CODEWHALE_HOME/（默认：~/.codewhale/）
 ├── config.toml      API 密钥、模型、钩子、配置集
 ├── mcp.json         MCP 服务器定义
 ├── skills/          用户技能（每个含 SKILL.md）
 ├── sessions/        检查点 + 离线队列
 ├── tasks/           后台任务存储
-└── audit.log        凭证 / 审批 / 提权审计日志
+└── audit.log        尽力写入的凭证 / 审批 / 提权事件
 
 ./.codewhale/        项目级配置（可选，每个仓库）`;
 
@@ -85,8 +81,13 @@ export default async function InstallPage({ params }: { params: Promise<{ locale
   const { locale } = await params;
   const isZh = locale === "zh";
   const facts = await getFacts();
-  const tag = facts.version ? `v${facts.version}` : "v0.8.x";
-  const verify = `codewhale --version   # ${facts.version ?? "prints the installed version"}
+  const publishedRelease = facts.latestPublishedRelease;
+  const sourceIsPublished = publishedRelease?.version === facts.version;
+  const firstSession = GETTING_STARTED_STEPS.find((step) => step.id === "first-session")!;
+  const connectProvider = GETTING_STARTED_STEPS.find((step) => step.id === "connect-provider")!;
+  const verify = `codewhale --version${
+    publishedRelease ? `   # latest published: ${publishedRelease.version}` : ""
+  }
 codewhale doctor`;
 
   const copyLabel = isZh ? "复制" : "Copy";
@@ -95,7 +96,7 @@ codewhale doctor`;
   return (
     <>
       {/* ① INSTALL */}
-      <section className="mx-auto max-w-[1100px] px-6 pt-12 pb-10">
+      <section className="site-container section">
         <div className="flex items-baseline gap-4 mb-3">
           <Seal char="装" />
           <div className="eyebrow">{isZh ? "01 · 安装" : "01 · Install"}</div>
@@ -117,9 +118,9 @@ codewhale doctor`;
           {isZh ? (
             <>
               macOS / Linux 安装脚本会从 GitHub Releases 下载经 SHA-256 校验的二进制，
-              默认安装到 <code className="inline">~/.local/bin</code>，并安装{" "}
-              <code className="inline">codewhale</code>、<code className="inline">codew</code> 和{" "}
-              <code className="inline">codewhale-tui</code>。先审阅脚本可运行{" "}
+              默认安装到 <code className="inline">~/.local/bin</code>，并提供{" "}
+              <code className="inline">codewhale</code> 和 <code className="inline">codew</code>
+              两个命令名；两者运行同一个编译后的 runtime。先审阅脚本可运行{" "}
               <code className="inline">{SHELL_INSPECT}</code>。下方「其他安装方式」列出 npm、Cargo、GitHub Releases、
               CNB、国内镜像、Homebrew、预编译二进制和 Docker。
             </>
@@ -127,8 +128,8 @@ codewhale doctor`;
             <>
               The macOS / Linux installer downloads SHA-256-verified binaries from GitHub Releases,
               installs to <code className="inline">~/.local/bin</code> by default, and exposes{" "}
-              <code className="inline">codewhale</code>, <code className="inline">codew</code>, and{" "}
-              <code className="inline">codewhale-tui</code>. To inspect it first, run{" "}
+              <code className="inline">codewhale</code> and <code className="inline">codew</code> as
+              two names for the same compiled runtime. To inspect it first, run{" "}
               <code className="inline">{SHELL_INSPECT}</code>. See{" "}
               <a href="#other-ways" className="body-link">Other ways to install</a> below for
               npm, cargo, GitHub Releases, CNB, Homebrew, prebuilt binaries, Docker, or mainland
@@ -139,7 +140,7 @@ codewhale doctor`;
       </section>
 
       {/* ② VERIFY */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
+      <section className="site-container py-10 hairline-t">
         <div className="flex items-baseline gap-4 mb-5">
           <Seal char="验" />
           <div className="eyebrow">{isZh ? "02 · 验证" : "02 · Verify"}</div>
@@ -165,7 +166,7 @@ codewhale doctor`;
       </section>
 
       {/* ③ UPDATE */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
+      <section className="site-container py-10 hairline-t">
         <div className="flex items-baseline gap-4 mb-5">
           <Seal char="新" />
           <div className="eyebrow">{isZh ? "03 · 更新" : "03 · Update"}</div>
@@ -184,9 +185,11 @@ codewhale doctor`;
               <code className="inline">curl</code> 命令覆盖更新。
               通过包管理器安装的话，用包管理器升级更稳：npm 安装的运行{" "}
               <code className="inline">npm update -g codewhale</code>；
-              Cargo 安装的重跑两个 <code className="inline">cargo install</code> 命令并加{" "}
-              <code className="inline">--force</code>；
-              旧版 Homebrew tap 用 <code className="inline">brew upgrade deepseek-tui</code>。
+              Cargo 安装的重跑 <code className="inline">codewhale-cli</code> 这一条{" "}
+              <code className="inline">cargo install</code> 命令并加 <code className="inline">--force</code>；
+              Cargo 只安装 <code className="inline">codewhale</code>，如需短名称可自行定义{" "}
+              <code className="inline">codew</code> shell alias；
+              Homebrew 用 <code className="inline">brew upgrade codewhale</code>。
             </>
           ) : (
             <>
@@ -194,17 +197,20 @@ codewhale doctor`;
               installed with <code className="inline">install.sh</code>, re-run the same{" "}
               <code className="inline">curl</code> command to overwrite the binaries.
               If you installed via a package manager, prefer it instead: npm users run{" "}
-              <code className="inline">npm update -g codewhale</code>; cargo users re-run both{" "}
-              <code className="inline">cargo install</code> commands with{" "}
-              <code className="inline">--force</code>; the legacy Homebrew tap updates with{" "}
-              <code className="inline">brew upgrade deepseek-tui</code>.
+              <code className="inline">npm update -g codewhale</code>; Cargo users re-run the one{" "}
+              <code className="inline">codewhale-cli</code> install command with{" "}
+              <code className="inline">--force</code>. Cargo installs only{" "}
+              <code className="inline">codewhale</code>; define your own{" "}
+              <code className="inline">codew</code> shell alias if you want the shorter name;
+              Homebrew updates with{" "}
+              <code className="inline">brew upgrade codewhale</code>.
             </>
           )}
         </p>
       </section>
 
       {/* ④ FIRST RUN */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
+      <section className="site-container py-10 hairline-t">
         <div className="flex items-baseline gap-4 mb-5">
           <Seal char="始" />
           <div className="eyebrow">{isZh ? "04 · 首次运行" : "04 · First run"}</div>
@@ -213,40 +219,40 @@ codewhale doctor`;
         <ol className="space-y-6 max-w-2xl">
           <li>
             <div className="font-display text-lg mb-2">
-              {isZh ? "① 获取 API 密钥" : "① Get an API key"}
+              {isZh ? `① ${firstSession.title.zh}` : `① ${firstSession.title.en}`}
             </div>
             <p className="text-sm text-ink-soft leading-relaxed">
-              {isZh ? (
-                <>
-                  在{" "}
-                  <a href="https://platform.deepseek.com" className="body-link">
-                    platform.deepseek.com
-                  </a>{" "}
-                  注册并创建密钥，格式为 <code className="inline">sk-...</code>。
-                </>
-              ) : (
-                <>
-                  Sign up at{" "}
-                  <a href="https://platform.deepseek.com" className="body-link">
-                    platform.deepseek.com
-                  </a>{" "}
-                  and create a key (format: <code className="inline">sk-...</code>).
-                </>
-              )}
+              {isZh ? firstSession.body.zh : firstSession.body.en}
             </p>
+            <div className="mt-2">
+              <InstallCodeBlock
+                cmd={firstSession.commands.join("\n")}
+                copyLabel={copyLabel}
+                copiedLabel={copiedLabel}
+              />
+            </div>
           </li>
 
           <li>
             <div className="font-display text-lg mb-2">
-              {isZh ? "② 设置密钥" : "② Set the key"}
+              {isZh ? `② ${connectProvider.title.zh}` : `② ${connectProvider.title.en}`}
             </div>
-            <div className="space-y-2">
-              <InstallCodeBlock cmd={SET_KEY_BASH} copyLabel={copyLabel} copiedLabel={copiedLabel} />
-              <p className="text-xs text-ink-mute">
-                {isZh ? "或保存到 ~/.codewhale/config.toml：" : "Or persist it to ~/.codewhale/config.toml:"}
-              </p>
-              <InstallCodeBlock cmd={SET_KEY_AUTH} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+            <p className="text-sm text-ink-soft leading-relaxed">
+              {isZh ? connectProvider.body.zh : connectProvider.body.en}
+            </p>
+            <div className="mt-2">
+              <InstallCodeBlock
+                cmd={connectProvider.commands.join("\n")}
+                copyLabel={copyLabel}
+                copiedLabel={copiedLabel}
+              />
             </div>
+            <Link
+              href={`/${locale}${connectProvider.link.href}`}
+              className="body-link mt-2 inline-block text-sm"
+            >
+              {isZh ? connectProvider.link.label.zh : connectProvider.link.label.en} →
+            </Link>
           </li>
 
           <li>
@@ -257,16 +263,23 @@ codewhale doctor`;
             <p className="mt-3 text-sm text-ink-soft leading-relaxed">
               {isZh ? (
                 <>
-                  默认 Plan 模式（只读调查）。按{" "}
+                  新会话使用你选择的默认模式（未修改则为 Act）。输入区空闲时，按{" "}
                   <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Tab</kbd>{" "}
-                  切换到 Agent 模式（执行工具，按需审批）。再按一次进入 YOLO 模式（自动批准）。
+                  循环 Plan → Act → Operate；按{" "}
+                  <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd>{" "}
+                  循环 Ask → Auto-Review → Full Access。也可以运行{" "}
+                  <code className="inline">/mode</code> 选择模式或运行 <code className="inline">/config</code>{" "}
+                  查看权限。Plan 始终只读；Full Access 仅应用于你信任的工作区。
                 </>
               ) : (
                 <>
-                  Plan mode (read-only) is the default. Press{" "}
+                  New sessions use your selected default mode (Act unless you changed it). When the composer is idle, press{" "}
                   <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Tab</kbd>{" "}
-                  to switch to Agent mode (tool execution, per-action approval). Press again for
-                  YOLO (auto-approve).
+                  to cycle Plan → Act → Operate; press{" "}
+                  <kbd className="font-mono text-xs px-1 hairline-t hairline-b hairline-l hairline-r">Shift+Tab</kbd>{" "}
+                  to cycle Ask → Auto-Review → Full Access. You can also run{" "}
+                  <code className="inline">/mode</code> to choose a mode or <code className="inline">/config</code>{" "}
+                  to inspect permissions. Plan stays read-only; use Full Access only in a workspace you trust.
                 </>
               )}
             </p>
@@ -276,7 +289,7 @@ codewhale doctor`;
 
       {/* ⑤ OTHER WAYS TO INSTALL */}
       <section id="other-ways" className="bg-paper-deep hairline-t hairline-b">
-        <div className="mx-auto max-w-[1100px] px-6 py-12">
+        <div className="site-container py-12">
           <div className="flex items-baseline gap-4 mb-5">
             <Seal char="备" />
             <div className="eyebrow">{isZh ? "05 · 其他安装方式" : "05 · Other ways to install"}</div>
@@ -284,10 +297,20 @@ codewhale doctor`;
           <h2 className="font-display text-3xl mb-2">
             {isZh ? "其他安装方式" : "Other ways to install"}
           </h2>
-          <p className="text-sm text-ink-soft max-w-2xl mb-10">
+          <p className="text-sm text-ink-soft max-w-2xl mb-4">
             {isZh
-              ? "如果上面的脚本路径不适合你，从下面找到匹配你情况的一条。每条都安装同一组 codewhale / codewhale-tui 二进制。"
-              : "If the script above doesn't fit your setup, pick the row that matches your situation. Every path installs the same codewhale / codewhale-tui binary pair."}
+              ? "如果上面的脚本不适合你的环境，从下面选一种。每种方式都写明了它安装什么。"
+              : "If the script above doesn't fit your setup, pick one of these. Each one says what it installs."}
+          </p>
+
+          <p className="text-sm text-ink-soft max-w-2xl mb-10">
+            {publishedRelease
+              ? isZh
+                ? `下方的命令安装 ${publishedRelease.tag}，即 GitHub 上最新的发布版本。${sourceIsPublished ? "源码与该版本一致。" : `源码已到 v${facts.version}，尚未发布。`}`
+                : `The commands below install ${publishedRelease.tag}, the latest release on GitHub. ${sourceIsPublished ? "The source matches that release." : `Source is at v${facts.version}, not yet released.`}`
+              : isZh
+                ? "暂时无法验证最新的 GitHub 发布标签；请先查看 Releases，再运行需要固定标签的命令。"
+                : "The latest GitHub release tag could not be verified. Check Releases before running a command that requires a pinned tag."}
           </p>
 
           <div className="space-y-10">
@@ -304,15 +327,14 @@ codewhale doctor`;
                 {isZh ? (
                   <>
                     npm wrapper 会从 GitHub Releases 下载经 SHA-256 校验的二进制，并安装{" "}
-                    <code className="inline">codewhale</code>、<code className="inline">codew</code> 和{" "}
-                    <code className="inline">codewhale-tui</code> 三个命令。
+                    <code className="inline">codewhale</code> 和 <code className="inline">codew</code>
+                    两个命令名；两者运行同一个 runtime。
                   </>
                 ) : (
                   <>
                     The npm wrapper downloads SHA-256-verified binaries from GitHub Releases and
-                    installs <code className="inline">codewhale</code>,{" "}
-                    <code className="inline">codew</code>, and{" "}
-                    <code className="inline">codewhale-tui</code>.
+                    installs <code className="inline">codewhale</code> and{" "}
+                    <code className="inline">codew</code> as two names for the same runtime.
                   </>
                 )}
               </p>
@@ -327,16 +349,19 @@ codewhale doctor`;
               <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
                 {isZh ? (
                   <>
-                    编译并安装 <code className="inline">codewhale</code> 和 <code className="inline">codewhale-tui</code> 到 <code className="inline">~/.cargo/bin</code>。
+                    <code className="inline">codewhale-cli</code> 这一个 Cargo package 只会把{" "}
+                    <code className="inline">codewhale</code> 安装到 <code className="inline">~/.cargo/bin</code>。
+                    如需较短的 <code className="inline">codew</code> 名称，可自行定义 shell alias。
                     需要 Rust 1.88+；Linux 用户先安装 <code className="inline">pkg-config</code> 和{" "}
                     <code className="inline">libdbus-1-dev</code> 等构建依赖。如未安装 Rust，可访问{" "}
                     <a href="https://rustup.rs" className="body-link">rustup.rs</a>。
                   </>
                 ) : (
                   <>
-                    Compiles and installs <code className="inline">codewhale</code> and{" "}
-                    <code className="inline">codewhale-tui</code> to{" "}
-                    <code className="inline">~/.cargo/bin</code>. Requires Rust 1.88+; install via{" "}
+                    The one <code className="inline">codewhale-cli</code> Cargo package installs only{" "}
+                    <code className="inline">codewhale</code> to <code className="inline">~/.cargo/bin</code>.
+                    Define your own <code className="inline">codew</code> shell alias if you want the shorter name.
+                    Requires Rust 1.88+; install via{" "}
                     <a href="https://rustup.rs" className="body-link">rustup.rs</a> if you don&apos;t have it.
                     On Linux, install build dependencies such as{" "}
                     <code className="inline">pkg-config</code> and{" "}
@@ -355,7 +380,20 @@ codewhale doctor`;
             {/* CNB */}
             <div className="rounded-lg border border-ink/12 bg-white/70 p-5">
               <div className="font-display text-lg mb-3">{isZh ? "CNB 镜像" : "CNB mirror"}</div>
-              <InstallCodeBlock cmd={cnbInstall(tag)} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              {publishedRelease ? (
+                <InstallCodeBlock
+                  cmd={cnbInstall(publishedRelease.tag)}
+                  copyLabel={copyLabel}
+                  copiedLabel={copiedLabel}
+                />
+              ) : (
+                <a
+                  href="https://github.com/Hmbown/CodeWhale/releases/latest"
+                  className="body-link"
+                >
+                  {isZh ? "查看最新 GitHub 发布" : "Check the latest GitHub release"}
+                </a>
+              )}
             </div>
 
             {/* Mainland China network */}
@@ -408,14 +446,14 @@ codewhale doctor`;
               <div className="eyebrow mb-2 text-indigo">
                 Homebrew{" "}
                 <span className="text-ink-mute font-mono normal-case tracking-normal">
-                  {isZh ? "· macOS / Linux · 旧版 tap" : "· macOS / Linux · legacy tap"}
+                  {isZh ? "· macOS / Linux" : "· macOS / Linux"}
                 </span>
               </div>
               <InstallCodeBlock cmd={BREW} copyLabel={copyLabel} copiedLabel={copiedLabel} />
               <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
                 {isZh
-                  ? "这是旧版 deepseek-tui tap，在 formula 重命名为 codewhale 期间保留以保证兼容，安装的同样是当前版本的二进制。"
-                  : "This is the legacy deepseek-tui tap, kept for compatibility while the formula is renamed to codewhale. It installs the same current-release binaries."}
+                  ? "formula 是 codewhale。tap 仓库在重命名前仍叫 Hmbown/homebrew-deepseek-tui；brew tap Hmbown/deepseek-tui 继续有效。旧的 deepseek-tui formula 作为一轮重叠的弃用别名保留。"
+                  : "The formula is codewhale. The tap repo is still Hmbown/homebrew-deepseek-tui until it is renamed; brew tap Hmbown/deepseek-tui keeps working. The legacy deepseek-tui formula remains a deprecated alias for one overlap release."}
               </p>
             </div>
 
@@ -462,7 +500,7 @@ codewhale doctor`;
       </section>
 
       {/* ⑥ WHERE CONFIG LIVES */}
-      <section className="mx-auto max-w-[1100px] px-6 py-12">
+      <section className="site-container py-12">
         <div className="flex items-baseline gap-4 mb-5">
           <Seal char="件" />
           <div className="eyebrow">{isZh ? "06 · 配置文件在哪" : "06 · Where config lives"}</div>
@@ -488,7 +526,7 @@ codewhale doctor`;
       </section>
 
       {/* ⑦ PROVENANCE */}
-      <section className="mx-auto max-w-[1100px] px-6 py-12 hairline-t">
+      <section className="site-container py-12 hairline-t">
         <div className="flex items-baseline gap-4 mb-5">
           <Seal char="源" />
           <div className="eyebrow">{isZh ? "07 · 来源与镜像" : "07 · Provenance & mirrors"}</div>
@@ -565,14 +603,14 @@ codewhale doctor`;
 
       {/* ⑧ NEXT STEPS */}
       <section className="bg-paper-deep hairline-t hairline-b">
-        <div className="mx-auto max-w-[1100px] px-6 py-12">
+        <div className="site-container py-12">
           <div className="flex items-baseline gap-4 mb-5">
             <Seal char="续" />
             <div className="eyebrow">{isZh ? "08 · 下一步" : "08 · Next steps"}</div>
           </div>
           <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
             <Link
-              href={isZh ? "/zh/docs" : "/en/docs"}
+              href={`/${locale}/docs`}
               className="p-6 hover:bg-paper-deep transition-colors"
             >
               <div className="font-display text-xl mb-2">Docs</div>
@@ -584,7 +622,7 @@ codewhale doctor`;
               </span>
             </Link>
             <Link
-              href={isZh ? "/zh/faq" : "/faq"}
+              href={`/${locale}/faq`}
               className="p-6 hover:bg-paper-deep transition-colors"
             >
               <div className="font-display text-xl mb-2">FAQ</div>
@@ -596,7 +634,7 @@ codewhale doctor`;
               </span>
             </Link>
             <Link
-              href={isZh ? "/zh/roadmap" : "/roadmap"}
+              href={`/${locale}/roadmap`}
               className="p-6 hover:bg-paper-deep transition-colors"
             >
               <div className="font-display text-xl mb-2">Roadmap</div>

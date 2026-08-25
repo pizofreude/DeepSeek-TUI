@@ -15,16 +15,16 @@ use unicode_width::UnicodeWidthStr;
 use crate::localization::Locale;
 use crate::palette;
 use crate::tui::app::AppMode;
+use crate::tui::app::AppModeUi;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
 
-// Operate remains parseable for restored sessions and explicit compatibility
-// inputs, but it is not a truthful interactive choice until Workflow dispatch
-// exists. Keep the visible roster local to this picker so compatibility does
-// not become a customer-visible affordance.
-const VISIBLE_MODES: [AppMode; 2] = [AppMode::Agent, AppMode::Plan];
+// Operate is visible because the engine now enforces a coordinator/worker
+// boundary while allowing ordinary conversation and asynchronous dispatch.
+const VISIBLE_MODES: [AppMode; 3] = [AppMode::Agent, AppMode::Plan, AppMode::Operate];
 
 pub struct ModePickerView {
     cursor: usize,
@@ -54,16 +54,11 @@ impl ModePickerView {
     }
 
     fn move_up(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
+        self.cursor = crate::tui::list_nav::wrap_index(self.cursor, VISIBLE_MODES.len(), -1);
     }
 
     fn move_down(&mut self) {
-        let max = VISIBLE_MODES.len().saturating_sub(1);
-        if self.cursor < max {
-            self.cursor += 1;
-        }
+        self.cursor = crate::tui::list_nav::wrap_index(self.cursor, VISIBLE_MODES.len(), 1);
     }
 
     fn select_by_number(&mut self, number: char) -> Option<ViewAction> {
@@ -167,21 +162,16 @@ impl ModalView for ModePickerView {
         for (idx, mode) in VISIBLE_MODES.iter().copied().enumerate() {
             let is_cursor = idx == self.cursor;
             let row_style = if is_cursor {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
-                    .add_modifier(Modifier::BOLD)
+                menu_style::selected_row_style()
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
             let hint_style = if is_cursor {
-                Style::default()
-                    .fg(palette::SELECTION_TEXT)
-                    .bg(palette::SELECTION_BG)
+                menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
             } else {
                 Style::default().fg(palette::TEXT_MUTED)
             };
-            let pointer = if is_cursor { ">" } else { " " };
+            let pointer = crate::tui::glyphs::selection_marker(is_cursor);
             let name = mode.display_name_localized(self.locale);
             let hint = mode.picker_hint_localized(self.locale);
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
@@ -278,6 +268,12 @@ mod tests {
             assert!(text.contains("select"), "{w}x{h}: missing 'select' hint");
             assert!(text.contains("cancel"), "{w}x{h}: missing 'cancel' hint");
 
+            // The cursor row carries the charter selection pointer.
+            assert!(
+                text.contains(crate::tui::glyphs::SELECTION),
+                "{w}x{h}: missing charter selection pointer"
+            );
+
             // Composited frame is fully opaque: no sentinel survives and every
             // cell carries the modal/backdrop ink background.
             assert!(
@@ -302,18 +298,23 @@ mod tests {
     }
 
     #[test]
-    fn operate_is_not_advertised_until_workflow_dispatch_exists() {
+    fn operate_is_advertised_as_a_visible_mode() {
         let (buf, area) = render_at(80, 24);
         let text = rows(&buf, area).join("\n");
-        assert!(!text.contains("Operate"), "{text}");
+        assert!(text.contains("Operate"), "{text}");
     }
 
     #[test]
     fn number_keys_select_modes() {
-        // Visible roster: 1 Act, 2 Plan. Operate remains compatibility-only.
+        // Visible roster: 1 Act, 2 Plan, 3 Operate.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
-        assert!(matches!(action, ViewAction::None));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModeSelected {
+                mode: AppMode::Operate
+            })
+        ));
 
         // Legacy YOLO shorthand (4) is not offered by the picker.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);

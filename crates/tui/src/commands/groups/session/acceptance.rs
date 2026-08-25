@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 use crate::commands::{self, CommandResult};
 use crate::config::Config;
-use crate::models::{ContentBlock, Message};
+use crate::models::{ContentBlock, Message, Role};
 use crate::session_manager::{SavedSession, SessionManager, create_saved_session_with_id_and_mode};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tui::app::{App, AppAction, TuiOptions};
@@ -20,7 +20,7 @@ const FEATURE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/features/session_command_workflows.feature"
 );
-const SAVE_LOAD_SCENARIO: &str = "Save, export, and load preserve the active session";
+const SAVE_LOAD_SCENARIO: &str = "Save and export preserve data while load defers restoration";
 const FORK_RESUMABLE_SCENARIO: &str = "Fork keeps the original session resumable";
 const NEW_THEN_FORK_SCENARIO: &str = "New session cannot be forked before messages exist";
 const CLEAR_THEN_FORK_SCENARIO: &str = "Cleared session cannot be forked before messages exist";
@@ -74,7 +74,7 @@ fn workspace_with_one_user_message(world: &mut SessionCommandWorld) {
     let tmpdir = TempDir::new().expect("session workflow TempDir");
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.api_messages.push(Message {
-        role: "user".to_string(),
+        role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Remember the whale migration".to_string(),
             cache_control: None,
@@ -304,15 +304,14 @@ fn saved_session_file_contains_saved_message(world: &mut SessionCommandWorld) {
     assert_saved_session_contains_message(&session, "Remember the whale migration");
 }
 
-#[then("the active session id should match the saved session file")]
-fn active_session_id_matches_saved_session_file(world: &mut SessionCommandWorld) {
-    let session = read_saved_session_file(world);
-    let app = world.app.as_deref().expect("app should exist");
+#[then("the load action should target the saved session file")]
+fn load_action_targets_saved_session_file(world: &mut SessionCommandWorld) {
+    let save_path = world.save_path.as_ref().expect("save path should exist");
 
-    assert_eq!(
-        app.current_session_id.as_deref(),
-        Some(session.metadata.id.as_str())
-    );
+    assert!(matches!(
+        world.last_action.as_ref(),
+        Some(AppAction::LoadSession(path)) if path == save_path
+    ));
 }
 
 #[then("the exported markdown should contain the active transcript")]
@@ -324,29 +323,16 @@ fn exported_markdown_contains_active_transcript(world: &mut SessionCommandWorld)
     let content = std::fs::read_to_string(export_path)
         .unwrap_or_else(|err| panic!("read exported transcript {export_path:?}: {err}"));
 
-    assert!(content.contains("# Chat Export"));
-    assert!(content.contains("**You:**"));
+    assert!(content.contains("# Codewhale conversation export"));
+    assert!(content.contains("## 1. user"));
     assert!(content.contains("Remember the whale migration"));
 }
 
-#[then("the restored token count should match the saved session")]
-fn restored_token_count_matches_saved_session(world: &mut SessionCommandWorld) {
-    let app = world.app.as_deref().expect("app should exist");
-
-    assert_eq!(app.session.total_tokens, 321);
-    assert_eq!(app.session.total_conversation_tokens, 321);
-}
-
-#[then("CodeWhale should report that the session was loaded")]
-fn codewhale_reports_session_loaded(world: &mut SessionCommandWorld) {
-    let message = world
-        .last_message
-        .as_deref()
-        .expect("load command should produce a message");
-
-    assert!(
-        message.contains("Session loaded from"),
-        "unexpected load message: {message}"
+#[then("CodeWhale should defer the session-loaded receipt to the event loop")]
+fn codewhale_defers_session_loaded_receipt(world: &mut SessionCommandWorld) {
+    assert_eq!(
+        world.last_message, None,
+        "the command layer must not report success before the event loop applies the load action"
     );
 }
 
@@ -549,7 +535,7 @@ fn codewhale_triggers_context_compaction(world: &mut SessionCommandWorld) {
     );
     assert!(matches!(
         world.last_action.as_ref(),
-        Some(AppAction::CompactContext)
+        Some(AppAction::CompactContext { .. })
     ));
     assert_eq!(
         world.last_message.as_deref(),
@@ -591,6 +577,7 @@ fn codewhale_sends_session_relay_instruction_focused_on(
 
     assert!(message.contains("Write or update `.deepseek/handoff.md`."));
     assert!(message.contains("# Session relay"));
+    assert!(message.contains("## Verification"));
     assert!(
         message.contains(&format!("- Requested relay focus: {focus}")),
         "relay instruction should include requested focus: {message}"
@@ -625,7 +612,7 @@ fn codewhale_rejects_unknown_session_command(world: &mut SessionCommandWorld) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn save_export_and_load_session_workflow() {
-    run_scenario(SAVE_LOAD_SCENARIO, 11).await;
+    run_scenario(SAVE_LOAD_SCENARIO, 10).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -697,25 +684,11 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 
 fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
     let options = TuiOptions {
-        model: "deepseek-v4-pro".to_string(),
-        workspace: tmpdir.path().to_path_buf(),
-        config_path: None,
-        config_profile: None,
-        allow_shell: false,
-        use_alt_screen: true,
-        use_mouse_capture: false,
-        use_bracketed_paste: true,
-        max_subagents: 1,
         skills_dir: tmpdir.path().join("skills"),
         memory_path: tmpdir.path().join("memory.md"),
         notes_path: tmpdir.path().join("notes.txt"),
         mcp_config_path: tmpdir.path().join("mcp.json"),
-        use_memory: false,
-        start_in_agent_mode: false,
-        skip_onboarding: true,
-        yolo: false,
-        resume_session_id: None,
-        initial_input: None,
+        ..crate::test_support::test_tui_options(tmpdir.path())
     };
     App::new(options, &Config::default())
 }

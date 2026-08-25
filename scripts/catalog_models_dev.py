@@ -37,7 +37,7 @@ from typing import Any
 
 DEFAULT_MODELS_DEV_URL = "https://models.dev/catalog.json"
 DEFAULT_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-USER_AGENT = "CodeWhale-catalog-automation/0.8.68 (+https://github.com/Hmbown/CodeWhale)"
+USER_AGENT = "CodeWhale-catalog-automation/0.9.0 (+https://github.com/Hmbown/CodeWhale)"
 FETCH_TIMEOUT_SECS = 60
 
 
@@ -168,6 +168,34 @@ def public_models_dev_document(data: dict[str, Any]) -> dict[str, Any]:
     if isinstance(data.get("providers"), dict):
         out["providers"] = scrub_secrets(data["providers"])
     return out
+
+
+def public_source_label(source: str) -> str:
+    """Log a catalog origin without query/fragment (tokens live there)."""
+    if source.startswith("url:"):
+        url = source[4:]
+        for sep in ("?", "#"):
+            url = url.split(sep, 1)[0]
+        return f"url:{url}"
+    return source
+
+
+def public_limit_value(value: Any) -> str:
+    """Format a catalog limit for logs. Never print credential-shaped strings.
+
+    Remote catalog JSON is tainted for clear-text-logging rules. Only numeric
+    limits are meaningful here; anything else (including token-shaped strings)
+    is replaced with a constant so the raw value cannot reach stdout.
+    """
+    if isinstance(value, bool):
+        return "redacted"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return format(value, ".6g")
+    return "redacted"
 
 
 def catalog_stats(data: dict[str, Any]) -> str:
@@ -303,6 +331,116 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     print("dry-run complete (use --check PATH to validate an existing snapshot)")
 
 
+def _limit_fields(entry: Any) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    limit = entry.get("limit")
+    return limit if isinstance(limit, dict) else {}
+
+
+def _collect_limit_drift(
+    seed_value: Any,
+    upstream_value: Any,
+    path: str,
+    drift: list[str],
+) -> None:
+    seed_limit = _limit_fields(seed_value)
+    upstream_limit = _limit_fields(upstream_value)
+    for field in ("context", "output"):
+        bundled = seed_limit.get(field)
+        upstream = upstream_limit.get(field)
+        if bundled != upstream:
+            drift.append(
+                f"{path}: limit.{field} "
+                f"bundled={public_limit_value(bundled)} "
+                f"upstream={public_limit_value(upstream)}"
+            )
+
+
+def cmd_drift(args: argparse.Namespace) -> None:
+    """Diff the bundled seed against upstream for limit.output / limit.context.
+
+    Dry-run only: no API key, no disk write. Network access (unless
+    CODEWHALE_MODELS_DEV_PATH points at a local file) reads the public
+    Models.dev catalog. Wiring this as a CI gate is a maintainer decision and
+    is deliberately not activated here.
+    """
+    seed_path = Path(args.seed)
+    if not seed_path.is_file():
+        die(f"drift: missing bundled seed {seed_path}")
+    seed = load_json_bytes(seed_path.read_bytes(), str(seed_path))
+    ensure_models_dev_shape(seed, str(seed_path))
+
+    upstream, source, _is_local = load_models_dev_catalog()
+
+    drift: list[str] = []
+    missing_upstream: list[str] = []
+
+    seed_models = seed.get("models") or {}
+    upstream_models = upstream.get("models") or {}
+    if isinstance(seed_models, dict) and isinstance(upstream_models, dict):
+        for model_id in sorted(seed_models):
+            if model_id not in upstream_models:
+                missing_upstream.append(f"models.{model_id}")
+                continue
+            _collect_limit_drift(
+                seed_models[model_id],
+                upstream_models[model_id],
+                f"models.{model_id}",
+                drift,
+            )
+
+    seed_providers = seed.get("providers") or {}
+    upstream_providers = upstream.get("providers") or {}
+    if isinstance(seed_providers, dict) and isinstance(upstream_providers, dict):
+        for provider_id in sorted(seed_providers):
+            seed_provider = seed_providers[provider_id]
+            seed_offerings = (
+                seed_provider.get("models") if isinstance(seed_provider, dict) else {}
+            )
+            if not isinstance(seed_offerings, dict):
+                continue
+            upstream_provider = upstream_providers.get(provider_id)
+            upstream_offerings = (
+                upstream_provider.get("models")
+                if isinstance(upstream_provider, dict)
+                else {}
+            )
+            if not isinstance(upstream_offerings, dict):
+                upstream_offerings = {}
+            for model_id in sorted(seed_offerings):
+                path = f"providers.{provider_id}.models.{model_id}"
+                if model_id not in upstream_offerings:
+                    missing_upstream.append(path)
+                    continue
+                _collect_limit_drift(
+                    seed_offerings[model_id],
+                    upstream_offerings[model_id],
+                    path,
+                    drift,
+                )
+
+    print(f"bundled seed: {seed_path}")
+    print(f"upstream: {public_source_label(source)}")
+    if missing_upstream:
+        print("removed upstream (bundled id no longer present):")
+        for path in missing_upstream:
+            print(f"  - {path}")
+    if drift:
+        print(f"limit drift detected ({len(drift)}):")
+        for path in drift:
+            print(f"  - {path}")
+        # Non-zero so a future CI gate can fail on drift; activating that gate
+        # is a maintainer decision.
+        die(
+            "bundled seed has drifted from upstream for limit.output / limit.context",
+            code=2,
+        )
+    if missing_upstream:
+        print("note: removed-upstream ids are reported above (non-fatal).")
+    print("no limit.output / limit.context drift")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Secret-free Models.dev / OpenRouter catalog automation (#4117)"
@@ -365,6 +503,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deprecated/unsupported with --write; retained for clear failure messages",
     )
     snapshot.set_defaults(func=cmd_snapshot)
+
+    drift = sub.add_parser(
+        "drift",
+        help="Diff bundled seed against upstream for limit.output / limit.context",
+    )
+    drift.add_argument(
+        "--seed",
+        default="crates/config/assets/models_dev.bundled.json",
+        help="Bundled seed path (default: crates/config/assets/models_dev.bundled.json)",
+    )
+    drift.set_defaults(func=cmd_drift)
     return p
 
 

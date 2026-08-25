@@ -1,16 +1,20 @@
 # Agent Fleet
 
-Agent Fleet is the local-first control plane for durable multi-worker runs. It
-is **not** a separate execution engine: a fleet worker is a headless
-`codewhale exec` run that the fleet launches and tracks durably. See
-[AGENT_RUNTIME.md](AGENT_RUNTIME.md) for how sub-agents, `exec`, and the fleet
-converge on one durable runtime. In product language, a user may still "open a
-sub-agent"; in architecture language, durable nested work should be a
-fleet-backed worker with a role.
+> 阅读简体中文版：[zh_hans/FLEET.md](zh_hans/FLEET.md)
 
-Use Fleet rather than short-lived `agent` fanout whenever the work
-needs retry, sleep/restart survival, remote execution, receipts, or a ledgered
-audit trail. The initial CLI surface is:
+Agent Fleet is the local-first roster and member-selection layer for durable
+multi-worker runs. It does not execute or authorize work. After Fleet resolves
+who should participate, the delegated coordinator launches a headless
+`codewhale exec` run and the Runtime tracks it durably. See
+[AGENT_RUNTIME.md](AGENT_RUNTIME.md) for how sub-agents, `exec`, and
+Fleet-backed workers converge on one runtime. In product language, a user may
+still "open a sub-agent"; in architecture language, durable nested work uses a
+Fleet member identity with delegated runtime execution.
+
+Use a Fleet roster rather than anonymous short-lived `agent` fanout whenever a
+delegated run needs stable member identities across retries, sleep/restart,
+remote execution, receipts, or a ledgered audit trail. The initial CLI surface
+is:
 
 For a guided start-to-monitor walkthrough that combines Fleet task specs with
 Workflow authoring, see [Fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
@@ -35,80 +39,319 @@ policy), and prints the post-resume status. It launches no new work and is
 idempotent, so it is safe to run after a manager exit, laptop sleep, or runtime
 restart.
 
-Fleet state is stored under the workspace in `.codewhale/fleet.jsonl`. Worker
-logs and adapter logs are stored under `.codewhale/fleet/` and
-`.codewhale/fleet-host/`.
+Coordinator state for Fleet-backed runs is stored under the workspace in
+`.codewhale/fleet.jsonl`. Worker logs and adapter logs are stored under
+`.codewhale/fleet/` and `.codewhale/fleet-host/`.
+
+## Public contract: identity, membership, and selection
+
+Fleet answers two questions: **who is in the roster?** and **which configured
+member did this request name?** A public roster identity consists only of:
+
+- a stable member id and an optional user-facing name;
+- a semantic role, such as `scout`, `builder`, or `reviewer`;
+- an exact provider/model identity, or an explicit inherited route;
+- visible roster state or origin.
+
+Project or workspace trust, filesystem and network reach, secret access,
+approval mode, sandboxing, tool authorization, and every other form of runtime
+authority are separate delegated-coordination and Runtime policy inputs. They
+are never Fleet identity fields, and they never select or reroute a Fleet
+member. The Runtime applies and clamps those policies only after member
+selection; if the selected member cannot run inside the effective envelope,
+launch fails closed instead of choosing somebody else.
+
+Natural-language member selection is deterministic. A caller may name:
+
+- an exact member id, optionally as `member:<id>` or `id:<id>`;
+- a unique user-facing member name, optionally as `name:<name>`;
+- a unique semantic role, for example `scout` or `role:scout`;
+- an exact pinned model id, for example `deepseek-v4-flash`, or its offline
+  display name, for example `DeepSeek V4 Flash`; or
+- an exact `route:<provider>/<model>`.
+
+An unqualified exact member id wins. Every other match succeeds only when it
+identifies one distinct roster member. Multiple matches produce an ambiguity
+error that names the candidates and asks for `member:<id>`; Codewhale never
+picks whichever match happened to be listed first. Users do not need to know
+an internal role label such as `scout`: a unique member name, display model, or
+exact model id is equally valid. Saved v2 Fleets store that optional human name
+as `display_name` (the input alias `name` is also accepted); it must be one
+trimmed printable line of at most 80 characters.
+
+### Interactive and persistent status
+
+`/fleet status` and `codewhale fleet status` are the **same** command on two
+surfaces. Both read the durable `.codewhale/fleet.jsonl` ledger for the
+workspace, through one shared control-plane contract, and both report the same
+verb id (`fleet.status`), read-vs-write authority, persistence scope, and
+receipt. When the workspace has no ledger they say so with a typed reason
+(`no_fleet_ledger`) instead of rendering an empty-looking "all clear" — and
+neither creates the ledger as a side effect of reading it.
+
+The current interactive session's sub-agents are a **different set**, and now
+have their own name:
+
+- `/fleet workers` (or `/subagents`, or `n`) shows sub-agents attached to the
+  current TUI session. It does not read the persistent ledger.
+- `/fleet list|status|interrupt|resume` and `codewhale fleet
+  list|status|interrupt|resume` act on the durable ledger.
+- `codewhale fleet restart <worker-id>` is CLI-only: it re-leases the task and
+  then drives the manager loop to completion. `/fleet restart` does not
+  silently do a smaller thing — it reports `surface_not_supported` and names
+  the CLI command.
+
+Before v0.9.2, `/fleet status` showed session sub-agents. That reading is gone;
+`/fleet workers` replaces it.
+
+The contract behind this — descriptors, availability reasons, exact-identity
+targets, receipts, typed unknowns, and bounds — is documented in
+[`docs/COMMAND_CONTROL_PLANE.md`](COMMAND_CONTROL_PLANE.md).
 
 ## Authoring agent profiles (`/fleet setup`)
 
 `/fleet setup` (also `/fleet setup edit` / `new`) opens an in-TUI wizard for
 authoring a reusable agent-team profile. Bare `/fleet` and the
 `roster`/`roles`/`profiles`/`party` aliases open the roster (the saved profiles).
-`/fleet status` opens the worker-status view; `/subagents` is a
-compatibility shortcut for that status view.
+`/fleet workers` opens the current-session worker view; `/subagents` is a
+compatibility shortcut for that view. For durable run history, use
+`/fleet status` or the shell command `codewhale fleet status` described above —
+they are the same command.
 
 The wizard is progressive: you make one focused choice at a time — a **role**,
 then a **model** (`inherit`, or a concrete model from *any configured
-provider*, not only the one the parent session is currently using), then a
-**thinking tier** (`inherit`, `off`, `low`, `medium`, `high`, `max`, or `auto`)
-— and then review the full posture (route, thinking, permissions, tools,
-workspace/org scope, and review policy) before doing anything. Picking a
-concrete model pins its provider explicitly: the saved profile records both
+provider*, not only the one the parent session is currently using), then
+**where the profile lives**, and finally a **review** of the member identity
+and route. When the review also previews thinking, tools, approvals, or another
+execution control, those rows summarize separate Runtime policy; they do not
+become Fleet identity or member selectors. The header shows "Saves to: …" on
+every step — the choice you still have to make, or the exact resolved file
+once you have made it. Nothing is written until you activate the save control
+on the review step.
+
+The **Destination** step is a focused two-option list (arrows move, Enter or
+Space chooses; Tab never changes the destination):
+
+- **This project** writes `<workspace>/.codewhale/agents/<role>.toml`. It
+  applies to this project only and takes precedence over a Personal profile
+  with the same id. When project profiles are disabled for the session
+  (`--no-project-config`) or the workspace folder is unavailable, the option is
+  shown disabled with that reason; the wizard never falls back to Personal on
+  its own.
+- **Personal** writes `$CODEWHALE_HOME/agents/<role>.toml` and is available in
+  every project on this machine, except where a project has its own profile
+  with the same id.
+
+For the highlighted option the step shows the exact file, whether saving would
+create a new file or **replace an existing one**, and the precedence
+consequence for the roster. The review step repeats those facts under
+"Saves to" and names the final action by its effect — **Save to this
+project**, **Save as Personal profile**, or **Replace …**. Replacing an
+existing file needs a second Enter on the save control. Tab / Shift+Tab (or
+←/→) move focus between the save control, **Change destination**, and
+**Back**; `s` is a secondary shortcut back to the Destination step. Reopening a
+saved member from `/fleet` starts from what is on disk: its member identity,
+route, and save scope. Thinking (`inherit`, `off`, `low`, `medium`, `high`,
+`max`, or `auto`) is adjusted on the review step with `t`, but remains a route
+execution setting rather than part of the member's Fleet identity.
+
+Profile scope controls where a role definition is reusable; it does not widen
+the authority of a running operation and is not a project-trust setting. To
+coordinate several nearby repositories, start Codewhale from their shared
+parent directory so that parent is the workspace. Project/workspace trust,
+external paths, filesystem and network reach, secrets, approvals, sandboxing,
+and tool authorization come from delegated-coordination and Runtime policy.
+For nested delegation, Runtime intersects the requested child posture with the
+live parent. For standalone `codewhale fleet` execution, Runtime instead uses
+the bounded tool-authority envelope minted from the task's explicit write
+scope together with live config, sandbox, and platform enforcement. Neither
+path reads authority from the profile's storage scope or identity selector.
+
+Picking a concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on
 whichever provider happens to be active when the profile is later loaded.
 Pressing **Enter** ("start") on the review step previews the exact starter
-profile TOML inline on that same screen; nothing is written until you ratify it.
+profile TOML inline on that same screen; nothing is written until you save it.
 The `provider` field may be a built-in provider id such as `openrouter` or a
 user-named OpenAI-compatible provider configured under `[providers.<name>]`
 such as `lm-studio`; the launch path preserves that id and fails closed if the
 provider is not configured.
 
+Profiles are also how the model-facing `agent` tool selects a route since the
+v0.9.9 schema slim (#5324, #5123): the advertised surface no longer carries
+`model` or `thinking` — a child either runs as a `profile` (whose saved route
+and thinking tier it uses exactly) or inherits the operator's model. Removed
+fields stay parse-accepted for saved transcripts, ACP/MCP clients and Fleet
+configs; see docs/SUBAGENTS.md for the advertised 12-field list and the
+compat list.
+
 When a provider is configured, the review step also offers model-assisted
-drafting behind a ratify gate:
+drafting behind an explicit preview-before-save gate:
 
 - Press **`m`** to have your first configured model draft the profile. The
-  draft arrives sanitized and bounded — permissions stay at the **fleet floor**
-  (no shell, no trust, approval required) regardless of what the model
-  proposes.
-- **Drafting is not ratifying.** The exact rendered TOML preview renders
+  draft arrives sanitized and bounded. Separately, the Runtime keeps its
+  conservative execution floor (no shell or trust escalation and approval
+  required) regardless of what the model proposes.
+- **Drafting is not saving.** The exact rendered TOML preview renders
   inline on the review step (not in a separate scrollable viewer), so nothing
-  is saved until you press **`g`** or **Enter** to ratify (or press `m` again
-  to redraft). Ratifying writes the profile to `.codewhale/agents/<role>`.
+  is saved until you press **`g`** or **Enter** to save (or press `m` again
+  to redraft). Saving writes the profile to the project or personal scope
+  shown in the preview.
 
 ## Naming: Modes, Workflow, and Fleet
 
 These names describe different layers, not competing systems. Plan and Act are
-the everyday work modes; Operate is an explicit preview while its control board
-is still being built. Workflow is an orchestration overlay that can run on top
-of those modes when the task needs a continuous workflow.
+the everyday work modes. Operate accepts ordinary messages and keeps the
+parent's normal tool surface under the same approval, sandbox, shell, ask-rule,
+and repository protections as Act. It prefers background Fleet workers for
+independent, parallel, isolated, or long-running work, but does not require a
+worker for every executable step. Workflow is an optional orchestration overlay
+for work that needs ordering, gates, shared budgets, replay, or deterministic
+fan-in.
+
+The short public vocabulary is:
+
+- **Fleet** = who is in the roster and which member is selected.
+  Fleet records member ids and names, semantic roles, provider/model
+  identities, and roster state.
+- **Workflow** = what order the work follows: phases, gates, budgets, replay,
+  and fan-in.
+- **Lane** = one running Workflow instance and its live progress.
+- **Runtime** = where, how, and with what authority selected work executes.
+  Runtime owns the local or remote process, provider route, project/workspace
+  trust, filesystem, network, secrets, approvals, sandbox, tools, and API
+  boundary.
 
 - **Workflow** is the repeatable plan and user-facing orchestration
   overlay: a script/IR that decides which phases and agents run next, keeps
   intermediate results out of the main conversation, and can be inspected or
   rerun. A Workflow run should have a visible progress view and a clear active
   header state instead of feeling like a hidden background task.
-- **Fleet** is the durable sub-agent configuration and execution substrate:
-  slots, profiles, per-slot models, tool posture, local/SSH hosts, trust
-  policy, leases, heartbeats, logs, receipts, and status APIs.
+- **Fleet** is the durable roster and deterministic member-selection surface:
+  member ids and names, semantic roles, pinned or inherited provider/model
+  identities, and roster state. The delegated
+  coordinator and Runtime own launch concurrency, leases, heartbeats, logs,
+  receipts, tools, sandboxing, approvals, and authority.
 - **High fan-out** is a behavior of a Workflow run, not a separate system:
   when a phase needs many workers at once, Workflow dispatches them as a
   Fleet-backed run (durable workers, receipts, goal re-dispatch) rather than
   reviving prompt-only sub-agent fanout.
-- **Fan-in is mandatory:** no fan-out without an owner that waits, aggregates,
-  verifies, and synthesizes one result. The operator should depend on one
-  manager or workflow receipt, not N loose `agent` children scattered across
-  the transcript.
+- **Fan-in is explicit:** when the user needs one combined result, an owner
+  aggregates, verifies, and synthesizes the worker receipts. Independent tasks
+  may finish separately; dispatch is never presented as completion.
 
 UI guidance: keep the main transcript calm. A Workflow run should appear as a
-compact progress card plus Work/Agents sidebar rows with phase names, worker
-counts, receipts, and nested indentation for child workers. Use the whale mark
-sparingly as an active header/status signal; avoid repeating emoji-heavy rows
-for every worker.
+compact progress card plus work-bar rows (the strip above the transcript, or
+a side rail) with phase names, worker counts, receipts, and nested
+indentation for child workers. Use the whale mark sparingly as an active
+header/status signal; avoid repeating emoji-heavy rows for every worker.
 
-## Manager-owned operations
+## Saved Fleets and the Reasoning Router
+
+A selected v2 Fleet freezes each selected member's id, semantic role, provider,
+and model identity into the durable run before a Workflow starts. Save the
+Fleet as `fleets/<name>.toml` in the workspace or under `$CODEWHALE_HOME`.
+Models cannot replace those identity or route assignments at runtime:
+
+```toml
+schema = "fleet"
+schema_revision = 2
+name = "release"
+
+[operator]
+provider = "deepseek"
+model = "deepseek-v4-pro"
+
+[[members]]
+id = "implementer"
+display_name = "Release Builder"
+role = "builder"
+provider = "zai"
+model = "glm-5.2"
+
+[[members]]
+id = "advice"
+role = "consultant"
+provider = "openai"
+model = "gpt-5.6"
+```
+
+The workflow crate's older `schema = "exact"`, revision 1 files are migration
+input only. Do not author them for v0.9.11; the selected roster and setup UI
+read and write only `schema = "fleet"`, revision 2.
+
+Reasoning is a separate route-execution decision, not Fleet identity. The
+optional Reasoning Router is a reusable Runtime service, not a Fleet member.
+Save one profile at `routers/<name>.toml` in either search root and reference it
+from any number of Fleets:
+
+```toml
+name = "luna-low"
+schema = "reasoning_router"
+schema_revision = 1
+provider = "openai"
+model = "gpt-5.6-luna"
+call_reasoning = "low"
+```
+
+At runtime it may choose only the reasoning tier for an already-frozen worker
+route. It cannot change the member, provider, model, or semantic role. The
+Router call itself is capped at `off` or `low`; more expensive values are
+rejected. A manually selected worker reasoning tier makes no Router call. Route
+and reasoning receipts name the worker model and, when used, the Router's exact
+provider/model so the operator can see which model did which job. If the same
+bare Router or Fleet name exists in both roots, qualify it as
+`workspace/<name>` or `codewhale_home/<name>` instead of relying on shadowing.
+
+Compatibility schemas may serialize `reasoning`, `permissions`, tool hints, or
+other execution settings beside a member. Those values are not Fleet identity,
+member selectors, or active authority. A valid legacy exact-Fleet snapshot
+retains its old `permissions` bytes only while verifying and replaying that
+snapshot's recorded content hash; a fresh capture emits the authority-free
+member shape. New-run validation rejects legacy Fleet
+`security_policy` and worker `trust_level` fields; configure execution authority
+through Runtime policy. The delegated coordinator resolves and durably freezes
+the member first. Runtime then applies either the delegating parent's effective
+ceiling or, for standalone Fleet CLI work, Runtime execution configuration plus
+live sandbox/platform enforcement. That boundary may
+reduce or refuse the selected worker's execution surface, but it must never
+choose a different member or route. See
+[`docs/MODES.md`](MODES.md), [`docs/SUBAGENTS.md`](SUBAGENTS.md), and
+[`docs/AGENT_RUNTIME.md`](AGENT_RUNTIME.md) for the enforcement contract.
+
+Reasoning receipts record the requested tier *and* the tier the provider was
+actually asked for. Those differ whenever a route cannot express the requested
+one — CodeWhale's route normalizer sends `high` for a requested `low` on most
+routes, and Z.AI's GLM routes express only thinking on/off — so the receipt
+reports the real request rather than the label that was selected. The value a
+call actually carries is spelled by that route's own normalizer, not by the tier
+label: an OpenAI Codex route is asked for `xhigh`, not `max`, and cannot be
+asked for `off` at all.
+
+A v0.9.11 durable Fleet CLI receipt keeps the selected profile id in
+`effective_permissions.profile_id`, the resolved semantic role in
+`resolved_route.role`, and the effective Runtime surface in the permission,
+shell, and tool-scope fields. An exact Workflow launch receipt records
+`member_role` separately from an optional Runtime `posture_role`, plus the
+fingerprint of the effective authority envelope checked at the spawn boundary.
+A member named `auditor` can therefore retain that identity while Runtime
+reports a `custom` posture and independently proves the narrower surface it
+enforced.
+
+A Workflow start fails closed on anything decidable locally: an unresolvable
+provider or model, a missing credential, a client that cannot be built for a
+member's route, or an `auto` member with no usable Reasoning Router. Per-task
+validation that the spawn boundary would refuse anyway — notably a write-capable
+member with no declared `write_roots`/`exact_files`/`coordination_contracts` —
+is checked before the Router is called, so an invalid task never spends a
+routing request. If a spawn fails *after* a Router decision, the receipt is
+still recorded: the tokens were spent, and any cross-provider disclosure already
+happened.
+
+## Manager-owned Workflow fan-in
 
 When parallel work must return one combined answer, use a manager-owned
-operation instead of a flat `agent` fan-out:
+Workflow instead of a flat `agent` fan-out:
 
 1. **Cast one manager** (operator or workflow orchestrator).
 2. **Fan out** child tasks through `workflow` (`task()`, `parallel()`,
@@ -128,30 +371,44 @@ decides a task needs more durable coordination than turn-by-turn sub-agent
 calls, it drafts a Workflow script/IR, presents the run plan according to the
 active permission mode, and the runtime compiles it into typed Fleet work.
 
-Fleet remains the sub-agent config surface. It owns slot count, role profiles,
-saved route pins or inheritance, tool posture, launch concurrency, and the ledger.
-Workflow owns only the orchestration plan: branch, sequence, loop, expand,
-review, and reduce decisions. The workflow script must not get direct shell,
-filesystem, network, provider-secret, cancellation, or TUI authority; workers
-perform real work as `codewhale exec` processes.
+Fleet remains the sub-agent roster and member-selection surface. It owns member
+identity, membership, semantic roles, saved provider/model pins or inheritance,
+and roster state. Workflow owns the orchestration plan:
+branch, sequence, loop, expand, review, and reduce decisions. The delegated
+coordinator and Runtime own slot admission, launch concurrency, the execution
+ledger, and every authority decision. A workflow script receives no direct
+shell, filesystem, network, provider-secret, cancellation, or TUI authority;
+workers perform real work as `codewhale exec` processes under the effective
+Runtime policy.
 
 Default Workflow-to-Fleet validation is intentionally bounded:
 
-- 100 total worker agents per workflow run;
-- 5 recursive Fleet rings;
+- 1,000 total worker agents per Workflow run;
+- 16 live worker agents at once; larger populations queue (block) on the host's
+  per-run concurrency gate until a live slot frees, then route through Fleet;
+- Workflow IR structural nesting no deeper than 5;
+- Runtime child delegation defaults to 3 levels and has an opt-in hard ceiling
+  of 8, independently of the Workflow document's structural depth;
 - bounded loops only (`max_iterations` required);
 - bounded dynamic expansion only (`max_children` plus a template required).
 
-These are population limits, not a demand to launch everything at once. A
-100-agent workflow should still drain through the configured Fleet worker pool.
+These are delegated-coordination population limits, not Fleet identity and not
+a demand to launch everything at once. A 1,000-agent Workflow should still
+drain through the configured Runtime worker pool. They are also not model-step
+budgets: omitted or zero `max_steps` remains unbounded. An explicit positive
+`max_steps` may cap that task, while wall-clock timeouts, cancellation,
+provider safeguards, heartbeats, and admission controls remain independent.
+
 Recommended model layouts, such as a DeepSeek Pro orchestrator with Flash
 workers in the first ring and cheaper workers farther out, are presets only.
 Every slot can inherit the active model or carry an explicit model override.
 Inheritance is literal: the model you select in `/model` is the **operator**
 (the pinned first row in `/fleet roster`), and any worker whose task spec and
-roster profile pin no model runs on that session model. Task-level `model` and
-profile `model` overrides still win; route receipts record which source
-applied (`task.model`, `agent_profile.model`, or `run.model`).
+roster profile pin no model runs on that session model. Once a selected member
+has an exact provider/model pin, the Runtime does not silently reroute that
+identity because a policy input differs; it either runs that route inside the
+effective envelope or fails closed. Route receipts record the requested and
+resolved identity.
 
 The setup UI should render this as an expanding grid: an orchestrator plus a
 small number of visible sub-agent slots, with Right/Enter drilling into a slot's
@@ -175,17 +432,26 @@ next recursive ring rather than trying to show the whole tree at once.
 }
 ```
 
-Workers are optional. If omitted, CodeWhale creates local worker slots up to
+Workers are optional. If omitted, Codewhale creates local worker slots up to
 `--max-workers`.
 
 Task specs are typed in Rust and keep verification data separate from worker
-transcripts. A task can declare:
+transcripts. Only the `worker` member/role reference participates in Fleet
+identity selection. The remaining execution fields are delegated-coordination
+or Runtime inputs applied after the member is resolved. A task can declare:
 
 - `id`, `name`, `description`, `objective`, and `instructions`
 - `worker` role, tool profile, tools, and required capabilities
 - `workspace` root, required files, writable paths, and environment allowlist
 - `input_files`, extra `context`, `budget`, `timeout_seconds`, and `retry_policy`
 - `expected_artifacts`, `scorer`, `tags`, and free-form `metadata`
+
+None of those execution-policy fields becomes part of a Fleet identity or an
+alternate member selector. Omitted or zero `max_steps` means no model-step
+ceiling; Codewhale must not synthesize a default step budget. Explicit positive
+step limits, timeouts, cancellation, provider safeguards, heartbeats, and
+admission control are enforced independently by the delegated coordinator and
+Runtime.
 
 Workers write bounded artifact files under `.codewhale/fleet/` and ledger only
 the artifact refs: kind, path, checksum, MIME type, and size. Receipts record
@@ -200,9 +466,10 @@ an explicit verifier pass completes.
 
 ### Using Role Presets
 
-Tasks can reference a role name, and the fleet manager fills in defaults
-from the role registry. Built-in roles (`smoke-runner`, `reviewer`, `builder`,
-`read-only`) are always available; define your own in `[fleet.roles]`.
+Tasks can reference a semantic role name to select one unique roster member.
+Built-in role names (`smoke-runner`, `reviewer`, `builder`, `read-only`) remain
+available for compatibility, and custom roles may be defined in
+`[fleet.roles]`.
 
 ```json
 {
@@ -219,8 +486,10 @@ from the role registry. Built-in roles (`smoke-runner`, `reviewer`, `builder`,
 }
 ```
 
-The task inherits the role's tool profile, budget, and timeout. You can
-override any field in the task spec:
+After identity resolution, compatibility role presets may provide tool,
+timeout, or retry defaults to the delegated coordinator. Those defaults do not
+grant authority, do not change which member was selected, and remain subject to
+Runtime clamping. A task spec may request its execution settings explicitly:
 
 ```json
 {
@@ -409,7 +678,7 @@ Choose one typed action:
 Safe Slack or PagerDuty draft:
 
 ```text
-CodeWhale fleet needs attention
+Codewhale fleet needs attention
 Run: <run-id>
 Worker: <worker-id>
 Task: <task-id or unknown>
@@ -431,8 +700,10 @@ skill registry after system skills are installed or refreshed.
 
 ## Host Adapters
 
-The host adapter boundary supports local child processes and explicit SSH
-workers. Adapters expose the same operations: start, read status, read bounded
+The Runtime host-adapter boundary supports local child processes and explicit
+SSH workers. Host choice is Runtime placement on a worker spec, not Fleet member
+identity or a member selector. It does not authenticate the host or grant
+access. Adapters expose the same operations: start, read status, read bounded
 logs, interrupt, restart, stop, and cleanup.
 
 Local workers run as child processes with stdin closed and stdout/stderr written
@@ -467,173 +738,42 @@ Example SSH worker spec:
 Defaults are intentionally conservative:
 
 - no hosted control plane or cloud provisioning is enabled;
-- SSH requires an explicit host, working directory, and CodeWhale binary path;
+- SSH requires an explicit host, working directory, and Codewhale binary path;
 - secret-like environment names such as `TOKEN`, `SECRET`, `PASSWORD`,
   `API_KEY`, and `PRIVATE_KEY` are rejected from adapter allowlists;
-- secrets should remain in CodeWhale config providers or remote host config,
+- secrets should remain in Codewhale config providers or remote host config,
   not in task instructions, argv, or fleet logs.
 
-## Security and Trust Boundaries
+## Runtime policy and authority are not Fleet identity
 
-Agent Fleet enforces a trust-level model that separates workers into four tiers.
-The trust level determines what a worker can access (secrets, network, workspace
-writes) and how it must prove its identity before being granted those privileges.
+Fleet does not define a project/workspace trust level, filesystem or network
+reach, secret access, approval mode, sandbox, tool set, or execution authority.
+Those belong to delegated-coordination and Runtime policy. This separation is
+load-bearing:
 
-### Trust Levels
+- member resolution considers only member id/name, semantic role,
+  provider/model identity, and roster state;
+- the selected identity is frozen before any authority policy is evaluated;
+- the Runtime applies the live parent ceiling when one exists; standalone
+  Fleet CLI launches instead carry an explicit bounded authority envelope,
+  and both paths remain subject to live sandbox and platform enforcement;
+- no trust, permission, capability, secret, sandbox, approval, or tool-policy
+  value may select another member or silently change its provider/model route;
+  and
+- receipts report requested and effective Runtime posture separately from the
+  Fleet member identity.
 
-| Level | Access | Requires |
-|-------|--------|----------|
-| `sandbox` | No network, no secrets, writes only to `.codewhale/fleet/` | Nothing — default for new workers |
-| `local` | Workspace reads, gated writes, configured secrets | Local process (same uid) |
-| `remote-verified` | Network access, bounded capability grants, configured secrets | SSH host-key verification or equivalent attestation |
-| `operator` | Full access to all secrets, unrestricted writes, any action | Operator-owned machine |
+Older persisted configuration and protocol shapes may still contain fields such as
+`security_policy`, `trust_level`, `permissions`, `capability_grants`, secret
+references, host authentication, environment allowlists, or tool profiles.
+They remain deserializable for ledger replay, but new Fleet run creation rejects
+`security_policy` and worker `trust_level` rather than pretending they grant
+authority. Their presence in old data does not make them Fleet variables or
+grants. The active Runtime remains the final authority and fails closed when a
+requested operation cannot be enforced.
 
-The default trust level is `sandbox`. Operators must explicitly raise trust for
-SSH or container workers through the security policy.
-
-### Security Policy
-
-A fleet run may carry an optional `security_policy` block that defines the
-default trust level, which secrets workers may resolve, what capabilities are
-granted, and a ceiling on the maximum trust level:
-
-```json
-{
-  "security_policy": {
-    "default_trust_level": "sandbox",
-    "allowed_secrets": [
-      {"key": "GH_TOKEN", "source": "env"},
-      {"key": "CODEWHALE_API_KEY", "source": "keyring"}
-    ],
-    "capability_grants": [
-      {
-        "capability": "network",
-        "scope": "github.com",
-        "reason": "PR review needs GitHub API access"
-      }
-    ],
-    "max_trust_level": "remote_verified",
-    "require_identity_verification": true
-  }
-}
-```
-
-When a run has no explicit `security_policy`, workers inherit conservative
-defaults: `sandbox` trust, no secrets, no capability grants, and no identity
-verification requirement.
-
-### Secret References
-
-Secrets are never stored as plaintext in task specs, alert configs, or worker
-definitions. Instead, every secret is a `FleetSecretRef` — a key name plus an
-optional source hint that tells the fleet manager where to resolve the value:
-
-```json
-{"key": "GH_TOKEN", "source": "env"}
-```
-
-Supported sources:
-- `"env"` — resolve from a process environment variable
-- `"keyring"` — resolve from the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service)
-- `"file"` — resolve from `~/.codewhale/secrets/`
-- absent — try all sources in default order (store first, then env)
-
-Secret refs are redacted in logs and ledger entries: `<secret:env.GH_TOKEN>`.
-
-### Worker Authentication
-
-Workers authenticate to the fleet manager using one of three methods:
-
-- **None** — local workers sharing the same uid (default)
-- **SSH key** — with optional host-key fingerprint pinning and known-hosts
-  verification. The `host_key_fingerprint` field (SHA256:...) pins the expected
-  server key, preventing MITM attacks on first connection.
-- **Token** — a bearer token resolved from a `FleetSecretRef`, useful for remote
-  workers behind a fleet proxy.
-- **mTLS** — mutual TLS with a client certificate and a secret-backed private key.
-
-SSH workers should always set `host_key_fingerprint` in production:
-
-```json
-{
-  "id": "builder-1",
-  "name": "Builder 1",
-  "trust_level": "remote_verified",
-  "host": {
-    "kind": "ssh",
-    "host": "builder.example.com",
-    "user": "codewhale",
-    "port": 22,
-    "identity": "~/.ssh/codewhale_fleet",
-    "host_key_fingerprint": "SHA256:aLGqZo1M6c...",
-    "known_hosts": "~/.ssh/known_hosts",
-    "working_directory": "/srv/codewhale/work",
-    "env_allowlist": ["CODEWHALE_PROFILE"],
-    "codewhale_binary": "/usr/local/bin/codewhale"
-  },
-  "capabilities": ["local", "linux", "tests"],
-  "max_concurrent_tasks": 1
-}
-```
-
-### Alert Channel Secrets
-
-Alert channels (Slack, generic webhook, PagerDuty) use `FleetAlertEndpoint`
-instead of raw URLs. The webhook URL can be provided inline for non-sensitive
-endpoints, or as a secret reference:
-
-```json
-{
-  "kind": "slack",
-  "webhook": {
-    "url_ref": {"key": "CODEWHALE_FLEET_SLACK_WEBHOOK", "source": "env"},
-    "secret_ref": {"key": "CODEWHALE_FLEET_SLACK_SIGNING_SECRET", "source": "keyring"}
-  }
-}
-```
-
-The `secret_ref` field provides an optional HMAC secret for webhook payload
-signing, never stored in plaintext.
-
-### Config File
-
-The `[fleet]` table in `config.toml` sets global trust policy defaults:
-
-```toml
-[fleet]
-default_trust_level = "sandbox"
-require_identity_verification = true
-max_trust_level = "operator"
-
-[fleet.exec]
-# Recursion depth shares ONE axis with standalone sub-agents — a fleet worker
-# IS a headless sub-agent. 0 blocks child agents (the root worker still runs);
-# 3 is the default; explicit config clamps to the shared safety ceiling.
-max_spawn_depth = 3
-```
-
-These defaults apply to fleet runs that don't carry their own `security_policy`.
-Per-run policies always override the config defaults.
-
-### Capability Grants
-
-Capability grants are additive, scoped permissions that authorize specific
-actions. By default, workers get no grants (least privilege). Common grants:
-
-- `"network"` with scope `"github.com"` — allow outbound HTTP to GitHub
-- `"git-push"` — allow `git push` to remotes
-- `"provider-secrets"` — allow accessing provider API keys
-- `"release"` — allow release-related operations (tagging, publishing)
-- `"workspace-write"` with scope `"crates/tui/**"` — allow writes within a path
-
-### Environment Sanitization
-
-The host adapter layer enforces environment sanitization at worker start:
-
-- Only `HOME`, `PATH`, and platform-specific vars (`SYSTEMROOT`, `COMSPEC`) are
-  injected into worker processes by default
-- Environment allowlists reject any key containing `SECRET`, `TOKEN`, `PASSWORD`,
-  `PASSWD`, `API_KEY`, `CREDENTIAL`, or `PRIVATE_KEY`
-- SSH workers only send explicitly allowlisted variables via OpenSSH `SendEnv`
-- Secret values are never embedded in worker argv, task instructions, or fleet
-  logs — only secret refs appear, and they are always redacted
+For current enforcement behavior, use [Modes](MODES.md),
+[Sub-agents](SUBAGENTS.md), [Agent Runtime](AGENT_RUNTIME.md), and the
+[Command Control Plane](COMMAND_CONTROL_PLANE.md). Keep secret values out of
+task instructions, arguments, logs, and receipts; adapter and Runtime layers
+must continue to redact or reject them independently of Fleet selection.

@@ -12,10 +12,51 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ApiProvider, expand_path, normalize_model_name};
 use crate::localization::normalize_configured_locale;
-use crate::palette::{normalize_hex_rgb_color, normalize_theme_name};
+use crate::palette::{normalize_hex_rgb_color, normalize_theme_setting};
+use crate::tui::app::ReasoningEffort;
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
+
+/// Smallest Top work surface that can show its divider plus the compact
+/// goal / to-do / Agent projection without turning the rail into invisible
+/// keyboard state. Older releases accepted two rows, which left only one
+/// content row and could hide every actionable item behind the goal title.
+pub(crate) const WORK_SURFACE_TOP_HEIGHT_MIN: u16 = 5;
+pub(crate) const WORK_SURFACE_TOP_HEIGHT_MAX: u16 = 16;
 const TUI_PREFS_FILE_NAME: &str = "tui.toml";
+
+/// How successful structured file mutations are represented in the live
+/// transcript. Exact evidence is retained for inspection in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InlineDiffMode {
+    /// Show a bounded red/green unified diff plus semantic change statistics.
+    #[default]
+    Full,
+    /// Show only bounded semantic change statistics.
+    Summary,
+    /// Keep the calm File outcome row without any inline diff detail.
+    Off,
+}
+
+impl InlineDiffMode {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "summary" => Self::Summary,
+            "off" => Self::Off,
+            _ => Self::Full,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_setting(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+            Self::Off => "off",
+        }
+    }
+}
 
 // ============================================================================
 // TuiPrefs — ~/.codewhale/tui.toml
@@ -96,35 +137,25 @@ impl TuiPrefs {
     /// Return the canonical path of the TUI preferences file:
     /// `~/.codewhale/tui.toml`, or legacy `~/.deepseek/tui.toml` when present.
     ///
-    /// Tests may override the home directory through the
-    /// `DEEPSEEK_CONFIG_PATH` environment variable (the parent directory of
-    /// the pointed-to config is used instead of `~/.deepseek`).
+    /// Tests may override the home directory through the canonical
+    /// `CODEWHALE_CONFIG_PATH` environment variable. The parent directory of
+    /// the pointed-to config is used instead of the default settings home.
     pub fn path() -> Result<PathBuf> {
-        // Honour the same env-var escape hatch used by Settings::path so that
-        // integration tests can redirect all config I/O to a temp directory.
-        if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-            let config_path = config_path.trim();
-            if !config_path.is_empty() {
-                let p = expand_path(config_path);
-                if let Some(parent) = p.parent() {
-                    return Ok(parent.join("tui.toml"));
+        #[cfg(test)]
+        {
+            let honor_guarded_environment =
+                crate::test_support::guarded_environment_provides_state_paths();
+            crate::test_support::with_test_env_lock(|| {
+                if honor_guarded_environment {
+                    tui_prefs_path_from_environment()
+                } else {
+                    Ok(crate::test_support::unsealed_test_state_root().join(TUI_PREFS_FILE_NAME))
                 }
-            }
+            })
         }
 
-        let primary = codewhale_config::codewhale_home()
-            .ok()
-            .map(|home| home.join(TUI_PREFS_FILE_NAME));
-        if codewhale_config::codewhale_home_is_explicit() {
-            return primary.ok_or_else(|| {
-                anyhow::anyhow!("Failed to resolve tui.toml path: no CodeWhale home found.")
-            });
-        }
-        let legacy_home = codewhale_config::legacy_deepseek_home()
-            .ok()
-            .map(|home| home.join(TUI_PREFS_FILE_NAME));
-
-        resolve_tui_prefs_path_from_candidates(primary, legacy_home)
+        #[cfg(not(test))]
+        tui_prefs_path_from_environment()
     }
 
     /// Load TUI preferences from `~/.codewhale/tui.toml` or a legacy fallback.
@@ -134,10 +165,19 @@ impl TuiPrefs {
     /// user without crashing the session.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
+        #[cfg(test)]
+        {
+            crate::test_support::with_test_state_io_lock(|| Self::load_from_path(&path))
+        }
+        #[cfg(not(test))]
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)
+        let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read tui.toml from {}", path.display()))?;
         let prefs: TuiPrefs = match toml::from_str(&content) {
             Ok(p) => p,
@@ -153,6 +193,15 @@ impl TuiPrefs {
     /// it already exists), creating the target directory if needed.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        #[cfg(test)]
+        {
+            crate::test_support::with_test_state_io_lock(|| self.save_to_path(&path))
+        }
+        #[cfg(not(test))]
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create config directory {}", parent.display())
@@ -160,7 +209,7 @@ impl TuiPrefs {
         }
         let serialized = toml::to_string_pretty(self).context("Failed to serialize TuiPrefs")?;
         let body = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
+            let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read tui.toml at {}", path.display()))?;
             codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
                 tracing::warn!("failed to merge tui.toml comments, saving without them: {e:#}");
@@ -169,7 +218,7 @@ impl TuiPrefs {
         } else {
             serialized
         };
-        std::fs::write(&path, body)
+        std::fs::write(path, body)
             .with_context(|| format!("Failed to write tui.toml to {}", path.display()))?;
         Ok(())
     }
@@ -179,16 +228,31 @@ impl TuiPrefs {
     /// Returns `Err` if an unrecognised `theme` value is found so callers can
     /// surface a helpful message rather than silently ignoring a typo.
     pub fn validate(&mut self) -> Result<()> {
-        let theme = self.theme.trim().to_ascii_lowercase();
-        let Some(theme) = normalize_theme_name(&theme) else {
-            anyhow::bail!(
-                "Invalid tui.toml theme '{}': expected system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, or solarized-light.",
-                self.theme
-            );
-        };
-        self.theme = theme.to_string();
+        self.theme = normalize_theme_setting(&self.theme).map_err(anyhow::Error::msg)?;
         Ok(())
     }
+}
+
+fn tui_prefs_path_from_environment() -> Result<PathBuf> {
+    // Honour the same env-var escape hatch used by Settings::path so that
+    // integration tests can redirect all config I/O to a temp directory.
+    if let Some(parent) = config_override_parent() {
+        return Ok(parent.join("tui.toml"));
+    }
+
+    let primary = codewhale_config::codewhale_home()
+        .ok()
+        .map(|home| home.join(TUI_PREFS_FILE_NAME));
+    if codewhale_config::codewhale_home_is_explicit() {
+        return primary.ok_or_else(|| {
+            anyhow::anyhow!("Failed to resolve tui.toml path: no Codewhale home found.")
+        });
+    }
+    let legacy_home = codewhale_config::legacy_deepseek_home()
+        .ok()
+        .map(|home| home.join(TUI_PREFS_FILE_NAME));
+
+    resolve_tui_prefs_path_from_candidates(primary, legacy_home)
 }
 
 fn resolve_tui_prefs_path_from_candidates(
@@ -213,6 +277,17 @@ fn resolve_tui_prefs_path_from_candidates(
 }
 
 /// User settings with defaults
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinnedModel {
+    /// Exact configured provider identity; labels never replace this value.
+    pub provider: String,
+    /// Exact provider-owned model id.
+    pub model: String,
+    /// Optional presentation-only label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -221,6 +296,11 @@ pub struct Settings {
     /// Context-window percentage that triggers pre-send auto-compaction when
     /// `auto_compact` is enabled. The hard token floor still applies.
     pub auto_compact_threshold_percent: f64,
+    /// Whether the persisted settings file expressed an auto-compaction
+    /// preference. Runtime defaults must not be written back as user intent
+    /// when an unrelated setting is saved.
+    #[serde(skip)]
+    pub(crate) auto_compact_explicit: bool,
     /// Reduce status noise and collapse details more aggressively
     pub calm_mode: bool,
     /// Dense tool-run collapse mode: compact, expanded, or calm.
@@ -234,9 +314,26 @@ pub struct Settings {
     /// Background treatment: `ombre` paints the terminal-native water column;
     /// `flat` preserves all state marks on the theme's plain surface.
     pub ocean_treatment: String,
+    /// Focus-context texture prototype for modal views (#4823): `off`
+    /// (default), `scrim` dims the area outside the focused modal, `grain`
+    /// sprinkles deterministic dots over blank cells there. Static texture,
+    /// never obscures text; unknown values fall back to `off` at render time.
+    pub focus_texture: String,
     /// Ocean Tasks / To-do / Workers rail placement: top, left, or right.
     /// The lower edge remains owned by the composer and phase footer.
     pub work_surface_placement: String,
+    /// Remembered total height (content plus divider) for top Work placement.
+    pub work_surface_top_height: u16,
+    /// Remembered total width (content plus divider) for side Work placement.
+    pub work_surface_side_width: u16,
+    /// Which panel the rail shows: tasks, agents, context, or pinned.
+    /// Orthogonal to `work_surface_placement` (rail unification, 0.9.4).
+    pub rail_panel: String,
+    /// Runtime-only: whether the loaded settings document explicitly named
+    /// `rail_panel`. The sidebar→rail migration must not override an
+    /// explicit choice that happens to equal the default ("tasks").
+    #[serde(skip)]
+    pub(crate) rail_panel_explicit: bool,
     /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
     /// rates. Separate from accessibility motion and text delivery.
     #[serde(skip)]
@@ -260,9 +357,35 @@ pub struct Settings {
     pub mention_menu_behavior: String,
     /// Show thinking blocks from the model
     pub show_thinking: bool,
+    /// When true, thinking blocks render expanded by default instead of
+    /// collapsed. Space still toggles collapse/expand. Useful for SSH/tmux
+    /// users where the Space key may be captured by the terminal layer.
+    #[serde(default)]
+    pub thinking_default_expanded: bool,
+    /// Collapsed completed-thought preview rows. Default 2 (compact).
+    /// Set `10` for the older dump, or `0` for header-only. Full expand is
+    /// still `thinking_default_expanded` / Space.
+    #[serde(default = "default_thinking_preview_lines")]
+    pub thinking_preview_lines: usize,
+    /// Keep thinking visible while disabling its filled background treatment.
+    pub thinking_highlight: bool,
+    /// When true, Help/shortcuts groups start expanded. Default false folds
+    /// the long tail. Type-to-filter still unfolds matches.
+    #[serde(default)]
+    pub help_expand_groups: bool,
+    /// Pin the last user prompt at the top of the transcript when it has
+    /// scrolled off. Default on.
+    #[serde(default = "default_true")]
+    pub pin_last_prompt: bool,
     /// Show detailed tool output
     pub show_tool_details: bool,
-    /// UI locale: auto, en, ja, zh-Hans, pt-BR, es-419
+    /// Successful structured File mutation evidence: full, summary, or off.
+    /// This affects inline presentation only; exact evidence remains available
+    /// through the tool-details route in every mode.
+    pub inline_diffs: String,
+    /// UI locale: auto, en, ja, zh-Hans, zh-Hant, pt-BR, es-419, vi, ko,
+    /// ca, de, fr, id, hi, ru, uk.
+    /// Every shipped pack holds full `en.json` parity; nothing falls back.
     pub locale: String,
     /// Named UI theme. Accepts `"system"` (follow terminal background),
     /// `"dark"`, `"light"`, `"grayscale"`, or one of the community
@@ -276,6 +399,10 @@ pub struct Settings {
     pub composer_density: String,
     /// Show a border around the composer input area
     pub composer_border: bool,
+    /// Keep bare Enter available for multiline drafting. When enabled,
+    /// Shift+Enter submits; Ctrl+J and Alt+Enter remain newline shortcuts.
+    #[serde(default)]
+    pub composer_multiline_mode: bool,
     /// Composer editing mode: "normal" (default) or "vim" for modal editing.
     /// When set to "vim" the composer starts in Normal mode; press i/a/o to
     /// enter Insert mode and Esc to return to Normal.
@@ -286,26 +413,45 @@ pub struct Settings {
     /// session directly; resume remains available in-session.
     #[serde(default)]
     pub launch_screen: bool,
-    /// Default mode: "agent" or "plan". Legacy permission
+    /// Default mode: "agent" (Act), "plan", or "operate". Legacy permission
     /// shorthands are accepted for migration but never advertised as modes.
     pub default_mode: String,
-    /// Sidebar width as percentage of terminal width
+    /// Legacy sidebar width as percentage of terminal width. Load-only
+    /// migration shim (0.9.4 rail unification): read by
+    /// `migrate_sidebar_settings_to_rail`, never written back.
+    #[serde(skip_serializing)]
     pub sidebar_width_percent: u16,
-    /// Sidebar focus mode: pinned, auto, tasks, agents, context, hidden
+    /// Legacy sidebar focus mode: pinned, auto, tasks, agents, context,
+    /// hidden. Load-only migration shim, never written back.
+    #[serde(skip_serializing)]
     pub sidebar_focus: String,
-    /// Migration marker for users who explicitly opt into idle auto-collapse.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub sidebar_auto_collapse_opt_in: bool,
     /// Enable the session-context panel (#504). Shows working set, tokens,
     /// cost, MCP/LSP status, cycle count, and memory info.
     pub context_panel: bool,
+    /// Show the persistent Sessions rail in the sidebar (#2934).
+    ///
+    /// Off by default: the rail spends sidebar rows that Work, Activity, and
+    /// Agents already compete for, so it is opt-in rather than something a
+    /// user discovers by having their layout change under them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sessions_rail: bool,
+    /// Reattach to this workspace's most recent session on startup (#2934).
+    ///
+    /// Off by default. `--resume`/`--continue` remain the explicit paths and
+    /// always take precedence; when this is on, startup still refuses to
+    /// resume an archived, unreadable, or foreign-workspace session and falls
+    /// back to a fresh transcript with a receipt. See
+    /// [`crate::session_resume`] for the decision table.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_auto_resume: bool,
     /// Cost display currency: usd or cny.
     pub cost_currency: String,
     /// Maximum number of input history entries to save
     pub max_input_history: usize,
     /// Default provider override (e.g. "deepseek", "openai").
     pub default_provider: Option<String>,
-    /// Default model to use
+    /// DeepSeek-only fallback model. Non-DeepSeek providers use the
+    /// provider-scoped entry in [`Self::provider_models`] instead.
     pub default_model: Option<String>,
     /// Default reasoning effort selected from the TUI model picker.
     /// `None` falls back to `config.toml` and then the runtime default.
@@ -313,14 +459,31 @@ pub struct Settings {
     /// TUI-only Shift+Tab posture: ask, auto-review, or full-access.
     /// An explicit/managed `config.toml` approval policy always takes
     /// precedence, so this preference cannot loosen project requirements.
+    /// This is **tool-approval posture**, not filesystem scope — see
+    /// [`Self::sandbox_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_posture: Option<String>,
+    /// Filesystem sandbox scope, independent of approval posture:
+    /// `read-only | workspace-write | danger-full-access | external-sandbox`.
+    /// Surfaced in Settings and the shell so "Full Access" (approval) is
+    /// never confused with unrestricted filesystem writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
     /// Per-provider model overrides. Key is provider name (e.g. "openai"),
     /// value is the model id. Takes precedence over `default_model`.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
+    /// Provider-scoped model IDs intentionally enabled for the ordinary model
+    /// picker. Missing on older files; current and saved provider choices are
+    /// seeded at load time so the migration is additive and non-breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Exact provider/model tuples pinned to the top of model choosers, in
+    /// user-defined order. Stale entries remain persisted and visible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_models: Vec<PinnedModel>,
     /// Header status indicator next to the effort chip. Cycles through a
     /// per-turn animation keyed off `App::turn_started_at`:
-    /// - `"cw"` (default): static typographic CodeWhale mark.
+    /// - `"cw"` (default): static typographic Codewhale mark.
     /// - `"whale"`: historical `🐳 → 🐋` 12-frame sequence
     ///   originally shipped in v0.3.5, removed in v0.8.x's "smoother TUI
     ///   streaming" pass, restored in v0.8.30. Idle frame is a steady `🐳`.
@@ -345,17 +508,6 @@ pub struct Settings {
     ///   *do* support DEC 2026; it is purely a rendering-quality knob,
     ///   not a correctness one.
     pub synchronized_output: String,
-    /// Prefer the external `pdftotext` binary (Poppler) over the bundled
-    /// pure-Rust `pdf-extract` extractor for PDF reads in `read_file`.
-    /// Pure-Rust extraction is the v0.8.32 default because it removes the
-    /// install-poppler-first hurdle most users hit, but `pdftotext -layout`
-    /// still wins for column-heavy or complex-table PDFs (academic papers
-    /// laid out in two columns, financial filings, etc.). Set to `true` to
-    /// route every PDF read through `pdftotext` instead — when the binary
-    /// is missing in that mode the tool returns the structured
-    /// `binary_unavailable` response with an install hint, matching the
-    /// pre-v0.8.32 behavior.
-    pub prefer_external_pdftotext: bool,
     /// Follow symbolic links during workspace file discovery walks (`@`-mention
     /// completion, fuzzy resolve, and the file-index builder). When `false`
     /// (default) symlinked directories are skipped, which keeps walks fast and
@@ -376,6 +528,11 @@ pub struct Settings {
     /// One-time YOLO deprecation toast has been shown. Suppresses the repeat
     /// toast after the first sighting per install (persisted across sessions).
     pub yolo_deprecation_shown: bool,
+    /// Persisted impression counts for action-triggered, ephemeral product
+    /// guidance. Keys are stable tip identifiers; values are bounded by the
+    /// behavioral-tip engine and omitted entirely before the first sighting.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub behavioral_tip_impressions: std::collections::BTreeMap<String, u8>,
     /// True only for the current load when `default_mode = "yolo"` was read
     /// from an older settings file. App startup uses this provenance to migrate
     /// the old bundled Full Access choice without weakening project or managed
@@ -393,13 +550,21 @@ impl Default for Settings {
             // making long-session continuity the default runtime behavior.
             auto_compact: false,
             auto_compact_threshold_percent: 80.0,
+            auto_compact_explicit: false,
             // #4095: default presentation is compact/calm; verbose detail is opt-in.
             calm_mode: true,
             tool_collapse_mode: "compact".to_string(),
             low_motion: false,
             fancy_animations: true,
             ocean_treatment: "ombre".to_string(),
+            focus_texture: "off".to_string(),
             work_surface_placement: "top".to_string(),
+            // Cap, not fixed height: the top strip auto-fits its rows and
+            // only grows to this many lines (user request, 2026-07-23).
+            work_surface_top_height: 8,
+            work_surface_side_width: 30,
+            rail_panel: "tasks".to_string(),
+            rail_panel_explicit: false,
             constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
@@ -409,33 +574,47 @@ impl Default for Settings {
             // Reasoning is useful when explicitly requested, but it should
             // never displace the actual conversation in the default TUI.
             show_thinking: false,
+            thinking_default_expanded: false,
+            thinking_preview_lines: default_thinking_preview_lines(),
+            thinking_highlight: true,
+            help_expand_groups: false,
+            pin_last_prompt: true,
             show_tool_details: false,
+            inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
             theme: "system".to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
             composer_border: true,
+            composer_multiline_mode: false,
             composer_vim_mode: "normal".to_string(),
             transcript_spacing: "comfortable".to_string(),
             launch_screen: false,
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
-            sidebar_auto_collapse_opt_in: true,
             context_panel: false,
+            sessions_rail: false,
+            session_auto_resume: false,
             cost_currency: "usd".to_string(),
             max_input_history: 100,
             default_provider: None,
             default_model: None,
             reasoning_effort: None,
             permission_posture: None,
+            sandbox_mode: None,
             provider_models: None,
+            enabled_models: None,
+            pinned_models: Vec::new(),
+            // The whale lives in the terminal window title (OSC 0). The in-app
+            // header defaults to the static typographic `cw` mark so the two
+            // surfaces do not compete with a second spinner.
             status_indicator: "cw".to_string(),
             synchronized_output: "auto".to_string(),
-            prefer_external_pdftotext: false,
             workspace_follow_symlinks: false,
             feature_intro_shown: false,
             yolo_deprecation_shown: false,
+            behavioral_tip_impressions: std::collections::BTreeMap::new(),
             legacy_yolo_default: false,
         }
     }
@@ -468,8 +647,79 @@ fn normalize_work_surface_placement(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "left" => "left",
         "right" => "right",
+        "off" => "off",
         _ => "top",
     }
+}
+
+fn normalize_rail_panel(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "agents" => "agents",
+        "context" => "context",
+        "pinned" => "pinned",
+        _ => "tasks",
+    }
+}
+
+/// Rail unification (0.9.4): carry the classic sidebar's settings forward
+/// instead of stranding them. `sidebar_focus` picks the rail panel —
+/// pinned/tasks/agents/context map onto the same-named panels, auto folds
+/// into the auto-fitting Tasks panel (it is the shipped default for
+/// `sidebar_focus`, and "show work when there is work" is what Tasks does;
+/// folding it into the always-on Pinned strip inverted that intent for every
+/// upgrading user), and hidden turns the rail off.
+/// `sidebar_width_percent` maps onto the absolute side width at a
+/// 120-column reference. Auto-collapse itself is deliberately dropped: the
+/// rail hides via placement off. Explicit new keys win over migrated ones.
+fn migrate_sidebar_settings_to_rail(s: &mut Settings) {
+    match s.sidebar_focus.trim().to_ascii_lowercase().as_str() {
+        "hidden" | "hide" | "closed" | "off" | "none" => {
+            if s.work_surface_placement == "top" {
+                s.work_surface_placement = "off".to_string();
+            }
+        }
+        // #5141 let users pin a dedicated sessions panel in the classic
+        // sidebar; on the unified rail the equivalent surface is the
+        // first-class sessions rail, so carry the intent forward by
+        // enabling it.
+        "sessions" | "sessions_rail" | "session_history" => {
+            s.sessions_rail = true;
+        }
+        panel @ ("pinned" | "work" | "plan" | "todos" | "tasks" | "activity" | "live"
+        | "running" | "agents" | "subagents" | "sub-agents" | "context" | "session"
+        // `rail_panel == "tasks"` is the default, so only treat it as unset
+        // when the document did not name the key explicitly. Failing the
+        // guard falls through to the no-op arm below, which is exactly what
+        // the old nested `if` did.
+        | "auto")
+            if s.rail_panel == "tasks" && !s.rail_panel_explicit =>
+        {
+            s.rail_panel = match panel {
+                // `auto` is the shipped *default* for `sidebar_focus`, so
+                // this arm runs for anyone who has a settings.toml at all
+                // — even one that only sets `theme`. Auto-collapse meant
+                // "show work when there is work", which is exactly the
+                // Tasks panel (it auto-fits, and an empty projection
+                // reserves no rows). Folding it into the always-on Pinned
+                // strip inverted the intent and made a 4-row band the
+                // effective default for every upgrading user.
+                "tasks" | "activity" | "live" | "running" | "auto" => "tasks",
+                "agents" | "subagents" | "sub-agents" => "agents",
+                "context" | "session" => "context",
+                _ => "pinned",
+            }
+            .to_string();
+        }
+        _ => {}
+    }
+    if s.sidebar_width_percent != 28 {
+        let cols = (u32::from(s.sidebar_width_percent) * 120 / 100) as u16;
+        s.work_surface_side_width = cols.clamp(26, 80);
+    }
+}
+
+fn normalize_inline_diffs(value: &str) -> &'static str {
+    InlineDiffMode::parse(value).as_setting()
 }
 
 /// The `(key, value)` fields a named preset applies, or `None` for an unknown
@@ -503,18 +753,88 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Load settings for a diagnostic without migrating a legacy file.
+    ///
+    /// This preserves the same candidate precedence, parser normalization, and
+    /// environment overlays as [`Settings::load`]. Unlike an interactive
+    /// startup, diagnostics must not create `~/.codewhale/settings.toml` just
+    /// because they inspected a legacy `~/.deepseek/settings.toml` file.
+    pub(crate) fn load_read_only() -> Result<Self> {
+        let mut settings = Self::load_persisted_read_only()?;
+        settings.apply_env_overrides();
+        Ok(settings)
+    }
+
     /// Load the normalized values stored on disk without terminal/runtime
     /// overlays. Configuration editors use this path so a value labelled
     /// "saved" never silently reports a tmux, SSH, or accessibility override.
     pub(crate) fn load_persisted() -> Result<Self> {
+        with_settings_transaction(SettingsTransaction::load)
+    }
+
+    /// Load persisted values while the caller already holds the settings
+    /// process mutex and adjacent file lock.
+    fn load_persisted_locked() -> Result<Self> {
         let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
         Self::load_persisted_from_candidates(primary, legacy_home, legacy_config_dir)
+    }
+
+    /// Load normalized disk values for a diagnostic without creating a
+    /// primary settings file from a legacy fallback.
+    fn load_persisted_read_only() -> Result<Self> {
+        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        Self::load_persisted_from_candidates_with_migration(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            false,
+        )
     }
 
     fn load_persisted_from_candidates(
         primary: Option<PathBuf>,
         legacy_home: Option<PathBuf>,
         legacy_config_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::load_persisted_from_candidates_with_migration(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            true,
+        )
+    }
+
+    fn load_persisted_from_candidates_with_migration(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+        migrate_legacy_file: bool,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        {
+            crate::test_support::with_test_state_io_lock(|| {
+                Self::load_persisted_from_candidates_with_migration_unlocked(
+                    primary,
+                    legacy_home,
+                    legacy_config_dir,
+                    migrate_legacy_file,
+                )
+            })
+        }
+        #[cfg(not(test))]
+        Self::load_persisted_from_candidates_with_migration_unlocked(
+            primary,
+            legacy_home,
+            legacy_config_dir,
+            migrate_legacy_file,
+        )
+    }
+
+    fn load_persisted_from_candidates_with_migration_unlocked(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+        migrate_legacy_file: bool,
     ) -> Result<Self> {
         let write_path = primary
             .as_ref()
@@ -532,6 +852,7 @@ impl Settings {
         } else {
             let content = std::fs::read_to_string(&read_path)
                 .with_context(|| format!("Failed to read settings from {}", read_path.display()))?;
+            let parsed_document = toml::from_str::<toml::Value>(&content).ok();
             let mut s: Settings = match toml::from_str(&content) {
                 Ok(s) => s,
                 Err(e) => {
@@ -542,6 +863,27 @@ impl Settings {
                     Self::default()
                 }
             };
+            // A persisted threshold is itself an explicit request for
+            // auto-compaction. Older versions accepted this setting while
+            // leaving the default `auto_compact = false`, silently turning the
+            // requested trigger into a no-op. Preserve an explicit boolean
+            // opt-out, but make threshold-only files effective on load.
+            s.auto_compact_explicit = parsed_document
+                .as_ref()
+                .is_some_and(auto_compact_explicitly_configured_in_document);
+            s.rail_panel_explicit = parsed_document
+                .as_ref()
+                .and_then(toml::Value::as_table)
+                .is_some_and(|table| table.contains_key("rail_panel"));
+            if parsed_document.as_ref().is_some_and(|document| {
+                document.as_table().is_some_and(|table| {
+                    !table.contains_key("auto_compact")
+                        && (table.contains_key("auto_compact_threshold")
+                            || table.contains_key("auto_compact_threshold_percent"))
+                })
+            }) {
+                s.auto_compact = true;
+            }
             // "yolo" used to bundle two independent choices: Agent mode and
             // unrestricted approvals.  Keep that behavior on upgrade, but
             // store/show the two choices explicitly so Settings does not claim
@@ -557,25 +899,29 @@ impl Settings {
             s.transcript_spacing = normalize_transcript_spacing(&s.transcript_spacing).to_string();
             s.tool_collapse_mode = normalize_tool_collapse_mode(&s.tool_collapse_mode).to_string();
             s.sidebar_focus = normalize_sidebar_focus(&s.sidebar_focus).to_string();
-            if s.sidebar_focus == "auto" && !s.sidebar_auto_collapse_opt_in {
-                // v0.8.62 wrote the surprising auto-collapse default into many
-                // full settings files. Treat unmarked saved "auto" as that
-                // legacy default so upgraded users get the sidebar back, while
-                // `/sidebar auto --save` and `/set sidebar_focus auto` below
-                // preserve an explicit opt-in from this release onward (#3328).
-                s.sidebar_focus = "pinned".to_string();
-            }
+            // Rail unification (0.9.4) migration: the classic sidebar is
+            // gone, so its settings carry forward instead of stranding.
+            migrate_sidebar_settings_to_rail(&mut s);
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
             s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
             s.work_surface_placement =
                 normalize_work_surface_placement(&s.work_surface_placement).to_string();
+            s.rail_panel = normalize_rail_panel(&s.rail_panel).to_string();
+            // Migrate the unreadable 2..=4 legacy range in memory. The next
+            // ordinary settings transaction persists the normalized value;
+            // loading settings remains a read-only operation.
+            s.work_surface_top_height = s
+                .work_surface_top_height
+                .clamp(WORK_SURFACE_TOP_HEIGHT_MIN, WORK_SURFACE_TOP_HEIGHT_MAX);
+            s.work_surface_side_width = s.work_surface_side_width.clamp(26, 80);
+            s.inline_diffs = normalize_inline_diffs(&s.inline_diffs).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
             s.locale = normalize_configured_locale(&s.locale)
                 .unwrap_or("en")
                 .to_string();
             s.background_color = normalize_optional_background_color(s.background_color.as_deref());
-            s.theme = normalize_settings_theme(&s.theme).to_string();
+            s.theme = normalize_settings_theme(&s.theme);
             s.default_model = s.default_model.as_deref().and_then(normalize_default_model);
             s.reasoning_effort = s
                 .reasoning_effort
@@ -588,9 +934,12 @@ impl Settings {
             if legacy_yolo_default && s.permission_posture.is_none() {
                 s.permission_posture = Some("full-access".to_string());
             }
+            s.sandbox_mode = s.sandbox_mode.as_deref().and_then(normalize_sandbox_mode);
             s
         };
-        migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
+        if migrate_legacy_file {
+            migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
+        }
         Ok(settings)
     }
 
@@ -602,26 +951,48 @@ impl Settings {
         self.legacy_yolo_default
     }
 
-    /// Whether the user explicitly persisted an `auto_compact` preference.
-    /// When absent, callers may choose a model-aware default.
+    /// Whether the user explicitly persisted an auto-compaction preference.
+    /// A threshold is intent to enable compaction unless an explicit boolean
+    /// says otherwise. When all three keys are absent, callers may choose a
+    /// model-aware default.
     pub fn auto_compact_explicitly_configured() -> bool {
-        let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
-        let Ok(path) =
-            resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
-        else {
-            return false;
-        };
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(&content) else {
-            return false;
-        };
-        value
-            .as_table()
-            .is_some_and(|table| table.contains_key("auto_compact"))
+        let candidates = settings_path_candidates();
+        #[cfg(test)]
+        {
+            crate::test_support::with_test_state_io_lock(|| {
+                auto_compact_explicitly_configured_from_candidates(candidates)
+            })
+        }
+        #[cfg(not(test))]
+        auto_compact_explicitly_configured_from_candidates(candidates)
     }
+}
 
+fn auto_compact_explicitly_configured_from_candidates(
+    (primary, legacy_home, legacy_config_dir): (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>),
+) -> bool {
+    let Ok(path) = resolve_settings_path_from_candidates(primary, legacy_home, legacy_config_dir)
+    else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return false;
+    };
+    auto_compact_explicitly_configured_in_document(&value)
+}
+
+fn auto_compact_explicitly_configured_in_document(value: &toml::Value) -> bool {
+    value.as_table().is_some_and(|table| {
+        table.contains_key("auto_compact")
+            || table.contains_key("auto_compact_threshold")
+            || table.contains_key("auto_compact_threshold_percent")
+    })
+}
+
+impl Settings {
     /// Apply environment-driven overlays after disk load. Used for
     /// platform a11y signals that should ignore the user's saved
     /// preference (#450). The env values are consulted at startup;
@@ -632,26 +1003,34 @@ impl Settings {
             self.low_motion = true;
             self.fancy_animations = false;
         }
-        // VS Code (TERM_PROGRAM=vscode, #1356), Ghostty (#1445), and a few
-        // VTE terminals (#1470) produce visible flicker at 120 FPS. Cap their
-        // redraw rate without changing motion semantics or model text pacing.
-        // Ghostty may report
-        // either TERM_PROGRAM=Ghostty/ghostty or TERM=xterm-ghostty.
+        // VS Code (TERM_PROGRAM=vscode, #1356) and a few VTE terminals
+        // (#1470) produce visible flicker at 120 FPS. Cap their redraw rate.
+        // VS Code's xterm.js renderer also needs decorative
+        // motion disabled: the underwater chrome added substantially more
+        // independently moving cells than the original #1356 fix covered.
+        // Ghostty is deliberately absent from this 30 FPS compatibility lane.
+        // Its synchronized GPU renderer gets a dedicated 60 FPS atmosphere
+        // cap in display_refresh; putting it here made the restored truecolor
+        // ocean visibly step even though the terminal could keep up.
         // Like NO_ANIMATIONS above, this unconditionally overrides any
         // disk-loaded value — consistent precedence: env signals always win.
         let term_program = std::env::var("TERM_PROGRAM")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let term = std::env::var("TERM")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let term_constrains_frame_rate =
-            matches!(term_program.as_str(), "vscode" | "ghostty") || term.contains("ghostty");
+        // Tabby renders through Electron/xterm.js. Its Windows IME bridge
+        // can observe cursor-positioning sequences while a frame is still
+        // being applied, so use the calmer rendering path there.
+        let term_is_tabby = term_program.contains("tabby");
+        let term_constrains_frame_rate = term_program == "vscode";
         let vte_env_constrains_frame_rate = std::env::var_os("TILIX_ID")
             .is_some_and(|v| !v.is_empty())
             || std::env::var_os("TERMINATOR_UUID").is_some_and(|v| !v.is_empty());
         if term_constrains_frame_rate || vte_env_constrains_frame_rate {
             self.constrained_frame_rate = true;
+        }
+        if term_program == "vscode" {
+            self.low_motion = true;
+            self.fancy_animations = false;
         }
 
         // Termius (TERM_PROGRAM=Termius) and SSH sessions exhibit the
@@ -671,6 +1050,14 @@ impl Settings {
         if term_is_termius || in_ssh_session {
             self.low_motion = true;
             self.fancy_animations = false;
+        }
+        if term_is_tabby {
+            self.low_motion = true;
+            self.fancy_animations = false;
+            self.constrained_frame_rate = true;
+            if self.synchronized_output.eq_ignore_ascii_case("auto") {
+                self.synchronized_output = "off".to_string();
+            }
         }
 
         // Multiplexers need a bounded redraw rate, not a different product.
@@ -715,10 +1102,82 @@ impl Settings {
         }
     }
 
-    /// Save settings to disk
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+    /// Run one atomic load → mutate → save cycle against `settings.toml`.
+    ///
+    /// **Every writer that reads the whole file, changes some fields, and writes
+    /// the whole file back must go through here** (or through
+    /// [`SettingsTransaction`] for the multi-step shape). `save` serializes the
+    /// complete struct, so two unsynchronized writers that each did their own
+    /// `load_persisted` will each write back the *other's* pre-image: whichever
+    /// saves last silently reverts the other's field. Locking `save` alone does
+    /// not help, because the stale read already happened before the lock.
+    ///
+    /// Two locks are taken (see [`with_settings_transaction`]): a process-wide
+    /// mutex keyed by the resolved settings path, which covers writers that
+    /// never share an object — a background startup-default drain and a
+    /// synchronous Shift+Tab permission write, the concrete pair that lost
+    /// `default_mode` / `permission_posture` against each other — and a
+    /// cross-process file lock, which covers a second Codewhale process on the
+    /// same home directory.
+    ///
+    /// The closure must not call `transact`, [`with_settings_transaction`],
+    /// `save`, or `load_persisted` itself — the lock is not re-entrant. Use
+    /// [`with_settings_transaction`] when you need more than one save in one
+    /// critical section.
+    pub fn transact<T>(mutate: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        with_settings_transaction(|transaction| {
+            let mut settings = transaction.load()?;
+            let value = mutate(&mut settings)?;
+            transaction.save(&settings)?;
+            Ok(value)
+        })
+    }
 
+    /// [`Self::transact`] for a mutation that may decide there is nothing to
+    /// write. Returning `None` abandons the transaction without touching disk,
+    /// so a "flag already set" early return does not rewrite the file.
+    pub fn transact_opt<T>(
+        mutate: impl FnOnce(&mut Self) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        with_settings_transaction(|transaction| {
+            let mut settings = transaction.load()?;
+            let Some(value) = mutate(&mut settings)? else {
+                return Ok(None);
+            };
+            transaction.save(&settings)?;
+            Ok(Some(value))
+        })
+    }
+
+    /// Save settings to disk as a standalone, fully locked write.
+    ///
+    /// Prefer [`Self::transact`]: calling this on a `Settings` that was loaded
+    /// outside a transaction writes back a snapshot that may already be stale
+    /// for every field the caller did *not* mean to change. This entry point
+    /// still takes both locks, so the bytes it writes are never interleaved with
+    /// another writer's — it just cannot fix a stale read that already happened.
+    ///
+    /// Not callable from inside a transaction: the cross-process lock is not
+    /// re-entrant, so a nested acquisition would deadlock against itself. Inside
+    /// a critical section use [`SettingsTransaction::save`].
+    #[cfg(test)]
+    pub fn save(&self) -> Result<()> {
+        with_settings_transaction(|transaction| transaction.save(self))
+    }
+
+    /// The write half of a settings transaction: serialize, merge comments, and
+    /// replace the file atomically. The caller already holds both the
+    /// process-wide mutex and the cross-process file lock.
+    fn save_locked(&self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        {
+            crate::test_support::with_test_state_io_lock(|| self.save_to_path(path))
+        }
+        #[cfg(not(test))]
+        self.save_to_path(path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
         // Create config directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -726,9 +1185,18 @@ impl Settings {
             })?;
         }
 
-        let serialized = toml::to_string_pretty(self).context("Failed to serialize settings")?;
+        let mut serialized =
+            toml::to_string_pretty(self).context("Failed to serialize settings")?;
+        if !self.auto_compact_explicit {
+            let mut document = serialized
+                .parse::<toml_edit::DocumentMut>()
+                .context("Failed to prepare settings for persistence")?;
+            document.remove("auto_compact");
+            document.remove("auto_compact_threshold_percent");
+            serialized = document.to_string();
+        }
         let body = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
+            let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read settings at {}", path.display()))?;
             codewhale_config::merge_and_preserve_comments(&serialized, &raw).unwrap_or_else(|e| {
                 tracing::warn!("failed to merge settings comments, saving without them: {e:#}");
@@ -737,15 +1205,7 @@ impl Settings {
         } else {
             serialized
         };
-        std::fs::write(&path, body)
-            .with_context(|| format!("Failed to write settings to {}", path.display()))?;
-        Ok(())
-    }
-
-    /// Update and persist sidebar width percentage (10-50) — used by the
-    /// drag-to-resize handle in the TUI.
-    pub fn update_sidebar_width(&mut self, percent: u16) {
-        self.sidebar_width_percent = percent.clamp(10, 50);
+        atomically_replace_settings_file(path, body.as_bytes())
     }
 
     /// Set a single setting by key
@@ -753,10 +1213,13 @@ impl Settings {
         match key {
             "auto_compact" | "compact" => {
                 self.auto_compact = parse_bool(value)?;
+                self.auto_compact_explicit = true;
             }
             "auto_compact_threshold" | "auto_compact_threshold_percent" => {
                 self.auto_compact_threshold_percent =
                     parse_percent_setting("auto_compact_threshold_percent", value)?;
+                self.auto_compact = true;
+                self.auto_compact_explicit = true;
             }
             "calm_mode" | "calm" => {
                 self.calm_mode = parse_bool(value)?;
@@ -785,14 +1248,48 @@ impl Settings {
                 }
                 self.ocean_treatment = normalized;
             }
+            "focus_texture" | "texture" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "off" | "scrim" | "grain") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid focus texture '{value}'. Expected: off, scrim, or grain."
+                    );
+                }
+                self.focus_texture = normalized;
+            }
             "work_surface_placement" | "work_surface" | "work_rail" => {
                 let normalized = value.trim().to_ascii_lowercase();
-                if !matches!(normalized.as_str(), "top" | "left" | "right") {
+                if !matches!(normalized.as_str(), "top" | "left" | "right" | "off") {
                     anyhow::bail!(
-                        "Failed to update setting: invalid work surface placement '{value}'. Expected: top, left, or right."
+                        "Failed to update setting: invalid work surface placement '{value}'. Expected: top, left, right, or off."
                     );
                 }
                 self.work_surface_placement = normalized;
+            }
+            "rail_panel" | "rail" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "tasks" | "agents" | "context" | "pinned"
+                ) {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid rail panel '{value}'. Expected: tasks, agents, context, or pinned."
+                    );
+                }
+                self.rail_panel = normalized;
+                self.rail_panel_explicit = true;
+            }
+            "work_surface_top_height" | "work_top_height" => {
+                self.work_surface_top_height = parse_u16_range(
+                    "work_surface_top_height",
+                    value,
+                    WORK_SURFACE_TOP_HEIGHT_MIN,
+                    WORK_SURFACE_TOP_HEIGHT_MAX,
+                )?;
+            }
+            "work_surface_side_width" | "work_side_width" => {
+                self.work_surface_side_width =
+                    parse_u16_range("work_surface_side_width", value, 26, 80)?;
             }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
@@ -812,8 +1309,33 @@ impl Settings {
             "show_thinking" | "thinking" => {
                 self.show_thinking = parse_bool(value)?;
             }
+            "thinking_default_expanded" | "thinking_expanded" => {
+                self.thinking_default_expanded = parse_bool(value)?;
+            }
+            "thinking_preview_lines" | "thinking_preview" => {
+                self.thinking_preview_lines =
+                    parse_usize_setting("thinking_preview_lines", value)?.min(40);
+            }
+            "thinking_highlight" | "reasoning_highlight" => {
+                self.thinking_highlight = parse_bool(value)?;
+            }
+            "help_expand_groups" | "help_expanded" => {
+                self.help_expand_groups = parse_bool(value)?;
+            }
+            "pin_last_prompt" | "pin_prompt" => {
+                self.pin_last_prompt = parse_bool(value)?;
+            }
             "show_tool_details" | "tool_details" => {
                 self.show_tool_details = parse_bool(value)?;
+            }
+            "inline_diffs" | "inline_diff" | "diffs" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "full" | "summary" | "off") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid inline diff mode '{value}'. Expected: full, summary, or off."
+                    );
+                }
+                self.inline_diffs = normalized;
             }
             "locale" | "language" => {
                 let Some(locale) = normalize_configured_locale(value) else {
@@ -825,20 +1347,10 @@ impl Settings {
                 self.locale = locale.to_string();
             }
             "theme" => {
-                let Some(id) = crate::palette::ThemeId::from_name(value) else {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
-                    );
-                };
-                self.theme = id.name().to_string();
+                self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
             }
             "ui_theme" => {
-                let Some(id) = crate::palette::ThemeId::from_name(value) else {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
-                    );
-                };
-                self.theme = id.name().to_string();
+                self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
             }
             "background_color" | "background" | "bg" => {
                 self.background_color = normalize_background_color_setting(value)?;
@@ -854,6 +1366,9 @@ impl Settings {
             }
             "composer_border" | "border" => {
                 self.composer_border = parse_bool(value)?;
+            }
+            "composer_multiline_mode" | "multiline_mode" | "multiline" => {
+                self.composer_multiline_mode = parse_bool(value)?;
             }
             "composer_vim_mode" | "vim_mode" | "vim" => {
                 let normalized = value.trim().to_ascii_lowercase();
@@ -894,59 +1409,29 @@ impl Settings {
                 }
                 self.synchronized_output = normalized.to_string();
             }
-            "prefer_external_pdftotext" | "external_pdftotext" | "pdftotext" => {
-                self.prefer_external_pdftotext = parse_bool(value)?;
-            }
             "workspace_follow_symlinks" | "follow_symlinks" => {
                 self.workspace_follow_symlinks = parse_bool(value)?;
             }
             "default_mode" | "mode" => {
-                // Loading remains deliberately liberal so old `operate` and
-                // `yolo` files migrate safely. New writes are strict: these
-                // are session actions/permission aliases, not startup modes.
+                // Act (wire: agent), Plan, and Operate are valid startup modes.
+                // yolo remains a permission-migration alias, not a mode write.
                 self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
-                    "agent" | "normal" => "agent".to_string(),
+                    "agent" | "normal" | "act" | "work" | "edit" => "agent".to_string(),
                     "plan" => "plan".to_string(),
+                    "operate" | "operation" | "ops" => "operate".to_string(),
                     _ => anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: agent or plan."
+                        "Failed to update setting: invalid mode '{value}'. Expected: act (agent), plan, or operate."
                     ),
                 };
             }
-            "sidebar_width" | "sidebar" => {
-                let width: u16 = value
-                    .parse()
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Failed to update setting: invalid width '{value}'. Expected a number between 10-50."
-                        )
-                    })?;
-                if !(10..=50).contains(&width) {
-                    anyhow::bail!(
-                        "Failed to update setting: width must be between 10 and 50 percent."
-                    );
-                }
-                self.sidebar_width_percent = width;
-            }
-            "sidebar_focus" | "focus" => {
-                let normalized = match value.trim().to_ascii_lowercase().as_str() {
-                    "auto" => "auto",
-                    "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
-                    // Persist as "tasks"; user-facing panel label is Activity (#4147/#4135).
-                    "tasks" | "activity" | "live" | "running" => "tasks",
-                    "agents" | "subagents" | "sub-agents" => "agents",
-                    "context" | "session" => "context",
-                    "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
-                    _ => {
-                        anyhow::bail!(
-                            "Failed to update setting: invalid sidebar focus '{value}'. Expected: pinned, auto, activity (tasks), agents, context, hidden."
-                        )
-                    }
-                };
-                self.sidebar_focus = normalized.to_string();
-                self.sidebar_auto_collapse_opt_in = normalized == "auto";
-            }
             "context_panel" | "context" | "session_panel" => {
                 self.context_panel = parse_bool(value)?;
+            }
+            "sessions_rail" | "sessions_panel" | "session_rail" => {
+                self.sessions_rail = parse_bool(value)?;
+            }
+            "session_auto_resume" | "auto_resume" => {
+                self.session_auto_resume = parse_bool(value)?;
             }
             "cost_currency" | "currency" => {
                 let Some(currency) = crate::pricing::CostCurrency::from_setting(value) else {
@@ -998,6 +1483,14 @@ impl Settings {
                     );
                 }
             }
+            "sandbox_mode" | "sandbox" | "filesystem_sandbox" => {
+                self.sandbox_mode = normalize_sandbox_mode(value);
+                if self.sandbox_mode.is_none() {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid sandbox_mode '{value}'. Expected: read-only, workspace-write, danger-full-access, or external-sandbox."
+                    );
+                }
+            }
             _ => {
                 anyhow::bail!("Failed to update setting: unknown setting '{key}'.");
             }
@@ -1045,10 +1538,20 @@ impl Settings {
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
         lines.push(format!("  ocean_treatment:    {}", self.ocean_treatment));
+        lines.push(format!("  focus_texture:      {}", self.focus_texture));
         lines.push(format!(
             "  work_surface:       {}",
             self.work_surface_placement
         ));
+        lines.push(format!(
+            "  work_top_height:    {}",
+            self.work_surface_top_height
+        ));
+        lines.push(format!(
+            "  work_side_width:    {}",
+            self.work_surface_side_width
+        ));
+        lines.push(format!("  rail_panel:         {}", self.rail_panel));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
@@ -1061,7 +1564,22 @@ impl Settings {
             self.mention_menu_behavior
         ));
         lines.push(format!("  show_thinking:      {}", self.show_thinking));
+        lines.push(format!(
+            "  thinking_expanded:   {}",
+            self.thinking_default_expanded
+        ));
+        lines.push(format!(
+            "  thinking_preview:    {}",
+            self.thinking_preview_lines
+        ));
+        lines.push(format!("  thinking_highlight: {}", self.thinking_highlight));
+        lines.push(format!(
+            "  help_expand_groups:  {}",
+            self.help_expand_groups
+        ));
+        lines.push(format!("  pin_last_prompt:    {}", self.pin_last_prompt));
         lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
+        lines.push(format!("  inline_diffs:      {}", self.inline_diffs));
         lines.push(format!("  locale:            {}", self.locale));
         lines.push(format!("  theme:              {}", self.theme));
         lines.push(format!(
@@ -1070,6 +1588,10 @@ impl Settings {
         ));
         lines.push(format!("  composer_density:   {}", self.composer_density));
         lines.push(format!("  composer_border:    {}", self.composer_border));
+        lines.push(format!(
+            "  composer_multiline_mode: {}",
+            self.composer_multiline_mode
+        ));
         lines.push(format!("  composer_vim_mode:  {}", self.composer_vim_mode));
         lines.push(format!("  transcript_spacing: {}", self.transcript_spacing));
         lines.push(format!("  status_indicator:   {}", self.status_indicator));
@@ -1078,27 +1600,38 @@ impl Settings {
             self.synchronized_output
         ));
         lines.push(format!(
-            "  prefer_external_pdftotext: {}",
-            self.prefer_external_pdftotext
-        ));
-        lines.push(format!(
             "  workspace_follow_symlinks: {}",
             self.workspace_follow_symlinks
         ));
         lines.push(format!("  default_mode:       {}", self.default_mode));
         lines.push(format!("  launch_screen:      {}", self.launch_screen));
-        lines.push(format!(
-            "  sidebar_width:      {}%",
-            self.sidebar_width_percent
-        ));
-        lines.push(format!("  sidebar_focus:      {}", self.sidebar_focus));
         lines.push(format!("  context_panel:      {}", self.context_panel));
         lines.push(format!("  cost_currency:      {}", self.cost_currency));
         lines.push(format!("  max_history:        {}", self.max_input_history));
         lines.push(format!(
-            "  default_model:      {}",
+            "  deepseek_fallback:  {}",
             self.default_model.as_deref().unwrap_or("(default)")
         ));
+        lines.push(format!(
+            "  default_provider:   {}",
+            self.default_provider
+                .as_deref()
+                .unwrap_or("(config/default)")
+        ));
+        let mut provider_models = self
+            .provider_models
+            .as_ref()
+            .map(|models| models.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        provider_models.sort_by_key(|(provider, _)| *provider);
+        if provider_models.is_empty() {
+            lines.push("  provider_models:    (none)".to_string());
+        } else {
+            lines.push("  provider_models:".to_string());
+            for (provider, model) in provider_models {
+                lines.push(format!("    {provider}: {model}"));
+            }
+        }
         lines.push(format!(
             "  reasoning_effort:   {}",
             self.reasoning_effort
@@ -1110,6 +1643,10 @@ impl Settings {
             self.permission_posture
                 .as_deref()
                 .unwrap_or("(config/default)")
+        ));
+        lines.push(format!(
+            "  sandbox_mode:       {}  # filesystem scope (not approval)",
+            self.sandbox_mode.as_deref().unwrap_or("(config/default)")
         ));
         lines.push(String::new());
         lines.push(format!(
@@ -1130,7 +1667,7 @@ impl Settings {
             ),
             (
                 "auto_compact_threshold_percent",
-                "Auto-compact trigger threshold percent when auto_compact is on: 10-100 (default 80)",
+                "Auto-compact trigger threshold percent: 10-100 (default 80; setting it enables auto-compaction unless auto_compact=false is explicit)",
             ),
             ("calm_mode", "Calmer UI defaults: on/off"),
             (
@@ -1147,8 +1684,24 @@ impl Settings {
                 "Transcript background treatment: ombre/flat (independent of motion)",
             ),
             (
+                "focus_texture",
+                "Modal focus-context texture prototype: off/scrim/grain (default off)",
+            ),
+            (
                 "work_surface_placement",
                 "Ocean Tasks/To-do/Workers rail placement: top/left/right",
+            ),
+            (
+                "work_surface_top_height",
+                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
+            ),
+            (
+                "work_surface_side_width",
+                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
+            ),
+            (
+                "rail_panel",
+                "Which panel the rail shows: tasks/agents/context/pinned",
             ),
             (
                 "bracketed_paste",
@@ -1164,25 +1717,49 @@ impl Settings {
             ),
             (
                 "mention_walk_depth",
-                "Maximum @-mention workspace walk depth; 0 means unlimited (default 6)",
+                "Maximum @-mention workspace walk depth; 0 means unlimited (default 10)",
             ),
             (
                 "mention_menu_behavior",
                 "@-mention completion behavior: fuzzy/browser (default fuzzy)",
             ),
             ("show_thinking", "Show model thinking: on/off"),
+            (
+                "thinking_default_expanded",
+                "Expand model thinking by default; Space still toggles: on/off",
+            ),
+            (
+                "thinking_preview_lines",
+                "Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)",
+            ),
+            (
+                "thinking_highlight",
+                "Fill the thinking/reasoning background: on/off",
+            ),
+            (
+                "help_expand_groups",
+                "Start Help/shortcuts with every group expanded: on/off (default off)",
+            ),
+            (
+                "pin_last_prompt",
+                "Pin the last user prompt at the top when it scrolls off: on/off (default on)",
+            ),
             ("show_tool_details", "Show detailed tool output: on/off"),
+            (
+                "inline_diffs",
+                "Successful File mutation evidence: full/summary/off (exact detail is always retained)",
+            ),
             (
                 "base_url",
                 "HTTP base URL for DeepSeek-compatible endpoints.",
             ),
             (
                 "locale",
-                "UI locale and default model language: auto, en, ja, zh-Hans, pt-BR, es-419",
+                "UI locale and default model language: auto, en, ja, zh-Hans, zh-Hant, pt-BR, es-419, vi, ko, ca, de, fr, id, hi, ru, uk; every shipped pack holds full English parity",
             ),
             (
                 "theme",
-                "UI theme: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light",
+                "UI theme: a compiled name or custom:<name> from the Codewhale themes directory",
             ),
             (
                 "background_color",
@@ -1196,6 +1773,10 @@ impl Settings {
                 "composer_border",
                 "Show a border around the composer input area: on/off",
             ),
+            (
+                "composer_multiline_mode",
+                "Enter inserts a newline and Shift+Enter sends: on/off",
+            ),
             ("composer_vim_mode", "Composer editing mode: normal, vim"),
             (
                 "transcript_spacing",
@@ -1207,35 +1788,37 @@ impl Settings {
             ),
             (
                 "status_indicator",
-                "Header status indicator next to effort chip: cw, whale, dots, off",
+                "Header status mark, shown before the route: cw, whale, dots, off",
             ),
             (
                 "synchronized_output",
                 "DEC 2026 synchronized output: auto, on, off (set off if your terminal flickers)",
             ),
             (
-                "prefer_external_pdftotext",
-                "Route PDF reads through Poppler's pdftotext instead of the bundled pure-Rust extractor: on/off (default off)",
-            ),
-            (
                 "workspace_follow_symlinks",
                 "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
             ),
-            ("default_mode", "Default mode: agent or plan"),
-            ("sidebar_width", "Sidebar width percentage: 10-50"),
             (
-                "sidebar_focus",
-                "Sidebar focus: auto, work, activity (tasks), agents, context, hidden",
+                "default_mode",
+                "Default mode: act (agent), plan, or operate",
             ),
             (
                 "context_panel",
                 "Show the session context sidebar panel: on/off",
             ),
+            (
+                "sessions_rail",
+                "Show the persistent Sessions rail in the sidebar: on/off (default off)",
+            ),
+            (
+                "session_auto_resume",
+                "Reattach to this workspace's most recent session on startup: on/off (default off). --resume/--continue still win; archived, unreadable, or other-workspace sessions are never auto-resumed.",
+            ),
             ("cost_currency", "Cost display currency: usd, cny"),
             ("max_history", "Max input history entries"),
             (
                 "default_model",
-                "Default model: auto or any DeepSeek model ID (e.g. deepseek-v4-pro)",
+                "DeepSeek fallback model: auto or a DeepSeek model ID (e.g. deepseek-v4-pro); other providers use provider_models",
             ),
             (
                 "reasoning_effort",
@@ -1249,6 +1832,90 @@ impl Settings {
         self.provider_models
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(provider.to_string(), model.to_string());
+        self.enable_model_for_provider(provider, model);
+    }
+
+    /// Add a model to a provider's enabled chooser set without removing prior
+    /// choices. IDs are compared case-insensitively but preserve their wire
+    /// spelling on disk.
+    pub fn enable_model_for_provider(&mut self, provider: &str, model: &str) {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
+            return;
+        }
+        let models = self
+            .enabled_models
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(provider.to_string())
+            .or_default();
+        if !models
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(model))
+        {
+            models.push(model.to_string());
+        }
+    }
+
+    /// Toggle one exact provider/model pin without touching credentials or
+    /// the provider's default route.
+    pub fn toggle_pinned_model(&mut self, provider: &str, model: &str) -> bool {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
+            return false;
+        }
+        if let Some(index) = self.pinned_models.iter().position(|pin| {
+            pin.provider.eq_ignore_ascii_case(provider) && pin.model.eq_ignore_ascii_case(model)
+        }) {
+            self.pinned_models.remove(index);
+            return false;
+        }
+        self.pinned_models.push(PinnedModel {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            label: None,
+        });
+        true
+    }
+
+    #[allow(dead_code)] // label editing surface is exposed through settings serialization first
+    pub fn set_pinned_model_label(
+        &mut self,
+        provider: &str,
+        model: &str,
+        label: Option<String>,
+    ) -> bool {
+        self.pinned_models
+            .iter_mut()
+            .find(|pin| {
+                pin.provider.eq_ignore_ascii_case(provider) && pin.model.eq_ignore_ascii_case(model)
+            })
+            .map(|pin| {
+                pin.label = label.filter(|value| !value.trim().is_empty());
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn move_pinned_model(&mut self, provider: &str, model: &str, delta: isize) -> bool {
+        let Some(index) = self.pinned_models.iter().position(|pin| {
+            pin.provider.eq_ignore_ascii_case(provider) && pin.model.eq_ignore_ascii_case(model)
+        }) else {
+            return false;
+        };
+        let target = if delta.is_negative() {
+            index.saturating_sub(delta.unsigned_abs())
+        } else {
+            index.saturating_add(delta as usize)
+        };
+        let target = target.min(self.pinned_models.len().saturating_sub(1));
+        if target == index {
+            return false;
+        }
+        let pin = self.pinned_models.remove(index);
+        self.pinned_models.insert(target, pin);
+        true
     }
 
     /// Persist a provider's model selection.
@@ -1284,15 +1951,6 @@ impl Settings {
         Ok(())
     }
 
-    /// Load, update, and save a provider's model selection *without* touching
-    /// the shared global default (the session-local path; see
-    /// [`Self::set_provider_model_selection`]).
-    pub fn persist_provider_model_selection(provider: ApiProvider, model: &str) -> Result<()> {
-        let mut settings = Self::load()?;
-        settings.set_provider_model_selection(provider, model, false)?;
-        settings.save()
-    }
-
     /// Load, update, and save a provider/model tuple as the global default
     /// (the explicit "save as default" path).
     #[allow(dead_code)] // wired to an explicit save-as-default action in a later UX pass (#3227).
@@ -1300,9 +1958,7 @@ impl Settings {
         provider: ApiProvider,
         model: &str,
     ) -> Result<()> {
-        let mut settings = Self::load()?;
-        settings.set_provider_model_selection(provider, model, true)?;
-        settings.save()
+        Self::transact(|settings| settings.set_provider_model_selection(provider, model, true))
     }
 
     /// Resolved boolean for whether the renderer should wrap each frame in
@@ -1356,18 +2012,377 @@ fn resolve_settings_path_from_candidates(
     })
 }
 
-fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
-    // Allow tests to override the settings directory via the same env var
-    // used for config (DEEPSEEK_CONFIG_PATH points at config.toml; the
-    // settings file lives as a sibling in the same directory).
-    if let Ok(config_path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let config_path = config_path.trim();
-        if !config_path.is_empty() {
-            let p = expand_path(config_path);
-            if let Some(parent) = p.parent() {
-                return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
-            }
+/// Proof that the caller is inside the settings critical section.
+///
+/// Only [`with_settings_transaction`] can hand one out, so a `load`/`save` pair
+/// on this type is by construction covered by both the process-wide mutex and
+/// the cross-process file lock.
+pub(crate) struct SettingsTransaction {
+    path: PathBuf,
+}
+
+impl SettingsTransaction {
+    /// Read the on-disk values inside the critical section.
+    pub(crate) fn load(&self) -> Result<Settings> {
+        Settings::load_persisted_locked()
+    }
+
+    /// Write the whole file inside the critical section.
+    pub(crate) fn save(&self, settings: &Settings) -> Result<()> {
+        settings.save_locked(&self.path)
+    }
+}
+
+/// Run `operation` as one whole-file settings critical section.
+///
+/// Most callers want [`Settings::transact`]. Reach for this directly only when a
+/// single logical change needs more than one save under one lock — the
+/// Shift+Tab root-policy release is the motivating case: it commits the new
+/// posture, unsets the shadowing root config key, and must restore the previous
+/// posture if that unset fails. Splitting that into two `transact` calls would
+/// let another writer observe (and rewrite over) the uncommitted middle state.
+///
+/// Two locks are taken, in this order, and both are held across disk I/O:
+///
+/// 1. A process-wide mutex keyed by the resolved settings path. It covers
+///    writers that never share an object — a background startup-default drain
+///    and a synchronous Shift+Tab permission write, the concrete pair that lost
+///    `default_mode` / `permission_posture` against each other.
+/// 2. An **advisory file lock on an adjacent `settings.toml.lock`**, following
+///    the `codewhale_config::config_document` pattern. The process mutex says
+///    nothing about a second Codewhale process (a second TUI, `codewhale exec`,
+///    the runtime HTTP surface in another instance) doing its own
+///    load/modify/save. Without a cross-process lock those two interleave and
+///    the later save reverts the earlier one's field — last-save-wins across
+///    processes, which is exactly the bug the in-process lock was added to
+///    prevent in-process.
+///
+/// The lock file is only ever a lock: no settings content is written to it, so
+/// a stale one carries nothing to lose.
+///
+/// There is exactly one permitted lock order for anything that touches
+/// `settings.toml`, and every acquisition in the tree below obeys it:
+///
+/// ```text
+/// StartupDefaultsWriter::write  →  settings process mutex  →  settings file lock  →  test env lock  →  test state-I/O lock
+/// ```
+///
+/// Two consequences worth stating, because breaking either is a deadlock:
+///
+/// - A thread holding a transaction must never wait on
+///   `StartupDefaultsWriter::write`. The queued-drain paths (`flush`,
+///   `apply_blocking`) take `write` *first* and only then enter a transaction.
+/// - Under `cfg(test)` path resolution enters the process-wide env barrier from
+///   inside a transaction, so a background thread inside a transaction must be
+///   enrolled in the sealing test's env scope (see `tui::startup_defaults`) or it
+///   will park on a lock its own test holds.
+///
+/// Neither lock is re-entrant. `operation` must not call back into `transact`,
+/// `Settings::save`, or this function.
+pub(crate) fn with_settings_transaction<T>(
+    operation: impl FnOnce(&SettingsTransaction) -> Result<T>,
+) -> Result<T> {
+    let path = Settings::path()?;
+    let _process_guard = lock_settings_transaction(settings_transaction_mutex(&path));
+    with_settings_file_lock(&path, || {
+        operation(&SettingsTransaction { path: path.clone() })
+    })
+}
+
+/// Hold an exclusive advisory lock on `<settings.toml>.lock` for `operation`.
+///
+/// The lock file is opened (not followed) with owner-only permissions and is
+/// created if absent. Dropping the `fd_lock` guard — including on an unwind —
+/// releases it, and the OS releases it if the process dies, so a crash cannot
+/// wedge another Codewhale instance out of its settings.
+fn with_settings_file_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::fs;
+
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        anyhow::bail!(
+            "Failed to lock settings: {} has no parent directory",
+            path.display()
+        );
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create config directory {}", parent.display()))?;
+
+    let mut lock_name = path
+        .file_name()
+        .context("Failed to lock settings: settings path has no file name")?
+        .to_os_string();
+    lock_name.push(".lock");
+    let lock_path = parent.join(lock_name);
+    reject_settings_lock_symlink(&lock_path)?;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let lock_file = options
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open settings lock at {}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        lock_file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!("Failed to secure settings lock at {}", lock_path.display())
+            })?;
+    }
+    if !lock_file
+        .metadata()
+        .with_context(|| format!("Failed to inspect settings lock at {}", lock_path.display()))?
+        .file_type()
+        .is_file()
+    {
+        anyhow::bail!(
+            "Refusing a non-regular settings lock at {}",
+            lock_path.display()
+        );
+    }
+
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock
+        .write()
+        .with_context(|| format!("Failed to acquire settings lock at {}", lock_path.display()))?;
+    operation()
+}
+
+/// Refuse to lock through a symlink: a planted `settings.toml.lock -> …` would
+/// otherwise let an attacker pick which file we create with our permissions.
+fn reject_settings_lock_symlink(lock_path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => anyhow::bail!(
+            "Refusing a symlinked settings lock at {}",
+            lock_path.display()
+        ),
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+/// Replace `path` with `body` by writing an adjacent temporary file and
+/// renaming it into place.
+///
+/// A direct `fs::write` truncates first, so any concurrent reader — another
+/// Codewhale process, an editor, a `cat` — can observe a half-written file and
+/// parse it as truncated TOML, silently losing every key past the tear. A
+/// same-directory temp file plus the platform's replace primitive makes the
+/// swap atomic for readers: they see either the whole previous file or the
+/// whole new one.
+///
+/// The temp file inherits the existing file's permission bits when there is one
+/// (so a user who tightened `settings.toml` keeps that), and is created
+/// owner-only otherwise. `NamedTempFile` removes itself if anything below fails,
+/// so a failed save leaves no debris and never damages the previous file.
+fn atomically_replace_settings_file(path: &Path, body: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".settings-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .with_context(|| format!("Failed to stage settings write in {}", dir.display()))?;
+    tmp.write_all(body)
+        .with_context(|| format!("Failed to write settings to {}", path.display()))?;
+    tmp.flush()
+        .with_context(|| format!("Failed to flush settings for {}", path.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("Failed to sync settings for {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("Failed to set permissions for {}", path.display()))?;
+    }
+
+    #[cfg(windows)]
+    if path.exists() {
+        // `tempfile::persist` uses MoveFileExW on Windows. Under concurrent
+        // reads that can expose a partially replaced destination. ReplaceFileW
+        // is the native existing-file replacement operation and also preserves
+        // the destination's ACLs and attributes.
+        let mut temporary = tmp.into_temp_path();
+        replace_existing_settings_file(path, &temporary)
+            .with_context(|| format!("Failed to write settings to {}", path.display()))?;
+        // ReplaceFileW consumed the temporary pathname. Do not ask TempPath to
+        // clean up that now-nonexistent source when it drops.
+        temporary.disable_cleanup(true);
+        return Ok(());
+    }
+
+    tmp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Failed to write settings to {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_existing_settings_file(path: &Path, replacement: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, ReplaceFileW, SetFileAttributesW,
+    };
+
+    fn wide_path(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let path_wide = wide_path(path);
+    let replacement_wide = wide_path(replacement);
+    unsafe {
+        // NamedTempFile marks its source with the temporary caching hint.
+        // Clear it before publication, matching tempfile's persistence path.
+        if SetFileAttributesW(replacement_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) == 0 {
+            return Err(std::io::Error::last_os_error());
         }
+
+        if ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        ) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            // Restore the hint so TempPath retains its normal cleanup behavior
+            // when replacement fails and the source still exists.
+            let _ = SetFileAttributesW(replacement_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Per-settings-path transaction mutexes.
+///
+/// Keyed by path rather than global because tests seal `HOME` onto their own
+/// temp dirs: two sealed tests write different files and have no reason to
+/// serialize against each other. Production has exactly one entry, so the
+/// registry never grows; entries are intentionally `'static` (leaked once) so a
+/// transaction can hold a plain `MutexGuard` without also pinning the registry
+/// lock it came from.
+fn settings_transaction_mutex(path: &Path) -> &'static std::sync::Mutex<()> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
+    let key = path.to_path_buf();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mutex: &'static Mutex<()> = locks
+        .entry(key)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))));
+    drop(locks);
+    mutex
+}
+
+/// Acquire a transaction lock.
+///
+/// The mutex protects ordering, not an invariant, so a panic inside one
+/// transaction must not wedge settings persistence for the rest of the session:
+/// a poisoned guard is recovered rather than propagated.
+#[cfg(not(test))]
+fn lock_settings_transaction(
+    mutex: &'static std::sync::Mutex<()>,
+) -> std::sync::MutexGuard<'static, ()> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Test build of [`lock_settings_transaction`], with a watchdog.
+///
+/// Production blocks indefinitely, which is correct — the only thing ahead of it
+/// is a bounded settings transaction. In a test binary an indefinite wait is
+/// indistinguishable from a lock-order inversion, and a hung test job reports
+/// nothing. This is not a synchronization device: every honest acquisition
+/// succeeds on the first `try_lock` or shortly after. It exists so a regression
+/// fails loudly instead of hanging CI.
+///
+/// The deadline is generous on purpose. A transaction still reads and writes
+/// under `cfg(test)`'s state-I/O barrier, and the cross-process file lock can be
+/// held by a deliberately slow child process in the cross-process regressions —
+/// so the watchdog only has to be longer than the slowest honest transaction and
+/// shorter than a CI job timeout, not tight.
+#[cfg(test)]
+fn lock_settings_transaction(
+    mutex: &'static std::sync::Mutex<()>,
+) -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::TryLockError;
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "settings transaction lock was not released within {DEADLINE:?}. Some thread is \
+             holding it across a load/modify/save that cannot finish — usually because it is \
+             blocked on a lock this test already holds, or because a transaction was opened \
+             re-entrantly. See Settings::transact."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    #[cfg(test)]
+    {
+        let honor_guarded_environment =
+            crate::test_support::guarded_environment_provides_state_paths();
+        crate::test_support::with_test_env_lock(|| {
+            if honor_guarded_environment {
+                settings_path_candidates_from_environment()
+            } else {
+                (
+                    Some(crate::test_support::unsealed_test_state_root().join(SETTINGS_FILE_NAME)),
+                    None,
+                    None,
+                )
+            }
+        })
+    }
+
+    #[cfg(not(test))]
+    settings_path_candidates_from_environment()
+}
+
+fn settings_path_candidates_from_environment() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)
+{
+    // Allow tests to override the settings directory via the same env vars
+    // used for config. CODEWHALE_CONFIG_PATH is canonical; the legacy alias
+    // remains a read-only fallback for existing installs.
+    if let Some(parent) = config_override_parent() {
+        return (Some(parent.join(SETTINGS_FILE_NAME)), None, None);
     }
 
     let primary = codewhale_config::codewhale_home()
@@ -1385,7 +2400,32 @@ fn settings_path_candidates() -> (Option<PathBuf>, Option<PathBuf>, Option<PathB
     (primary, legacy_home, legacy_config_dir)
 }
 
+fn config_override_parent() -> Option<PathBuf> {
+    fn read() -> Option<PathBuf> {
+        for var in ["CODEWHALE_CONFIG_PATH", "DEEPSEEK_CONFIG_PATH"] {
+            if let Ok(config_path) = std::env::var(var) {
+                let config_path = config_path.trim();
+                if !config_path.is_empty() {
+                    return expand_path(config_path).parent().map(Path::to_path_buf);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    {
+        crate::test_support::with_test_env_lock(read)
+    }
+    #[cfg(not(test))]
+    {
+        read()
+    }
+}
+
 fn migrate_settings_file_to_primary_if_needed(primary: &Path, active_read_path: &Path) {
+    use std::io::Write as _;
+
     if primary == active_read_path || primary.exists() || !active_read_path.exists() {
         return;
     }
@@ -1402,7 +2442,56 @@ fn migrate_settings_file_to_primary_if_needed(primary: &Path, active_read_path: 
         return;
     }
 
-    if let Err(err) = std::fs::copy(active_read_path, primary) {
+    let migration = (|| -> Result<()> {
+        let body = std::fs::read(active_read_path).with_context(|| {
+            format!(
+                "Failed to read legacy settings from {}",
+                active_read_path.display()
+            )
+        })?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".settings-migration-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!("Failed to stage settings migration in {}", parent.display())
+            })?;
+        tmp.write_all(&body).with_context(|| {
+            format!(
+                "Failed to stage legacy settings from {}",
+                active_read_path.display()
+            )
+        })?;
+        tmp.flush()
+            .context("Failed to flush staged settings migration")?;
+        tmp.as_file()
+            .sync_all()
+            .context("Failed to sync staged settings migration")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(active_read_path)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .context("Failed to preserve legacy settings permissions")?;
+        }
+
+        match tmp.persist_noclobber(primary) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.error).with_context(|| {
+                format!(
+                    "Failed to install migrated settings at {}",
+                    primary.display()
+                )
+            }),
+        }
+    })();
+
+    if let Err(err) = migration {
         tracing::warn!(
             "failed to migrate settings from {} to {}: {err}",
             active_read_path.display(),
@@ -1429,6 +2518,22 @@ fn normalize_permission_posture(value: &str) -> Option<String> {
     }
 }
 
+/// Normalize filesystem sandbox mode. Distinct from permission posture.
+fn normalize_sandbox_mode(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "read_only" | "ro" => Some("read-only".to_string()),
+        "workspace-write" | "workspace_write" | "workspace" | "workspace-only" => {
+            Some("workspace-write".to_string())
+        }
+        "danger-full-access" | "danger_full_access" | "full-fs" | "full_filesystem"
+        | "filesystem-full" => Some("danger-full-access".to_string()),
+        "external-sandbox" | "external_sandbox" | "opensandbox" | "external" => {
+            Some("external-sandbox".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -1440,20 +2545,9 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let normalized = match trimmed.to_ascii_lowercase().as_str() {
-        "off" | "disabled" | "none" | "false" => "off",
-        "low" | "minimal" => "low",
-        "medium" | "mid" => "medium",
-        "high" => "high",
-        "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" | "ultracode" => "max",
-        _ => {
-            anyhow::bail!(
-                "Failed to update setting: invalid reasoning_effort '{value}'. Expected: auto, off, low, medium, high, max, xhigh, ultracode, or default."
-            );
-        }
-    };
-    Ok(Some(normalized.to_string()))
+    ReasoningEffort::parse_strict(trimmed)
+        .map(|effort| Some(effort.as_setting().to_string()))
+        .map_err(|err| anyhow::anyhow!("Failed to update setting: {err}"))
 }
 
 /// Parse a boolean value from various formats
@@ -1467,12 +2561,31 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn default_thinking_preview_lines() -> usize {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn parse_usize_setting(key: &str, value: &str) -> Result<usize> {
     value.trim().parse::<usize>().map_err(|_| {
         anyhow::anyhow!(
             "Failed to update setting: invalid {key} '{value}'. Expected 0 or a positive integer."
         )
     })
+}
+
+fn parse_u16_range(key: &str, value: &str, min: u16, max: u16) -> Result<u16> {
+    let parsed = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("Invalid {key} '{value}': expected {min}-{max}"))?;
+    if !(min..=max).contains(&parsed) {
+        anyhow::bail!("Invalid {key} '{value}': expected {min}-{max}");
+    }
+    Ok(parsed)
 }
 
 fn parse_percent_setting(key: &str, value: &str) -> Result<f64> {
@@ -1506,13 +2619,11 @@ fn normalize_mode(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "edit" => "agent",
         "normal" => "agent",
-        "agent" => "agent",
+        "agent" | "act" | "work" => "agent",
         "plan" => "plan",
-        // Operate is a session action, not a startup personality. Old saved
-        // values fall back to the safe general-purpose Agent startup mode.
-        "operate" | "operation" | "ops" => "agent",
-        // Kept as a migration input in `load_persisted`; new settings never
-        // advertise it as a mode because permission posture is separate.
+        // Operate is a first-class startup mode (Hunter 2026-07-24).
+        "operate" | "operation" | "ops" => "operate",
+        // yolo was mode+permission; keep mode as Act and migrate posture on load.
         "yolo" => "agent",
         _ => value,
     }
@@ -1552,7 +2663,9 @@ fn normalize_tool_collapse_mode(value: &str) -> &str {
 fn normalize_status_indicator(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "cw" | "mark" | "text" => "cw",
-        "whale" | "🐳" | "🐋" => "whale",
+        // The whale emoji header chip is retired (2026-07-23): persisted
+        // opt-ins migrate to the typographic mark on load.
+        "whale" | "🐳" | "🐋" => "cw",
         "dots" | "dot" => "dots",
         "off" | "none" | "hidden" | "false" => "off",
         _ => value,
@@ -1572,8 +2685,8 @@ fn normalize_synchronized_output(value: &str) -> &str {
     }
 }
 
-fn normalize_settings_theme(value: &str) -> &'static str {
-    normalize_theme_name(value).unwrap_or("system")
+fn normalize_settings_theme(value: &str) -> String {
+    normalize_theme_setting(value).unwrap_or_else(|_| "system".to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default
@@ -1654,7 +2767,8 @@ fn normalize_sidebar_focus(value: &str) -> &str {
         "pinned" | "visible" | "show" | "on" | "work" | "plan" | "todos" => "pinned",
         "tasks" | "activity" | "live" | "running" => "tasks",
         "agents" | "subagents" | "sub-agents" => "agents",
-        "context" | "session" => "context",
+        "context" => "context",
+        "sessions" | "sessions_rail" | "session_history" => "sessions",
         "hidden" | "hide" | "closed" | "off" | "none" => "hidden",
         _ => "auto",
     }
@@ -1682,6 +2796,292 @@ fn env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Cross-process settings integrity
+    // -----------------------------------------------------------------------
+    //
+    // The in-process mutex says nothing about a *second* Codewhale process on
+    // the same home directory — a second TUI, `codewhale exec`, the runtime HTTP
+    // surface in another instance. Two of those doing load/modify/save at once
+    // is the same last-save-wins bug the in-process lock was added to prevent,
+    // and no amount of thread-based testing can observe it: threads share the
+    // mutex that makes the bug impossible. These regressions therefore drive a
+    // real child process.
+    //
+    // The child is this same test binary, re-invoked with `--ignored --exact`
+    // on the helper below. It inherits the sealed `HOME`/`CODEWHALE_HOME`
+    // through its environment, so both processes resolve the same
+    // `settings.toml`.
+
+    /// Selects which child behavior [`settings_cross_process_child_helper`] runs.
+    const CHILD_ROLE_ENV: &str = "CODEWHALE_TEST_SETTINGS_CHILD_ROLE";
+    /// Path of the parent↔child handshake file. Its meaning is per-role: the
+    /// slow writer *creates* it once its transaction is open; the reader *waits*
+    /// for it as a stop signal.
+    const CHILD_SIGNAL_ENV: &str = "CODEWHALE_TEST_SETTINGS_CHILD_SIGNAL";
+    /// Where the child writes what it observed, for the parent to assert on.
+    const CHILD_RESULT_ENV: &str = "CODEWHALE_TEST_SETTINGS_CHILD_RESULT";
+
+    /// The other process in the cross-process regressions.
+    ///
+    /// Ignored so a normal `cargo test` never runs it directly; the parent tests
+    /// invoke it explicitly with `--ignored --exact`. With no role set it is a
+    /// no-op, so an accidental `--ignored` sweep stays green.
+    #[test]
+    #[ignore = "spawned as a child process by the cross-process settings regressions"]
+    fn settings_cross_process_child_helper() {
+        use std::time::{Duration, Instant};
+
+        let Ok(role) = std::env::var(CHILD_ROLE_ENV) else {
+            return;
+        };
+        // Under `cfg(test)` the settings path only honors the real environment
+        // for a thread that holds this lock; without it the child would resolve
+        // the isolated per-process test root and never touch the parent's file.
+        // The child is a fresh process, so the acquisition is uncontended.
+        let _env_lock = crate::test_support::lock_test_env();
+        let inherited_home = std::env::var_os("CODEWHALE_HOME")
+            .expect("settings child needs an inherited Codewhale home");
+        let _state_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", inherited_home);
+        let signal = PathBuf::from(
+            std::env::var(CHILD_SIGNAL_ENV).expect("child helper needs a signal path"),
+        );
+
+        match role.as_str() {
+            // Hold the settings critical section open across a visible delay, so
+            // the parent's transaction is guaranteed to arrive while this one is
+            // mid-flight.
+            "slow-writer" => {
+                with_settings_transaction(|transaction| {
+                    let mut settings = transaction.load()?;
+                    settings.default_mode = "operate".to_string();
+                    // Announce *after* the read: from here on, any parent write
+                    // that is not excluded by the lock will be lost by the save
+                    // below.
+                    std::fs::write(&signal, b"loaded").expect("write the handshake file");
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    transaction.save(&settings)
+                })
+                .expect("the child transaction must commit");
+            }
+            // Read the raw file as fast as possible while the parent rewrites
+            // it, and report how many reads were torn.
+            "reader" => {
+                let result = PathBuf::from(
+                    std::env::var(CHILD_RESULT_ENV).expect("reader needs a result path"),
+                );
+                let path = Settings::path().expect("resolve the shared settings path");
+                let ready = result.with_extension("ready");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let (mut reads, mut torn) = (0_u64, 0_u64);
+
+                // A ready marker must mean that the reader has actually run.
+                // On Windows the child can otherwise create the marker, lose
+                // its time slice, and perform no reads before the parent
+                // completes every write and signals it to stop.
+                loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "reader did not observe the seeded settings file"
+                    );
+                    match std::fs::read_to_string(&path) {
+                        Ok(raw)
+                            if !raw.is_empty() && toml::from_str::<toml::Value>(&raw).is_ok() =>
+                        {
+                            reads += 1;
+                            break;
+                        }
+                        Ok(_) | Err(_) => std::thread::yield_now(),
+                    }
+                }
+                std::fs::write(&ready, b"ready").expect("announce that the reader is ready");
+
+                while !path_exists_for_test(&signal) && Instant::now() < deadline {
+                    let Ok(raw) = std::fs::read_to_string(&path) else {
+                        // The file legitimately does not exist yet.
+                        continue;
+                    };
+                    reads += 1;
+                    // Both failure shapes a truncate-then-write produces: the
+                    // momentarily empty file, and a prefix that stops mid-value.
+                    if raw.is_empty() || toml::from_str::<toml::Value>(&raw).is_err() {
+                        torn += 1;
+                    }
+                }
+                std::fs::write(&result, format!("{reads} {torn}")).expect("write the result file");
+            }
+            other => panic!("unknown child role {other}"),
+        }
+    }
+
+    fn path_exists_for_test(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok()
+    }
+
+    /// Spawn this test binary as a child running the helper above in `role`.
+    fn spawn_settings_child(
+        role: &str,
+        home: &Path,
+        signal: &Path,
+        result: Option<&Path>,
+    ) -> std::process::Child {
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("the test binary path is the child program"),
+        );
+        command
+            .arg("settings::tests::settings_cross_process_child_helper")
+            .args(["--exact", "--ignored", "--test-threads", "1"])
+            .env(CHILD_ROLE_ENV, role)
+            .env(CHILD_SIGNAL_ENV, signal)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("CODEWHALE_HOME", home.join(".codewhale"))
+            .env_remove("DEEPSEEK_CONFIG_PATH")
+            .env_remove("CODEWHALE_CONFIG_PATH")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(result) = result {
+            command.env(CHILD_RESULT_ENV, result);
+        }
+        command.spawn().expect("spawn the settings child process")
+    }
+
+    fn seal_settings_home_for_test(home: &Path) -> Vec<crate::test_support::EnvVarGuard> {
+        use crate::test_support::EnvVarGuard;
+        vec![
+            EnvVarGuard::set("HOME", home),
+            EnvVarGuard::set("USERPROFILE", home),
+            EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale")),
+            EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH"),
+            EnvVarGuard::remove("CODEWHALE_CONFIG_PATH"),
+        ]
+    }
+
+    fn wait_for_file(path: &Path, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !path_exists_for_test(path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what} at {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Two processes mutating **disjoint** fields must both survive.
+    ///
+    /// The child opens a transaction, reads the pre-image, announces itself, and
+    /// only then saves `default_mode`. The parent's `max_history` write arrives
+    /// squarely inside that window. Without the cross-process lock the parent
+    /// loads the same pre-image, saves, and is then overwritten wholesale by the
+    /// child's later save — `max_history` silently reverts. With the lock the
+    /// parent waits, re-reads the child's committed value, and both fields land.
+    #[test]
+    fn two_processes_mutating_disjoint_fields_do_not_last_save_wins() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _env = seal_settings_home_for_test(tmp.path());
+
+        // A real pre-image, so "whichever saves last wins" has something to
+        // revert rather than a fresh file.
+        Settings::transact(|settings| settings.set("max_history", "100"))
+            .expect("seed the settings file");
+        let signal = tmp.path().join("child-transaction-open");
+
+        let mut child = spawn_settings_child("slow-writer", tmp.path(), &signal, None);
+        wait_for_file(&signal, "the child's open transaction");
+
+        // The child is mid-transaction right now. This must block, not race.
+        Settings::transact(|settings| settings.set("max_history", "321"))
+            .expect("the parent write must land once the child releases the lock");
+
+        let status = child.wait().expect("await the child process");
+        assert!(status.success(), "the child transaction must succeed");
+
+        let settled = Settings::load_persisted().expect("reload the shared settings");
+        assert_eq!(
+            settled.default_mode, "operate",
+            "the child's field must survive the parent's whole-file save"
+        );
+        assert_eq!(
+            settled.max_input_history, 321,
+            "the parent's field must survive the child's whole-file save"
+        );
+    }
+
+    /// A concurrent reader must never observe a half-written `settings.toml`.
+    ///
+    /// `fs::write` truncates before it writes, so any other process reading at
+    /// the wrong moment sees an empty file or a prefix that stops mid-value —
+    /// and parses it as a settings file that is simply missing everything past
+    /// the tear. Writing to an adjacent temp file and renaming makes the swap
+    /// atomic: a reader sees either the whole old file or the whole new one.
+    #[test]
+    fn concurrent_readers_never_observe_a_truncated_settings_file() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _env = seal_settings_home_for_test(tmp.path());
+
+        // Make the file big enough that a non-atomic write has a real window.
+        // A short file can be written in one syscall and hide the bug.
+        Settings::transact(|settings| {
+            settings.pinned_models = (0..400)
+                .map(|index| PinnedModel {
+                    provider: "deepseek".to_string(),
+                    model: format!("pinned-model-{index:04}"),
+                    label: Some(format!("Pinned model {index:04}")),
+                })
+                .collect();
+            Ok(())
+        })
+        .expect("seed a large settings file");
+
+        let stop = tmp.path().join("reader-stop");
+        let result = tmp.path().join("reader-result");
+        let ready = result.with_extension("ready");
+        let mut child = spawn_settings_child("reader", tmp.path(), &stop, Some(&result));
+        wait_for_file(&ready, "the settings reader to become ready");
+
+        for index in 0..150 {
+            Settings::transact(|settings| settings.set("max_history", &(100 + index).to_string()))
+                .expect("the parent write must land");
+        }
+
+        std::fs::write(&stop, b"stop").expect("signal the reader to stop");
+        let status = child.wait().expect("await the reader process");
+        assert!(status.success(), "the reader must exit cleanly");
+
+        let observed = std::fs::read_to_string(&result).expect("read the reader's report");
+        let mut parts = observed.split_whitespace();
+        let reads: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let torn: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        assert!(
+            reads > 0,
+            "the reader observed nothing, so it proves nothing (report: {observed:?})"
+        );
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} concurrent reads saw a truncated or unparseable settings file"
+        );
+    }
+
+    #[test]
+    fn focus_texture_defaults_off_and_validates() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.focus_texture, "off");
+
+        settings.set("focus_texture", "scrim").unwrap();
+        assert_eq!(settings.focus_texture, "scrim");
+        settings.set("texture", "grain").unwrap();
+        assert_eq!(settings.focus_texture, "grain");
+        settings.set("focus_texture", " OFF ").unwrap();
+        assert_eq!(settings.focus_texture, "off");
+
+        let err = settings.set("focus_texture", "static").unwrap_err();
+        assert!(err.to_string().contains("off, scrim, or grain"));
+    }
+
     #[test]
     fn ocean_treatment_is_appearance_not_motion() {
         let mut settings = Settings::default();
@@ -1697,11 +3097,11 @@ mod tests {
     }
 
     #[test]
-    fn work_surface_placement_persists_only_top_left_or_right() {
+    fn work_surface_placement_persists_top_left_right_and_off() {
         let mut settings = Settings::default();
         assert_eq!(settings.work_surface_placement, "top");
 
-        for placement in ["left", "right", "top"] {
+        for placement in ["left", "right", "top", "off"] {
             settings
                 .set("work_surface_placement", placement)
                 .expect("valid placement");
@@ -1714,8 +3114,145 @@ mod tests {
         let err = settings
             .set("work_surface_placement", "bottom")
             .expect_err("bottom is owned by composer/footer");
-        assert!(err.to_string().contains("top, left, or right"));
-        assert_eq!(settings.work_surface_placement, "top");
+        assert!(err.to_string().contains("top, left, right, or off"));
+        assert_eq!(settings.work_surface_placement, "off");
+    }
+
+    #[test]
+    fn rail_panel_persists_tasks_agents_context_and_pinned() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.rail_panel, "tasks");
+
+        for panel in ["agents", "context", "pinned", "tasks"] {
+            settings.set("rail_panel", panel).expect("valid panel");
+            assert_eq!(settings.rail_panel, panel);
+            let body = toml::to_string(&settings).expect("serialize settings");
+            let restored: Settings = toml::from_str(&body).expect("restore settings");
+            assert_eq!(restored.rail_panel, panel);
+        }
+
+        let err = settings
+            .set("rail_panel", "auto")
+            .expect_err("auto-collapse was dropped with the legacy sidebar");
+        assert!(
+            err.to_string()
+                .contains("tasks, agents, context, or pinned")
+        );
+        assert_eq!(settings.rail_panel, "tasks");
+    }
+
+    #[test]
+    fn work_surface_drag_sizes_round_trip_with_bounded_values() {
+        let mut settings = Settings::default();
+        settings.set("work_surface_top_height", "9").unwrap();
+        settings.set("work_surface_side_width", "54").unwrap();
+        let body = toml::to_string(&settings).expect("serialize settings");
+        let restored: Settings = toml::from_str(&body).expect("restore settings");
+        assert_eq!(restored.work_surface_top_height, 9);
+        assert_eq!(restored.work_surface_side_width, 54);
+        assert!(settings.set("work_surface_top_height", "17").is_err());
+        assert!(settings.set("work_surface_top_height", "4").is_err());
+        assert!(settings.set("work_surface_side_width", "25").is_err());
+    }
+
+    #[test]
+    fn settings_load_migrates_unreadable_top_work_surface_height() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let settings_path = tmp.path().join("settings.toml");
+        let legacy = "work_surface_placement = \"top\"\nwork_surface_top_height = 2\nrail_panel = \"pinned\"\n";
+        std::fs::write(&settings_path, legacy).expect("settings");
+        let _config_override =
+            EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
+
+        let loaded = Settings::load().expect("load settings");
+
+        assert_eq!(loaded.work_surface_top_height, WORK_SURFACE_TOP_HEIGHT_MIN);
+        assert_eq!(loaded.work_surface_placement, "top");
+        assert_eq!(loaded.rail_panel, "pinned");
+        assert_eq!(
+            std::fs::read_to_string(settings_path).expect("read unchanged settings"),
+            legacy,
+            "normalizing a legacy height at read time must not rewrite the user's file"
+        );
+    }
+
+    #[test]
+    fn inline_diffs_default_full_and_persist_exactly_one_mode() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.inline_diffs, "full");
+        assert_eq!(
+            InlineDiffMode::parse(&settings.inline_diffs),
+            InlineDiffMode::Full
+        );
+
+        for mode in ["summary", "off", "full"] {
+            settings.set("inline_diffs", mode).expect("valid mode");
+            assert_eq!(settings.inline_diffs, mode);
+            let body = toml::to_string(&settings).expect("serialize settings");
+            let restored: Settings = toml::from_str(&body).expect("restore settings");
+            assert_eq!(restored.inline_diffs, mode);
+        }
+
+        let error = settings
+            .set("inline_diffs", "compact")
+            .expect_err("unknown mode must not be guessed");
+        assert!(error.to_string().contains("full, summary, or off"));
+        assert_eq!(settings.inline_diffs, "full");
+    }
+
+    #[test]
+    fn thinking_highlight_is_independently_configurable_and_persisted() {
+        let mut settings = Settings::default();
+        assert!(settings.thinking_highlight);
+
+        settings
+            .set("thinking_highlight", "false")
+            .expect("valid thinking highlight setting");
+        assert!(!settings.thinking_highlight);
+
+        let restored: Settings =
+            toml::from_str(&toml::to_string(&settings).expect("serialize settings"))
+                .expect("restore settings");
+        assert!(!restored.thinking_highlight);
+    }
+
+    #[test]
+    fn thinking_default_expanded_is_opt_in_and_persisted() {
+        let mut settings = Settings::default();
+        assert!(!settings.thinking_default_expanded);
+
+        settings
+            .set("thinking_default_expanded", "true")
+            .expect("valid thinking expansion setting");
+        assert!(settings.thinking_default_expanded);
+
+        let restored: Settings =
+            toml::from_str(&toml::to_string(&settings).expect("serialize settings"))
+                .expect("restore settings");
+        assert!(restored.thinking_default_expanded);
+    }
+
+    #[test]
+    fn density_knobs_default_compact_and_persist() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.thinking_preview_lines, 2);
+        assert!(!settings.help_expand_groups);
+        assert!(settings.pin_last_prompt);
+
+        settings.set("thinking_preview_lines", "10").unwrap();
+        settings.set("help_expand_groups", "true").unwrap();
+        settings.set("pin_last_prompt", "false").unwrap();
+        assert_eq!(settings.thinking_preview_lines, 10);
+        assert!(settings.help_expand_groups);
+        assert!(!settings.pin_last_prompt);
+
+        let restored: Settings =
+            toml::from_str(&toml::to_string(&settings).expect("serialize settings"))
+                .expect("restore settings");
+        assert_eq!(restored.thinking_preview_lines, 10);
+        assert!(restored.help_expand_groups);
+        assert!(!restored.pin_last_prompt);
     }
 
     /// Explicit animated baseline for env-force tests (#4095 flipped defaults to calm).
@@ -1770,6 +3307,26 @@ mod tests {
     }
 
     #[test]
+    fn behavioral_tip_impressions_are_backward_compatible_and_persist_when_seen() {
+        let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
+        assert!(!default_body.contains("behavioral_tip_impressions"));
+
+        let mut settings = Settings::default();
+        settings
+            .behavioral_tip_impressions
+            .insert("planning_mode".to_string(), 1);
+        let body = toml::to_string_pretty(&settings).expect("serialize");
+        let restored: Settings = toml::from_str(&body).expect("restore settings");
+        assert_eq!(
+            restored
+                .behavioral_tip_impressions
+                .get("planning_mode")
+                .copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn apply_preset_rejects_unknown_name() {
         let mut settings = Settings::default();
         let err = settings.apply_preset("turbo").expect_err("unknown preset");
@@ -1787,6 +3344,7 @@ mod tests {
         // `auto_compact`.
         assert!(!settings.auto_compact);
         assert_eq!(settings.auto_compact_threshold_percent, 80.0);
+        assert!(!settings.auto_compact_explicit);
     }
 
     #[test]
@@ -1794,8 +3352,50 @@ mod tests {
         let mut settings = Settings::default();
         settings.set("auto_compact", "on").expect("enable");
         assert!(settings.auto_compact);
+        assert!(settings.auto_compact_explicit);
         settings.set("auto_compact", "off").expect("disable");
         assert!(!settings.auto_compact);
+    }
+
+    #[test]
+    fn unrelated_save_does_not_materialize_implicit_auto_compact_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        let settings = Settings {
+            calm_mode: false,
+            ..Settings::default()
+        };
+
+        settings.save_to_path(&path).expect("save settings");
+
+        let body = std::fs::read_to_string(&path).expect("read settings");
+        let document = toml::from_str::<toml::Value>(&body).expect("parse settings");
+        assert!(!auto_compact_explicitly_configured_in_document(&document));
+        let reloaded = Settings::load_persisted_from_candidates(Some(path), None, None)
+            .expect("reload settings");
+        assert!(!reloaded.auto_compact_explicit);
+        assert!(!reloaded.auto_compact);
+        assert!(!reloaded.calm_mode);
+    }
+
+    #[test]
+    fn explicit_auto_compact_off_survives_save_and_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        let mut settings = Settings::default();
+        settings.set("auto_compact", "off").expect("disable");
+
+        settings.save_to_path(&path).expect("save settings");
+
+        assert!(auto_compact_explicitly_configured_from_candidates((
+            Some(path.clone()),
+            None,
+            None,
+        )));
+        let reloaded = Settings::load_persisted_from_candidates(Some(path), None, None)
+            .expect("reload settings");
+        assert!(reloaded.auto_compact_explicit);
+        assert!(!reloaded.auto_compact);
     }
 
     #[test]
@@ -1804,9 +3404,52 @@ mod tests {
         settings
             .set("auto_compact_threshold", "65%")
             .expect("threshold");
+        assert!(settings.auto_compact, "a threshold expresses enable intent");
         assert_eq!(settings.auto_compact_threshold_percent, 65.0);
+        assert!(settings.auto_compact_explicit);
         assert!(settings.set("auto_compact_threshold", "9").is_err());
         assert!(settings.set("auto_compact_threshold", "101").is_err());
+    }
+
+    #[test]
+    fn threshold_only_persisted_config_enables_auto_compaction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "auto_compact_threshold_percent = 65\n").expect("settings");
+
+        let loaded = Settings::load_persisted_from_candidates(Some(path.clone()), None, None)
+            .expect("load threshold-only settings");
+
+        assert!(loaded.auto_compact);
+        assert!(loaded.auto_compact_explicit);
+        assert_eq!(loaded.auto_compact_threshold_percent, 65.0);
+        assert!(auto_compact_explicitly_configured_from_candidates((
+            Some(path),
+            None,
+            None,
+        )));
+    }
+
+    #[test]
+    fn explicit_auto_compact_off_overrides_a_persisted_threshold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "auto_compact = false\nauto_compact_threshold_percent = 65\n",
+        )
+        .expect("settings");
+
+        let loaded = Settings::load_persisted_from_candidates(Some(path.clone()), None, None)
+            .expect("load explicit opt-out");
+
+        assert!(!loaded.auto_compact);
+        assert!(loaded.auto_compact_explicit);
+        assert!(auto_compact_explicitly_configured_from_candidates((
+            Some(path),
+            None,
+            None,
+        )));
     }
 
     #[test]
@@ -1825,38 +3468,97 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_keep_the_water_field_open_until_inspection_is_needed() {
-        let settings = Settings::default();
-        assert_eq!(settings.sidebar_focus, "auto");
-        assert!(settings.sidebar_auto_collapse_opt_in);
+    fn legacy_sidebar_focus_migrates_to_rail_panel_and_placement() {
+        let migrate = |focus: &str| {
+            let mut settings = Settings {
+                sidebar_focus: focus.to_string(),
+                ..Settings::default()
+            };
+            migrate_sidebar_settings_to_rail(&mut settings);
+            settings
+        };
+
+        assert_eq!(migrate("agents").rail_panel, "agents");
+        assert_eq!(migrate("subagents").rail_panel, "agents");
+        assert_eq!(migrate("context").rail_panel, "context");
+        assert_eq!(migrate("session").rail_panel, "context");
+        assert_eq!(migrate("tasks").rail_panel, "tasks");
+        assert_eq!(migrate("activity").rail_panel, "tasks");
+        assert_eq!(migrate("pinned").rail_panel, "pinned");
+        assert_eq!(migrate("work").rail_panel, "pinned");
+        // `auto` is the shipped default for `sidebar_focus`, so this arm is
+        // the effective default for every upgrading user — it must land on
+        // the panel that hides itself when there is nothing to show, not on
+        // the always-on pinned strip.
+        assert_eq!(migrate("auto").rail_panel, "tasks");
+        // A hidden sidebar becomes rail placement off.
+        let hidden = migrate("hidden");
+        assert_eq!(hidden.work_surface_placement, "off");
+        // #5141's pinned sessions panel carries forward as the first-class
+        // sessions rail.
+        assert!(migrate("sessions").sessions_rail);
+        assert!(migrate("sessions_rail").sessions_rail);
+        // An explicit `rail_panel = "tasks"` in the document wins over the
+        // auto→pinned migration even though "tasks" is the default value.
+        let mut explicit = Settings {
+            sidebar_focus: "auto".to_string(),
+            rail_panel: "tasks".to_string(),
+            rail_panel_explicit: true,
+            ..Settings::default()
+        };
+        migrate_sidebar_settings_to_rail(&mut explicit);
+        assert_eq!(explicit.rail_panel, "tasks");
+        // Placement panels keep their placement when the rail hides.
+        let mut left = Settings {
+            sidebar_focus: "hidden".to_string(),
+            work_surface_placement: "left".to_string(),
+            ..Settings::default()
+        };
+        migrate_sidebar_settings_to_rail(&mut left);
+        assert_eq!(left.work_surface_placement, "left");
     }
 
     #[test]
-    fn sidebar_auto_opt_in_marker_is_serialized_only_when_enabled() {
-        let default_body = toml::to_string_pretty(&Settings::default()).expect("serialize");
-        assert!(default_body.contains("sidebar_auto_collapse_opt_in = true"));
+    fn legacy_sidebar_width_maps_to_side_columns_and_new_keys_win() {
+        let mut settings = Settings {
+            sidebar_width_percent: 40,
+            ..Settings::default()
+        };
+        migrate_sidebar_settings_to_rail(&mut settings);
+        assert_eq!(settings.work_surface_side_width, 48);
 
+        // The default percent leaves the default side width alone.
         let mut settings = Settings::default();
-        settings
-            .set("sidebar_focus", "auto")
-            .expect("enable auto collapse");
+        migrate_sidebar_settings_to_rail(&mut settings);
+        assert_eq!(settings.work_surface_side_width, 30);
 
-        let auto_body = toml::to_string_pretty(&settings).expect("serialize");
-        assert!(auto_body.contains("sidebar_focus = \"auto\""));
-        assert!(auto_body.contains("sidebar_auto_collapse_opt_in = true"));
+        // An explicit rail panel wins over the migrated sidebar focus.
+        let mut settings = Settings {
+            sidebar_focus: "context".to_string(),
+            rail_panel: "agents".to_string(),
+            ..Settings::default()
+        };
+        migrate_sidebar_settings_to_rail(&mut settings);
+        assert_eq!(settings.rail_panel, "agents");
     }
 
     #[test]
     fn reasoning_effort_setting_normalizes_and_clears() {
         let mut settings = Settings::default();
-        settings
-            .set("reasoning_effort", "xhigh")
-            .expect("normalize xhigh");
-        assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
-        settings
-            .set("reasoning_effort", "ultracode")
-            .expect("normalize ultracode");
-        assert_eq!(settings.reasoning_effort.as_deref(), Some("max"));
+        // `xhigh` and `ultra` are their own rungs since the thinking ladder,
+        // so normalizing collapses spellings *within* a tier instead of
+        // folding the top three tiers into `max`.
+        for (input, stored) in [
+            ("xhigh", "xhigh"),
+            ("ultracode", "ultra"),
+            ("maximum", "max"),
+            ("minimal", "low"),
+        ] {
+            settings
+                .set("reasoning_effort", input)
+                .unwrap_or_else(|error| panic!("normalize {input}: {error}"));
+            assert_eq!(settings.reasoning_effort.as_deref(), Some(stored));
+        }
         settings
             .set("reasoning_effort", "default")
             .expect("clear effort");
@@ -1888,6 +3590,15 @@ mod tests {
         assert_eq!(settings.mention_menu_limit, 128);
         assert_eq!(settings.mention_walk_depth, 10);
         assert_eq!(settings.mention_menu_behavior, "fuzzy");
+        let mention_help = Settings::available_settings()
+            .into_iter()
+            .find(|(key, _)| *key == "mention_walk_depth")
+            .map(|(_, desc)| desc)
+            .expect("mention_walk_depth help");
+        assert!(
+            mention_help.contains("default 10"),
+            "help text still lists the pre-v0.8.50 default: {mention_help}"
+        );
 
         settings
             .set("mention_menu_limit", "256")
@@ -1917,8 +3628,27 @@ mod tests {
     #[test]
     fn locale_normalizes_supported_values_and_rejects_unknowns() {
         let mut settings = Settings::default();
-        settings.set("locale", "ja_JP.UTF-8").expect("set ja");
-        assert_eq!(settings.locale, "ja");
+        for (input, expected) in [
+            ("ja_JP.UTF-8", "ja"),
+            ("zh-CN", "zh-Hans"),
+            ("zh-TW", "zh-Hant"),
+            ("zh-Hant", "zh-Hant"),
+            ("es-MX", "es-419"),
+            ("vi_VN.UTF-8", "vi"),
+            ("ko-KR", "ko"),
+            ("ca-ES", "ca"),
+            ("de_DE.UTF-8", "de"),
+            ("fr-FR", "fr"),
+            ("id-ID", "id"),
+            ("hi_IN.UTF-8", "hi"),
+            ("ru-RU", "ru"),
+            ("uk_UA.UTF-8", "uk"),
+        ] {
+            settings
+                .set("locale", input)
+                .unwrap_or_else(|err| panic!("set locale {input}: {err}"));
+            assert_eq!(settings.locale, expected);
+        }
 
         settings.set("language", "pt-PT").expect("set pt fallback");
         assert_eq!(settings.locale, "pt-BR");
@@ -1952,6 +3682,11 @@ mod tests {
             .set("theme", "solarized")
             .expect("set solarized alias");
         assert_eq!(settings.theme, "solarized-light");
+
+        settings
+            .set("theme", "custom:Ocean_1")
+            .expect("custom selector validation must not depend on the file system");
+        assert_eq!(settings.theme, "custom:ocean_1");
 
         let err = settings
             .set("theme", "nord")
@@ -1997,60 +3732,6 @@ mod tests {
             .set("cost_currency", "eur")
             .expect_err("unsupported currency");
         assert!(err.to_string().contains("invalid cost currency"));
-    }
-
-    #[test]
-    fn sidebar_focus_accepts_pinned_values_and_legacy_aliases() {
-        let mut settings = Settings::default();
-
-        settings.set("sidebar_focus", "pinned").expect("set pinned");
-        assert_eq!(settings.sidebar_focus, "pinned");
-
-        settings.set("sidebar_focus", "work").expect("set work");
-        assert_eq!(settings.sidebar_focus, "pinned");
-
-        settings.set("focus", "plan").expect("legacy plan alias");
-        assert_eq!(settings.sidebar_focus, "pinned");
-
-        settings.set("focus", "todos").expect("legacy todos alias");
-        assert_eq!(settings.sidebar_focus, "pinned");
-
-        settings.set("focus", "context").expect("context focus");
-        assert_eq!(settings.sidebar_focus, "context");
-
-        settings.set("focus", "hidden").expect("hidden focus");
-        assert_eq!(settings.sidebar_focus, "hidden");
-
-        settings.set("focus", "off").expect("off alias");
-        assert_eq!(settings.sidebar_focus, "hidden");
-        assert!(!settings.sidebar_auto_collapse_opt_in);
-
-        settings.set("focus", "auto").expect("auto focus");
-        assert_eq!(settings.sidebar_focus, "auto");
-        assert!(settings.sidebar_auto_collapse_opt_in);
-
-        settings
-            .set("focus", "visible")
-            .expect("pinned alias clears auto marker");
-        assert_eq!(settings.sidebar_focus, "pinned");
-        assert!(!settings.sidebar_auto_collapse_opt_in);
-
-        // Activity is the user-facing panel name; config key remains "tasks" (#4135).
-        settings
-            .set("focus", "activity")
-            .expect("activity alias for Activity panel");
-        assert_eq!(settings.sidebar_focus, "tasks");
-        settings.set("focus", "live").expect("live alias");
-        assert_eq!(settings.sidebar_focus, "tasks");
-
-        let err = settings
-            .set("sidebar_focus", "classic")
-            .expect_err("classic is not a supported public focus");
-        assert!(err.to_string().contains("invalid sidebar focus"));
-        assert!(
-            err.to_string().contains("activity (tasks)"),
-            "error should teach the Activity alias: {err}"
-        );
     }
 
     #[test]
@@ -2104,6 +3785,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_collapse_threshold_is_not_a_settings_key() {
+        // #3256: rollup min-run size stays a fixed runtime constant (3), not a
+        // user setting — reject any accidental /set surface for it.
+        let mut settings = Settings::default();
+        let err = settings
+            .set("tool_collapse_threshold", "5")
+            .expect_err("threshold must not be configurable");
+        assert!(
+            err.to_string().contains("Unknown setting")
+                || err.to_string().contains("unknown setting")
+                || err.to_string().contains("Failed to update"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(settings.tool_collapse_mode, "compact");
+        assert!(!settings.show_tool_details);
+    }
+
+    #[test]
     fn display_localizes_header_and_config_file_label() {
         let settings = Settings::default();
         let en = settings.display(crate::localization::Locale::En);
@@ -2121,6 +3820,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn display_separates_deepseek_fallback_from_provider_scoped_models() {
+        let mut settings = Settings {
+            default_provider: Some("zai".to_string()),
+            default_model: Some("deepseek-v4-pro".to_string()),
+            ..Settings::default()
+        };
+        settings.set_model_for_provider("zai", "GLM-5.2");
+        settings.set_model_for_provider("deepseek", "deepseek-v4-flash");
+
+        let display = settings.display(crate::localization::Locale::En);
+
+        assert!(display.contains("deepseek_fallback:  deepseek-v4-pro"));
+        assert!(display.contains("default_provider:   zai"));
+        assert!(display.contains("    zai: GLM-5.2"));
+        assert!(display.contains("    deepseek: deepseek-v4-flash"));
+        assert!(!display.contains("  default_model:"));
+    }
+
+    #[test]
+    fn provider_model_selection_additively_enables_models() {
+        let mut settings = Settings::default();
+
+        settings.set_model_for_provider("openrouter", "anthropic/claude-sonnet-4");
+        settings.enable_model_for_provider("openrouter", "qwen/qwen3.7-plus");
+        settings.enable_model_for_provider("openrouter", "QWEN/QWEN3.7-PLUS");
+        settings.enable_model_for_provider("openrouter", "auto");
+
+        assert_eq!(
+            settings
+                .provider_models
+                .as_ref()
+                .and_then(|models| models.get("openrouter")),
+            Some(&"anthropic/claude-sonnet-4".to_string())
+        );
+        assert_eq!(
+            settings
+                .enabled_models
+                .as_ref()
+                .and_then(|models| models.get("openrouter")),
+            Some(&vec![
+                "anthropic/claude-sonnet-4".to_string(),
+                "qwen/qwen3.7-plus".to_string(),
+            ])
+        );
+
+        let encoded = toml::to_string(&settings).expect("serialize enabled models");
+        let decoded: Settings = toml::from_str(&encoded).expect("deserialize enabled models");
+        assert_eq!(decoded.enabled_models, settings.enabled_models);
+    }
+
     /// Tests that mutate process-global `NO_ANIMATIONS` serialise
     /// through this guard so the cargo parallel runner doesn't
     /// observe interleaved overrides. Uses the process-wide test env
@@ -2128,7 +3878,7 @@ mod tests {
     /// otherwise a `NO_ANIMATIONS=1` leak from this test family can
     /// flip a concurrent `TERM_PROGRAM=iTerm` test's `low_motion`
     /// assertion through the shared `apply_env_overrides` path.
-    fn no_animations_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn no_animations_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 
@@ -2279,12 +4029,12 @@ mod tests {
     /// — otherwise a concurrent test that calls `animated_settings()`
     /// can read whatever value our two `set_var`s have raced into the
     /// env at that instant.
-    fn term_program_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn term_program_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 
     #[test]
-    fn vscode_caps_redraws_without_disabling_motion_or_text_cadence() {
+    fn vscode_uses_calm_rendering_without_changing_text_cadence() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
@@ -2294,8 +4044,11 @@ mod tests {
         let mut settings = animated_settings();
         assert!(!settings.low_motion, "default is animated");
         settings.apply_env_overrides();
-        assert!(!settings.low_motion);
-        assert!(settings.fancy_animations);
+        assert!(
+            settings.low_motion,
+            "TERM_PROGRAM=vscode must disable decorative motion"
+        );
+        assert!(!settings.fancy_animations);
         assert!(
             settings.constrained_frame_rate,
             "TERM_PROGRAM=vscode should cap redraws without changing animation semantics"
@@ -2310,8 +4063,13 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_program_caps_redraws_without_disabling_motion() {
+    fn ghostty_term_program_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        // Neutralize the SSH markers: production intentionally caps motion
+        // over SSH, and the suite routinely runs inside one.
+        let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
+        let _ssh_connection = crate::test_support::EnvVarGuard::remove("SSH_CONNECTION");
+        let _ssh_tty = crate::test_support::EnvVarGuard::remove("SSH_TTY");
         let prev = std::env::var_os("TERM_PROGRAM");
         // SAFETY: serialised by the guard.
         unsafe {
@@ -2322,7 +4080,7 @@ mod tests {
         settings.apply_env_overrides();
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert!(settings.constrained_frame_rate);
+        assert!(!settings.constrained_frame_rate);
         // SAFETY: cleanup under the guard.
         unsafe {
             match prev {
@@ -2333,8 +4091,13 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_fallback_caps_redraws_without_disabling_motion() {
+    fn ghostty_term_fallback_keeps_full_motion_without_the_legacy_30_fps_cap() {
         let _g = term_program_test_guard();
+        // Neutralize the SSH markers: production intentionally caps motion
+        // over SSH, and the suite routinely runs inside one.
+        let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
+        let _ssh_connection = crate::test_support::EnvVarGuard::remove("SSH_CONNECTION");
+        let _ssh_tty = crate::test_support::EnvVarGuard::remove("SSH_TTY");
         let prev_program = std::env::var_os("TERM_PROGRAM");
         let prev_term = std::env::var_os("TERM");
         // SAFETY: serialised by the guard.
@@ -2346,7 +4109,7 @@ mod tests {
         settings.apply_env_overrides();
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert!(settings.constrained_frame_rate);
+        assert!(!settings.constrained_frame_rate);
         // SAFETY: cleanup under the guard.
         unsafe {
             match prev_program {
@@ -2430,6 +4193,11 @@ mod tests {
     #[test]
     fn tilix_and_terminator_cap_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
+        // Neutralize the SSH markers: production intentionally caps motion
+        // over SSH, and the suite routinely runs inside one.
+        let _ssh_client = crate::test_support::EnvVarGuard::remove("SSH_CLIENT");
+        let _ssh_connection = crate::test_support::EnvVarGuard::remove("SSH_CONNECTION");
+        let _ssh_tty = crate::test_support::EnvVarGuard::remove("SSH_TTY");
         let prev_term_program = std::env::var_os("TERM_PROGRAM");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
         let prev_terminator_uuid = std::env::var_os("TERMINATOR_UUID");
@@ -2778,6 +4546,20 @@ mod tests {
     }
 
     #[test]
+    fn composer_multiline_mode_defaults_off_and_accepts_boolean_aliases() {
+        let mut settings = Settings::default();
+        assert!(!settings.composer_multiline_mode);
+
+        settings.set("multiline", "on").expect("enable multiline");
+        assert!(settings.composer_multiline_mode);
+
+        settings
+            .set("composer_multiline_mode", "false")
+            .expect("disable multiline");
+        assert!(!settings.composer_multiline_mode);
+    }
+
+    #[test]
     fn ptyxis_term_program_flips_synchronized_output_off() {
         let _g = term_program_test_guard();
         let prev = std::env::var_os("TERM_PROGRAM");
@@ -2807,6 +4589,29 @@ mod tests {
             match prev_ptyxis {
                 Some(v) => std::env::set_var("PTYXIS_VERSION", v),
                 None => std::env::remove_var("PTYXIS_VERSION"),
+            }
+        }
+    }
+
+    #[test]
+    fn tabby_uses_calm_rendering_for_stable_ime_cursor() {
+        let _g = term_program_test_guard();
+        let prev = std::env::var_os("TERM_PROGRAM");
+        // SAFETY: serialised by the guard.
+        unsafe {
+            std::env::set_var("TERM_PROGRAM", "Tabby");
+        }
+        let mut settings = animated_settings();
+        settings.apply_env_overrides();
+        assert!(settings.low_motion);
+        assert!(!settings.fancy_animations);
+        assert!(settings.constrained_frame_rate);
+        assert_eq!(settings.synchronized_output, "off");
+        // SAFETY: cleanup under the guard.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TERM_PROGRAM", v),
+                None => std::env::remove_var("TERM_PROGRAM"),
             }
         }
     }
@@ -2909,8 +4714,9 @@ mod tests {
             "WezTerm",
             "xterm-256color",
             "gnome-terminal-server",
-            // The Ghostty / VS Code paths force low_motion but must NOT
-            // disable DEC 2026 — they handle synchronized output cleanly.
+            // The Ghostty / VS Code paths keep DEC 2026 enabled; both handle
+            // synchronized output cleanly even though their motion policies
+            // differ.
             "ghostty",
             "vscode",
         ] {
@@ -2948,49 +4754,21 @@ mod tests {
 
     /// Serialise tests that mutate `DEEPSEEK_CONFIG_PATH` through this guard
     /// so the parallel test runner doesn't observe interleaved env values.
-    fn config_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    fn config_path_test_guard() -> crate::test_support::TestEnvLock {
         crate::test_support::lock_test_env()
     }
 
-    struct EnvVarRestore {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarRestore {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: tests using this helper hold config_path_test_guard.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: tests using this helper hold config_path_test_guard.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            // SAFETY: tests using this helper hold config_path_test_guard.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    /// The shared guard, under this module's historical name.
+    ///
+    /// It was a byte-for-byte copy of `EnvVarGuard` until #5359 gave the shared
+    /// one a second job: recording which variables a test actually redirected,
+    /// so state-path resolution can tell a sealed environment from a test that
+    /// holds the lock for unrelated reasons. A private copy silently opts every
+    /// caller here out of that record.
+    use crate::test_support::EnvVarGuard as EnvVarRestore;
 
     #[test]
-    fn startup_mode_writes_only_accept_agent_or_plan() {
+    fn startup_mode_writes_accept_act_plan_operate() {
         let mut settings = Settings::default();
 
         settings.set("default_mode", "plan").expect("plan mode");
@@ -2999,13 +4777,22 @@ mod tests {
             .set("default_mode", "normal")
             .expect("legacy normal alias remains harmless");
         assert_eq!(settings.default_mode, "agent");
+        settings
+            .set("default_mode", "operate")
+            .expect("operate is a valid startup mode");
+        assert_eq!(settings.default_mode, "operate");
+        settings
+            .set("default_mode", "act")
+            .expect("act alias maps to agent wire value");
+        assert_eq!(settings.default_mode, "agent");
 
-        for removed in ["operate", "ops", "yolo"] {
-            let err = settings
-                .set("default_mode", removed)
-                .expect_err("session actions must not become saved startup modes");
-            assert!(err.to_string().contains("agent or plan"), "{err}");
-        }
+        let err = settings
+            .set("default_mode", "yolo")
+            .expect_err("yolo remains a permission migration alias, not a mode write");
+        assert!(
+            err.to_string().contains("act (agent), plan, or operate"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3032,9 +4819,9 @@ mod tests {
             codewhale_home.join("settings.toml"),
             "default_mode = \"operate\"\n",
         )
-        .expect("legacy operate settings");
-        let loaded = Settings::load_persisted().expect("load legacy operate settings");
-        assert_eq!(loaded.default_mode, "agent");
+        .expect("operate startup settings");
+        let loaded = Settings::load_persisted().expect("load operate settings");
+        assert_eq!(loaded.default_mode, "operate");
         assert_eq!(loaded.permission_posture, None);
     }
 
@@ -3092,6 +4879,40 @@ mod tests {
         assert!(
             display.contains(&format!("Config file: {}", primary.display())),
             "settings display should surface the canonical codewhale path:\n{display}"
+        );
+    }
+
+    #[test]
+    fn settings_load_read_only_reads_legacy_home_without_creating_primary() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join(".codewhale").join("settings.toml");
+        let legacy = tmp.path().join(".deepseek").join("settings.toml");
+        let legacy_bytes =
+            b"default_mode = \"plan\"\nlow_motion = false\nfancy_animations = true\n";
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy directory");
+        std::fs::write(&legacy, legacy_bytes).expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+        let _no_animations = EnvVarRestore::set("NO_ANIMATIONS", "1");
+
+        let loaded = Settings::load_read_only().expect("read-only settings load");
+
+        assert_eq!(loaded.default_mode, "plan");
+        assert!(loaded.low_motion, "environment overlays still apply");
+        assert!(
+            !loaded.fancy_animations,
+            "environment overlays still apply to parsed legacy settings"
+        );
+        assert!(
+            !primary.exists(),
+            "a diagnostic settings read must not create the primary settings path"
+        );
+        assert_eq!(
+            std::fs::read(&legacy).expect("legacy settings after read"),
+            legacy_bytes,
+            "a diagnostic settings read must not rewrite the legacy settings file"
         );
     }
 
@@ -3172,7 +4993,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_load_migrates_legacy_saved_auto_sidebar_focus_to_pinned() {
+    fn settings_load_migrates_legacy_saved_auto_sidebar_focus_to_rail() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let settings_path = tmp.path().join("settings.toml");
@@ -3182,27 +5003,24 @@ mod tests {
 
         let loaded = Settings::load().expect("load settings");
 
-        assert_eq!(loaded.sidebar_focus, "pinned");
-        assert!(!loaded.sidebar_auto_collapse_opt_in);
+        // A settings.toml that only names `sidebar_focus = "auto"` — the
+        // shipped default — must not silently earn an always-on rail strip.
+        assert_eq!(loaded.rail_panel, "tasks");
+        assert_eq!(loaded.work_surface_placement, "top");
     }
 
     #[test]
-    fn settings_load_preserves_explicit_auto_sidebar_opt_in() {
+    fn settings_load_migrates_hidden_sidebar_to_rail_off() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let settings_path = tmp.path().join("settings.toml");
-        std::fs::write(
-            &settings_path,
-            "sidebar_focus = \"auto\"\nsidebar_auto_collapse_opt_in = true\n",
-        )
-        .expect("settings");
+        std::fs::write(&settings_path, "sidebar_focus = \"hidden\"\n").expect("settings");
         let _config_override =
             EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.path().join("config.toml"));
 
         let loaded = Settings::load().expect("load settings");
 
-        assert_eq!(loaded.sidebar_focus, "auto");
-        assert!(loaded.sidebar_auto_collapse_opt_in);
+        assert_eq!(loaded.work_surface_placement, "off");
     }
 
     #[test]
@@ -3303,12 +5121,20 @@ mod tests {
             ..TuiPrefs::default()
         };
         let err = prefs.validate().expect_err("nord is not a valid theme");
-        assert!(err.to_string().contains("Invalid tui.toml theme"));
-        assert!(
-            err.to_string()
-                .contains("expected system, dark, light, grayscale")
-        );
-        assert!(err.to_string().contains("solarized-light"));
+        assert!(err.to_string().contains("invalid theme 'nord'"));
+        assert!(err.to_string().contains("custom:<name>"));
+    }
+
+    #[test]
+    fn tui_prefs_validate_custom_selector_without_loading_file() {
+        let mut prefs = TuiPrefs {
+            theme: "custom:Ocean_1".to_string(),
+            ..TuiPrefs::default()
+        };
+        prefs
+            .validate()
+            .expect("selector validation must not depend on the file system");
+        assert_eq!(prefs.theme, "custom:ocean_1");
     }
 
     #[test]
@@ -3339,19 +5165,9 @@ mod tests {
         // Point config path at a non-existent location so tui.toml is absent.
         let tmp = std::env::temp_dir().join("dst_tui_prefs_absent_test");
         std::fs::create_dir_all(&tmp).unwrap();
-        // SAFETY: test-only env mutation guarded by config_path_test_guard.
-        unsafe {
-            std::env::set_var(
-                "DEEPSEEK_CONFIG_PATH",
-                tmp.join("config.toml").to_str().unwrap(),
-            );
-        }
+        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.join("config.toml"));
         let prefs = TuiPrefs::load().expect("load should not fail when file absent");
         assert_eq!(prefs.theme, "dark", "should fall back to default theme");
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3360,13 +5176,7 @@ mod tests {
         let _g = config_path_test_guard();
         let tmp = std::env::temp_dir().join("dst_tui_prefs_save_test");
         std::fs::create_dir_all(&tmp).unwrap();
-        // SAFETY: test-only env mutation guarded by config_path_test_guard.
-        unsafe {
-            std::env::set_var(
-                "DEEPSEEK_CONFIG_PATH",
-                tmp.join("config.toml").to_str().unwrap(),
-            );
-        }
+        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", tmp.join("config.toml"));
 
         let prefs = TuiPrefs {
             theme: "light".to_string(),
@@ -3383,10 +5193,6 @@ mod tests {
         assert_eq!(loaded.font_size, 14);
         assert_eq!(loaded.keybinds.submit.as_deref(), Some("ctrl+enter"));
 
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3396,10 +5202,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("dst_tui_prefs_comment_test");
         std::fs::create_dir_all(&tmp).unwrap();
         let config_file = tmp.join("config.toml");
-        // SAFETY: test-only env mutation guarded by config_path_test_guard.
-        unsafe {
-            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
-        }
+        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", &config_file);
 
         // tui.toml lives next to config.toml
         let tui_path = tmp.join("tui.toml");
@@ -3420,10 +5223,6 @@ mod tests {
         assert!(body.contains("# footer note"), "footer lost: {body}");
         assert!(body.contains("light"), "new value not written: {body}");
 
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3433,10 +5232,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("dst_settings_comment_test");
         std::fs::create_dir_all(&tmp).unwrap();
         let config_file = tmp.join("config.toml");
-        // SAFETY: test-only env mutation guarded by config_path_test_guard.
-        unsafe {
-            std::env::set_var("DEEPSEEK_CONFIG_PATH", config_file.to_str().unwrap());
-        }
+        let _config_override = EnvVarRestore::set("DEEPSEEK_CONFIG_PATH", &config_file);
 
         // settings.toml lives next to config.toml
         let settings_path = tmp.join("settings.toml");
@@ -3456,10 +5252,6 @@ mod tests {
         assert!(body.contains("# trailing"), "trailing lost: {body}");
         assert!(body.contains("cny"), "new value not written: {body}");
 
-        // SAFETY: cleanup under the guard.
-        unsafe {
-            std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3474,5 +5266,21 @@ mod tests {
         let got = TuiPrefs::path().expect("path should resolve");
 
         assert_eq!(got, tmp.path().join(".codewhale").join("tui.toml"));
+    }
+
+    #[test]
+    fn pinned_models_are_exact_ordered_and_round_trip() {
+        let mut settings = Settings::default();
+        assert!(settings.toggle_pinned_model("zai", "glm-5.2"));
+        assert!(settings.toggle_pinned_model("openrouter", "glm-5.2"));
+        assert_eq!(settings.pinned_models[0].provider, "zai");
+        assert!(settings.move_pinned_model("openrouter", "glm-5.2", -1));
+        assert_eq!(settings.pinned_models[0].provider, "openrouter");
+        assert!(settings.set_pinned_model_label("openrouter", "glm-5.2", Some("fast".to_string())));
+        let encoded = toml::to_string(&settings).unwrap();
+        let decoded: Settings = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.pinned_models, settings.pinned_models);
+        assert!(!settings.toggle_pinned_model("openrouter", "glm-5.2"));
+        assert_eq!(settings.pinned_models.len(), 1);
     }
 }

@@ -57,23 +57,31 @@ generic checklist does not enumerate.
       (the recent-releases slice embedded in the binary for `/change`). Do
       not edit that file by hand, and do not copy the full root changelog
       into it — older entries live in `docs/CHANGELOG_ARCHIVE.md`.
+- [ ] Run `scripts/release/check-feature-release-notes.sh vPREV HEAD`. Every
+      issue-linked `feat` commit must leave a receipt in `CHANGELOG.md` or the
+      archive; the Version drift CI gate runs the same check with full history.
 
 ## 2. Version pins are in sync
 
 - [ ] Run `./scripts/release/prepare-release.sh X.Y.Z` — it bumps the
-      workspace version, every per-crate dependency pin,
-      `npm/codewhale/package.json` (`version` + `codewhaleBinaryVersion`),
-      the README install-tag examples, refreshes `Cargo.lock`, regenerates
+      workspace version, every per-crate dependency pin, the npm wrapper
+      (`version` + `codewhaleBinaryVersion`), Runtime SDK, VS Code extension
+      and lock, remote-smoke default, public source-candidate facts, and README
+      install-tag examples; it refreshes the Cargo/npm locks, regenerates
       `crates/tui/CHANGELOG.md` and `web/lib/facts.generated.ts`, and ends
-      by running `check-versions.sh`. Write the CHANGELOG entry **before**
-      running it.
+      by running the version and OHOS gates. Write the CHANGELOG entry
+      **before** running it. The helper is safe to rerun at the requested
+      workspace version; it skips replacements but refreshes both generated
+      files and reruns the gates.
 - [ ] `npm/deepseek-tui/package.json` remains private/compatibility-only and
       is **not** bumped or published.
 - [ ] `./scripts/release/check-versions.sh` reports
-      `Version state OK: workspace=X.Y.Z, npm=X.Y.Z, lockfile in sync.`
+      `Version state OK: workspace=X.Y.Z, npm=X.Y.Z, npm-binary=X.Y.Z, lockfile in sync.`
 - [ ] `./scripts/release/check-ohos-deps.sh` reports that the OpenHarmony
-      target graph does not pull the unsupported `nix` 0.28/0.29,
-      `portable-pty`, `starlark`, `arboard`, or `keyring` crates.
+      Windows linker keeps the target/sysroot flags, the target enables the
+      `rquickjs-sys` bindgen edge, and its graph does not pull the unsupported
+      `nix` 0.28/0.29, `portable-pty`, `starlark`, `arboard`, or `keyring`
+      crates.
 
 ## 3. Preflight gates
 
@@ -159,6 +167,19 @@ release anxiety: contributors cannot tell whether their work merged.
 
 - [ ] All required CI jobs are green. The `versions` job should mirror the
       preflight `check-versions.sh` and is your last line of defense.
+- [ ] After the final source reaches `main`, dispatch exact-head full CI and the
+      non-publishing release-candidate build with the same 40-character SHA:
+      ```bash
+      candidate_sha="$(git rev-parse origin/main)"
+      gh workflow run ci.yml --ref main -f expected_sha="${candidate_sha}"
+      gh workflow run release-candidate.yml --ref main -f expected_sha="${candidate_sha}"
+      ```
+      Both runs must resolve to that SHA. The candidate must report all seven
+      targets and the complete 34-file asset inventory, including Android
+      arm64, Windows arm64, `codew`, the NSIS installer, archives, checksum
+      manifests, and seven compatibility-only `codewhale-tui-*` release
+      filenames that are not installed commands. These are Actions artifacts
+      only and are not a release.
 - [ ] PR has been reviewed.
 
 ## 7. Tag and release (after review)
@@ -178,8 +199,8 @@ release anxiety: contributors cannot tell whether their work merged.
       ./scripts/release/verify-release-assets.sh X.Y.Z
       ```
       This checks the local tag, remote tag, successful Release workflow SHA,
-      npm-facing assets, and `codewhale-artifacts-sha256.txt` manifest. If it
-      fails, rerun or repair the GitHub Release workflow before touching any
+      full binary/archive/installer asset set, and both checksum manifests. If
+      it fails, rerun or repair the GitHub Release workflow before touching any
       registry.
 - [ ] The live GitHub Release body has its own `## Contributors` or
       `## Credits` section; do not rely on "see CHANGELOG" alone. Verify with:
@@ -192,7 +213,7 @@ release anxiety: contributors cannot tell whether their work merged.
 - [ ] `npm view deepseek-tui deprecated` is non-empty. The legacy npm package
       is deprecated and must not receive an `X.Y.Z` publish.
 - [ ] Distribution channels are canonical-first: the website install page
-      (codewhale.net/install) shows CodeWhale-native commands first (`npm install -g
+      (codewhale.net/install) shows Codewhale-native commands first (`npm install -g
       codewhale`, `curl .../install.sh | sh`); Homebrew is labeled as legacy
       compatibility; the shell installer uses codewhale-native names as documented
       in `docs/REBRAND.md#homebrew`.

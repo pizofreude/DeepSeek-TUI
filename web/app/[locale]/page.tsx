@@ -1,197 +1,389 @@
+import { Fragment } from "react";
+import Image from "next/image";
 import Link from "next/link";
+import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { InstallCodeBlock } from "@/components/install-code-block";
+import { RevealOnScroll } from "@/components/reveal-on-scroll";
+import { Seal } from "@/components/seal";
+import { TerminalPlayer } from "@/components/terminal-player";
+import { Ticker } from "@/components/ticker";
+import { TiltFigure } from "@/components/tilt-figure";
 import { Whale } from "@/components/whale";
-import { DOC_TOPICS, REPO_DOCS_BASE, type DocTopic } from "@/lib/docs-map";
 import { getFacts } from "@/lib/facts";
+import { fetchFeed } from "@/lib/github";
+import { fill, getChrome, getHome, splitToken } from "@/lib/i18n/dictionaries";
+import { REPO_ISSUES_URL, REPO_RELEASES_URL, REPO_URL, DISCORD_URL } from "@/lib/i18n/links";
+import { serializeJsonLd } from "@/lib/json-ld";
+import { getEnv } from "@/lib/kv";
+import { buildSoftwareApplicationJsonLd } from "@/lib/software-application-schema";
+import type { FeedItem } from "@/lib/types";
 
-const START_TOPIC_IDS = ["install", "guide", "configuration", "modes"];
-const RUNTIME_TOPIC_IDS = ["tools", "sandbox", "providers", "subagents"];
-const EXTEND_TOPIC_IDS = ["runtime-api", "mcp", "fleet", "troubleshooting"];
+// Revalidate against source-proven runtime facts without giving up static edge
+// caching. `getFacts()` rejects legacy or older KV snapshots.
+export const revalidate = 300;
 
-function topics(ids: string[]): DocTopic[] {
-  return ids.flatMap((id) => {
-    const topic = DOC_TOPICS.find((candidate) => candidate.id === id);
-    return topic ? [topic] : [];
-  });
-}
-
-const TOPIC_PAGE_OVERRIDES: Record<string, string> = {
-  install: "install",
-  providers: "models",
-};
-
-function topicIsExternal(topic: DocTopic): boolean {
-  return !topic.hasPage && !(topic.id in TOPIC_PAGE_OVERRIDES);
-}
-
-function topicHref(topic: DocTopic, locale: string): string {
-  const override = TOPIC_PAGE_OVERRIDES[topic.id];
-  if (override) return `/${locale}/${override}`;
-  if (topic.hasPage) return `/${locale}/docs/${topic.slug}`;
-
-  const source = Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource;
-  return `${REPO_DOCS_BASE}/${source}`;
-}
-
-function TopicList({ items, locale }: { items: DocTopic[]; locale: string }) {
-  const isZh = locale === "zh";
-
-  return (
-    <div className="portal-topic-list">
-      {items.map((topic) => {
-        const external = topicIsExternal(topic);
-        return (
-          <Link
-            key={topic.id}
-            href={topicHref(topic, locale)}
-            target={external ? "_blank" : undefined}
-            rel={external ? "noreferrer" : undefined}
-          >
-            <strong>{isZh ? topic.label.zh : topic.label.en}</strong>
-            <span>{isZh ? topic.description.zh : topic.description.en}</span>
-            <span aria-hidden="true">{external ? "↗" : "→"}</span>
-          </Link>
-        );
-      })}
-    </div>
-  );
-}
-
+/**
+ * The newspaper-ocean homepage.
+ *
+ * Every visible string resolves through `getHome(locale)` / `getChrome(locale)`
+ * — English, Chinese, and every other routed locale take the identical path,
+ * with the English dictionary as the build-time-guaranteed fallback. The only
+ * literals left in this file are code-owned per docs/VOICE.md: the product
+ * control vocabulary (`Plan · Work · Operate`, `Ask · Auto-Review · Full
+ * Access`, `TUI · exec · web · API`), the install command, `cargo test
+ * --locked`, the receipt verbs, package-manager and mirror proper nouns, and
+ * the screenshot path.
+ */
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const d = getHome(locale);
+  const chrome = getChrome(locale);
   const facts = await getFacts();
+  const sourceVersion = facts.version ?? "unknown";
+  const publishedRelease = facts.latestPublishedRelease;
+  const sourceIsPublished = publishedRelease?.version === sourceVersion;
+  const providerCount = facts.providers.length;
+  const providerRoutes = fill(d.providerRoutes, { count: providerCount });
+
+  // The install URL resolves published artifacts, so its structured version
+  // must come from the published-release receipt rather than source-candidate
+  // facts. When no release is known, the schema omits softwareVersion.
+  const jsonLd = buildSoftwareApplicationJsonLd(publishedRelease);
+
+  // The lede typesets the brand in its own span. Splitting on the {brand}
+  // token keeps the sentence a single translated unit — no concatenation of
+  // fragments around a variable, and a locale may place the brand anywhere.
+  const ledeParts = splitToken(d.heroIntro, "brand");
+
+  let feed: FeedItem[] = [];
+  try {
+    const env = await getEnv();
+    feed = await fetchFeed(env.GITHUB_TOKEN, 20);
+  } catch {
+    /* ticker is optional chrome */
+  }
 
   return (
-    <div className="portal-home">
-      <section className="portal-hero">
-        <div className="portal-current" aria-hidden="true" />
-        <div className="portal-container portal-hero-grid">
-          <div className="portal-hero-copy">
-            <div className="portal-mark">
-              <Whale size={28} className="text-current" />
-              <span>{isZh ? "Codewhale 文档" : "Codewhale documentation"}</span>
+    <div className="product-home paper-home">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
+      />
+      {/* Entrance motion for the below-fold sections: the marks are the
+          data-reveal / data-reveal-group attributes in this tree; the
+          observer does the rest, and reduced motion skips it wholesale. */}
+      <RevealOnScroll />
+      {/* HERO — newspaper split: claim + live terminal proof */}
+      <section className="hero">
+        <div className="product-container product-hero-grid paper-hero-grid">
+          <div className="product-hero-copy paper-hero-copy">
+            <div className="mb-5">
+              <span className="pill pill-hot">{d.kicker}</span>
             </div>
-            <h1>{isZh ? "Codewhale 文档" : "Codewhale documentation"}</h1>
-            <p className="portal-lede">
-              {isZh
-                ? "安装这个开源终端编程智能体，连接你已有的模型提供商，并在需要时查找有关模式、权限、工具、配置和运行时集成的准确说明。"
-                : "Install the open-source terminal coding agent, connect the provider you already use, and find precise guidance for modes, permissions, tools, configuration, and runtime integrations."}
+
+            <h1 className="font-display tracking-crisp">
+              {d.heroTitleA}
+              <br />
+              <span className="paper-hero-accent">{d.heroTitleB}</span>
+            </h1>
+
+            <p className="paper-hero-lede">
+              {ledeParts.map((part, index) => (
+                <Fragment key={index}>
+                  {index > 0 && (
+                    <span className="font-cjk text-indigo font-semibold">Codewhale</span>
+                  )}
+                  {part}
+                </Fragment>
+              ))}
             </p>
-            <div className="portal-actions">
-              <Link href={`/${locale}/docs`} className="portal-button portal-button-primary">
-                {isZh ? "浏览文档" : "Browse the documentation"}
+
+            <div className="product-actions paper-actions">
+              <Link href={`/${locale}/install`} className="product-button product-button-primary">
+                {d.install} <span aria-hidden>→</span>
               </Link>
-              <Link href={`/${locale}/install`} className="portal-button portal-button-secondary">
-                {isZh ? "查看安装指南" : "Read the installation guide"}
+              <Link href={`/${locale}/docs`} className="product-button">
+                {d.docs} <span aria-hidden>→</span>
               </Link>
+              <a href={REPO_URL} className="product-button product-button-ghost">
+                GitHub
+              </a>
             </div>
-            <p className="portal-meta">
-              {isZh
-                ? `当前运行时版本为 ${facts.version ?? "0.8.x"}，支持 ${facts.providers.length} 个提供商，并采用 ${facts.license ?? "MIT"} 许可证。`
-                : `The current runtime is version ${facts.version ?? "0.8.x"}, supports ${facts.providers.length} providers, and is licensed under ${facts.license ?? "MIT"}.`}
+
+            <div className="product-install paper-install">
+              <div className="eyebrow mb-2">{d.installEyebrow}</div>
+              <InstallCodeBlock
+                cmd="npm install -g codewhale"
+                copyLabel={d.copy}
+                copiedLabel={d.copied}
+              />
+              <div className="paper-install-meta">
+                <span>{d.installRequirement}</span>
+                <Link href={`/${locale}/install`} className="text-indigo hover:underline">
+                  {d.installOtherWays}
+                </Link>
+              </div>
+            </div>
+
+            {/*
+              The TUI header grammar: a `cw` chip and a dot chain. Each fact is
+              its own translated unit — the separators are CSS punctuation, so
+              nothing is concatenated around a token and no locale inherits an
+              English joining word. `cw` is the binary's own name, code-owned
+              exactly like `Codewhale`.
+            */}
+            <p
+              className="product-facts paper-facts dotline"
+              data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+              data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
+            >
+              <span className="dotline-chip">cw</span>
+              <span>
+                {publishedRelease
+                  ? fill(d.latestRelease, { tag: publishedRelease.tag })
+                  : d.releaseUnavailable}
+              </span>
+              <span>
+                {`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}
+              </span>
+              <span>{providerRoutes}</span>
+              <span>{facts.license ?? "MIT"}</span>
             </p>
           </div>
 
-          <aside className="portal-quickstart" aria-labelledby="quickstart-heading">
-            <span>{isZh ? "快速开始" : "Quickstart"}</span>
-            <h2 id="quickstart-heading">
-              {isZh ? "安装 CLI 与交互式 TUI。" : "Install the CLI and interactive TUI."}
-            </h2>
-            <p>
-              {isZh
-                ? "npm 软件包会安装两个可执行文件；完整安装指南还包括 Cargo、Homebrew、Docker 和直接下载。"
-                : "The npm package installs both executables. The full guide also covers Cargo, Homebrew, Docker, and direct downloads."}
-            </p>
-            <InstallCodeBlock
-              cmd="npm install -g codewhale"
-              copyLabel={isZh ? "复制" : "Copy"}
-              copiedLabel={isZh ? "已复制 ✓" : "Copied ✓"}
+          <TiltFigure className="product-shot paper-shot">
+            <div className="product-shot-toolbar paper-shot-toolbar">
+              <span>
+                <Whale size={18} />
+                Codewhale TUI
+              </span>
+              <span>{d.shotSession}</span>
+            </div>
+            <Image
+              src="/codewhale-tui.webp"
+              alt={d.screenshotAlt}
+              width={1562}
+              height={1256}
+              sizes="(max-width: 900px) calc(100vw - 2rem), 52vw"
+              priority
             />
-            <Link href={`/${locale}/install`}>
-              {isZh ? "阅读安装与首次运行说明 →" : "Read installation and first-run guidance →"}
-            </Link>
-          </aside>
+            <figcaption>{d.figcaption}</figcaption>
+          </TiltFigure>
         </div>
       </section>
 
-      <section className="portal-section">
-        <div className="portal-container portal-section-grid">
-          <div className="portal-section-copy">
-            <span>{isZh ? "从这里开始" : "Start here"}</span>
-            <h2>{isZh ? "开始使用运行时。" : "Get started with the runtime."}</h2>
-            <p>
-              {isZh
-                ? "先选择安装方式和提供商，然后阅读模式与配置说明，了解 Codewhale 在修改代码之前会如何工作。"
-                : "Choose an installation path and provider first, then read the mode and configuration guidance so you know how Codewhale will behave before it changes code."}
-            </p>
+      {/* Live repo wire — merges, issues, and releases straight from GitHub,
+          with the contributor named. Absent entirely when the feed is empty. */}
+      {feed.length > 0 ? (
+        <Ticker
+          items={feed}
+          labels={{
+            liveLabel: chrome.tickerLiveLabel,
+            liveTag: chrome.tickerLiveTag,
+            ariaLabel: chrome.tickerAria,
+            merged: chrome.tickerMerged,
+            opened: chrome.tickerOpened,
+            closed: chrome.tickerClosed,
+            released: chrome.tickerReleased,
+            firstContribution: chrome.tickerFirstContribution,
+            by: chrome.tickerBy,
+            dateLocale: chrome.dateLocale,
+          }}
+        />
+      ) : null}
+
+      {/* Proof strip */}
+      <section className="product-proof paper-proof">
+        <div className="product-container product-proof-grid" data-reveal>
+          <h2 className="font-display">{d.proofHeading}</h2>
+          <p>{d.proofBody}</p>
+        </div>
+      </section>
+
+      {/* See how it decides — constitution traces in terminal chrome */}
+      <section className="paper-decides">
+        <div className="product-container paper-decides-grid" data-reveal>
+          <div>
+            <div className="flex items-baseline gap-4 mb-3 hairline-b pb-3">
+              <Seal char={d.sealDecides} size="sm" variant="indigo" />
+              <div>
+                <div className="eyebrow mb-1">{d.decidesEyebrow}</div>
+                <h2 className="font-display text-2xl sm:text-3xl">{d.decidesHeading}</h2>
+              </div>
+            </div>
+            <p className="paper-decides-lede">{d.decidesLede}</p>
           </div>
-          <TopicList items={topics(START_TOPIC_IDS)} locale={locale} />
+          <div>
+            <TerminalPlayer
+              locale={locale}
+              traceLabel={chrome.traceLabel}
+              tabsAria={chrome.traceTabsAria}
+            />
+          </div>
         </div>
       </section>
 
-      <section className="portal-section portal-section-muted">
-        <div className="portal-container">
-          <div className="portal-docs-heading">
+      {/* Workflow */}
+      <section className="product-workflow paper-workflow">
+        <div className="product-container">
+          <div className="flex items-baseline gap-4 mb-6 hairline-b pb-4" data-reveal>
+            <Seal char={d.sealWorkflow} size="sm" />
+            <h2 className="font-display">{d.workflowHeading}</h2>
+          </div>
+          <ol className="product-workflow-steps" data-reveal-group>
+            {d.workflow.map(([title, description], index) => (
+              <li key={title}>
+                <span>{String(index + 1).padStart(2, "0")}</span>
+                <h3>{title}</h3>
+                <p>{description}</p>
+              </li>
+            ))}
+          </ol>
+          <div className="product-receipt" aria-label={d.receiptAria} data-reveal>
+            <span>$ codewhale exec &quot;fix the failing test&quot;</span>
+            <span>inspect&nbsp;&nbsp; {d.receiptInspect}</span>
+            <span>act&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {d.receiptAct}</span>
+            <span>verify&nbsp;&nbsp;&nbsp; cargo test --locked</span>
+            <strong>report&nbsp;&nbsp;&nbsp; {d.receiptReport}</strong>
+          </div>
+        </div>
+      </section>
+
+      {/* Getting started */}
+      <section className="product-start paper-start">
+        <div className="product-container">
+          <div className="flex items-baseline gap-4 mb-4 hairline-b pb-4" data-reveal>
+            <Seal char={d.sealStart} size="sm" />
+            <h2 className="font-display">{d.startHeading}</h2>
+          </div>
+          <p className="product-start-lede" data-reveal>{d.startLede}</p>
+          <GettingStartedSteps locale={locale} />
+          <div className="product-start-links" data-reveal>
+            <Link href={`/${locale}/docs/guide`}>{d.startGuideLink}</Link>
+            <Link href={`/${locale}/docs/vocabulary`}>{d.startVocabularyLink}</Link>
+          </div>
+        </div>
+      </section>
+
+      {/* Boundaries */}
+      <section className="product-boundaries paper-boundaries">
+        <div className="product-container product-boundaries-grid">
+          <div data-reveal>
+            <div className="flex items-baseline gap-4 mb-4">
+              <Seal char={d.sealBoundaries} size="sm" />
+              <h2 className="font-display">
+                {d.boundariesHeadingA}
+                <br />
+                <span>{d.boundariesHeadingB}</span>
+              </h2>
+            </div>
+            <p>{d.boundariesBody}</p>
+          </div>
+          <dl className="product-boundary-list" data-reveal-group>
             <div>
-              <span>{isZh ? "文档索引" : "Documentation index"}</span>
-              <h2>{isZh ? "浏览 Codewhale 文档。" : "Browse the Codewhale documentation."}</h2>
+              <dt>{providerRoutes}</dt>
+              <dd>{d.hostedGatewayLocal}</dd>
             </div>
-            <Link href={`/${locale}/docs`}>{isZh ? "查看全部文档 →" : "View all documentation →"}</Link>
-          </div>
-
-          <div className="portal-doc-groups">
-            <section>
-              <h3>{isZh ? "使用运行时" : "Use the runtime"}</h3>
-              <p>
-                {isZh
-                  ? "了解工具、审批边界、提供商和子 Agent 在一次实际会话中如何协同。"
-                  : "Understand how tools, approval boundaries, providers, and sub-agents work together in a real session."}
-              </p>
-              <TopicList items={topics(RUNTIME_TOPIC_IDS)} locale={locale} />
-            </section>
-            <section>
-              <h3>{isZh ? "扩展与运维" : "Extend and operate"}</h3>
-              <p>
-                {isZh
-                  ? "使用运行时 API、MCP、Fleet 和故障排除资料把 Codewhale 接入更大的工作流。"
-                  : "Use the runtime API, MCP, Fleet, and troubleshooting material when Codewhale becomes part of a larger workflow."}
-              </p>
-              <TopicList items={topics(EXTEND_TOPIC_IDS)} locale={locale} />
-            </section>
-          </div>
+            <div>
+              <dt>Plan · Work · Operate</dt>
+              <dd>{d.planActOperateDesc}</dd>
+            </div>
+            <div>
+              <dt>Ask · Auto-Review · Full Access</dt>
+              <dd>{d.askAutoReviewDesc}</dd>
+            </div>
+            <div>
+              <dt>TUI · exec · web · API</dt>
+              <dd>{d.tuiExecWebDesc}</dd>
+            </div>
+          </dl>
         </div>
       </section>
 
-      <section className="portal-community">
-        <div className="portal-container portal-community-grid">
-          <div>
-            <span>{isZh ? "国际开源社区" : "An international open-source community"}</span>
-            <h2>{isZh ? "Codewhale 由国际社区共同构建。" : "Codewhale is built by an international community."}</h2>
+      {/*
+        THE WATERLINE. Everything below here is one water column: a single
+        gradient on the wrapper, sampled by absolute page position across the
+        three bands inside it, continuing into the footer's identical deep
+        stop as the seabed. The bands themselves carry no field of their own.
+      */}
+      <div className="ocean-column">
+        {/* Surfaces */}
+        <section className="product-surfaces paper-surfaces">
+          <div className="product-container">
+            <div className="flex items-baseline gap-4 mb-6 hairline-b pb-4" data-reveal>
+              <Seal char={d.sealSurfaces} size="sm" />
+              <h2 className="font-display">{d.surfacesHeading}</h2>
+            </div>
+            <div className="product-surface-list" data-reveal-group>
+              {d.surfaces.map(([name, description]) => (
+                <div key={name}>
+                  <strong>{name}</strong>
+                  <span>{description}</span>
+                </div>
+              ))}
+            </div>
+            <Link href={`/${locale}/runtime`} data-reveal>{d.runtimeLink}</Link>
           </div>
-          <div>
-            <p>
-              {isZh
-                ? "Codewhale 由不同时区、语言和技术背景的贡献者公开构建。如果某个行为不清楚，请提交带有复现步骤的 issue；如果你能改进运行时、文档或测试，请发送 pull request。"
-                : "Codewhale is built in public by contributors working across time zones, languages, and technical backgrounds. If behavior is unclear, file an issue with a reproduction; if you can improve the runtime, documentation, or tests, send a pull request."}
-            </p>
-            <div className="portal-community-links">
-              <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose">
-                {isZh ? "提交 issue →" : "File an issue →"}
-              </Link>
-              <Link href={`/${locale}/contribute`}>
-                {isZh ? "阅读贡献指南 →" : "Read the contribution guide →"}
-              </Link>
-              <Link href="https://github.com/Hmbown/CodeWhale/pulls">
-                {isZh ? "查看 pull requests →" : "Browse pull requests →"}
-              </Link>
-              <Link href={`/${locale}/community`}>
-                {isZh ? "了解社区 →" : "Meet the community →"}
-              </Link>
+        </section>
+
+        {/* Install band */}
+        <section className="product-install-band paper-install-band">
+          <div className="product-container product-install-grid" data-reveal-group>
+            <h2 className="font-display">{d.installBandHeading}</h2>
+            <div>
+              {/* The composer plate. `❯` is a code-owned literal, like the
+                  install command it prompts for — it is the product's glyph,
+                  not a sentence, and no locale renders it differently. */}
+              <div className="product-composer">
+                <span className="product-composer-prompt" aria-hidden>
+                  ❯
+                </span>
+                <InstallCodeBlock
+                  cmd="npm install -g codewhale"
+                  copyLabel={d.copy}
+                  copiedLabel={d.copied}
+                />
+              </div>
+              {/* Already a dot chain in every locale; the separators just stop
+                  being characters in the markup and become CSS punctuation. */}
+              <p className="dotline">
+                <span>Cargo</span>
+                <span>{d.binaries}</span>
+                <span>Docker</span>
+                <span>Nix</span>
+                <span>Windows</span>
+                <span>Android / Termux</span>
+                <span>{d.chinaMirrors}</span>
+              </p>
+              <Link href={`/${locale}/install`}>{d.installGuideLink}</Link>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
+
+        {/* Community */}
+        <section className="product-community paper-community">
+          <div className="product-container product-community-grid" data-reveal>
+            <div className="product-community-illustration" aria-hidden="true">
+              <Seal char={d.sealCommunity} size="lg" />
+            </div>
+            <div>
+              <h2 className="font-display">{d.communityHeading}</h2>
+              <p>{d.communityBody}</p>
+            </div>
+            <nav aria-label={d.communityLinksAria}>
+              <a href={REPO_URL}>GitHub</a>
+              <a href={REPO_ISSUES_URL}>Issues</a>
+              <a href={DISCORD_URL}>Discord</a>
+              <Link href={`/${locale}/contribute`}>{d.contribute}</Link>
+              {publishedRelease ? (
+                <a href={publishedRelease.url}>{publishedRelease.tag}</a>
+              ) : (
+                <a href={REPO_RELEASES_URL}>Releases</a>
+              )}
+            </nav>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }

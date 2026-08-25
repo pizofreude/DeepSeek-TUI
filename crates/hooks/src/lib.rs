@@ -129,8 +129,16 @@ impl HookSink for StdoutHookSink {
 /// The file is created (along with any missing parent directories) on the
 /// first emitted event. Each line is a JSON object of the form
 /// `{"at": "<ISO 8601 timestamp>", "event": {...}}`.
+///
+/// Concurrent [`emit`](HookSink::emit) calls serialize on an internal mutex so
+/// that each JSON event is written and flushed as a complete line; without that
+/// lock, overlapping `write_all` calls can interleave partial lines and corrupt
+/// the JSONL log (see issue #4739).
 pub struct JsonlHookSink {
     path: PathBuf,
+    /// Serializes open+append+flush so concurrent tool-call emits cannot
+    /// interleave bytes mid-line.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl JsonlHookSink {
@@ -139,7 +147,10 @@ impl JsonlHookSink {
     /// Parent directories are created lazily on the first [`HookSink::emit`]
     /// call.
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -151,17 +162,20 @@ impl HookSink for JsonlHookSink {
                 format!("failed to create hook log directory {}", parent.display())
             })?;
         }
+        // Encode outside the lock so only I/O is serialized.
+        let payload = json!({
+            "at": Utc::now().to_rfc3339(),
+            "event": event
+        });
+        let encoded = serde_json::to_string(&payload).context("failed to encode hook event")?;
+
+        let _guard = self.write_lock.lock().await;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .await
             .with_context(|| format!("failed to open hook log {}", self.path.display()))?;
-        let payload = json!({
-            "at": Utc::now().to_rfc3339(),
-            "event": event
-        });
-        let encoded = serde_json::to_string(&payload).context("failed to encode hook event")?;
         file.write_all(encoded.as_bytes())
             .await
             .context("failed to write hook event")?;
@@ -169,7 +183,9 @@ impl HookSink for JsonlHookSink {
             .await
             .context("failed to write hook event newline")?;
         // Flush before drop so sequential emits (and tests that read the
-        // file immediately after) observe every completed line.
+        // file immediately after) observe every completed line. Holding the
+        // mutex through flush guarantees concurrent writers never observe a
+        // partial line at EOF.
         file.flush().await.context("failed to flush hook event")?;
         Ok(())
     }
@@ -196,7 +212,7 @@ impl WebhookHookSink {
                 .unwrap_or_else(|_| {
                     codewhale_release::platform_http_client_builder()
                         .build()
-                        .expect("build fallback HTTP client")
+                        .unwrap_or_else(|_| reqwest::Client::new())
                 }),
         }
     }
@@ -309,6 +325,13 @@ impl HookDispatcher {
         self.sinks.push(sink);
     }
 
+    /// Number of registered sinks. Exposed so transport setup can assert
+    /// exactly which sinks were wired (e.g. no stdout sink in stdio mode).
+    #[must_use]
+    pub fn sink_count(&self) -> usize {
+        self.sinks.len()
+    }
+
     /// Broadcast an event to every registered sink.
     ///
     /// Errors from individual sinks are silently discarded so that one failing
@@ -324,7 +347,14 @@ impl HookDispatcher {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    static SOCKET_PATH_NONCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn hook_event_serializes_with_snake_case_type_and_payload() {
@@ -391,6 +421,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Concurrent emits must not interleave partial lines (#4739).
+    ///
+    /// Spawns many tasks writing through one shared [`JsonlHookSink`] and
+    /// asserts every line in the resulting file is complete, parseable JSON.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn jsonl_sink_concurrent_emits_write_atomic_json_lines() {
+        let root = unique_temp_dir("jsonl_sink_concurrent");
+        let path = root.join("hooks.jsonl");
+        let sink = Arc::new(JsonlHookSink::new(path.clone()));
+
+        const TASKS: usize = 32;
+        const EVENTS_PER_TASK: usize = 20;
+        let expected = TASKS * EVENTS_PER_TASK;
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for task_id in 0..TASKS {
+            let sink = Arc::clone(&sink);
+            handles.push(tokio::spawn(async move {
+                for n in 0..EVENTS_PER_TASK {
+                    let event = HookEvent::ToolLifecycle {
+                        response_id: format!("resp-{task_id}"),
+                        tool_name: "shell".to_string(),
+                        phase: "end".to_string(),
+                        payload: json!({ "n": n, "task": task_id }),
+                    };
+                    sink.emit(&event).await.expect("concurrent emit");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("join concurrent writer");
+        }
+
+        let raw = std::fs::read_to_string(&path).expect("read concurrent jsonl");
+        // Trailing newline yields an empty final split; keep non-empty lines only.
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            expected,
+            "expected {expected} complete lines, got {}; sample: {:?}",
+            lines.len(),
+            lines
+                .first()
+                .map(|s| s.chars().take(80).collect::<String>())
+        );
+
+        for (idx, line) in lines.iter().enumerate() {
+            let parsed: Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("line {idx} is not complete JSON ({err}): {line:?}");
+            });
+            assert!(
+                parsed.get("at").and_then(|v| v.as_str()).is_some(),
+                "line {idx} missing at: {parsed}"
+            );
+            assert_eq!(
+                parsed["event"]["type"], "tool_lifecycle",
+                "line {idx} unexpected event type"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn dispatcher_continues_after_sink_error() {
         let mut dispatcher = HookDispatcher::default();
@@ -424,7 +517,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_sink_skips_when_listener_absent() {
-        let (root, socket_path) = unique_short_socket_path("missing");
+        let (_root, socket_path) = unique_short_socket_path("missing");
         let sink = UnixSocketHookSink::new(socket_path);
         let result = sink
             .emit(&HookEvent::ResponseStart {
@@ -432,7 +525,6 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -447,8 +539,12 @@ mod tests {
 
         let listener = UnixListener::bind(&socket_path).expect("bind");
         let sink = UnixSocketHookSink::new(socket_path.clone());
+        let cleanup = || {
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_dir_all(&root);
+        };
 
-        let handle = tokio::spawn(async move {
+        let mut handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut reader = tokio::io::BufReader::new(stream);
             let mut line = String::new();
@@ -456,20 +552,35 @@ mod tests {
             line
         });
 
-        sink.emit(&HookEvent::ResponseStart {
+        let event = HookEvent::ResponseStart {
             response_id: "resp-42".to_string(),
-        })
-        .await
-        .expect("emit");
+        };
+        let emit = sink.emit(&event);
+        match tokio::time::timeout(Duration::from_secs(5), emit).await {
+            Ok(result) => result.expect("emit"),
+            Err(_) => {
+                handle.abort();
+                let _ = (&mut handle).await;
+                cleanup();
+                panic!("unix socket emit timed out");
+            }
+        }
 
-        let received = handle.await.expect("join");
+        let received = match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
+            Ok(result) => result.expect("join"),
+            Err(_) => {
+                handle.abort();
+                let _ = (&mut handle).await;
+                cleanup();
+                panic!("unix socket exchange timed out");
+            }
+        };
         let parsed: Value = serde_json::from_str(&received).expect("parse");
         assert_eq!(parsed["event"]["type"], "response_start");
         assert_eq!(parsed["event"]["response_id"], "resp-42");
         assert!(parsed["at"].as_str().is_some());
 
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(root);
+        cleanup();
     }
 
     #[derive(Default)]
@@ -517,8 +628,21 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = PathBuf::from("/tmp").join(format!("cw-hk-{}-{nanos}", std::process::id()));
-        let path = root.join(format!("{label}.sock"));
+        let nonce = SOCKET_PATH_NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from("/tmp").join(format!(
+            "cw-hk-{label}-{}-{nanos}-{nonce}",
+            std::process::id()
+        ));
+        let path = root.join("hook.sock");
         (root, path)
+    }
+
+    #[test]
+    fn webhook_sink_new_does_not_panic() {
+        // Construction must never panic: if the configured client builder
+        // fails, the code falls back to a default `reqwest::Client` instead of
+        // calling `.expect(...)`.
+        let sink = WebhookHookSink::new("https://example.invalid/webhook".to_string());
+        let _ = sink;
     }
 }

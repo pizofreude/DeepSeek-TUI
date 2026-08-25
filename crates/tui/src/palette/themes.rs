@@ -38,11 +38,21 @@ pub struct UiTheme {
     pub warning: Color,
     pub success: Color,
     pub info: Color,
-    // Mode badge colors (act/plan/operate; mode_yolo kept for legacy theme data)
+    // Mode badge colors (act/plan/operate; mode_yolo kept for legacy theme data).
+    // These must be distinct from one another and from the general accent,
+    // human, warning, danger, and success lanes: the terminal backend receives
+    // only the final `Color` and needs that identity to perform semantic ANSI
+    // adaptation.
     pub mode_agent: Color,
     pub mode_yolo: Color,
     pub mode_plan: Color,
     pub mode_operate: Color,
+    // Permission posture colors (Ask / Auto-Review / Full Access). These are
+    // explicit theme slots because the warm permission ramp is independent
+    // from the cool mode ramp.
+    pub permission_ask: Color,
+    pub permission_auto_review: Color,
+    pub permission_full_access: Color,
     // Footer statusline colors
     pub status_ready: Color,
     pub status_working: Color,
@@ -64,32 +74,20 @@ pub const UI_THEME: UiTheme = UiTheme {
     surface_bg: WHALE_BG,
     panel_bg: WHALE_PANEL,
     elevated_bg: SURFACE_ELEVATED,
-    composer_bg: WHALE_PANEL,
+    composer_bg: WHALE_COMPOSER,
     selection_bg: SELECTION_BG,
-    header_bg: WHALE_BG,
-    footer_bg: WHALE_BG,
+    header_bg: WHALE_CHROME,
+    footer_bg: WHALE_CHROME,
     text_dim: TEXT_DIM,
     text_hint: TEXT_HINT,
     text_muted: TEXT_MUTED,
     text_body: TEXT_BODY,
     text_soft: TEXT_SOFT,
     border: BORDER_COLOR,
-    accent_primary: Color::Rgb(
-        WHALE_ACCENT_PRIMARY_RGB.0,
-        WHALE_ACCENT_PRIMARY_RGB.1,
-        WHALE_ACCENT_PRIMARY_RGB.2,
-    ),
-    accent_secondary: Color::Rgb(
-        WHALE_ACCENT_SECONDARY_RGB.0,
-        WHALE_ACCENT_SECONDARY_RGB.1,
-        WHALE_ACCENT_SECONDARY_RGB.2,
-    ),
-    accent_action: Color::Rgb(
-        WHALE_ACCENT_ACTION_RGB.0,
-        WHALE_ACCENT_ACTION_RGB.1,
-        WHALE_ACCENT_ACTION_RGB.2,
-    ),
-    error_fg: Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2),
+    accent_primary: WHALE_ACTION,
+    accent_secondary: WHALE_LIVE,
+    accent_action: WHALE_HUMAN,
+    error_fg: WHALE_ERROR,
     error_hover: Color::Rgb(
         WHALE_ERROR_HOVER_RGB.0,
         WHALE_ERROR_HOVER_RGB.1,
@@ -110,39 +108,34 @@ pub const UI_THEME: UiTheme = UiTheme {
         WHALE_ERROR_TEXT_RGB.1,
         WHALE_ERROR_TEXT_RGB.2,
     ),
-    warning: Color::Rgb(
-        WHALE_WARNING_RGB.0,
-        WHALE_WARNING_RGB.1,
-        WHALE_WARNING_RGB.2,
-    ),
+    warning: STATUS_WARNING,
     success: Color::Rgb(
         WHALE_SUCCESS_RGB.0,
         WHALE_SUCCESS_RGB.1,
         WHALE_SUCCESS_RGB.2,
     ),
-    info: Color::Rgb(WHALE_INFO_RGB.0, WHALE_INFO_RGB.1, WHALE_INFO_RGB.2),
+    info: WHALE_ACTION,
     mode_agent: MODE_AGENT,
     mode_yolo: MODE_YOLO,
     mode_plan: MODE_PLAN,
     mode_operate: MODE_OPERATE,
+    permission_ask: TEXT_REASONING,
+    permission_auto_review: WHALE_HUMAN,
+    permission_full_access: STATUS_WARNING,
     status_ready: TEXT_MUTED,
-    status_working: Color::Rgb(
-        WHALE_ACCENT_SECONDARY_RGB.0,
-        WHALE_ACCENT_SECONDARY_RGB.1,
-        WHALE_ACCENT_SECONDARY_RGB.2,
-    ),
+    status_working: WHALE_LIVE,
     status_warning: STATUS_WARNING,
     diff_added_fg: DIFF_ADDED,
-    diff_deleted_fg: Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2),
+    diff_deleted_fg: WHALE_ERROR,
     diff_added_bg: DIFF_ADDED_BG,
     diff_deleted_bg: DIFF_DELETED_BG,
-    tool_running: ACCENT_TOOL_LIVE,
+    tool_running: WHALE_LIVE,
     tool_success: Color::Rgb(
         WHALE_WORKING_GREEN_RGB.0,
         WHALE_WORKING_GREEN_RGB.1,
         WHALE_WORKING_GREEN_RGB.2,
     ),
-    tool_failed: ACCENT_TOOL_ISSUE,
+    tool_failed: WHALE_ERROR,
 };
 
 pub const LIGHT_UI_THEME: UiTheme = UiTheme {
@@ -161,35 +154,34 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
     text_body: LIGHT_TEXT_BODY,
     text_soft: LIGHT_TEXT_SOFT,
     border: LIGHT_BORDER,
-    accent_primary: Color::Rgb(53, 120, 229),   // blue
-    accent_secondary: Color::Rgb(79, 180, 160), // teal
-    accent_action: Color::Rgb(220, 90, 60),     // warm coral
-    error_fg: Color::Rgb(200, 40, 60),          // red
-    error_hover: Color::Rgb(220, 70, 85),
-    error_surface: Color::Rgb(254, 229, 229),
-    error_border: Color::Rgb(240, 120, 130),
-    error_text: Color::Rgb(120, 20, 30),
-    warning: Color::Rgb(180, 83, 9), // amber
-    success: Color::Rgb(
-        LIGHT_SUCCESS_FG_RGB.0,
-        LIGHT_SUCCESS_FG_RGB.1,
-        LIGHT_SUCCESS_FG_RGB.2,
-    ), // readable green foreground
-    info: Color::Rgb(53, 120, 229),  // blue
-    mode_agent: Color::Rgb(53, 120, 229), // blue
-    mode_yolo: Color::Rgb(200, 40, 60), // red
-    mode_plan: Color::Rgb(180, 83, 9), // amber
-    mode_operate: Color::Rgb(124, 58, 237), // violet
+    accent_primary: LIGHT_ACTION,
+    accent_secondary: LIGHT_LIVE,
+    accent_action: LIGHT_HUMAN,
+    error_fg: LIGHT_DANGER,
+    error_hover: Color::Rgb(201, 71, 120), // #C94778
+    error_surface: LIGHT_ERROR,
+    error_border: LIGHT_DANGER,
+    error_text: Color::Rgb(109, 22, 56), // #6D1638
+    warning: LIGHT_WARNING,
+    success: LIGHT_SUCCESS_FG,
+    info: LIGHT_ACTION,
+    mode_agent: LIGHT_MODE_AGENT,
+    mode_yolo: LIGHT_MODE_YOLO,
+    mode_plan: LIGHT_MODE_PLAN,
+    mode_operate: LIGHT_OPERATE,
+    permission_ask: Color::Rgb(146, 64, 14),
+    permission_auto_review: LIGHT_HUMAN,
+    permission_full_access: LIGHT_WARNING,
     status_ready: LIGHT_TEXT_MUTED,
-    status_working: Color::Rgb(79, 180, 160), // teal live work
-    status_warning: Color::Rgb(180, 83, 9),   // amber
-    diff_added_fg: Color::Rgb(22, 101, 52),   // green
-    diff_deleted_fg: Color::Rgb(200, 40, 60), // red
+    status_working: LIGHT_LIVE,
+    status_warning: LIGHT_WARNING,
+    diff_added_fg: Color::Rgb(22, 101, 52), // green
+    diff_deleted_fg: LIGHT_DANGER,
     diff_added_bg: Color::Rgb(223, 247, 231), // light green
-    diff_deleted_bg: Color::Rgb(254, 229, 229), // light red
-    tool_running: Color::Rgb(53, 120, 229),   // blue
-    tool_success: Color::Rgb(21, 128, 61),
-    tool_failed: Color::Rgb(200, 40, 60), // red
+    diff_deleted_bg: LIGHT_ERROR,
+    tool_running: LIGHT_LIVE,
+    tool_success: LIGHT_SUCCESS_FG,
+    tool_failed: LIGHT_DANGER,
 };
 
 pub const SOLARIZED_LIGHT_UI_THEME: UiTheme = UiTheme {
@@ -219,10 +211,13 @@ pub const SOLARIZED_LIGHT_UI_THEME: UiTheme = UiTheme {
     warning: SOLARIZED_YELLOW,
     success: SOLARIZED_GREEN,
     info: SOLARIZED_BLUE,
-    mode_agent: SOLARIZED_BLUE,
-    mode_yolo: SOLARIZED_RED,
-    mode_plan: SOLARIZED_ORANGE,
+    mode_agent: Color::Rgb(0x27, 0x8B, 0xD2),
+    mode_yolo: Color::Rgb(0xDD, 0x32, 0x2F),
+    mode_plan: Color::Rgb(0xCC, 0x4B, 0x16),
     mode_operate: Color::Rgb(0x6C, 0x71, 0xC4), // solarized violet
+    permission_ask: SOLARIZED_YELLOW,
+    permission_auto_review: SOLARIZED_ORANGE,
+    permission_full_access: SOLARIZED_RED,
     status_ready: SOLARIZED_CYAN,
     status_working: SOLARIZED_CYAN,
     status_warning: SOLARIZED_YELLOW,
@@ -263,11 +258,14 @@ pub const GRAYSCALE_UI_THEME: UiTheme = UiTheme {
     success: GRAYSCALE_TEXT_SOFT,
     info: GRAYSCALE_TEXT_MUTED,
     mode_agent: Color::Rgb(200, 200, 200),
-    mode_yolo: GRAYSCALE_TEXT_BODY,
-    mode_plan: GRAYSCALE_TEXT_MUTED,
-    // Monochrome theme: pure white is the one step left above the YOLO
-    // body tone (236) that stays unmistakably distinct.
-    mode_operate: Color::Rgb(255, 255, 255),
+    mode_yolo: Color::Rgb(237, 237, 237),
+    mode_plan: Color::Rgb(181, 181, 181),
+    // Near-white stays unmistakably distinct without claiming arbitrary pure
+    // white content as an already-resolved mode slot.
+    mode_operate: Color::Rgb(250, 250, 250),
+    permission_ask: Color::Rgb(181, 181, 181),
+    permission_auto_review: Color::Rgb(210, 210, 210),
+    permission_full_access: Color::Rgb(237, 237, 237),
     status_ready: GRAYSCALE_TEXT_MUTED,
     status_working: GRAYSCALE_TEXT_SOFT,
     status_warning: GRAYSCALE_TEXT_BODY,
@@ -304,17 +302,20 @@ pub const CATPPUCCIN_MOCHA_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x3a, 0x1f, 0x2a),
     error_border: Color::Rgb(0xf3, 0x8b, 0xa8),
     error_text: Color::Rgb(0xf5, 0xc2, 0xd0),
-    warning: Color::Rgb(0xf9, 0xe2, 0xaf),         // yellow
-    success: Color::Rgb(0xa6, 0xe3, 0xa1),         // green
-    info: Color::Rgb(0x89, 0xd9, 0xeb),            // sky
-    mode_agent: Color::Rgb(0x89, 0xb4, 0xfa),      // blue
-    mode_yolo: Color::Rgb(0xf3, 0x8b, 0xa8),       // red
-    mode_plan: Color::Rgb(0xfa, 0xb3, 0x87),       // peach
-    mode_operate: Color::Rgb(0xcb, 0xa6, 0xf7),    // mauve
-    status_ready: Color::Rgb(0x7f, 0x84, 0x9c),    // overlay1
-    status_working: Color::Rgb(0x74, 0xc7, 0xec),  // sapphire
-    status_warning: Color::Rgb(0xf9, 0xe2, 0xaf),  // yellow
-    diff_added_fg: Color::Rgb(0xa6, 0xe3, 0xa1),   // green
+    warning: Color::Rgb(0xf9, 0xe2, 0xaf),      // yellow
+    success: Color::Rgb(0xa6, 0xe3, 0xa1),      // green
+    info: Color::Rgb(0x89, 0xd9, 0xeb),         // sky
+    mode_agent: Color::Rgb(0x8a, 0xb4, 0xfa),   // blue
+    mode_yolo: Color::Rgb(0xf3, 0x8c, 0xa8),    // red
+    mode_plan: Color::Rgb(0xfa, 0xb4, 0x87),    // peach
+    mode_operate: Color::Rgb(0xcb, 0xa6, 0xf7), // mauve
+    permission_ask: Color::Rgb(0xf9, 0xe2, 0xaf),
+    permission_auto_review: Color::Rgb(0xfa, 0xb3, 0x87),
+    permission_full_access: Color::Rgb(0xf3, 0x8b, 0xa8),
+    status_ready: Color::Rgb(0x7f, 0x84, 0x9c), // overlay1
+    status_working: Color::Rgb(0x74, 0xc7, 0xec), // sapphire
+    status_warning: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
+    diff_added_fg: Color::Rgb(0xa6, 0xe3, 0xa1), // green
     diff_deleted_fg: Color::Rgb(0xf3, 0x8b, 0xa8), // red
     diff_added_bg: Color::Rgb(0x1f, 0x33, 0x29),
     diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x2a),
@@ -333,10 +334,10 @@ pub const TOKYO_NIGHT_UI_THEME: UiTheme = UiTheme {
     selection_bg: Color::Rgb(0x28, 0x34, 0x57), // visual selection
     header_bg: Color::Rgb(0x16, 0x16, 0x1e),
     footer_bg: Color::Rgb(0x16, 0x16, 0x1e),
-    text_dim: Color::Rgb(0x56, 0x5f, 0x89),   // comment
-    text_hint: Color::Rgb(0x73, 0x7a, 0xa2),  // dark5
+    text_dim: Color::Rgb(0x5c, 0x65, 0x8d), // comment, lifted to 3:1 on bg
+    text_hint: Color::Rgb(0x73, 0x7a, 0xa2), // dark5
     text_muted: Color::Rgb(0xa9, 0xb1, 0xd6), // fg_dark
-    text_body: Color::Rgb(0xc0, 0xca, 0xf5),  // fg
+    text_body: Color::Rgb(0xc0, 0xca, 0xf5), // fg
     text_soft: Color::Rgb(0xbb, 0xc2, 0xe0),
     border: Color::Rgb(0x41, 0x48, 0x68), // terminal_black
     accent_primary: Color::Rgb(0x7a, 0xa2, 0xf7), // blue
@@ -347,17 +348,20 @@ pub const TOKYO_NIGHT_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x33, 0x1c, 0x24),
     error_border: Color::Rgb(0xf7, 0x76, 0x8e),
     error_text: Color::Rgb(0xfa, 0xcc, 0xd4),
-    warning: Color::Rgb(0xe0, 0xaf, 0x68),         // yellow
-    success: Color::Rgb(0x9e, 0xce, 0x6a),         // green
-    info: Color::Rgb(0x7d, 0xcf, 0xff),            // cyan
-    mode_agent: Color::Rgb(0x7a, 0xa2, 0xf7),      // blue
-    mode_yolo: Color::Rgb(0xf7, 0x76, 0x8e),       // red
-    mode_plan: Color::Rgb(0xff, 0x9e, 0x64),       // orange
-    mode_operate: Color::Rgb(0xbb, 0x9a, 0xf7),    // purple
-    status_ready: Color::Rgb(0x56, 0x5f, 0x89),    // comment
-    status_working: Color::Rgb(0x7d, 0xcf, 0xff),  // cyan
-    status_warning: Color::Rgb(0xe0, 0xaf, 0x68),  // yellow
-    diff_added_fg: Color::Rgb(0x9e, 0xce, 0x6a),   // green
+    warning: Color::Rgb(0xe0, 0xaf, 0x68),      // yellow
+    success: Color::Rgb(0x9e, 0xce, 0x6a),      // green
+    info: Color::Rgb(0x7d, 0xcf, 0xff),         // cyan
+    mode_agent: Color::Rgb(0x7b, 0xa2, 0xf7),   // blue
+    mode_yolo: Color::Rgb(0xf7, 0x77, 0x8e),    // red
+    mode_plan: Color::Rgb(0xff, 0x9f, 0x64),    // orange
+    mode_operate: Color::Rgb(0xbb, 0x9a, 0xf7), // purple
+    permission_ask: Color::Rgb(0xe0, 0xaf, 0x68),
+    permission_auto_review: Color::Rgb(0xff, 0x9e, 0x64),
+    permission_full_access: Color::Rgb(0xf7, 0x76, 0x8e),
+    status_ready: Color::Rgb(0x5c, 0x65, 0x8d), // comment, lifted to 3:1 on bg
+    status_working: Color::Rgb(0x7d, 0xcf, 0xff), // cyan
+    status_warning: Color::Rgb(0xe0, 0xaf, 0x68), // yellow
+    diff_added_fg: Color::Rgb(0x9e, 0xce, 0x6a), // green
     diff_deleted_fg: Color::Rgb(0xf7, 0x76, 0x8e), // red
     diff_added_bg: Color::Rgb(0x1b, 0x2b, 0x1f),
     diff_deleted_bg: Color::Rgb(0x33, 0x1c, 0x24),
@@ -390,17 +394,20 @@ pub const DRACULA_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x3a, 0x1f, 0x22),
     error_border: Color::Rgb(0xff, 0x55, 0x55),
     error_text: Color::Rgb(0xff, 0xbb, 0xbb),
-    warning: Color::Rgb(0xf1, 0xfa, 0x8c),         // yellow
-    success: Color::Rgb(0x50, 0xfa, 0x7b),         // green
-    info: Color::Rgb(0x8b, 0xe9, 0xfd),            // cyan
-    mode_agent: Color::Rgb(0xbd, 0x93, 0xf9),      // purple
-    mode_yolo: Color::Rgb(0xff, 0x55, 0x55),       // red
-    mode_plan: Color::Rgb(0xff, 0xb8, 0x6c),       // orange
-    mode_operate: Color::Rgb(0x8b, 0xe9, 0xfd),    // cyan
-    status_ready: Color::Rgb(0x62, 0x72, 0xa4),    // comment
-    status_working: Color::Rgb(0x8b, 0xe9, 0xfd),  // cyan
-    status_warning: Color::Rgb(0xf1, 0xfa, 0x8c),  // yellow
-    diff_added_fg: Color::Rgb(0x50, 0xfa, 0x7b),   // green
+    warning: Color::Rgb(0xf1, 0xfa, 0x8c),      // yellow
+    success: Color::Rgb(0x50, 0xfa, 0x7b),      // green
+    info: Color::Rgb(0x8b, 0xe9, 0xfd),         // cyan
+    mode_agent: Color::Rgb(0xbe, 0x93, 0xf9),   // purple
+    mode_yolo: Color::Rgb(0xff, 0x56, 0x55),    // red
+    mode_plan: Color::Rgb(0xff, 0xb9, 0x6c),    // orange
+    mode_operate: Color::Rgb(0x8c, 0xe9, 0xfd), // cyan
+    permission_ask: Color::Rgb(0xf1, 0xfa, 0x8c),
+    permission_auto_review: Color::Rgb(0xff, 0xb8, 0x6c),
+    permission_full_access: Color::Rgb(0xff, 0x55, 0x55),
+    status_ready: Color::Rgb(0x62, 0x72, 0xa4), // comment
+    status_working: Color::Rgb(0x8b, 0xe9, 0xfd), // cyan
+    status_warning: Color::Rgb(0xf1, 0xfa, 0x8c), // yellow
+    diff_added_fg: Color::Rgb(0x50, 0xfa, 0x7b), // green
     diff_deleted_fg: Color::Rgb(0xff, 0x55, 0x55), // red
     diff_added_bg: Color::Rgb(0x21, 0x3a, 0x2a),
     diff_deleted_bg: Color::Rgb(0x3a, 0x1f, 0x22),
@@ -414,7 +421,7 @@ pub const DRACULA_UI_THEME: UiTheme = UiTheme {
 /// (the terminal's own default bg) and most text uses `Color::Reset`
 /// (terminal's own default fg). Accents are ANSI named colors so they
 /// also inherit the user's terminal palette (Solarized, Nord, custom
-/// schemes, etc.) rather than DeepSeek brand RGB.
+/// schemes, etc.) rather than Codewhale brand RGB.
 pub const TERMINAL_UI_THEME: UiTheme = UiTheme {
     name: "terminal",
     // Mode is reported as Dark to avoid the dark→light cell remap kicking
@@ -445,13 +452,16 @@ pub const TERMINAL_UI_THEME: UiTheme = UiTheme {
     warning: Color::Yellow,
     success: Color::Green,
     info: Color::Cyan,
-    mode_agent: Color::Blue,
-    mode_yolo: Color::Red,
+    mode_agent: Color::LightBlue,
+    mode_yolo: Color::LightRed,
     // Magenta keeps Plan visually distinct from `status_warning` (yellow)
     // so the mode indicator and warning chip don't collide on themes that
     // render both in the status row.
     mode_plan: Color::Magenta,
-    mode_operate: Color::Cyan,
+    mode_operate: Color::LightCyan,
+    permission_ask: Color::Yellow,
+    permission_auto_review: Color::LightYellow,
+    permission_full_access: Color::LightRed,
     // DarkGray gives "Ready" a low-contrast but still distinguishable hue
     // versus default body text (which is `Color::Reset` on this theme).
     status_ready: Color::DarkGray,
@@ -478,7 +488,7 @@ pub const GRUVBOX_DARK_UI_THEME: UiTheme = UiTheme {
     footer_bg: Color::Rgb(0x1d, 0x20, 0x21),
     text_dim: Color::Rgb(0x92, 0x83, 0x74),         // gray
     text_hint: Color::Rgb(0xa8, 0x99, 0x84),        // fg4
-    text_muted: Color::Rgb(0xbd, 0xae, 0x93),       // fg3
+    text_muted: Color::Rgb(0xc5, 0xb8, 0xa0),       // fg3, lifted to 4.5:1 on bg2
     text_body: Color::Rgb(0xeb, 0xdb, 0xb2),        // fg1
     text_soft: Color::Rgb(0xd5, 0xc4, 0xa1),        // fg2
     border: Color::Rgb(0x66, 0x5c, 0x54),           // bg3
@@ -490,13 +500,16 @@ pub const GRUVBOX_DARK_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(0x35, 0x1c, 0x18),
     error_border: Color::Rgb(0xfb, 0x49, 0x34),
     error_text: Color::Rgb(0xfc, 0xc4, 0xb8),
-    warning: Color::Rgb(0xfa, 0xbd, 0x2f),         // yellow
-    success: Color::Rgb(0x8e, 0xc0, 0x7c),         // green
-    info: Color::Rgb(0x83, 0xa5, 0x98),            // blue
-    mode_agent: Color::Rgb(0x83, 0xa5, 0x98),      // blue
-    mode_yolo: Color::Rgb(0xfb, 0x49, 0x34),       // red
-    mode_plan: Color::Rgb(0xfe, 0x80, 0x19),       // orange
-    mode_operate: Color::Rgb(0xd3, 0x86, 0x9b),    // purple
+    warning: Color::Rgb(0xfa, 0xbd, 0x2f),      // yellow
+    success: Color::Rgb(0x8e, 0xc0, 0x7c),      // green
+    info: Color::Rgb(0x83, 0xa5, 0x98),         // blue
+    mode_agent: Color::Rgb(0x84, 0xa5, 0x98),   // blue
+    mode_yolo: Color::Rgb(0xfb, 0x4a, 0x34),    // red
+    mode_plan: Color::Rgb(0xfe, 0x81, 0x19),    // orange
+    mode_operate: Color::Rgb(0xd3, 0x86, 0x9b), // purple
+    permission_ask: Color::Rgb(0xfa, 0xbd, 0x2f),
+    permission_auto_review: Color::Rgb(0xfe, 0x80, 0x19),
+    permission_full_access: Color::Rgb(0xfb, 0x49, 0x34),
     status_ready: Color::Rgb(0x92, 0x83, 0x74),    // gray
     status_working: Color::Rgb(0x8e, 0xc0, 0x7c),  // aqua
     status_warning: Color::Rgb(0xfa, 0xbd, 0x2f),  // yellow
@@ -542,10 +555,13 @@ pub const CLAUDE_UI_THEME: UiTheme = UiTheme {
     success: Color::Rgb(0x5d, 0xb8, 0x72), // green
     info: Color::Rgb(0x5d, 0xb8, 0xa6),    // teal
     // Mode badges
-    mode_agent: Color::Rgb(0xcc, 0x78, 0x5c),   // coral
-    mode_yolo: Color::Rgb(0xc6, 0x45, 0x45),    // red
-    mode_plan: Color::Rgb(0xe8, 0xa5, 0x5a),    // amber
+    mode_agent: Color::Rgb(0xcd, 0x78, 0x5c),   // coral
+    mode_yolo: Color::Rgb(0xc7, 0x45, 0x45),    // red
+    mode_plan: Color::Rgb(0xe8, 0xa6, 0x5a),    // amber
     mode_operate: Color::Rgb(0x8a, 0x63, 0xd2), // violet
+    permission_ask: Color::Rgb(0xd4, 0xa0, 0x17),
+    permission_auto_review: Color::Rgb(0xe8, 0xa5, 0x5a),
+    permission_full_access: Color::Rgb(0xe0, 0x60, 0x60),
     // Footer statusline
     status_ready: Color::Rgb(0xa0, 0x9d, 0x96),
     status_working: Color::Rgb(0x5d, 0xb8, 0xa6),
@@ -644,11 +660,14 @@ pub const MATRIX_UI_THEME: UiTheme = UiTheme {
     warning: Color::Rgb(204, 204, 0),
     success: Color::Rgb(0x88, 0xff, 0x88),
     info: Color::Rgb(0, 204, 0),
-    mode_agent: Color::Rgb(0, 153, 0),
+    mode_agent: Color::Rgb(0, 154, 0),
     mode_yolo: Color::Rgb(255, 100, 100),
     mode_plan: Color::Rgb(255, 170, 60),
     mode_operate: Color::Rgb(100, 255, 220),
-    status_ready: Color::Rgb(0, 85, 0),
+    permission_ask: Color::Rgb(204, 204, 0),
+    permission_auto_review: Color::Rgb(255, 170, 60),
+    permission_full_access: Color::Rgb(255, 100, 100),
+    status_ready: Color::Rgb(0, 108, 0),
     status_working: Color::Rgb(
         MATRIX_TEXT_BODY_RGB.0,
         MATRIX_TEXT_BODY_RGB.1,
@@ -656,12 +675,58 @@ pub const MATRIX_UI_THEME: UiTheme = UiTheme {
     ),
     status_warning: Color::Rgb(204, 204, 0),
     diff_added_fg: Color::Rgb(0x88, 0xff, 0x88),
-    diff_deleted_fg: Color::Rgb(0xb4, 0, 0),
+    diff_deleted_fg: Color::Rgb(0xbc, 0x1d, 0x1d), // lifted to 3:1 on diff_deleted_bg
     diff_added_bg: Color::Rgb(0x0d, 0x1a, 0x0d),
     diff_deleted_bg: Color::Rgb(0x1a, 0x0d, 0x0d),
     tool_running: Color::Rgb(0x88, 0xff, 0x88),
     tool_success: Color::Rgb(0, 102, 0),
     tool_failed: Color::Rgb(0xb4, 0, 0),
+};
+
+pub const UWU_UI_THEME: UiTheme = UiTheme {
+    name: "uwu",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x16, 0x12, 0x1c),
+    panel_bg: Color::Rgb(0x1f, 0x18, 0x28),
+    elevated_bg: Color::Rgb(0x2c, 0x22, 0x38),
+    composer_bg: Color::Rgb(0x1f, 0x18, 0x28),
+    selection_bg: Color::Rgb(0x3d, 0x2e, 0x4e),
+    header_bg: Color::Rgb(0x12, 0x0e, 0x18),
+    footer_bg: Color::Rgb(0x12, 0x0e, 0x18),
+    text_dim: Color::Rgb(0x6e, 0x60, 0x7a),
+    text_hint: Color::Rgb(0x8a, 0x7c, 0x98),
+    text_muted: Color::Rgb(0xb8, 0xaa, 0xc8),
+    text_body: Color::Rgb(0xf7, 0xf0, 0xf8),
+    text_soft: Color::Rgb(0xe8, 0xdc, 0xee),
+    border: Color::Rgb(0x4a, 0x3a, 0x5c),
+    accent_primary: Color::Rgb(0xff, 0x9e, 0xcd),
+    accent_secondary: Color::Rgb(0x9a, 0xec, 0xe0),
+    accent_action: Color::Rgb(0xff, 0xd6, 0x9a),
+    error_fg: Color::Rgb(0xff, 0x6b, 0x8a),
+    error_hover: Color::Rgb(0xff, 0x8f, 0xa8),
+    error_surface: Color::Rgb(0x3a, 0x18, 0x28),
+    error_border: Color::Rgb(0xff, 0x6b, 0x8a),
+    error_text: Color::Rgb(0xff, 0xc8, 0xd6),
+    warning: Color::Rgb(0xff, 0xe0, 0x8a),
+    success: Color::Rgb(0x9a, 0xef, 0xc0),
+    info: Color::Rgb(0xb8, 0xc8, 0xff),
+    mode_agent: Color::Rgb(0xc4, 0xa8, 0xff),
+    mode_yolo: Color::Rgb(0xff, 0x55, 0x77),
+    mode_plan: Color::Rgb(0xff, 0xb4, 0xe8),
+    mode_operate: Color::Rgb(0x8a, 0xd4, 0xff),
+    permission_ask: Color::Rgb(0xff, 0xe0, 0x8a),
+    permission_auto_review: Color::Rgb(0xff, 0xd6, 0x9a),
+    permission_full_access: Color::Rgb(0xff, 0x6b, 0x8a),
+    status_ready: Color::Rgb(0x8a, 0x7c, 0x98),
+    status_working: Color::Rgb(0x9a, 0xec, 0xe0),
+    status_warning: Color::Rgb(0xff, 0xe0, 0x8a),
+    diff_added_fg: Color::Rgb(0x9a, 0xef, 0xc0),
+    diff_deleted_fg: Color::Rgb(0xff, 0x6b, 0x8a),
+    diff_added_bg: Color::Rgb(0x1a, 0x2a, 0x24),
+    diff_deleted_bg: Color::Rgb(0x3a, 0x18, 0x28),
+    tool_running: Color::Rgb(0x9a, 0xec, 0xe0),
+    tool_success: Color::Rgb(0x8a, 0x7c, 0x98),
+    tool_failed: Color::Rgb(0xff, 0x6b, 0x8a),
 };
 
 /// Stable identifiers for the named themes the user can select. `System`
@@ -681,6 +746,7 @@ pub enum ThemeId {
     Claude,
     Matrix,
     SolarizedLight,
+    Uwu,
 }
 
 impl ThemeId {
@@ -702,6 +768,7 @@ impl ThemeId {
             "claude" => Some(Self::Claude),
             "matrix" => Some(Self::Matrix),
             "solarized-light" => Some(Self::SolarizedLight),
+            "uwu" => Some(Self::Uwu),
             _ => None,
         }
     }
@@ -723,6 +790,7 @@ impl ThemeId {
             Self::Claude => "claude",
             Self::Matrix => "matrix",
             Self::SolarizedLight => "solarized-light",
+            Self::Uwu => "uwu",
         }
     }
 
@@ -732,8 +800,8 @@ impl ThemeId {
         match self {
             Self::System => "System",
             Self::Terminal => "Terminal",
-            Self::Whale => "Whale (Dark)",
-            Self::WhaleLight => "Whale Light",
+            Self::Whale => "Blue Stage",
+            Self::WhaleLight => "Blue Stage Light",
             Self::Grayscale => "Grayscale",
             Self::CatppuccinMocha => "Catppuccin Mocha",
             Self::TokyoNight => "Tokyo Night",
@@ -742,6 +810,7 @@ impl ThemeId {
             Self::Claude => "Claude",
             Self::Matrix => "Matrix",
             Self::SolarizedLight => "Solarized Light",
+            Self::Uwu => "Uwu",
         }
     }
 
@@ -751,8 +820,8 @@ impl ThemeId {
         match self {
             Self::System => "Follow terminal background (COLORFGBG / macOS appearance)",
             Self::Terminal => "Inherit terminal colors fully (transparent surfaces, ANSI accents)",
-            Self::Whale => "Whale dark — deep navy & gold",
-            Self::WhaleLight => "DeepSeek light, paper-ish",
+            Self::Whale => "Stage black, action blue, and one Signal Gold human beacon",
+            Self::WhaleLight => "Paper, cobalt action, and one Signal Gold human beacon",
             Self::Grayscale => "Color-minimal high contrast",
             Self::CatppuccinMocha => "Soft pastels on warm dark",
             Self::TokyoNight => "Deep blue/violet night palette",
@@ -763,6 +832,7 @@ impl ThemeId {
             Self::SolarizedLight => {
                 "Solarized light — Light, calming palette on warm ivory — easy on the eyes"
             }
+            Self::Uwu => "Soft kawaii night — sakura, mint, and peach",
         }
     }
 
@@ -785,6 +855,7 @@ impl ThemeId {
             Self::Claude => CLAUDE_UI_THEME,
             Self::Matrix => MATRIX_UI_THEME,
             Self::SolarizedLight => SOLARIZED_LIGHT_UI_THEME,
+            Self::Uwu => UWU_UI_THEME,
         }
     }
 }
@@ -803,6 +874,7 @@ pub const SELECTABLE_THEMES: &[ThemeId] = &[
     ThemeId::Claude,
     ThemeId::Matrix,
     ThemeId::SolarizedLight,
+    ThemeId::Uwu,
 ];
 
 impl UiTheme {
@@ -819,11 +891,6 @@ impl UiTheme {
     #[must_use]
     pub fn detect() -> Self {
         Self::for_mode(PaletteMode::detect())
-    }
-
-    #[must_use]
-    pub fn from_setting(value: &str) -> Option<Self> {
-        ThemeId::from_name(value).map(ThemeId::ui_theme)
     }
 
     #[must_use]
@@ -851,6 +918,7 @@ pub fn normalize_theme_name(value: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "matrix" | "hacker" => Some("matrix"),
         "solarized-light" | "solarized" => Some("solarized-light"),
+        "uwu" | "owo" | "kawaii" => Some("uwu"),
         _ => None,
     }
 }
@@ -866,12 +934,11 @@ pub fn theme_label_for_mode(mode: PaletteMode) -> &'static str {
 }
 
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ui_theme_from_settings(theme: &str, background_color: Option<&str>) -> UiTheme {
-    let mut ui_theme = UiTheme::from_setting(theme).unwrap_or_else(UiTheme::detect);
-    if let Some(background) = background_color.and_then(parse_hex_rgb_color) {
-        ui_theme = ui_theme.with_background_color(background);
-    }
-    ui_theme
+    super::resolve_theme_setting(theme, background_color)
+        .map(|(_, _, theme)| theme)
+        .unwrap_or_else(|_| UiTheme::detect())
 }
 
 #[must_use]
@@ -904,16 +971,65 @@ pub fn hex_rgb_string(color: Color) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn whale_refresh_keeps_theme_ids_and_default_compatibility() {
+        let names = SELECTABLE_THEMES
+            .iter()
+            .map(|theme| theme.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "system",
+                "terminal",
+                "dark",
+                "light",
+                "grayscale",
+                "catppuccin-mocha",
+                "tokyo-night",
+                "dracula",
+                "gruvbox-dark",
+                "claude",
+                "matrix",
+                "solarized-light",
+                "uwu",
+            ]
+        );
+        assert_eq!(normalize_theme_name("default"), Some("system"));
+        assert_eq!(normalize_theme_name("whale"), Some("dark"));
+        assert_eq!(normalize_theme_name("owo"), Some("uwu"));
+        assert_eq!(normalize_theme_name("kawaii"), Some("uwu"));
+    }
+
+    #[test]
+    fn whale_pair_uses_codewhale_semantic_grammar() {
+        assert_eq!(UI_THEME.accent_primary, WHALE_ACTION);
+        assert_eq!(UI_THEME.status_working, WHALE_LIVE);
+        assert_eq!(UI_THEME.accent_action, WHALE_HUMAN);
+        assert_eq!(UI_THEME.warning, STATUS_WARNING);
+        assert_eq!(UI_THEME.error_fg, WHALE_ERROR);
+        assert_eq!(UI_THEME.mode_operate, MODE_OPERATE);
+        assert_eq!(LIGHT_UI_THEME.accent_primary, LIGHT_ACTION);
+        assert_eq!(LIGHT_UI_THEME.status_working, LIGHT_LIVE);
+        assert_eq!(LIGHT_UI_THEME.accent_action, LIGHT_HUMAN);
+        assert_eq!(LIGHT_UI_THEME.warning, LIGHT_WARNING);
+        assert_eq!(LIGHT_UI_THEME.error_fg, LIGHT_DANGER);
+        assert_eq!(LIGHT_UI_THEME.mode_operate, LIGHT_OPERATE);
+    }
+
     /// Dogfood A7 (#4092): every mode must be tellable apart from the footer
-    /// badge alone — Operate must never wear the YOLO red again.
+    /// badge alone — Operate must never wear the full-access red again. Mode
+    /// slots also stay distinct from general semantic lanes so limited-color
+    /// adaptation can identify direct `UiTheme` call sites without guessing.
     #[test]
     fn every_selectable_theme_keeps_mode_badges_distinct() {
         for theme_id in SELECTABLE_THEMES {
             let ui = theme_id.ui_theme();
             let badges = [
-                ("act", ui.mode_agent),
+                ("work", ui.mode_agent),
                 ("plan", ui.mode_plan),
                 ("operate", ui.mode_operate),
+                ("full access", ui.mode_yolo),
             ];
             for (i, (name_a, color_a)) in badges.iter().enumerate() {
                 for (name_b, color_b) in badges.iter().skip(i + 1) {
@@ -921,6 +1037,46 @@ mod tests {
                         color_a,
                         color_b,
                         "theme '{}' renders modes '{name_a}' and '{name_b}' with the same badge color",
+                        theme_id.name(),
+                    );
+                }
+            }
+            let semantic_lanes = [
+                ("action", ui.accent_primary),
+                ("live", ui.status_working),
+                ("human", ui.accent_action),
+                ("warning", ui.warning),
+                ("danger", ui.error_fg),
+                ("success", ui.success),
+            ];
+            for (mode_name, mode_color) in badges {
+                for (lane_name, lane_color) in semantic_lanes {
+                    assert_ne!(
+                        mode_color,
+                        lane_color,
+                        "theme '{}' reuses the {lane_name} color for mode '{mode_name}', erasing render-stage identity",
+                        theme_id.name(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_selectable_theme_keeps_permission_lanes_distinct() {
+        for theme_id in SELECTABLE_THEMES {
+            let ui = theme_id.ui_theme();
+            let permissions = [
+                ("ask", ui.permission_ask),
+                ("auto-review", ui.permission_auto_review),
+                ("full-access", ui.permission_full_access),
+            ];
+            for (index, (name_a, color_a)) in permissions.iter().enumerate() {
+                for (name_b, color_b) in permissions.iter().skip(index + 1) {
+                    assert_ne!(
+                        color_a,
+                        color_b,
+                        "theme '{}' renders permission lanes '{name_a}' and '{name_b}' identically",
                         theme_id.name(),
                     );
                 }

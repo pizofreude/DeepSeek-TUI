@@ -69,15 +69,17 @@ function buildFromSourceHint() {
     "You can still run codewhale by building from source with Cargo:",
     "",
     "  # Requires Rust 1.88+ (https://rustup.rs)",
-    "  cargo install codewhale-cli --locked   # provides `codewhale` and `codew`",
-    "  cargo install codewhale-tui --locked   # provides `codewhale-tui`",
+    "  cargo install codewhale-cli --locked   # provides `codewhale`",
+    "  bin=$(dirname \"$(command -v codewhale)\")",
+    "  ln -sf \"$bin/codewhale\" \"$bin/codew\"   # optional short alias",
     "",
     "Or build from a checkout:",
     "",
     "  git clone https://github.com/Hmbown/CodeWhale.git",
     "  cd CodeWhale",
     "  cargo install --path crates/cli --locked",
-    "  cargo install --path crates/tui --locked",
+    "  bin=$(dirname \"$(command -v codewhale)\")",
+    "  ln -sf \"$bin/codewhale\" \"$bin/codew\"",
     "",
     "See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md",
   ].join("\n");
@@ -96,7 +98,7 @@ function glibcCompatibilityMessage(required, host) {
     ? `this system has glibc ${formatVersion(host)}, which is too old for that asset.`
     : "this system does not appear to provide GNU libc.";
   return [
-    `Prebuilt CodeWhale Linux binaries require GLIBC_${formatVersion(required)}, but ${hostLine}`,
+    `Prebuilt Codewhale Linux binaries require GLIBC_${formatVersion(required)}, but ${hostLine}`,
     "",
     "The Linux x64 release asset is a static (musl) build that runs on any glibc,",
     "but the Linux arm64 asset is a GNU libc build linked against",

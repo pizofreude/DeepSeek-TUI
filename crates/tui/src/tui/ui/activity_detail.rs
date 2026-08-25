@@ -1,82 +1,21 @@
-//! Activity Detail, raw tool-detail, and pager-text helpers extracted from
-//! `ui.rs` (issue #4103).
+//! Reasoning Detail, Turn Inspector, raw tool-detail, and pager-text helpers
+//! extracted from `ui.rs` (issue #4103).
 //!
-//! Behavior-preserving move: these helpers build the Ctrl+O "Activity Detail" /
-//! "Reasoning Timeline" pager, the `v` raw tool-details pager (including #500
-//! spillover folding), the copy-cell actions, and the footer detail labels.
-//! No logic changes were made during the extraction.
+//! Ctrl+O opens the full recorded Reasoning Detail timeline for the selected
+//! reasoning block or the current/latest turn. The whole-turn Turn Inspector
+//! moved to a dedicated surface (Ctrl+Alt+O and `/turn inspect`). The `v` raw
+//! tool-details pager (including #500 spillover folding), copy-cell actions, and
+//! footer detail labels live here too.
 
+use crate::localization::{MessageId, tr};
 use crate::snapshot::SnapshotRepo;
 use crate::tui::app::App;
 use crate::tui::footer_ui::one_line_summary;
 use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
-use crate::tui::key_shortcuts;
-use crate::tui::pager::PagerView;
-use crate::tui::ui_text::{history_cell_to_text, truncate_line_to_width};
-// Only the test-gated single-cell Activity Detail renderer needs these
-// (Ctrl+O now opens the Turn Inspector, #4104).
-#[cfg(test)]
-use crate::tui::history::TranscriptRenderOptions;
-#[cfg(test)]
-use crate::tui::ui_text::line_to_plain;
-
-/// Open a pager for the activity the user is most likely asking about.
-///
-/// Ctrl+O uses this path. It prefers an explicitly selected activity cell,
-/// then a live activity in the current turn, then the most recent meaningful
-/// activity across history + active cells. Tool activity is intentionally
-/// rendered through the compact live view so Activity Detail does not become
-/// an accidental raw-output dump; `v` remains the direct full tool-detail
-/// surface.
-///
-/// Ctrl+O now opens the whole-turn Turn Inspector (#4104), so this single-cell
-/// pager and its private helper chain are retained for tests (and potential
-/// reuse by the #4106/#4107/#4108 follow-ups) but are no longer bound to a key.
-#[cfg(test)]
-pub(super) fn open_activity_detail_pager(app: &mut App) -> bool {
-    let Some(idx) = activity_target_cell_index(app) else {
-        app.status_message = Some("No activity detail available".to_string());
-        return true;
-    };
-
-    let width = app
-        .viewport
-        .last_transcript_area
-        .map(|area| area.width)
-        .unwrap_or(80);
-    let Some(text) = activity_detail_text(app, idx, width) else {
-        app.status_message = Some("No activity detail available".to_string());
-        return true;
-    };
-    let title = if matches!(
-        app.cell_at_virtual_index(idx),
-        Some(HistoryCell::Thinking { .. })
-    ) {
-        "Reasoning Timeline"
-    } else {
-        "Activity Detail"
-    };
-    app.view_stack
-        .push(PagerView::from_text(title, &text, width.saturating_sub(2)));
-    true
-}
-
-fn activity_target_cell_index(app: &App) -> Option<usize> {
-    if let Some(selected) = selected_transcript_cell_index(app)
-        && app
-            .cell_at_virtual_index(selected)
-            .is_some_and(is_meaningful_activity_cell)
-    {
-        return Some(selected);
-    }
-
-    current_activity_cell_index(app).or_else(|| {
-        (0..app.virtual_cell_count()).rev().find(|&idx| {
-            app.cell_at_virtual_index(idx)
-                .is_some_and(is_meaningful_activity_cell)
-        })
-    })
-}
+use crate::tui::pager::{PagerPage, PagerView};
+use crate::tui::ui_text::{
+    history_cell_to_clipboard_text, history_cell_to_text, truncate_line_to_width,
+};
 
 fn selected_transcript_cell_index(app: &App) -> Option<usize> {
     app.viewport
@@ -92,94 +31,79 @@ fn selected_transcript_cell_index(app: &App) -> Option<usize> {
         })
 }
 
-fn current_activity_cell_index(app: &App) -> Option<usize> {
-    let active = app.active_cell.as_ref()?;
-    let base = app.history.len();
-    for desired_rank in [0, 1, 2] {
-        if let Some((entry_idx, _)) = active
-            .entries()
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, cell)| activity_cell_rank(cell) == Some(desired_rank))
-        {
-            return Some(base + entry_idx);
-        }
-    }
-    None
-}
-
-fn is_meaningful_activity_cell(cell: &HistoryCell) -> bool {
-    activity_cell_rank(cell).is_some()
-}
-
-fn activity_cell_rank(cell: &HistoryCell) -> Option<u8> {
-    match cell {
-        HistoryCell::Thinking {
-            streaming: true, ..
-        } => Some(0),
-        HistoryCell::Tool(tool) => match tool_status_for_activity(tool) {
-            Some(ToolStatus::Running) => Some(0),
-            Some(ToolStatus::Failed) => Some(1),
-            Some(ToolStatus::Hydrated) => Some(2),
-            Some(ToolStatus::Success) => Some(2),
-            None => Some(2),
-        },
-        HistoryCell::SubAgent(_) => Some(0),
-        HistoryCell::Error { .. } => Some(1),
-        HistoryCell::Thinking { .. } => Some(2),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn activity_detail_text(app: &App, cell_index: usize, width: u16) -> Option<String> {
-    let cell = app.cell_at_virtual_index(cell_index)?;
-    if matches!(cell, HistoryCell::Thinking { .. }) {
-        return reasoning_timeline_text(app, cell_index);
-    }
-
-    let mut sections = Vec::new();
-
-    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
-        let status = humanized_turn_status(app);
-        sections.push(format!("Turn {} \u{00B7} {status}", short_turn_id(turn_id)));
-    }
-
-    sections.push(format!(
-        "Activity: {}",
-        activity_cell_label(app, cell_index, cell)
+/// Open the full recorded-reasoning detail pager for the selected thinking
+/// block, or for the current/latest turn when no reasoning block is selected.
+/// Ctrl+O routes here; only provider-supplied reasoning is shown.
+pub(super) fn open_reasoning_detail_pager(app: &mut App) -> bool {
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    let Some(text) = reasoning_detail_text(app) else {
+        app.status_message = Some("No reasoning detail available".to_string());
+        return true;
+    };
+    app.view_stack.push(PagerView::from_text(
+        "Reasoning Detail",
+        &text,
+        width.saturating_sub(2),
     ));
-
-    if let Some(status) = activity_status_line(cell) {
-        sections.push(status);
-    }
-
-    let activity_indices = activity_indices(app);
-    if let Some(position) = activity_indices.iter().position(|&idx| idx == cell_index) {
-        sections.push(format!(
-            "Activity chunk: {} of {}",
-            position + 1,
-            activity_indices.len()
-        ));
-        sections.extend(activity_navigation_lines(app, position, &activity_indices));
-    }
-
-    if let Some(handle) = activity_detail_handle_line(app, cell_index, cell) {
-        sections.push(handle);
-    }
-    if let Some(summary) = activity_input_summary_line(cell) {
-        sections.push(summary);
-    }
-
-    sections.push(String::new());
-    sections.push(activity_cell_to_text(cell, width));
-    Some(sections.join("\n"))
+    true
 }
 
-#[cfg(test)]
-fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<String> {
-    let thinking_indices: Vec<usize> = (0..app.virtual_cell_count())
+/// Resolve the turn range that contains the given virtual cell index.
+/// The turn starts at the most recent user cell at or before the index and
+/// ends at the next user cell after the index, or the end of the transcript.
+fn turn_range_for_index(app: &App, index: usize) -> (usize, usize) {
+    let end = app.virtual_cell_count();
+    let start = (0..index.saturating_add(1))
+        .rev()
+        .find(|&idx| {
+            matches!(
+                app.cell_at_virtual_index(idx),
+                Some(HistoryCell::User { .. })
+            )
+        })
+        .unwrap_or(0);
+    let turn_end = (index..end)
+        .find(|&idx| {
+            idx > index
+                && matches!(
+                    app.cell_at_virtual_index(idx),
+                    Some(HistoryCell::User { .. })
+                )
+        })
+        .unwrap_or(end);
+    (start, turn_end)
+}
+
+/// Assemble the full recorded reasoning for the selected thinking block's
+/// turn, or for the current/latest turn when nothing is selected. Empty
+/// chunks are surfaced as "(no reasoning text recorded)" rather than invented.
+pub(super) fn reasoning_detail_text(app: &App) -> Option<String> {
+    let selected = selected_transcript_cell_index(app).filter(|&idx| {
+        matches!(
+            app.cell_at_virtual_index(idx),
+            Some(HistoryCell::Thinking { .. })
+        )
+    });
+    let (start, end) = selected
+        .map(|idx| turn_range_for_index(app, idx))
+        .unwrap_or_else(|| current_turn_range(app));
+    reasoning_timeline_text(app, selected, start, end)
+}
+
+/// Build the full recorded-reasoning text for a turn-scoped set of thinking
+/// cells. Only provider-supplied reasoning Codewhale actually recorded is
+/// shown; nothing is fabricated when a chunk is empty.
+pub(super) fn reasoning_timeline_text(
+    app: &App,
+    selected_cell_index: Option<usize>,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    let thinking_indices: Vec<usize> = (start..end)
         .filter(|&idx| {
             matches!(
                 app.cell_at_virtual_index(idx),
@@ -191,10 +115,12 @@ fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<Stri
         return None;
     }
 
-    let selected_position = thinking_indices
-        .iter()
-        .position(|&idx| idx == selected_cell_index)
-        .map(|idx| idx + 1);
+    let selected_position = selected_cell_index.and_then(|selected| {
+        thinking_indices
+            .iter()
+            .position(|&idx| idx == selected)
+            .map(|idx| idx + 1)
+    });
     let total = thinking_indices.len();
     let running = thinking_indices.iter().any(|&idx| {
         matches!(
@@ -260,7 +186,9 @@ fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<Stri
         };
         if let Some(duration_secs) = duration_secs {
             status.push_str(" · ");
-            status.push_str(&format!("{duration_secs:.1}s"));
+            status.push_str(&crate::elapsed::format_elapsed_ms(
+                (duration_secs * 1000.0) as u64,
+            ));
         }
         sections.push(format!("Thinking chunk {position} of {total}{marker}"));
         sections.push(format!("Status: {status}"));
@@ -276,7 +204,6 @@ fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<Stri
     Some(sections.join("\n"))
 }
 
-#[cfg(test)]
 fn thinking_chunk_preview(app: &App, cell_index: usize) -> String {
     let Some(HistoryCell::Thinking { content, .. }) = app.cell_at_virtual_index(cell_index) else {
         return "thinking".to_string();
@@ -307,40 +234,6 @@ fn activity_cell_label(app: &App, cell_index: usize, cell: &HistoryCell) -> Stri
     }
 }
 
-#[cfg(test)]
-fn activity_status_line(cell: &HistoryCell) -> Option<String> {
-    match cell {
-        HistoryCell::Thinking {
-            streaming,
-            duration_secs,
-            ..
-        } => {
-            let mut line = if *streaming {
-                "Status: running".to_string()
-            } else {
-                "Status: done".to_string()
-            };
-            if let Some(duration_secs) = duration_secs {
-                line.push_str(" · ");
-                line.push_str(&format!("{duration_secs:.1}s"));
-            }
-            Some(line)
-        }
-        HistoryCell::Tool(tool) => {
-            let status = tool_status_for_activity(tool)?;
-            let mut line = format!("Status: {}", activity_status_label(status));
-            if let Some(duration_ms) = tool_duration_for_activity(tool) {
-                line.push_str(" · ");
-                line.push_str(&format_activity_duration_ms(duration_ms));
-            }
-            Some(line)
-        }
-        HistoryCell::Error { severity, .. } => Some(format!("Status: {severity:?}")),
-        HistoryCell::SubAgent(_) => None,
-        _ => None,
-    }
-}
-
 fn tool_status_for_activity(tool: &ToolCell) -> Option<ToolStatus> {
     match tool {
         ToolCell::Exec(cell) => Some(cell.status),
@@ -360,6 +253,12 @@ fn tool_status_for_activity(tool: &ToolCell) -> Option<ToolStatus> {
             } else if cell
                 .entries
                 .iter()
+                .any(|entry| entry.status == ToolStatus::Warning)
+            {
+                Some(ToolStatus::Warning)
+            } else if cell
+                .entries
+                .iter()
                 .any(|entry| entry.status == ToolStatus::Hydrated)
             {
                 Some(ToolStatus::Hydrated)
@@ -370,7 +269,6 @@ fn tool_status_for_activity(tool: &ToolCell) -> Option<ToolStatus> {
         ToolCell::PlanUpdate(cell) => Some(cell.status),
         ToolCell::PatchSummary(cell) => Some(cell.status),
         ToolCell::Review(cell) => Some(cell.status),
-        ToolCell::DiffPreview(_) => Some(ToolStatus::Success),
         ToolCell::Mcp(cell) => Some(cell.status),
         ToolCell::ViewImage(_) => Some(ToolStatus::Success),
         ToolCell::WebSearch(cell) => Some(cell.status),
@@ -399,133 +297,24 @@ fn activity_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Running => "running",
         ToolStatus::Success => "done",
         ToolStatus::Hydrated => "tool loaded - retry required",
+        ToolStatus::Warning => "issue",
         ToolStatus::Failed => "failed",
     }
-}
-
-fn format_activity_duration_ms(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    }
-}
-
-#[cfg(test)]
-fn activity_indices(app: &App) -> Vec<usize> {
-    (0..app.virtual_cell_count())
-        .filter(|&idx| {
-            app.cell_at_virtual_index(idx)
-                .is_some_and(is_meaningful_activity_cell)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn activity_navigation_lines(
-    app: &App,
-    position: usize,
-    activity_indices: &[usize],
-) -> Vec<String> {
-    let total = activity_indices.len();
-    let mut lines = Vec::new();
-    if position > 0 {
-        let previous_idx = activity_indices[position - 1];
-        if let Some(cell) = app.cell_at_virtual_index(previous_idx) {
-            let label = activity_cell_label(app, previous_idx, cell);
-            lines.push(format!(
-                "Previous activity: {} of {total} - {}",
-                position,
-                truncate_line_to_width(&label, 56)
-            ));
-        }
-    }
-    if position + 1 < total {
-        let next_idx = activity_indices[position + 1];
-        if let Some(cell) = app.cell_at_virtual_index(next_idx) {
-            let label = activity_cell_label(app, next_idx, cell);
-            lines.push(format!(
-                "Next activity: {} of {total} - {}",
-                position + 2,
-                truncate_line_to_width(&label, 56)
-            ));
-        }
-    }
-    lines
-}
-
-#[cfg(test)]
-fn activity_detail_handle_line(app: &App, cell_index: usize, cell: &HistoryCell) -> Option<String> {
-    if let Some(detail) = app.tool_detail_record_for_cell(cell_index) {
-        if let Some(artifact) = app
-            .session_artifacts
-            .iter()
-            .find(|artifact| artifact.tool_call_id == detail.tool_id)
-        {
-            return Some(format!(
-                "Detail handle: {} (retrieve_tool_result ref={}; v raw details)",
-                artifact.id, artifact.id
-            ));
-        }
-        return Some(format!(
-            "Detail handle: tool:{} (v raw details)",
-            detail.tool_id
-        ));
-    }
-
-    match cell {
-        HistoryCell::Tool(_) => Some("Detail handle: v details".to_string()),
-        HistoryCell::SubAgent(_) => Some("Detail handle: v details".to_string()),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn activity_input_summary_line(cell: &HistoryCell) -> Option<String> {
-    let HistoryCell::Tool(ToolCell::Generic(generic)) = cell else {
-        return None;
-    };
-    let summary = generic.input_summary.as_deref()?.trim();
-    if summary.is_empty() {
-        None
-    } else {
-        Some(format!("Input: {summary}"))
-    }
-}
-
-#[cfg(test)]
-fn activity_cell_to_text(cell: &HistoryCell, width: u16) -> String {
-    let lines = match cell {
-        HistoryCell::Tool(_) => cell.lines_with_options(
-            width,
-            TranscriptRenderOptions {
-                calm_mode: true,
-                low_motion: true,
-                ..TranscriptRenderOptions::default()
-            },
-        ),
-        _ => cell.transcript_lines(width),
-    };
-    lines
-        .iter()
-        .map(line_to_plain)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Empty-state hint shown when the selection has no raw leaf detail to open.
 /// `v` / `Alt+V` only ever surface the raw detail of the ONE selected
 /// tool/card/leaf, so when there is nothing leaf-level to show we point the
-/// user at Ctrl+O for the whole-turn context instead of failing silently
+/// user at Ctrl+Alt+O for the whole-turn context instead of failing silently
 /// (#4105).
 const NO_RAW_DETAIL_HINT: &str =
-    "No raw detail for this item — press Ctrl+O for the turn overview.";
+    "No raw detail for this item — press Ctrl+Alt+O for the turn overview.";
 
 /// Intro line prepended to the raw tool-detail pager body so the surface reads
-/// as the raw detail of the single selected item — not the whole turn. Ctrl+O
-/// remains the whole-turn Turn Inspector (#4105).
+/// as the raw detail of the single selected item — not the whole turn.
+/// Ctrl+Alt+O is now the whole-turn Turn Inspector (#v092-reasoning-fix).
 const RAW_DETAIL_PAGER_INTRO: &str =
-    "Raw detail for the selected item — press Ctrl+O for the whole-turn overview.";
+    "Raw detail for the selected item — press Ctrl+Alt+O for the whole-turn overview.";
 
 pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
     let target_cell = detail_target_cell_index(app);
@@ -538,30 +327,92 @@ pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
 }
 
 /// Build the trailing "Spillover" section for the tool-details pager
-/// (#500). Returns `None` when the cell at `cell_index` is not a
-/// `GenericToolCell` with a recorded spillover path, or when the
-/// spillover file is missing or unreadable. Failures fall back to a
-/// short notice in the section so the user understands why the full
-/// content can't be loaded — better than silent truncation.
+/// (#500). Session artifact records are authoritative for every tool family
+/// (including specialized Bash and MCP cells); the historical generic-cell
+/// path is only a UI compatibility fallback. The pager deliberately keeps the
+/// backing path and operating-system error private: a detail surface may be
+/// captured or shared, and neither is useful evidence for the user.
 pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<String> {
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell};
 
     let cell = app.cell_at_virtual_index(cell_index)?;
-    let HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-        spillover_path: Some(path),
-        ..
-    })) = cell
-    else {
+    let current_session = app.current_session_id.as_deref();
+    let session_artifact = app
+        .tool_detail_record_for_cell(cell_index)
+        .and_then(|detail| {
+            app.session_artifacts.iter().find(|artifact| {
+                artifact.kind == crate::artifacts::ArtifactKind::ToolOutput
+                    && artifact.tool_call_id == detail.tool_id
+                    && current_session == Some(artifact.session_id.as_str())
+            })
+        });
+    let legacy_path = match cell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            spillover_path: Some(path),
+            ..
+        })) => Some(path.clone()),
+        _ => None,
+    };
+    if session_artifact.is_none() && legacy_path.is_none() {
         return None;
-    };
-    let path_str = path.display().to_string();
-    let body = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) => format!("(could not read spillover file: {err})"),
-    };
-    Some(format!(
-        "── Full output (spillover) ──\nFile: {path_str}\n\n{body}"
-    ))
+    }
+    let body = session_artifact
+        .and_then(read_owned_session_artifact)
+        .or_else(|| {
+            legacy_path.as_deref().and_then(|path| {
+                current_session.and_then(|session_id| read_owned_legacy_spillover(path, session_id))
+            })
+        })
+        .unwrap_or_else(|| "(retained output is unavailable)".to_string());
+    Some(format!("── Full output ──\n\n{body}"))
+}
+
+fn read_owned_session_artifact(artifact: &crate::artifacts::ArtifactRecord) -> Option<String> {
+    if artifact.storage_path.is_absolute() {
+        return None;
+    }
+    let root = crate::artifacts::session_artifact_absolute_path(
+        &artifact.session_id,
+        std::path::Path::new(crate::artifacts::ARTIFACTS_DIR_NAME),
+    )?;
+    let candidate = crate::artifacts::session_artifact_absolute_path(
+        &artifact.session_id,
+        &artifact.storage_path,
+    )?;
+    let path = canonical_owned_file(&candidate, &root)?;
+    std::fs::read_to_string(path).ok()
+}
+
+fn read_owned_legacy_spillover(path: &std::path::Path, session_id: &str) -> Option<String> {
+    let root = crate::tools::truncate::spillover_root()?;
+    let path = canonical_owned_file(path, &root)?;
+    let ownership = crate::tools::truncate::read_legacy_spillover_ownership(&path).ok()?;
+    if ownership.origin_session != session_id {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if ownership.size_bytes != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || ownership.digest != crate::hashing::sha256_hex(&bytes)
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn canonical_owned_file(
+    candidate: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if std::fs::symlink_metadata(candidate)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
 }
 
 pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
@@ -579,15 +430,27 @@ pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> b
         // stays above as `Output:` so the user can compare what the
         // model received against the full payload.
         let spillover_section = spillover_pager_section(app, cell_index);
+        let mutation_section = match app.cell_at_virtual_index(cell_index) {
+            Some(HistoryCell::Tool(ToolCell::PatchSummary(cell))) => cell
+                .receipt
+                .as_ref()
+                .map(|receipt| format!("── Exact File change ──\n{}", receipt.inspect_text())),
+            _ => None,
+        };
 
         // Frame the body as leaf-level raw detail for the selected item. The
         // Tool ID / Input / Output / spillover content below is unchanged — only
         // the leading intro line is new, so existing raw-output visibility is
         // preserved (#4105).
-        let content = if let Some(section) = spillover_section {
+        let trailing_sections = [mutation_section, spillover_section]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let content = if !trailing_sections.is_empty() {
             format!(
                 "{RAW_DETAIL_PAGER_INTRO}\n\nTool ID: {}\nTool: {}\n\nInput:\n{}\n\nOutput:\n{}\n\n{}",
-                detail.tool_id, detail.tool_name, input, output, section
+                detail.tool_id, detail.tool_name, input, output, trailing_sections
             )
         } else {
             format!(
@@ -629,11 +492,14 @@ pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> b
         .map(|area| area.width)
         .unwrap_or(80);
     let content = history_cell_to_text(cell, width);
-    app.view_stack.push(PagerView::from_text(
-        title,
-        &content,
-        width.saturating_sub(2),
-    ));
+    let mut pager = PagerView::from_text(title, &content, width.saturating_sub(2));
+    // A completed assistant cell gets a clean `a` (copy answer) action so
+    // this raw-detail pager can hand over the answer text without the
+    // glyph/label scaffolding that `c`/`y` (rendered body) would include.
+    if let Some(answer) = completed_assistant_answer_text(cell, width) {
+        pager = pager.with_copy_answer(answer);
+    }
+    app.view_stack.push(pager);
     true
 }
 
@@ -659,7 +525,7 @@ pub(crate) fn copy_cell_to_clipboard(app: &mut App, cell_index: usize) -> bool {
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(80);
-    let text = history_cell_to_text(cell, width);
+    let text = history_cell_to_clipboard_text(cell, width);
     if text.trim().is_empty() {
         app.status_message = Some("Message is empty".to_string());
         return false;
@@ -673,6 +539,29 @@ pub(crate) fn copy_cell_to_clipboard(app: &mut App, cell_index: usize) -> bool {
     }
 }
 
+/// Clean clipboard payload for a completed assistant answer cell.
+///
+/// Selection reuses the typed `HistoryCell::is_completed_assistant_answer`
+/// projection so reasoning/thinking blocks, tool calls and results, runtime
+/// status, and still-streaming partials never qualify; serialization reuses
+/// `history_cell_to_clipboard_text`, the canonical clean-copy path that
+/// returns the authored assistant Markdown with no glyph/label scaffolding.
+pub(crate) fn completed_assistant_answer_text(cell: &HistoryCell, width: u16) -> Option<String> {
+    cell.is_completed_assistant_answer()
+        .then(|| history_cell_to_clipboard_text(cell, width))
+}
+
+/// Latest completed assistant answer inside the virtual-cell range
+/// `[start, end)` — the payload behind the Turn Inspector's `a` (copy
+/// answer) action. Scanning backwards keeps each inspector page scoped to
+/// its own turn, so the latest page carries the latest completed answer.
+fn turn_answer_payload(app: &App, start: usize, end: usize, width: u16) -> Option<String> {
+    (start..end).rev().find_map(|idx| {
+        app.cell_at_virtual_index(idx)
+            .and_then(|cell| completed_assistant_answer_text(cell, width))
+    })
+}
+
 pub(super) fn detail_target_cell_index(app: &App) -> Option<usize> {
     if let Some((start, _)) = app.viewport.transcript_selection.ordered_endpoints() {
         return app
@@ -683,64 +572,12 @@ pub(super) fn detail_target_cell_index(app: &App) -> Option<usize> {
             .and_then(|meta| meta.cell_line())
             .map(|(cell_index, _)| app.original_cell_index_for_rendered(cell_index));
     }
-
     app.detail_cell_index_for_viewport(
         app.viewport.last_transcript_top,
         app.viewport.last_transcript_visible.max(1),
         app.viewport.transcript_cache.line_meta(),
     )
-    .or_else(|| app.history.len().checked_sub(1))
-}
-
-pub(crate) fn selected_detail_footer_label(app: &App) -> Option<String> {
-    if app.viewport.transcript_selection.is_active() {
-        return None;
-    }
-    let cell_index = activity_footer_target_cell_index(app)?;
-    let cell = app.cell_at_virtual_index(cell_index)?;
-    let label = truncate_line_to_width(&activity_cell_label(app, cell_index, cell), 30);
-    let detail_hint = if app.cell_has_detail_target(cell_index) {
-        let noun = if matches!(cell, HistoryCell::SubAgent(_)) {
-            "details"
-        } else {
-            "raw details"
-        };
-        format!(
-            " · {}",
-            key_shortcuts::tool_details_shortcut_action_hint(noun)
-        )
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "{} Turn Inspector · {label}{detail_hint}",
-        key_shortcuts::activity_shortcut_label()
-    ))
-}
-
-fn activity_footer_target_cell_index(app: &App) -> Option<usize> {
-    let line_meta = app.viewport.transcript_cache.line_meta();
-    let start = app
-        .viewport
-        .last_transcript_top
-        .min(line_meta.len().saturating_sub(1));
-    let end = start
-        .saturating_add(app.viewport.last_transcript_visible.max(1))
-        .min(line_meta.len());
-    for meta in line_meta.iter().take(end).skip(start) {
-        let Some((cell_index, _)) = meta.cell_line() else {
-            continue;
-        };
-        let cell_index = app.original_cell_index_for_rendered(cell_index);
-        if app
-            .cell_at_virtual_index(cell_index)
-            .is_some_and(is_meaningful_activity_cell)
-        {
-            return Some(cell_index);
-        }
-    }
-
-    activity_target_cell_index(app)
+    .or_else(|| app.virtual_cell_count().checked_sub(1))
 }
 
 pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String> {
@@ -757,7 +594,7 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
             explore.entries.len(),
             if explore.entries.len() == 1 { "" } else { "s" }
         )),
-        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("update Strategy".to_string()),
+        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("legacy plan update".to_string()),
         HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(format!("patch {}", patch.path)),
         HistoryCell::Tool(ToolCell::Review(review)) => {
             let target = one_line_summary(&review.target, 80);
@@ -767,7 +604,6 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
                 format!("review {target}")
             })
         }
-        HistoryCell::Tool(ToolCell::DiffPreview(diff)) => Some(format!("diff {}", diff.title)),
         HistoryCell::Tool(ToolCell::Mcp(mcp)) => Some(format!("tool {}", mcp.tool)),
         HistoryCell::Tool(ToolCell::ViewImage(image)) => {
             Some(format!("image {}", image.path.display()))
@@ -780,6 +616,7 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
             ),
         ),
         HistoryCell::SubAgent(_) => Some("sub-agent".to_string()),
+        HistoryCell::Error { .. } => Some("full error message".to_string()),
         _ => None,
     }
 }
@@ -822,16 +659,59 @@ pub(super) fn open_turn_inspector_pager(app: &mut App) -> bool {
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(80);
-    let text = turn_inspector_text(app);
-    // Precompute the compact Markdown handoff (#4108) and attach it so the
-    // pager's `e` key can copy a pasteable artifact without reaching back into
-    // `app`. Reuses the same turn scope + section data as the overview above.
-    let handoff = turn_handoff_markdown(app);
-    app.view_stack.push(
-        PagerView::from_text("Turn Inspector", &text, width.saturating_sub(2))
-            .with_export_markdown(handoff),
-    );
+    let ranges = turn_ranges(app);
+    let page_count = ranges.len();
+    let pages = ranges
+        .into_iter()
+        .enumerate()
+        .map(|(page_index, (start, end))| {
+            let latest = page_index + 1 == page_count;
+            let text =
+                turn_inspector_text_for_range(app, start, end, page_index, page_count, latest);
+            let page = PagerPage::from_text("Turn Inspector", &text, width.saturating_sub(2))
+                .with_copy_text(text);
+            // `a` copies only this turn's final assistant answer — the clean
+            // counterpart to `e` (whole-turn handoff markdown).
+            let page = match turn_answer_payload(app, start, end, width) {
+                Some(answer) => page.with_copy_answer(answer),
+                None => page,
+            };
+            if latest {
+                // The existing handoff remains attached only to the
+                // current/latest turn it actually describes.
+                page.with_export_markdown(turn_handoff_markdown(app))
+            } else {
+                page
+            }
+        })
+        .collect();
+    app.view_stack
+        .push(PagerView::from_pages(pages, page_count.saturating_sub(1)));
     true
+}
+
+/// Chronological virtual-cell ranges for every recorded turn. A transcript
+/// without a user prompt still gets one coherent page, matching the previous
+/// Turn Inspector empty/degraded behavior.
+fn turn_ranges(app: &App) -> Vec<(usize, usize)> {
+    let end = app.virtual_cell_count();
+    let starts: Vec<usize> = (0..end)
+        .filter(|&idx| {
+            matches!(
+                app.cell_at_virtual_index(idx),
+                Some(HistoryCell::User { .. })
+            )
+        })
+        .collect();
+    if starts.is_empty() {
+        return vec![(0, end)];
+    }
+    starts
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, start)| (start, starts.get(idx + 1).copied().unwrap_or(end)))
+        .collect()
 }
 
 /// Virtual-cell range `[start, end)` of the turn under inspection.
@@ -872,14 +752,38 @@ fn short_turn_id(turn_id: &str) -> &str {
 }
 
 /// Assemble the Turn Inspector overview text from all available turn data.
+#[cfg(test)]
 pub(super) fn turn_inspector_text(app: &App) -> String {
     let (start, end) = current_turn_range(app);
+    turn_inspector_text_for_range(app, start, end, 0, 1, true)
+}
+
+fn turn_inspector_text_for_range(
+    app: &App,
+    start: usize,
+    end: usize,
+    page_index: usize,
+    page_count: usize,
+    latest: bool,
+) -> String {
     let mut out: Vec<String> = Vec::new();
 
     // Turn identity header. Lead with the human turn number and status; the
     // id is a short correlation suffix, never a raw UUID dump (dogfood A6).
-    let status = humanized_turn_status(app);
-    if app.turn_counter > 0 {
+    let status = if latest {
+        std::borrow::Cow::Borrowed(humanized_turn_status(app))
+    } else {
+        tr(app.ui_locale, MessageId::AutomationRunStatusCompleted)
+    };
+    if !latest {
+        let historical_offset = page_count.saturating_sub(page_index + 1) as u64;
+        let number = app
+            .turn_counter
+            .checked_sub(historical_offset)
+            .filter(|number| *number > 0)
+            .unwrap_or(page_index as u64 + 1);
+        out.push(format!("Turn #{number} \u{00B7} {status}"));
+    } else if app.turn_counter > 0 {
         let mut line = format!("Turn #{} \u{00B7} {status}", app.turn_counter);
         if let Some(turn_id) = app.runtime_turn_id.as_ref() {
             line.push_str(&format!(" \u{00B7} id {}", short_turn_id(turn_id)));
@@ -890,45 +794,152 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     } else {
         out.push("Turn: \u{2014} (no turn recorded yet)".to_string());
     }
-    // Restate the Ctrl+O (overview) vs. `v` (raw leaf detail) contract so the
-    // two surfaces never get confused.
-    out.push(
-        "Overview of the current/latest turn · press v for the selected item's raw detail"
-            .to_string(),
+    // Restate the Ctrl+O (overview) vs. Alt+V/⌥V (raw leaf detail) contract so
+    // the two surfaces never get confused. Bare `v` is never a details shortcut.
+    let details = crate::tui::shell_key_routing::display_chord(
+        crate::tui::shell_key_routing::binding(
+            crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+        )
+        .footer_chord,
     );
+    if latest {
+        out.push(format!(
+            "Overview of the current/latest turn · press {details} for the selected item's raw detail"
+        ));
+    }
 
     push_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
-    if let Some(line) = selected_item_context_line(app) {
+    if latest && let Some(line) = selected_item_context_line(app) {
         push_section(&mut out, "Selected item", vec![line]);
     }
 
-    push_section(&mut out, "Strategy / To-do", turn_plan_lines(app));
     push_section(
         &mut out,
-        "Turn timeline",
-        turn_timeline_lines(app, start, end),
+        "To-do",
+        if latest {
+            turn_todo_lines(app)
+        } else {
+            Vec::new()
+        },
     );
+    let mut timeline = turn_full_conversation_lines(app, start, end);
+    if !timeline.is_empty() {
+        timeline.push(String::new());
+    }
+    timeline.extend(turn_timeline_lines(app, start, end));
+    push_section(&mut out, "Turn timeline", timeline);
     push_section(
         &mut out,
         "Files changed",
         turn_files_changed(app, start, end),
     );
-    push_section(&mut out, "Diagnostics loop", turn_diagnostics_lines(app));
+    push_section(
+        &mut out,
+        "Diagnostics loop",
+        if latest {
+            turn_diagnostics_lines(app)
+        } else {
+            Vec::new()
+        },
+    );
     push_section(
         &mut out,
         "Tests / verifier",
         turn_verifier_lines(app, start, end),
     );
-    push_section(&mut out, "Approvals / denials", turn_approvals_lines(app));
-    push_section(&mut out, "Model route + tokens/cost", turn_route_lines(app));
+    push_section(
+        &mut out,
+        "Approvals / denials",
+        if latest {
+            turn_approvals_lines(app)
+        } else {
+            Vec::new()
+        },
+    );
+    push_section(
+        &mut out,
+        "Model route + tokens/cost",
+        if latest {
+            turn_route_lines(app)
+        } else {
+            Vec::new()
+        },
+    );
     push_section(
         &mut out,
         "Final result / status",
-        turn_result_lines(app, start, end),
+        turn_result_lines(app, start, end, ResultDetail::Full),
     );
 
     out.join("\n")
+}
+
+/// Source-faithful, turn-scoped transcript for the inspector page. The normal
+/// transcript can stay compact/folded; this explicit detail surface preserves
+/// complete recorded input, reasoning, tool results, and assistant output.
+fn turn_full_conversation_lines(app: &App, start: usize, end: usize) -> Vec<String> {
+    let thinking_total = (start..end)
+        .filter(|&idx| {
+            matches!(
+                app.cell_at_virtual_index(idx),
+                Some(HistoryCell::Thinking { .. })
+            )
+        })
+        .count();
+    let mut thinking_position = 0usize;
+    let mut out = Vec::new();
+
+    for idx in start..end {
+        let Some(cell) = app.cell_at_virtual_index(idx) else {
+            continue;
+        };
+        let tag = match cell {
+            HistoryCell::User { .. } => "[›]".to_string(),
+            HistoryCell::Thinking { streaming, .. } => {
+                thinking_position += 1;
+                format!(
+                    "[∿ {} {thinking_position}/{thinking_total} · {}]",
+                    tr(app.ui_locale, MessageId::PhaseReasoning),
+                    tr(
+                        app.ui_locale,
+                        if *streaming {
+                            MessageId::AutomationRunStatusRunning
+                        } else {
+                            MessageId::PhaseDone
+                        }
+                    )
+                )
+            }
+            HistoryCell::Tool(_) => format!("[⚙ {}]", tr(app.ui_locale, MessageId::PhaseUsingTool)),
+            HistoryCell::SubAgent(_) => "[↗]".to_string(),
+            HistoryCell::Assistant { streaming, .. } => format!(
+                "[◆ · {}]",
+                tr(
+                    app.ui_locale,
+                    if *streaming {
+                        MessageId::AutomationRunStatusRunning
+                    } else {
+                        MessageId::PhaseDone
+                    }
+                )
+            ),
+            HistoryCell::Error { .. } => "[!]".to_string(),
+            HistoryCell::System { .. } | HistoryCell::ArchivedContext { .. } => "[i]".to_string(),
+        };
+        if !out.is_empty() {
+            out.push(String::new());
+        }
+        out.push(tag);
+        let body = history_cell_to_clipboard_text(cell, 120);
+        if body.trim().is_empty() {
+            out.push("—".to_string());
+        } else {
+            out.push(body);
+        }
+    }
+
+    out
 }
 
 /// Build a compact, pasteable Markdown handoff of the current/latest turn
@@ -969,11 +980,11 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
 
     push_md_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
-    // Strategy / To-do is optional context: include it only when a plan or
-    // To-do tool actually ran, to keep the handoff compact.
-    let plan = turn_plan_lines(app);
-    if !plan.is_empty() {
-        push_md_section(&mut out, "Strategy / To-do", md_bullets(plan));
+    // To-do is optional context: include it only when the canonical list has
+    // items, keeping the handoff compact without recreating a second plan.
+    let todos = turn_todo_lines(app);
+    if !todos.is_empty() {
+        push_md_section(&mut out, "To-do", md_bullets(todos));
     }
 
     push_md_section(
@@ -999,7 +1010,7 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
     push_md_section(
         &mut out,
         "Result / status",
-        md_bullets(turn_result_lines(app, start, end)),
+        md_bullets(turn_result_lines(app, start, end, ResultDetail::Compact)),
     );
 
     // Trailing newline keeps the artifact clean when pasted into a PR body.
@@ -1064,61 +1075,38 @@ fn turn_intent_line(app: &App, start: usize) -> String {
 }
 
 /// Optional selected-item context. The first view is the turn overview, but
-/// when the user has an activity cell selected we surface it plus the `v`
-/// affordance so the Ctrl+O / `v` split stays discoverable.
+/// when the user has an activity cell selected we surface it plus the Alt+V
+/// affordance so the Ctrl+O / Alt+V split stays discoverable.
 fn selected_item_context_line(app: &App) -> Option<String> {
     let idx = selected_transcript_cell_index(app)?;
     let cell = app.cell_at_virtual_index(idx)?;
     let label = truncate_line_to_width(&activity_cell_label(app, idx, cell), 48);
     let hint = if app.cell_has_detail_target(idx) {
-        " · v opens its raw detail"
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        if matches!(cell, HistoryCell::Error { .. }) {
+            format!(" · {details} opens the full error")
+        } else {
+            format!(" · {details} opens its raw detail")
+        }
     } else {
-        ""
+        String::new()
     };
     Some(format!("{label}{hint}"))
 }
 
-/// Section 2 — Strategy metadata and/or To-do state when those tools ran.
-fn turn_plan_lines(app: &App) -> Vec<String> {
+/// Section 2 — canonical To-do state.
+fn turn_todo_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
-
-    if let Ok(plan) = app.plan_state.try_lock()
-        && !plan.is_empty()
-    {
-        let snapshot = plan.snapshot();
-        let headline = snapshot
-            .title
-            .as_deref()
-            .or(snapshot.objective.as_deref())
-            .map(str::trim)
-            .filter(|s: &&str| !s.is_empty());
-        if let Some(headline) = headline {
-            lines.push(format!(
-                "Strategy: {}",
-                truncate_line_to_width(headline, 64)
-            ));
-        }
-        let (pending, in_progress, completed) = plan.counts();
-        let total = pending + in_progress + completed;
-        if total > 0 {
-            lines.push(format!(
-                "Route steps: {completed}/{total} done ({}%)",
-                plan.progress_percent()
-            ));
-        }
-        for item in &snapshot.items {
-            lines.push(format!(
-                "{} {}",
-                step_status_glyph(&item.status),
-                truncate_line_to_width(&item.step, 72)
-            ));
-        }
-    }
 
     if let Ok(todos) = app.todos.try_lock() {
         let snapshot = todos.snapshot();
         if !snapshot.items.is_empty() {
-            lines.push(format!("To-do: {}% complete", snapshot.completion_pct));
+            lines.push(format!("To-do: {}% settled", snapshot.completion_pct));
             for item in &snapshot.items {
                 lines.push(format!(
                     "{} {}",
@@ -1132,19 +1120,12 @@ fn turn_plan_lines(app: &App) -> Vec<String> {
     lines
 }
 
-fn step_status_glyph(status: &crate::tools::plan::StepStatus) -> &'static str {
-    match status {
-        crate::tools::plan::StepStatus::Completed => "[x]",
-        crate::tools::plan::StepStatus::InProgress => "[~]",
-        crate::tools::plan::StepStatus::Pending => "[ ]",
-    }
-}
-
 fn todo_status_glyph(status: &crate::tools::todo::TodoStatus) -> &'static str {
     match status {
         crate::tools::todo::TodoStatus::Completed => "[x]",
         crate::tools::todo::TodoStatus::InProgress => "[~]",
         crate::tools::todo::TodoStatus::Pending => "[ ]",
+        crate::tools::todo::TodoStatus::Cancelled => "[-]",
     }
 }
 
@@ -1167,7 +1148,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             } => {
                 let summary = one_line_summary(content, 88);
                 let status = streaming.then_some("running").unwrap_or("done");
-                let duration = duration_secs.map(|secs| format!("{secs:.1}s"));
+                let duration = duration_secs
+                    .map(|secs| crate::elapsed::format_elapsed_ms((secs * 1000.0) as u64));
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     "reasoning",
@@ -1179,7 +1161,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             }
             HistoryCell::Tool(tool) => {
                 let (kind, summary) = timeline_tool_summary(app, idx, tool);
-                let duration = tool_duration_for_activity(tool).map(format_activity_duration_ms);
+                let duration =
+                    tool_duration_for_activity(tool).map(crate::elapsed::format_elapsed_ms);
                 let status = tool_status_for_activity(tool).map(activity_status_label);
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
@@ -1241,7 +1224,7 @@ fn timeline_tool_summary(app: &App, idx: usize, tool: &ToolCell) -> (&'static st
                 if explore.entries.len() == 1 { "" } else { "s" }
             ),
         ),
-        ToolCell::PlanUpdate(_) => ("Strategy", "Strategy metadata updated".to_string()),
+        ToolCell::PlanUpdate(_) => ("legacy plan", "Legacy plan metadata replayed".to_string()),
         ToolCell::PatchSummary(patch) => {
             let summary = one_line_summary(&patch.summary, 72);
             if summary.is_empty() {
@@ -1264,7 +1247,6 @@ fn timeline_tool_summary(app: &App, idx: usize, tool: &ToolCell) -> (&'static st
                 },
             )
         }
-        ToolCell::DiffPreview(diff) => ("diff", truncate_line_to_width(&diff.title, 88)),
         ToolCell::Mcp(mcp) => ("MCP tool", truncate_line_to_width(&mcp.tool, 88)),
         ToolCell::ViewImage(image) => (
             "image",
@@ -1313,16 +1295,29 @@ fn generic_tool_timeline_kind(generic: &crate::tui::history::GenericToolCell) ->
     }
 }
 
-fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<&'static str> {
+fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<String> {
     let mut actions = Vec::new();
     if app.cell_has_detail_target(idx) {
-        actions.push("v raw detail");
-    }
-    match cell {
-        HistoryCell::Tool(ToolCell::DiffPreview(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::PatchSummary(_)) => actions.push("d diff"),
-        HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff => actions.push("d diff"),
-        _ => {}
+        let details = crate::tui::shell_key_routing::display_chord(
+            crate::tui::shell_key_routing::binding(
+                crate::tui::shell_key_routing::ShellBindingId::ToolDetails,
+            )
+            .footer_chord,
+        );
+        // Diff-bearing cells open their diff through the same details chord;
+        // bare `v` / `d` always type text (TUI-DOG-002), so no bare-key claim.
+        let is_diff = matches!(cell, HistoryCell::Tool(ToolCell::PatchSummary(_)))
+            || matches!(
+                cell,
+                HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff
+            );
+        if is_diff {
+            actions.push(format!("{details} diff"));
+        } else if matches!(cell, HistoryCell::Error { .. }) {
+            actions.push(format!("{details} full error"));
+        } else {
+            actions.push(format!("{details} raw detail"));
+        }
     }
     actions
 }
@@ -1332,7 +1327,7 @@ fn timeline_row(
     summary: &str,
     status: Option<&str>,
     duration: Option<&str>,
-    actions: &[&str],
+    actions: &[String],
 ) -> String {
     let mut line = if summary.trim().is_empty() {
         kind.to_string()
@@ -1419,12 +1414,6 @@ fn turn_files_changed(app: &App, start: usize, end: usize) -> Vec<String> {
                     "• {} — {}",
                     truncate_line_to_width(&patch.path, 60),
                     activity_status_label(patch.status)
-                ));
-            }
-            ToolCell::DiffPreview(diff) if seen.insert(diff.title.clone()) => {
-                lines.push(format!(
-                    "• {} (diff)",
-                    truncate_line_to_width(&diff.title, 60)
                 ));
             }
             _ => {}
@@ -1555,13 +1544,50 @@ fn turn_route_lines(app: &App) -> Vec<String> {
         .as_ref()
         .and_then(|turn| turn.route.as_ref())
     {
-        (route.provider.display_name(), route.model.clone())
-    } else if let Some((provider, model, _auto_model)) = app.pending_turn_route.as_ref() {
-        (provider.display_name(), model.clone())
+        let provider = if route.provider == crate::config::ApiProvider::Custom {
+            route.provider_identity.clone()
+        } else {
+            route.provider.display_name().to_string()
+        };
+        (provider, route.model.clone())
     } else {
-        (app.api_provider.display_name(), app.model.clone())
+        // Pending and last Auto routes use the same billing-authoritative
+        // display contract as the header; do not fall back to `auto` after the
+        // concrete turn route has resolved.
+        app.effective_route_identity_display()
     };
     lines.push(format!("Route: {provider} · {model}"));
+
+    let auto_receipt = app
+        .active_turn
+        .as_ref()
+        .filter(|turn| turn.route.as_ref().is_some_and(|route| route.auto_model))
+        .and_then(|turn| turn.auto_route_receipt.as_ref())
+        .or_else(|| {
+            app.pending_turn_route
+                .as_ref()
+                .filter(|(_, _, auto_model)| *auto_model)
+                .and(app.pending_auto_route_receipt.as_ref())
+        })
+        .or_else(|| {
+            app.auto_model
+                .then_some(app.last_auto_route_receipt.as_ref())
+                .flatten()
+        });
+    if let Some(receipt) = auto_receipt {
+        lines.push(format!(
+            "Auto decision: {} · {}",
+            receipt.tier.label(),
+            receipt.reason.label()
+        ));
+        let pair = receipt.pair.fast.as_deref().map_or_else(
+            || format!("{} (no runnable fast sibling)", receipt.pair.strong),
+            |fast| format!("{} strong · {fast} fast", receipt.pair.strong),
+        );
+        lines.push(format!("Auto pair: {pair}"));
+        lines.push(format!("Auto scope: {}", receipt.scope.label()));
+        lines.push(format!("Auto data: {}", receipt.data_path.label()));
+    }
 
     let session = &app.session;
     match (session.last_prompt_tokens, session.last_completion_tokens) {
@@ -1579,18 +1605,16 @@ fn turn_route_lines(app: &App) -> Vec<String> {
         }
     }
 
-    let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    let chip = crate::route_billing::usage_chip(
-        app.billing_presentation,
-        app.api_provider,
-        &app.model,
-        cost,
-        app.cost_currency,
-        None,
-    );
-    match chip {
+    let chip = app.cumulative_usage_chip();
+    match &chip {
         crate::route_billing::UsageChip::Money(amount) => {
             lines.push(format!("Cost (session): {amount}"));
+        }
+        crate::route_billing::UsageChip::PricedSubtotal { .. } => {
+            lines.push(format!(
+                "Cost (session): {}",
+                crate::route_billing::format_usage_chip(&chip).unwrap_or_default()
+            ));
         }
         crate::route_billing::UsageChip::Allowance { label, used_pct } => {
             lines.push(match used_pct {
@@ -1610,8 +1634,27 @@ fn turn_route_lines(app: &App) -> Vec<String> {
     lines
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultDetail {
+    /// Pager content is the review surface and must retain the complete final
+    /// response. Width wrapping belongs to `PagerView`, not data assembly.
+    Full,
+    /// The exported handoff is intentionally a compact overview.
+    Compact,
+}
+
+fn cleaned_turn_text(text: &str, detail: ResultDetail, max_width: usize) -> String {
+    if detail == ResultDetail::Compact {
+        return one_line_summary(text, max_width);
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
+    cleaned.trim().to_string()
+}
+
 /// Section 9 — final result / current status.
-fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
+fn turn_result_lines(app: &App, start: usize, end: usize, detail: ResultDetail) -> Vec<String> {
     let mut lines = Vec::new();
 
     let status = match app.runtime_turn_status.as_deref() {
@@ -1625,8 +1668,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Assistant { content, .. }) => {
-                let summary = one_line_summary(content, 200);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(content, detail, 200);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1642,8 +1685,8 @@ fn turn_result_lines(app: &App, start: usize, end: usize) -> Vec<String> {
         .rev()
         .find_map(|idx| match app.cell_at_virtual_index(idx) {
             Some(HistoryCell::Error { message, .. }) => {
-                let summary = one_line_summary(message, 160);
-                (!summary.is_empty()).then_some(summary)
+                let text = cleaned_turn_text(message, detail, 160);
+                (!text.is_empty()).then_some(text)
             }
             _ => None,
         });
@@ -1664,24 +1707,8 @@ mod tests {
     fn test_app() -> App {
         let options = TuiOptions {
             model: "deepseek-v4-flash".to_string(),
-            workspace: PathBuf::from("."),
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
             start_in_agent_mode: true,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
         App::new(options, &Config::default())
     }
@@ -1714,5 +1741,265 @@ mod tests {
         );
         assert!(joined.contains("Model attempted a repair"), "{joined}");
         assert!(joined.contains("still failing"), "{joined}");
+    }
+
+    #[test]
+    fn turn_route_lines_include_truthful_auto_receipt() {
+        let mut app = test_app();
+        app.auto_model = true;
+        app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+        app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
+        app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
+            tier: crate::model_routing::AutoRouteTier::Fast,
+            pair: crate::model_routing::AutoRoutePair {
+                strong: crate::config::ZAI_GLM_5_2_MODEL.to_string(),
+                fast: Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string()),
+            },
+            scope: crate::model_routing::AutoRouteScope::RunnableProviders,
+            data_path: crate::model_routing::AutoRouteDataPath::Classifier {
+                provider: crate::config::ApiProvider::Deepseek,
+                model: "deepseek-v4-flash".to_string(),
+            },
+            reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,
+        });
+
+        let joined = turn_route_lines(&app).join("\n");
+
+        assert!(joined.contains("Route: Zhipu AI / Z.ai · GLM-5-Turbo"));
+        assert!(joined.contains("Auto decision: fast · classifier recommendation"));
+        assert!(joined.contains("GLM-5.2 strong · GLM-5-Turbo fast"));
+        assert!(joined.contains("Auto scope: runnable providers"));
+        assert!(joined.contains(
+            "Auto data: latest request + bounded recent context -> DeepSeek / deepseek-v4-flash"
+        ));
+        assert!(!joined.contains("API_KEY"));
+    }
+
+    #[test]
+    fn reasoning_detail_text_empty_when_no_thinking() {
+        let app = test_app();
+        assert!(reasoning_detail_text(&app).is_none());
+    }
+
+    #[test]
+    fn reasoning_detail_text_includes_active_cell_reasoning() {
+        let mut app = test_app();
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_thinking(HistoryCell::Thinking {
+            content: "active reasoning one".to_string(),
+            streaming: true,
+            duration_secs: None,
+        });
+        active.push_thinking(HistoryCell::Thinking {
+            content: "active reasoning two".to_string(),
+            streaming: false,
+            duration_secs: Some(1.0),
+        });
+        app.active_cell = Some(active);
+        app.runtime_turn_id = Some("turn-active-123".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+
+        let body = reasoning_detail_text(&app).expect("active reasoning should produce detail");
+        assert!(body.contains("Thinking chunk 1 of 2"), "{body}");
+        assert!(body.contains("Thinking chunk 2 of 2"), "{body}");
+        assert!(body.contains("active reasoning one"), "{body}");
+        assert!(body.contains("active reasoning two"), "{body}");
+        assert!(body.contains("running"), "{body}");
+    }
+
+    #[test]
+    fn reasoning_detail_text_scopes_to_latest_turn_without_selection() {
+        let mut app = test_app();
+        app.history = vec![
+            HistoryCell::User {
+                content: "first prompt".to_string(),
+            },
+            HistoryCell::Thinking {
+                content: "first turn reasoning".to_string(),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Assistant {
+                content: "first reply".to_string(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".to_string(),
+            },
+            HistoryCell::Thinking {
+                content: "second turn reasoning".to_string(),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Assistant {
+                content: "second reply".to_string(),
+                streaming: false,
+            },
+        ];
+        app.resync_history_revisions();
+
+        let body =
+            reasoning_detail_text(&app).expect("latest turn reasoning should produce detail");
+        assert!(body.contains("second turn reasoning"), "{body}");
+        assert!(
+            !body.contains("first turn reasoning"),
+            "reasoning detail without selection must scope to the latest turn: {body}"
+        );
+    }
+
+    #[test]
+    fn turn_range_for_index_scopes_to_containing_turn() {
+        let mut app = test_app();
+        app.history = vec![
+            HistoryCell::User {
+                content: "first prompt".to_string(),
+            },
+            HistoryCell::Thinking {
+                content: "first turn reasoning".to_string(),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Assistant {
+                content: "first reply".to_string(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".to_string(),
+            },
+            HistoryCell::Thinking {
+                content: "second turn reasoning".to_string(),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Assistant {
+                content: "second reply".to_string(),
+                streaming: false,
+            },
+        ];
+        app.resync_history_revisions();
+
+        let (start, end) = turn_range_for_index(&app, 1);
+        assert_eq!(start, 0, "first turn should start at user cell 0");
+        assert_eq!(end, 3, "first turn should end before second user cell");
+
+        let (start, end) = turn_range_for_index(&app, 4);
+        assert_eq!(start, 3, "second turn should start at user cell 3");
+        assert_eq!(end, 6, "second turn should run to end of transcript");
+    }
+
+    #[test]
+    fn open_reasoning_detail_pager_pushes_reasoning_detail_pager() {
+        let mut app = test_app();
+        app.history = vec![HistoryCell::Thinking {
+            content: "recorded reasoning".to_string(),
+            streaming: false,
+            duration_secs: Some(1.0),
+        }];
+        app.resync_history_revisions();
+        let revisions = app.history_revisions.clone();
+        app.viewport.transcript_cache.ensure(
+            &app.history,
+            &revisions,
+            100,
+            app.transcript_render_options(),
+        );
+        app.viewport.last_transcript_area = Some(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        });
+
+        assert!(open_reasoning_detail_pager(&mut app));
+        let top = app.view_stack.top_kind();
+        assert_eq!(top, Some(crate::tui::views::ModalKind::Pager));
+    }
+
+    #[test]
+    fn copy_cell_to_clipboard_uses_canonical_assistant_source() {
+        let mut app = test_app();
+        let content = "A long response with literal ● and ▏ glyphs that wraps visually.";
+        app.history = vec![HistoryCell::Assistant {
+            content: content.to_string(),
+            streaming: false,
+        }];
+        app.resync_history_revisions();
+        app.viewport.last_transcript_area = Some(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 24,
+        });
+
+        assert!(copy_cell_to_clipboard(&mut app, 0));
+        assert_eq!(app.clipboard.last_written_text(), Some(content));
+    }
+
+    #[test]
+    fn turn_inspector_copy_answer_copies_only_the_latest_completed_answer() {
+        use crate::tui::history::GenericToolCell;
+        use crate::tui::views::{ModalView, ViewAction, ViewEvent};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = test_app();
+        app.history = vec![
+            HistoryCell::User {
+                content: "please summarize".to_string(),
+            },
+            HistoryCell::Thinking {
+                content: "private reasoning trace".to_string(),
+                streaming: false,
+                duration_secs: Some(1.0),
+            },
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "read_file".to_string(),
+                status: ToolStatus::Success,
+                input_summary: Some("src/lib.rs".to_string()),
+                output: Some("raw tool result body".to_string()),
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+            HistoryCell::System {
+                content: "runtime status note".to_string(),
+            },
+            HistoryCell::Assistant {
+                content: "still streaming partial".to_string(),
+                streaming: true,
+            },
+            HistoryCell::Assistant {
+                content: "FINAL ANSWER\nauthored markdown".to_string(),
+                streaming: false,
+            },
+        ];
+
+        assert!(open_turn_inspector_pager(&mut app));
+        let mut view = app.view_stack.pop().expect("turn inspector pager");
+        let pager = view
+            .as_any_mut()
+            .downcast_mut::<PagerView>()
+            .expect("turn inspector should reuse PagerView");
+        let copied = match pager.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)) {
+            ViewAction::Emit(ViewEvent::CopyToClipboard { text, label }) => {
+                assert_eq!(label, "Answer");
+                text
+            }
+            other => panic!("expected answer copy event, got {other:?}"),
+        };
+
+        assert_eq!(copied, "FINAL ANSWER\nauthored markdown");
+        for excluded in [
+            "please summarize",
+            "private reasoning trace",
+            "raw tool result body",
+            "runtime status note",
+            "still streaming partial",
+        ] {
+            assert!(
+                !copied.contains(excluded),
+                "answer copy leaked {excluded:?}"
+            );
+        }
     }
 }

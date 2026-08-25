@@ -23,14 +23,14 @@ use std::sync::OnceLock;
 /// Repo-aware resolver for `@`-mentions and file pickers.
 ///
 /// `cwd` is captured at construction; if the host's current directory changes
-/// during a session, build a fresh `Workspace`. Fuzzy lookups are backed by a
-/// lazy basename → paths index built once on first miss and reused for the
-/// rest of the session — without it, every mis-typed mention triggered a full
-/// `WalkBuilder` traversal up to the configured completion depth.
+/// during a session, build a fresh `Workspace`. Composer discovery callers run
+/// its bounded walkers on a background worker; [`Workspace::resolve_exact`]
+/// deliberately performs no fuzzy tree traversal.
 #[derive(Debug)]
 pub struct Workspace {
     pub root: PathBuf,
     cwd: Option<PathBuf>,
+    #[cfg(test)]
     file_index: OnceLock<HashMap<String, Vec<PathBuf>>>,
     completion_walk_depth: Option<usize>,
     /// Follow symbolic links during file discovery walks. When `true`,
@@ -45,11 +45,16 @@ struct SearchContext<'a> {
     prefix_hits: &'a mut Vec<String>,
     substring_hits: &'a mut Vec<String>,
     seen: &'a mut HashSet<PathBuf>,
+    cancelled: &'a dyn Fn() -> bool,
 }
 
 impl SearchContext<'_> {
     fn is_full(&self) -> bool {
         self.prefix_hits.len() + self.substring_hits.len() >= self.limit
+    }
+
+    fn should_stop(&self) -> bool {
+        self.is_full() || (self.cancelled)()
     }
 
     fn remember(&mut self, path: PathBuf) -> bool {
@@ -100,6 +105,7 @@ impl Workspace {
         Self {
             root,
             cwd,
+            #[cfg(test)]
             file_index: OnceLock::new(),
             completion_walk_depth: normalize_completion_walk_depth(walk_depth),
             follow_links,
@@ -107,7 +113,25 @@ impl Workspace {
     }
 
     /// Two-pass resolution: workspace, then cwd, then fuzzy fallback.
+    #[cfg(test)]
     pub fn resolve(&self, raw_path: &str) -> Result<PathBuf, PathBuf> {
+        let literal = self.resolve_exact(raw_path);
+        if literal.is_ok() {
+            return literal;
+        }
+        let path = expand_mention_home(raw_path);
+        if let Some(fuzzy) = self.fuzzy_resolve(&path) {
+            return Ok(fuzzy);
+        }
+        literal
+    }
+
+    /// Resolve only the path the user actually typed: workspace, then cwd.
+    ///
+    /// Composer send-time resolution uses this path because fuzzy fallback
+    /// builds a full basename index. Fuzzy tree discovery is instead confined
+    /// to the bounded background completion worker (#4365).
+    pub fn resolve_exact(&self, raw_path: &str) -> Result<PathBuf, PathBuf> {
         let path = expand_mention_home(raw_path);
         if path.is_absolute() {
             if path.exists() {
@@ -127,14 +151,10 @@ impl Workspace {
                 return Ok(cwd_path);
             }
         }
-
-        if let Some(fuzzy) = self.fuzzy_resolve(&path) {
-            return Ok(fuzzy);
-        }
-
         Err(ws_path)
     }
 
+    #[cfg(test)]
     fn fuzzy_resolve(&self, path: &Path) -> Option<PathBuf> {
         let needle = path.file_name()?.to_string_lossy().to_lowercase();
         if needle.is_empty() {
@@ -145,6 +165,7 @@ impl Workspace {
         index.get(&needle).and_then(|paths| paths.first()).cloned()
     }
 
+    #[cfg(test)]
     fn build_file_index(&self) -> HashMap<String, Vec<PathBuf>> {
         let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut total: usize = 0;
@@ -253,6 +274,7 @@ impl Workspace {
     /// Honors `.gitignore`, `.git/info/exclude`, `.ignore`, and
     /// `.deepseekignore`. Capped at `limit` results.
     #[must_use]
+    #[cfg(test)]
     pub fn completions(&self, partial: &str, limit: usize) -> Vec<String> {
         if limit == 0 {
             return Vec::new();
@@ -261,6 +283,7 @@ impl Workspace {
         let mut prefix_hits: Vec<String> = Vec::new();
         let mut substring_hits: Vec<String> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
+        let never_cancelled = || false;
 
         // Walk the recorded cwd first when it diverges from the workspace
         // root, so cwd-relative entries appear ahead of duplicates surfaced by
@@ -272,6 +295,7 @@ impl Workspace {
                 prefix_hits: &mut prefix_hits,
                 substring_hits: &mut substring_hits,
                 seen: &mut seen,
+                cancelled: &never_cancelled,
             };
 
             let cwd_diverges = self
@@ -328,17 +352,44 @@ impl Workspace {
     /// callers must fall back to [`Workspace::completions`] for path-like
     /// needles (starting with `.` or containing a separator).
     #[must_use]
+    #[cfg(test)]
     pub fn completion_candidates(&self) -> Vec<String> {
+        let never_cancelled = || false;
+        self.completion_candidates_inner(usize::MAX, false, &never_cancelled)
+    }
+
+    /// Candidate collection used by the composer background worker. The walk
+    /// is hard-capped and checks `cancelled` between filesystem iterator
+    /// steps. A single slow iterator step may still return late, but it runs on
+    /// the discovery worker and can never park terminal input (#4365).
+    pub(crate) fn completion_discovery_candidates(
+        &self,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        self.completion_candidates_inner(limit, true, cancelled)
+    }
+
+    fn completion_candidates_inner(
+        &self,
+        limit: usize,
+        include_local_references: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        if limit == 0 || cancelled() {
+            return Vec::new();
+        }
         let mut prefix_hits: Vec<String> = Vec::new();
         let mut substring_hits: Vec<String> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         {
             let mut ctx = SearchContext {
                 needle: "",
-                limit: usize::MAX,
+                limit,
                 prefix_hits: &mut prefix_hits,
                 substring_hits: &mut substring_hits,
                 seen: &mut seen,
+                cancelled,
             };
             let cwd_diverges = self
                 .cwd
@@ -353,6 +404,15 @@ impl Workspace {
                     self.completion_walk_depth,
                     self.follow_links,
                 );
+                if include_local_references {
+                    add_all_local_reference_completions(
+                        cwd,
+                        cwd,
+                        &mut ctx,
+                        self.completion_walk_depth,
+                        self.follow_links,
+                    );
+                }
             }
             walk_for_completions(
                 &self.root,
@@ -361,6 +421,15 @@ impl Workspace {
                 self.completion_walk_depth,
                 self.follow_links,
             );
+            if include_local_references {
+                add_all_local_reference_completions(
+                    &self.root,
+                    &self.root,
+                    &mut ctx,
+                    self.completion_walk_depth,
+                    self.follow_links,
+                );
+            }
         }
         // Empty needle routes everything into prefix_hits.
         prefix_hits
@@ -373,8 +442,37 @@ impl Workspace {
     /// returns only that directory's immediate children in case-insensitive
     /// alphabetical order.
     #[must_use]
+    #[cfg(test)]
     pub fn browser_completions(&self, partial: &str, limit: usize) -> Vec<String> {
         if limit == 0 {
+            return Vec::new();
+        }
+        let never_cancelled = || false;
+        let mut entries =
+            self.browser_completion_candidates_inner(partial, usize::MAX, &never_cancelled);
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Background-worker directory-browser collection. It stops at `limit`
+    /// before sorting, so a directory with millions of direct children cannot
+    /// grow the cache without bound.
+    pub(crate) fn browser_completion_discovery_candidates(
+        &self,
+        partial: &str,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        self.browser_completion_candidates_inner(partial, limit, cancelled)
+    }
+
+    fn browser_completion_candidates_inner(
+        &self,
+        partial: &str,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Vec<String> {
+        if limit == 0 || cancelled() {
             return Vec::new();
         }
 
@@ -408,7 +506,12 @@ impl Workspace {
             .max_depth(Some(1));
         let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
+        let mut visited = 0usize;
         for entry in builder.build().flatten() {
+            if visited >= limit || cancelled() {
+                break;
+            }
+            visited = visited.saturating_add(1);
             let path = entry.path();
             if path == dir || path_is_excluded_from_discovery(&self.root, path) {
                 continue;
@@ -435,7 +538,6 @@ impl Workspace {
         }
 
         entries.sort_by_key(|entry| entry.to_lowercase());
-        entries.truncate(limit);
         entries
     }
 }
@@ -463,6 +565,7 @@ fn normalize_completion_walk_depth(depth: usize) -> Option<usize> {
     if depth == 0 { None } else { Some(depth) }
 }
 
+#[cfg(test)]
 fn child_completion_walk_depth(depth: Option<usize>) -> Option<usize> {
     depth.map(|depth| depth.saturating_sub(1))
 }
@@ -474,6 +577,7 @@ fn child_completion_walk_depth(depth: Option<usize>) -> Option<usize> {
 /// `fuzzy_resolve` call bounded on huge workspaces (#697 reported a
 /// ~10s hang on the first turn). For typical projects 50K is well
 /// above the actual entry count and the cap is a no-op.
+#[cfg(test)]
 const FILE_INDEX_MAX_ENTRIES: usize = 50_000;
 
 /// Configure a `WalkBuilder` for workspace discovery: hidden files,
@@ -505,6 +609,9 @@ fn walk_always_discoverable_dirs(
     follow_links: bool,
 ) {
     for dir_name in DISCOVERY_ALWAYS_DIRS {
+        if ctx.should_stop() {
+            break;
+        }
         let dot_dir = walk_root.join(dir_name);
         if !dot_dir.is_dir() {
             continue;
@@ -519,7 +626,7 @@ fn walk_always_discoverable_dirs(
             builder.max_depth(Some(depth.saturating_sub(1)));
         }
         for entry in builder.build().flatten() {
-            if ctx.is_full() {
+            if ctx.should_stop() {
                 break;
             }
             let path = entry.path();
@@ -560,7 +667,7 @@ fn walk_for_completions(
     let builder = discovery_walk_builder(walk_root, max_depth, follow_links);
 
     for entry in builder.build().flatten() {
-        if ctx.is_full() {
+        if ctx.should_stop() {
             break;
         }
         let path = entry.path();
@@ -593,6 +700,7 @@ fn walk_for_completions(
 
 const LOCAL_REFERENCE_SCAN_LIMIT: usize = 4096;
 
+#[cfg(test)]
 fn add_local_reference_completions(
     root: &Path,
     display_root: &Path,
@@ -605,7 +713,43 @@ fn add_local_reference_completions(
     }
 
     for path in local_reference_paths(root, LOCAL_REFERENCE_SCAN_LIMIT, max_depth, follow_links) {
-        if ctx.is_full() {
+        if ctx.should_stop() {
+            break;
+        }
+        let Ok(rel) = path.strip_prefix(display_root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.is_empty() || !ctx.remember(path.clone()) {
+            continue;
+        }
+        ctx.push_match(rel_str);
+    }
+}
+
+/// Add hidden/ignored candidates to the background cache even when the
+/// current needle is empty. The old UI path could defer this walk until a
+/// path-like query existed; the background cache must be self-contained so no
+/// later keystroke falls back to synchronous discovery.
+fn add_all_local_reference_completions(
+    root: &Path,
+    display_root: &Path,
+    ctx: &mut SearchContext<'_>,
+    max_depth: Option<usize>,
+    follow_links: bool,
+) {
+    if ctx.should_stop() {
+        return;
+    }
+    let paths = local_reference_paths_with_cancel(
+        root,
+        LOCAL_REFERENCE_SCAN_LIMIT,
+        max_depth,
+        follow_links,
+        ctx.cancelled,
+    );
+    for path in paths {
+        if ctx.should_stop() {
             break;
         }
         let Ok(rel) = path.strip_prefix(display_root) else {
@@ -620,7 +764,7 @@ fn add_local_reference_completions(
 }
 
 /// Rank pre-collected completion candidates for `partial` the same way
-/// [`Workspace::completions`] ranks live walk hits: case-insensitive prefix
+/// `Workspace::completions` ranks live walk hits: case-insensitive prefix
 /// matches first, then substring matches, each bucket alphabetical, truncated
 /// to `limit` (#3757).
 #[must_use]
@@ -650,6 +794,7 @@ pub fn rank_completion_candidates(
     prefix_hits
 }
 
+#[cfg(test)]
 fn should_try_local_reference_completion(needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -665,11 +810,23 @@ fn should_try_local_reference_completion(needle: &str) -> bool {
     needle.starts_with('.') || needle.contains('/') || needle.contains('\\')
 }
 
+#[cfg(test)]
 fn local_reference_paths(
     root: &Path,
     limit: usize,
     max_depth: Option<usize>,
     follow_links: bool,
+) -> Vec<PathBuf> {
+    let never_cancelled = || false;
+    local_reference_paths_with_cancel(root, limit, max_depth, follow_links, &never_cancelled)
+}
+
+fn local_reference_paths_with_cancel(
+    root: &Path,
+    limit: usize,
+    max_depth: Option<usize>,
+    follow_links: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut builder = WalkBuilder::new(root);
@@ -689,7 +846,7 @@ fn local_reference_paths(
     });
 
     for entry in builder.build().flatten() {
-        if out.len() >= limit {
+        if out.len() >= limit || cancelled() {
             break;
         }
         let path = entry.path();
@@ -713,6 +870,7 @@ impl Clone for Workspace {
         Self {
             root: self.root.clone(),
             cwd: self.cwd.clone(),
+            #[cfg(test)]
             file_index: OnceLock::new(),
             completion_walk_depth: self.completion_walk_depth,
             follow_links: self.follow_links,
@@ -907,9 +1065,21 @@ impl WorkingSet {
     /// conversation; any byte that drifts here cache-misses everything that
     /// follows in DeepSeek's KV prefix cache.
     pub fn summary_block(&self, workspace: &Path) -> Option<String> {
-        let prompt_entries: Vec<&WorkingSetEntry> = self
+        // Only stat-verified paths reach the model. Prose observation happily
+        // records tokens that merely look like paths ("120x40",
+        // "Hmbown/CodeWhale"), and a fabricated Active-paths line teaches the
+        // model false workspace facts it then spends turns disproving.
+        // Re-statting at render time also drops files deleted mid-session.
+        // Bytes only change when the filesystem genuinely changed — the same
+        // exception the #280 stability contract already makes for newly
+        // observed paths.
+        let prompt_entries: Vec<(&WorkingSetEntry, bool)> = self
             .sorted_for_prompt()
             .into_iter()
+            .filter_map(|entry| {
+                let metadata = fs::metadata(workspace.join(&entry.path)).ok()?;
+                Some((entry, metadata.is_dir()))
+            })
             .take(self.config.max_prompt_entries)
             .collect();
 
@@ -921,7 +1091,6 @@ impl WorkingSet {
 
         let mut lines: Vec<String> = Vec::new();
         lines.push("## Repo Working Set".to_string());
-        lines.push(format!("Workspace: {}", workspace.display()));
 
         if let Some(summary) = repo_summary {
             lines.push(summary);
@@ -929,8 +1098,8 @@ impl WorkingSet {
 
         if !prompt_entries.is_empty() {
             lines.push("Active paths (prioritize these):".to_string());
-            for entry in &prompt_entries {
-                let kind = if entry.is_dir { "dir" } else { "file" };
+            for (entry, is_dir) in &prompt_entries {
+                let kind = if *is_dir { "dir" } else { "file" };
                 lines.push(format!("- {} ({kind})", entry.path));
             }
         }
@@ -946,7 +1115,9 @@ impl WorkingSet {
         // per-file and total byte caps; order follows `sorted_for_prompt` so
         // the block is byte-stable while the files are unchanged.
         if self.cache_maximal_enabled() && !prompt_entries.is_empty() {
-            self.append_resident_file_contents(&mut lines, workspace, &prompt_entries);
+            let content_entries: Vec<&WorkingSetEntry> =
+                prompt_entries.iter().map(|(entry, _)| *entry).collect();
+            self.append_resident_file_contents(&mut lines, workspace, &content_entries);
         }
 
         Some(lines.join("\n"))
@@ -1039,44 +1210,6 @@ impl WorkingSet {
         }
     }
 
-    /// Return the most relevant paths in score order.
-    pub fn top_paths(&self, limit: usize) -> Vec<String> {
-        self.sorted_entries()
-            .into_iter()
-            .take(limit)
-            .map(|entry| entry.path.clone())
-            .collect()
-    }
-
-    /// Identify message indices that should be pinned during compaction.
-    pub fn pinned_message_indices(&self, messages: &[Message], workspace: &Path) -> Vec<usize> {
-        if messages.is_empty() || self.entries.is_empty() {
-            return Vec::new();
-        }
-
-        let pinned_paths: Vec<&WorkingSetEntry> = self
-            .sorted_entries()
-            .into_iter()
-            .take(self.config.max_pinned_paths)
-            .collect();
-        if pinned_paths.is_empty() {
-            return Vec::new();
-        }
-
-        let needles = build_search_needles(&pinned_paths, workspace);
-        if needles.is_empty() {
-            return Vec::new();
-        }
-
-        let mut pinned: Vec<usize> = Vec::new();
-        for (idx, message) in messages.iter().enumerate() {
-            if message_mentions_any_path(message, &needles, self.config.max_scan_chars) {
-                pinned.push(idx);
-            }
-        }
-        pinned
-    }
-
     fn record_candidates(
         &mut self,
         candidates: Vec<String>,
@@ -1140,17 +1273,6 @@ impl WorkingSet {
         }
     }
 
-    fn sorted_entries(&self) -> Vec<&WorkingSetEntry> {
-        let mut entries: Vec<&WorkingSetEntry> = self.entries.values().collect();
-        entries.sort_by(|a, b| {
-            let sb = score_entry(b, self.turn);
-            let sa = score_entry(a, self.turn);
-            sb.cmp(&sa).then_with(|| a.path.cmp(&b.path))
-        });
-        entries
-    }
-
-    /// Turn-agnostic ordering used when rendering the prompt summary block.
     /// `sorted_entries` mixes in a recency bonus from `self.turn`, so its
     /// output reorders as turns advance even when no new paths are touched —
     /// that movement would cross `max_prompt_entries` boundaries and bust the
@@ -1388,75 +1510,6 @@ fn path_regex() -> &'static Regex {
     })
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> &str {
-    if max_chars == 0 {
-        return "";
-    }
-    match text.char_indices().nth(max_chars) {
-        Some((idx, _)) => &text[..idx],
-        None => text,
-    }
-}
-
-fn build_search_needles(entries: &[&WorkingSetEntry], workspace: &Path) -> Vec<String> {
-    let mut needles: HashSet<String> = HashSet::new();
-    for entry in entries {
-        let rel = entry.path.clone();
-        if rel.is_empty() {
-            continue;
-        }
-        let abs = workspace.join(&rel);
-        let abs_str = abs.as_os_str().to_str().map(ToOwned::to_owned);
-
-        let _ = needles.insert(rel.clone());
-        if let Some(abs_str) = abs_str {
-            let _ = needles.insert(abs_str);
-        }
-    }
-    needles.into_iter().collect()
-}
-
-fn message_mentions_any_path(message: &Message, needles: &[String], max_scan_chars: usize) -> bool {
-    if needles.is_empty() {
-        return false;
-    }
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text, .. } => {
-                let snippet = truncate_chars(text, max_scan_chars);
-                if contains_any(snippet, needles) {
-                    return true;
-                }
-            }
-            ContentBlock::ToolUse { input, .. } => {
-                if let Ok(json) = serde_json::to_string(input)
-                    && contains_any(&json, needles)
-                {
-                    return true;
-                }
-            }
-            ContentBlock::ToolResult { content, .. } => {
-                let snippet = truncate_chars(content, max_scan_chars);
-                if contains_any(snippet, needles) {
-                    return true;
-                }
-            }
-            ContentBlock::Thinking { .. }
-            | ContentBlock::ServerToolUse { .. }
-            | ContentBlock::ToolSearchToolResult { .. }
-            | ContentBlock::CodeExecutionToolResult { .. }
-            | ContentBlock::ImageUrl { .. } => {}
-        }
-    }
-    false
-}
-
-fn contains_any(text: &str, needles: &[String]) -> bool {
-    needles
-        .iter()
-        .any(|needle| !needle.is_empty() && text.contains(needle))
-}
-
 fn summarize_repo_root(workspace: &Path) -> Option<String> {
     let key_files = detect_key_files(workspace);
     let top_dirs = list_top_level_dirs(workspace, 8);
@@ -1537,11 +1590,12 @@ const IGNORED_ROOT_DIRS: &[&str] = &["target", "node_modules", "dist", "build", 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Role;
     use tempfile::TempDir;
 
     fn make_message(role: &str, text: &str) -> Message {
         Message {
-            role: role.to_string(),
+            role: Role::from(role),
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
@@ -1580,27 +1634,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_message_indices_respects_working_set() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("src");
-        fs::create_dir_all(&src).expect("mkdir");
-        let file = src.join("main.rs");
-        fs::write(&file, "fn main() {}").expect("write");
-
-        let mut ws = WorkingSet::default();
-        ws.observe_user_message("Edit src/main.rs", tmp.path());
-
-        let messages = vec![
-            make_message("user", "Unrelated text"),
-            make_message("assistant", "I will read src/main.rs next."),
-            make_message("user", "More unrelated text"),
-        ];
-
-        let pinned = ws.pinned_message_indices(&messages, tmp.path());
-        assert_eq!(pinned, vec![1]);
-    }
-
-    #[test]
     fn summary_block_includes_repo_and_working_set() {
         let tmp = TempDir::new().expect("tempdir");
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"").expect("write");
@@ -1613,6 +1646,7 @@ mod tests {
         let block = ws.summary_block(tmp.path()).expect("block");
 
         assert!(block.contains("Repo Working Set"));
+        assert!(!block.contains("Workspace:"));
         assert!(block.contains("Cargo.toml"));
         assert!(block.contains("src"));
         assert!(block.contains("src/lib.rs"));
@@ -1672,6 +1706,39 @@ mod tests {
 
         assert_ne!(before, after, "new path must update the rendered summary");
         assert!(after.contains("src/c.rs"));
+    }
+
+    #[test]
+    fn summary_block_renders_only_paths_that_stat_verify() {
+        // Prose observation records tokens that merely look like paths
+        // ("120x40", "Hmbown/CodeWhale"); the rendered Active-paths list must
+        // never teach the model a workspace fact the filesystem contradicts.
+        let tmp = TempDir::new().expect("tempdir");
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).expect("mkdir");
+        fs::write(src.join("real.rs"), "real").expect("write");
+
+        let mut ws = WorkingSet::default();
+        ws.observe_user_message(
+            "Fix src/real.rs, test at 120x40/80x24, and check Hmbown/CodeWhale",
+            tmp.path(),
+        );
+
+        let block = ws.summary_block(tmp.path()).expect("block");
+        assert!(block.contains("- src/real.rs (file)"), "{block}");
+        assert!(!block.contains("120x40"), "{block}");
+        assert!(!block.contains("Hmbown/CodeWhale"), "{block}");
+
+        // A file deleted mid-session falls out on the next render — the same
+        // filesystem-changed exception #280 makes for newly observed paths.
+        fs::remove_file(src.join("real.rs")).expect("remove");
+        let after_delete = ws.summary_block(tmp.path());
+        assert!(
+            after_delete
+                .as_deref()
+                .is_none_or(|block| !block.contains("src/real.rs")),
+            "{after_delete:?}"
+        );
     }
 
     // ── Cache-maximal context mode (#528) ──
@@ -1817,7 +1884,7 @@ mod tests {
     #[test]
     fn extract_paths_from_message_picks_up_tool_results() {
         let msg = Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "tool_1".to_string(),
                 content: "Changed src/compaction.rs".to_string(),
@@ -2358,6 +2425,24 @@ mod tests {
         let ranked = rank_completion_candidates(&candidates, "ma", 1);
         assert_eq!(ranked.len(), 1);
         assert!(ranked[0].to_lowercase().starts_with("ma"), "{ranked:?}");
+    }
+
+    #[test]
+    fn background_completion_discovery_is_hard_capped_on_large_trees() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..256 {
+            std::fs::write(tmp.path().join(format!("candidate_{i:03}.rs")), "x").unwrap();
+        }
+        let ws = Workspace::with_cwd(tmp.path().to_path_buf(), None);
+        let never_cancelled = || false;
+
+        let candidates = ws.completion_discovery_candidates(32, &never_cancelled);
+
+        assert_eq!(
+            candidates.len(),
+            32,
+            "the background cache must stop at its hard candidate limit"
+        );
     }
 
     /// Regression for #1921 — `completions("/", N)` must return without

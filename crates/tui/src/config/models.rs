@@ -13,7 +13,7 @@ pub const DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL: &str = "https://api.deepseek.com/
 pub const DEFAULT_NVIDIA_NIM_MODEL: &str = "deepseek-ai/deepseek-v4-pro";
 pub const DEFAULT_NVIDIA_NIM_FLASH_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
 pub const DEFAULT_NVIDIA_NIM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
-pub const DEFAULT_OPENAI_MODEL: &str = "deepseek-v4-pro";
+pub const DEFAULT_OPENAI_MODEL: &str = codewhale_config::provider::OPENAI_DEFAULT_MODEL;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_ATLASCLOUD_MODEL: &str = "deepseek-ai/deepseek-v4-flash";
 pub const DEFAULT_ATLASCLOUD_BASE_URL: &str = "https://api.atlascloud.ai/v1";
@@ -24,11 +24,14 @@ pub const DEFAULT_VOLCENGINE_BASE_URL: &str = "https://ark.cn-beijing.volces.com
 pub const DEFAULT_WANJIE_ARK_BASE_URL: &str = "https://maas-openapi.wanjiedata.com/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_OPENROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
+pub const DEFAULT_ORCAROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
+pub const DEFAULT_ORCAROUTER_FLASH_MODEL: &str = "deepseek/deepseek-v4-flash";
 pub const OPENROUTER_ARCEE_TRINITY_LARGE_THINKING_MODEL: &str = "arcee-ai/trinity-large-thinking";
 pub const OPENROUTER_GEMMA_4_31B_MODEL: &str = "google/gemma-4-31b-it";
 pub const OPENROUTER_GEMMA_4_26B_A4B_MODEL: &str = "google/gemma-4-26b-a4b-it";
 pub const OPENROUTER_GLM_5_1_MODEL: &str = "z-ai/glm-5.1";
 pub const OPENROUTER_GLM_5_2_MODEL: &str = "z-ai/glm-5.2";
+pub const OPENROUTER_GLM_5_3_MODEL: &str = "z-ai/glm-5.3";
 pub const OPENROUTER_GLM_5_TURBO_MODEL: &str = "z-ai/glm-5-turbo";
 pub const OPENROUTER_KIMI_K2_7_CODE_MODEL: &str = "moonshotai/kimi-k2.7-code";
 pub const OPENROUTER_KIMI_K2_6_MODEL: &str = "moonshotai/kimi-k2.6";
@@ -40,6 +43,7 @@ pub const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 pub const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
 pub const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
 pub const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
+pub const OPENROUTER_QWEN_3_7_PLUS_MODEL: &str = "qwen/qwen3.7-plus";
 pub const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
 pub const OPENROUTER_MINIMAX_M2_7_MODEL: &str = "minimax/minimax-m2.7";
 pub const OPENROUTER_NEMOTRON_3_ULTRA_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
@@ -56,6 +60,7 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
     OPENROUTER_QWEN_3_6_27B_MODEL,
     OPENROUTER_QWEN_3_6_PLUS_MODEL,
+    OPENROUTER_QWEN_3_7_PLUS_MODEL,
     OPENROUTER_QWEN_3_7_MAX_MODEL,
     OPENROUTER_MINIMAX_M2_7_MODEL,
     OPENROUTER_NEMOTRON_3_ULTRA_MODEL,
@@ -63,12 +68,14 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_KIMI_K2_6_MODEL,
     OPENROUTER_GLM_5_1_MODEL,
     OPENROUTER_GLM_5_2_MODEL,
+    OPENROUTER_GLM_5_3_MODEL,
     OPENROUTER_TENCENT_HY3_PREVIEW_MODEL,
     OPENROUTER_GEMMA_4_31B_MODEL,
     OPENROUTER_GEMMA_4_26B_A4B_MODEL,
     OPENROUTER_NEMOTRON_3_NANO_OMNI_MODEL,
 ];
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_ORCAROUTER_BASE_URL: &str = "https://api.orcarouter.ai/v1";
 pub const DEFAULT_XIAOMI_MIMO_MODEL: &str = "mimo-v2.5-pro";
 pub const XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL: &str = "mimo-v2.5-pro-ultraspeed";
 pub const XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
@@ -96,10 +103,27 @@ pub const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
 pub const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 pub const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
+/// Moonshot's direct pay-as-you-go K3 wire model id.
+pub const MOONSHOT_KIMI_K3_MODEL: &str = "kimi-k3";
 pub const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
 pub const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
+    codewhale_config::provider::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL;
+/// Official Kimi Code route model id. It is deliberately distinct from
+/// Moonshot's pay-as-you-go `kimi-k3` catalog id.
+pub const KIMI_CODE_K3_MODEL: &str = "k3";
+/// Kimi Code membership high-speed wire model id. Membership route only, not
+/// a direct Moonshot platform catalog model.
+pub const KIMI_CODE_HIGHSPEED_MODEL: &str = "kimi-for-coding-highspeed";
+// The K3 contract constants (`KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS`,
+// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, and the distinct default/direct output
+// limits) live in `crate::models` — the model-facts table, which also compiles
+// standalone in integration tests — so the facts have exactly one home.
+// Re-export only the route-owned floor, which existing `crate::config` call
+// sites import.
+pub use crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
@@ -108,6 +132,8 @@ pub const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
 pub const DEFAULT_OLLAMA_MODEL: &str = "deepseek-v4-flash";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+pub const DEFAULT_OLLAMA_CLOUD_MODEL: &str = "gpt-oss:120b";
+pub const DEFAULT_OLLAMA_CLOUD_BASE_URL: &str = codewhale_config::provider::OLLAMA_CLOUD_BASE_URL;
 pub const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
@@ -116,10 +142,11 @@ pub const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 pub const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
+pub const TOGETHER_INKLING_MODEL: &str = "thinkingmachines/inkling";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
 pub const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
-pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
+pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.6";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 /// Conservative offline floor for an OAuth model absent from a fresh Codex
 /// roster. Fresh account-scoped cache metadata overrides this in route_runtime.
@@ -134,19 +161,44 @@ pub const DEFAULT_DEEPSEEKCN_BASE_URL: &str = DEFAULT_DEEPSEEK_BASE_URL;
 pub const COMMON_DEEPSEEK_MODELS: &[&str] = &[
     "deepseek-v4-pro",
     "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
     "deepseek-ai/deepseek-v4-pro",
     "deepseek-ai/deepseek-v4-flash",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
 ];
-pub const OFFICIAL_DEEPSEEK_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
-pub const DEFAULT_ZAI_MODEL: &str = "GLM-5.2";
+pub const OFFICIAL_DEEPSEEK_MODELS: &[&str] = &[
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    // Vision-experimental sibling of v4-flash; verified live on
+    // api.deepseek.com /models 2026-08-21. Same family aliases apply.
+    "deepseek-v4-flash-vision-exp",
+];
+pub const OFFICIAL_OPENAI_MODELS: &[&str] = &[
+    DEFAULT_OPENAI_MODEL,
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+// GLM-5.3 is live on the Z.ai Coding Plan (2026-08-13) and is the default
+// for new Z.ai routes. Limits and reasoning options still inherit from
+// glm-5.2 until Z.ai publishes distinct 5.3 numbers; no USD price is
+// claimed. Scope is first-party Z.ai plus its OpenRouter mirror only.
+// Correct at crates/config/assets/models_dev.bundled.json
+// `_meta.pending_release_metadata` when distinct 5.3 facts exist.
+// Explicit GLM-5.2 selections keep their own id: only the default moved.
+pub const DEFAULT_ZAI_MODEL: &str = ZAI_GLM_5_3_MODEL;
 pub const ZAI_GLM_5_1_MODEL: &str = "GLM-5.1";
 pub const ZAI_GLM_5_2_MODEL: &str = "GLM-5.2";
+pub const ZAI_GLM_5_3_MODEL: &str = "GLM-5.3";
 pub const ZAI_GLM_5_TURBO_MODEL: &str = "GLM-5-Turbo";
 pub const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 pub const DEFAULT_STEPFUN_MODEL: &str = "step-3.7-flash";
 pub const DEFAULT_STEPFUN_BASE_URL: &str = "https://api.stepfun.ai/v1";
+/// StepFun's Step Plan subscription endpoint. Billed against a plan allowance
+/// rather than per-token, so it is a separate route from pay-as-you-go and is
+/// never inferred — the user picks it during provider setup (#4526).
+pub const DEFAULT_STEPFUN_PLAN_BASE_URL: &str = "https://api.stepfun.ai/step_plan/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const ANTHROPIC_OPUS_MODEL: &str = "claude-opus-4-8";
 pub const ANTHROPIC_HAIKU_MODEL: &str = "claude-haiku-4-5";
@@ -168,12 +220,40 @@ pub const SAKANA_FUGU_ULTRA_MODEL: &str = "fugu-ultra-20260615";
 pub const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 pub const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
-pub const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
+pub const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
+pub const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+pub use codewhale_config::OPENCODE_GO_CHAT_MODELS;
+pub const DEFAULT_OPENCODE_ZEN_MODEL: &str = "gpt-5.6";
+pub const DEFAULT_OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
+pub const DEFAULT_META_MODEL: &str = "muse-spark-1.2";
 pub const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
-pub const DEFAULT_XAI_MODEL: &str = "grok-4.5";
+pub const XAI_GROK_4_6_MODEL: &str = "grok-4.6";
+pub const DEFAULT_XAI_MODEL: &str = XAI_GROK_4_6_MODEL;
+pub const XAI_GROK_4_5_MODEL: &str = "grok-4.5";
 pub const XAI_GROK_4_3_MODEL: &str = "grok-4.3";
 pub const XAI_GROK_BUILD_MODEL: &str = "grok-build";
 pub const XAI_GROK_COMPOSER_2_5_FAST_MODEL: &str = "grok-composer-2.5-fast";
 pub const XAI_GROK_4_20_0309_REASONING_MODEL: &str = "grok-4.20-0309-reasoning";
 pub const XAI_GROK_4_20_0309_NON_REASONING_MODEL: &str = "grok-4.20-0309-non-reasoning";
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-code-latest";
+pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
+pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3-pro-preview";
+pub const DEFAULT_ANTIGRAVITY_BASE_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-3.1-pro-preview";
+pub const DEFAULT_GOOGLE_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/";
+pub const DEFAULT_TELECOMJS_MODEL: &str = "deepseek-v4-pro";
+pub const DEFAULT_TELECOMJS_BASE_URL: &str = "https://aigw.telecomjs.com/v1";
+pub const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
+pub const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
+// Alibaba Cloud Model Studio (DashScope) defaults
+pub const DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL: &str = "qwen3.8-max";
+pub const DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+pub const MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+pub const DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL: &str =
+    "https://coding-intl.dashscope.aliyuncs.com/v1";
+pub const MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL: &str =
+    "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic";

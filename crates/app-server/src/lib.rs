@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,33 +13,23 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codewhale_agent::ModelRegistry;
-use codewhale_config::{CliRuntimeOverrides, ConfigStore};
+use codewhale_config::ConfigStore;
 use codewhale_core::Runtime;
 use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
 use codewhale_mcp::McpManager;
 use codewhale_protocol::{
-    AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadGoalClearParams,
-    ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse, UserInputAnswerEvent,
+    AppRequest, AppResponse, EventFrame, PromptRequest, PromptResponse, ResponseChannel,
+    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
 };
 use codewhale_state::StateStore;
 use codewhale_tools::{ToolCall, ToolRegistry};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
-
-/// Answers submitted for a pending `request_user_input` clarification.
-///
-/// The headless runtime emits [`codewhale_protocol::EventFrame::UserInputRequest`]
-/// fire-and-return (it has no resume channel, mirroring headless approval).
-/// Clients POST answers back via [`AppRequest::SubmitUserInput`]; we record
-/// them here keyed by `request_id` so a driver can retrieve and feed them into
-/// the next turn as structured context. True in-flight resume would require an
-/// awaiter in `invoke_tool` and is left as a follow-up.
-type PendingUserInputAnswers = Vec<UserInputAnswerEvent>;
 
 mod chat_completions;
 
@@ -101,9 +91,9 @@ impl std::fmt::Debug for AppServerOptions {
     }
 }
 
-/// Cached stdio→runtime bridge handle.
+/// Cached app-server→runtime bridge handle.
 ///
-/// The outer [`AppState::stdio_bridge`] mutex guards only the cache slot;
+/// The outer [`AppState::runtime_bridge`] mutex guards only the cache slot;
 /// this inner mutex serializes traffic on one bridge (single child process
 /// plus per-thread seq bookkeeping requires ordered access).
 type SharedRuntimeBridge = Arc<Mutex<RuntimeBridge>>;
@@ -120,13 +110,31 @@ struct AppState {
     runtime: Arc<RwLock<Runtime>>,
     registry: ModelRegistry,
     auth_token: Option<String>,
-    stdio_bridge: Arc<Mutex<Option<SharedRuntimeBridge>>>,
+    /// Cached bridge to the real runtime API. Shared by every surface that
+    /// executes a turn — stdio `thread/message`, HTTP `/thread` messages, and
+    /// both `/prompt` transports — because there is exactly one turn engine.
+    runtime_bridge: Arc<Mutex<Option<SharedRuntimeBridge>>>,
     stdio_thread_hints: Arc<Mutex<HashMap<String, RuntimeThreadHint>>>,
-    /// Answers submitted via `AppRequest::SubmitUserInput`, keyed by
-    /// `request_id`. A driver polls this to resolve clarification questions
-    /// raised by the model during a headless run.
-    pending_user_input: Arc<Mutex<std::collections::HashMap<String, PendingUserInputAnswers>>>,
+    /// Turns currently streaming over stdio, keyed by stdio thread id.
+    ///
+    /// Deliberately kept *outside* the bridge mutex: a streaming turn holds
+    /// that mutex for its entire duration, so anything reachable only through
+    /// it cannot be used to stop the turn. This holds its own copy of what an
+    /// interrupt needs, so a cancel never waits on the turn it is cancelling.
+    in_flight_turns: Arc<Mutex<HashMap<String, InFlightTurn>>>,
 }
+
+/// Everything needed to interrupt a running turn without the bridge lock.
+#[derive(Debug, Clone)]
+struct InFlightTurn {
+    base_url: String,
+    auth_token: Option<String>,
+    /// Thread id as the *runtime* knows it, not the stdio-facing id.
+    runtime_thread_id: String,
+    turn_id: String,
+}
+
+type TurnRegistry = Arc<Mutex<HashMap<String, InFlightTurn>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCallRequest {
@@ -145,6 +153,13 @@ struct JsonRpcRequest {
     #[serde(default)]
     params: Value,
 }
+
+/// Server error: the app-server could not reach the runtime that executes
+/// turns. Kept in the JSON-RPC implementation-defined server range
+/// (-32000..-32099) alongside `thread_not_found` (-32004).
+const RUNTIME_UNAVAILABLE_CODE: i64 = -32005;
+/// Server error: the named thread does not exist.
+const THREAD_NOT_FOUND_CODE: i64 = -32004;
 
 #[derive(Debug)]
 struct JsonRpcError {
@@ -183,6 +198,21 @@ enum TurnTerminalStatus {
     Canceled,
 }
 
+/// Structured capture of one bridged turn, for callers that must *return*
+/// the turn instead of streaming it (HTTP `/prompt`, HTTP `/thread` messages).
+///
+/// The stdio path streams the same events to its writer and needs none of
+/// this, so it passes `None` and pays nothing.
+#[derive(Debug, Default)]
+struct TurnTranscript {
+    /// Concatenated `agent_message` deltas — the model's actual output.
+    text: String,
+    /// The model the runtime reports for the thread that ran the turn.
+    model: Option<String>,
+    /// The same frames the stdio path writes, in order.
+    events: Vec<EventFrame>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTransport {
     Http,
@@ -209,6 +239,11 @@ struct ThreadIdParams {
 struct ThreadMessageParams {
     thread_id: String,
     input: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadInterruptParams {
+    thread_id: String,
 }
 
 pub async fn run(options: AppServerOptions) -> Result<()> {
@@ -273,71 +308,194 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
 }
 
 pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state(config_path, None)?;
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut writer = tokio::io::BufWriter::new(stdout);
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+    let state = build_state_with_transport(config_path, None, AppTransport::Stdio)?;
+    let reader = BufReader::new(tokio::io::stdin()).lines();
+    let writer = tokio::io::BufWriter::new(tokio::io::stdout());
+    run_stdio_loop(&state, reader, writer).await
+}
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(err) => {
-                let response = jsonrpc_error(
-                    None,
-                    JsonRpcError::parse_error(format!("invalid json: {err}")),
-                );
-                writer.write_all(&serde_json::to_vec(&response)?).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+/// The stdio JSON-RPC loop, generic over its transport so it can be driven by
+/// a duplex pipe in tests rather than the process's real stdin/stdout.
+async fn run_stdio_loop<R, W>(
+    state: &AppState,
+    mut reader: tokio::io::Lines<R>,
+    mut writer: W,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Work that arrived while a turn was streaming. The turn owns the writer
+    // for its whole duration, so these wait for it rather than interleaving
+    // into the middle of a response.
+    let mut pending: VecDeque<PendingStdioWork> = VecDeque::new();
+    let mut stdin_open = true;
+
+    loop {
+        let request = match pending.pop_front() {
+            Some(PendingStdioWork::Response(response)) => {
+                write_stdio_line(&mut writer, &response).await?;
                 continue;
+            }
+            Some(PendingStdioWork::Request(request)) => request,
+            None => {
+                if !stdin_open {
+                    break;
+                }
+                let Some(line) = reader.next_line().await? else {
+                    break;
+                };
+                match parse_stdio_line(&line) {
+                    ParsedStdioLine::Blank => continue,
+                    ParsedStdioLine::Rejected(response) => {
+                        write_stdio_line(&mut writer, &response).await?;
+                        continue;
+                    }
+                    ParsedStdioLine::Request(request) => request,
+                }
             }
         };
 
-        if request
-            .jsonrpc
-            .as_deref()
-            .is_some_and(|version| version != "2.0")
-        {
-            let response = jsonrpc_error(
-                request.id,
-                JsonRpcError::invalid_request("jsonrpc version must be 2.0"),
+        let id = request.id.clone();
+        let dispatched = if request.method == "thread/message" {
+            // A turn can run for minutes. Keep reading stdin while it streams
+            // so an interrupt (or a shutdown) can actually reach it — with a
+            // plain `await` here, nothing could be read until it finished.
+            let dispatch = dispatch_stdio_request_with_writer(
+                state,
+                &mut writer,
+                &request.method,
+                request.params,
             );
-            writer.write_all(&serde_json::to_vec(&response)?).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            continue;
-        }
+            tokio::pin!(dispatch);
+            loop {
+                tokio::select! {
+                    outcome = &mut dispatch => break outcome,
+                    line = reader.next_line(), if stdin_open => {
+                        match line? {
+                            None => stdin_open = false,
+                            Some(line) => {
+                                handle_line_during_turn(state, &line, &mut pending).await;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            dispatch_stdio_request_with_writer(state, &mut writer, &request.method, request.params)
+                .await
+        };
 
-        let response = match dispatch_stdio_request_with_writer(
-            &state,
-            &mut writer,
-            &request.method,
-            request.params,
-        )
-        .await
-        {
+        match dispatched {
             Ok(dispatch) => {
-                let encoded = jsonrpc_result(request.id, dispatch.result);
-                writer.write_all(&serde_json::to_vec(&encoded)?).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+                write_stdio_line(&mut writer, &jsonrpc_result(id, dispatch.result)).await?;
                 if dispatch.should_exit {
                     break;
                 }
-                continue;
             }
-            Err(err) => jsonrpc_error(request.id, err),
-        };
-
-        writer.write_all(&serde_json::to_vec(&response)?).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+            Err(err) => {
+                write_stdio_line(&mut writer, &jsonrpc_error(id, err)).await?;
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// Work deferred until a streaming turn releases the writer.
+enum PendingStdioWork {
+    /// Already answered (an interrupt acted immediately); just needs writing.
+    Response(Value),
+    /// Not started yet; runs normally once the turn is done.
+    Request(JsonRpcRequest),
+}
+
+enum ParsedStdioLine {
+    Blank,
+    Request(JsonRpcRequest),
+    Rejected(Value),
+}
+
+fn parse_stdio_line(line: &str) -> ParsedStdioLine {
+    if line.trim().is_empty() {
+        return ParsedStdioLine::Blank;
+    }
+    let request: JsonRpcRequest = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => {
+            return ParsedStdioLine::Rejected(jsonrpc_error(
+                None,
+                JsonRpcError::parse_error(format!("invalid json: {err}")),
+            ));
+        }
+    };
+    if request
+        .jsonrpc
+        .as_deref()
+        .is_some_and(|version| version != "2.0")
+    {
+        return ParsedStdioLine::Rejected(jsonrpc_error(
+            request.id,
+            JsonRpcError::invalid_request("jsonrpc version must be 2.0"),
+        ));
+    }
+    ParsedStdioLine::Request(request)
+}
+
+/// Triage a request that arrived mid-turn.
+///
+/// Cancellation is the whole point of reading here, so `thread/interrupt`
+/// runs immediately and only its reply waits for the writer. `shutdown` also
+/// interrupts immediately — otherwise it would block on the bridge mutex the
+/// turn is holding — and then queues so the turn can unwind first. Everything
+/// else simply queues: it was never urgent, and running it now would race the
+/// turn for the writer.
+async fn handle_line_during_turn(
+    state: &AppState,
+    line: &str,
+    pending: &mut VecDeque<PendingStdioWork>,
+) {
+    let request = match parse_stdio_line(line) {
+        ParsedStdioLine::Blank => return,
+        ParsedStdioLine::Rejected(response) => {
+            pending.push_back(PendingStdioWork::Response(response));
+            return;
+        }
+        ParsedStdioLine::Request(request) => request,
+    };
+
+    match request.method.as_str() {
+        "thread/interrupt" => {
+            let id = request.id.clone();
+            let response = match parse_params::<ThreadInterruptParams>(params_or_object(
+                request.params.clone(),
+            )) {
+                Ok(parsed) => match interrupt_stdio_turn(state, &parsed.thread_id).await {
+                    Ok(interrupted) => jsonrpc_result(
+                        id,
+                        json!({ "thread_id": parsed.thread_id, "interrupted": interrupted }),
+                    ),
+                    Err(err) => jsonrpc_error(id, err),
+                },
+                Err(err) => jsonrpc_error(id, err),
+            };
+            pending.push_back(PendingStdioWork::Response(response));
+        }
+        "shutdown" => {
+            let live: Vec<String> = state.in_flight_turns.lock().await.keys().cloned().collect();
+            for thread_id in live {
+                let _ = interrupt_stdio_turn(state, &thread_id).await;
+            }
+            pending.push_back(PendingStdioWork::Request(request));
+        }
+        _ => pending.push_back(PendingStdioWork::Request(request)),
+    }
+}
+
+async fn write_stdio_line<W: AsyncWrite + Unpin>(writer: &mut W, response: &Value) -> Result<()> {
+    writer.write_all(&serde_json::to_vec(response)?).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -349,13 +507,43 @@ async fn healthz() -> Json<Value> {
     }))
 }
 
-async fn thread_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ThreadRequest>,
-) -> (StatusCode, Json<ThreadResponse>) {
+/// Render a routing failure as a typed HTTP error body.
+///
+/// Deliberately *not* a success-shaped payload with the error stuffed into a
+/// content field: a client must be able to tell "the model said this" from
+/// "nothing ran".
+fn http_error_from_jsonrpc(err: JsonRpcError) -> (StatusCode, Json<Value>) {
+    let (status, code) = match err.code {
+        -32600 | -32602 => (StatusCode::BAD_REQUEST, "invalid_request"),
+        THREAD_NOT_FOUND_CODE => (StatusCode::NOT_FOUND, "thread_not_found"),
+        RUNTIME_UNAVAILABLE_CODE => (StatusCode::SERVICE_UNAVAILABLE, "runtime_unavailable"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": code,
+                "jsonrpc_code": err.code,
+                "message": err.message,
+            }
+        })),
+    )
+}
+
+async fn thread_handler(State(state): State<AppState>, Json(req): Json<ThreadRequest>) -> Response {
+    // A message is a turn, and turns belong to the runtime — not to the
+    // bookkeeping `Runtime` behind the other thread operations. This mirrors
+    // the interception stdio `thread/message` has always done.
+    if let ThreadRequest::Message { thread_id, input } = req {
+        return match run_http_thread_message(&state, thread_id, input).await {
+            Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+            Err(err) => http_error_from_jsonrpc(err).into_response(),
+        };
+    }
     let mut runtime = state.runtime.write().await;
     match runtime.handle_thread(req).await {
-        Ok(res) => (StatusCode::OK, Json(res)),
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ThreadResponse {
@@ -372,26 +560,21 @@ async fn thread_handler(
                 events: Vec::new(),
                 data: json!({}),
             }),
-        ),
+        )
+            .into_response(),
     }
 }
 
-async fn prompt_handler(
-    State(state): State<AppState>,
-    Json(req): Json<PromptRequest>,
-) -> (StatusCode, Json<PromptResponse>) {
-    let mut runtime = state.runtime.write().await;
-    let overrides = CliRuntimeOverrides::default();
-    match runtime.handle_prompt(req, &overrides).await {
-        Ok(res) => (StatusCode::OK, Json(res)),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(PromptResponse {
-                output: err.to_string(),
-                model: "unknown".to_string(),
-                events: Vec::new(),
-            }),
-        ),
+/// `POST /prompt` — runs a genuine model turn through the runtime bridge.
+///
+/// Note what this handler does *not* do: it never takes the `Runtime` write
+/// lock. The old implementation held it across the whole request while doing
+/// no model work at all.
+async fn prompt_handler(State(state): State<AppState>, Json(req): Json<PromptRequest>) -> Response {
+    let mut sink = tokio::io::sink();
+    match run_prompt_turn(&state, &mut sink, req).await {
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Err(err) => http_error_from_jsonrpc(err).into_response(),
     }
 }
 
@@ -468,6 +651,14 @@ fn app_response_status(response: &AppResponse) -> StatusCode {
 }
 
 fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
+    build_state_with_transport(config_path, auth_token, AppTransport::Http)
+}
+
+fn build_state_with_transport(
+    config_path: Option<PathBuf>,
+    auth_token: Option<String>,
+    transport: AppTransport,
+) -> Result<AppState> {
     let has_explicit_config_path = config_path.is_some();
     let store = ConfigStore::load(config_path)?;
     let config_path = has_explicit_config_path.then(|| store.path().to_path_buf());
@@ -481,7 +672,12 @@ fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Resu
     let state_store = StateStore::open(state_db_path)?;
 
     let mut hooks = HookDispatcher::default();
-    hooks.add_sink(Arc::new(StdoutHookSink));
+    // Stdio carries JSON-RPC on stdout: printing raw hook events there
+    // corrupts the protocol stream (#5165). HTTP mode keeps the stdout
+    // sink for local development visibility.
+    if transport == AppTransport::Http {
+        hooks.add_sink(Arc::new(StdoutHookSink));
+    }
     let hook_log_path = config_path
         .as_ref()
         .and_then(|p| p.parent().map(|parent| parent.join("events.jsonl")))
@@ -513,9 +709,9 @@ fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Resu
         runtime: Arc::new(RwLock::new(runtime)),
         registry,
         auth_token,
-        stdio_bridge: Arc::new(Mutex::new(None)),
+        runtime_bridge: Arc::new(Mutex::new(None)),
         stdio_thread_hints: Arc::new(Mutex::new(HashMap::new())),
-        pending_user_input: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        in_flight_turns: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
@@ -690,6 +886,33 @@ impl JsonRpcError {
         }
     }
 
+    /// Server error (-32000..-32099): the turn engine could not be reached,
+    /// or refused to start the turn — either way nothing ran. Distinct from
+    /// `internal` because the caller can retry this one once a runtime is up.
+    fn runtime_unavailable(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            code: RUNTIME_UNAVAILABLE_CODE,
+            message: message.clone(),
+            data: Some(json!({
+                "error": "runtime_unavailable",
+                "detail": message,
+            })),
+        }
+    }
+
+    /// Server error (-32000..-32099): the named thread does not exist.
+    fn thread_not_found(thread_id: &str) -> Self {
+        Self {
+            code: THREAD_NOT_FOUND_CODE,
+            message: format!("thread not found: {thread_id}"),
+            data: Some(json!({
+                "error": "thread_not_found",
+                "thread_id": thread_id,
+            })),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             code: -32603,
@@ -710,15 +933,185 @@ async fn handle_thread_request(
         .map_err(|err| JsonRpcError::internal(err.to_string()))
 }
 
-async fn handle_prompt_request(
+/// One turn's worth of routing decisions, shared by every surface that runs
+/// a turn through the bridge.
+struct BridgedTurn<'a> {
+    /// Client-facing thread id; the bridge maps it to a runtime thread.
+    thread_key: &'a str,
+    input: &'a str,
+    /// Model for the runtime thread when this call is the one that creates
+    /// it. An existing thread keeps the model it was created with.
+    model_override: Option<String>,
+    /// Publish the live turn so a concurrent `thread/interrupt` can cancel
+    /// it. Only stdio has a mid-turn channel, so only stdio sets this.
+    interruptible: bool,
+    /// Forget the thread mapping once the turn ends. Set for one-shot
+    /// prompts, whose synthetic thread key no client can name again.
+    ephemeral: bool,
+}
+
+/// Execute exactly one turn on the real runtime.
+///
+/// This is the only way any app-server surface runs a model: `/prompt`,
+/// `prompt/request`, `prompt/run`, stdio `thread/message`, and HTTP `/thread`
+/// messages all land here. There is no local fallback that fabricates a
+/// response — if the runtime cannot be reached the caller gets
+/// [`JsonRpcError::runtime_unavailable`] and nothing is written to history.
+async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     state: &AppState,
+    writer: &mut W,
+    turn: BridgedTurn<'_>,
+    transcript: Option<&mut TurnTranscript>,
+) -> std::result::Result<Value, JsonRpcError> {
+    let mut hint = {
+        let hints = state.stdio_thread_hints.lock().await;
+        hints.get(turn.thread_key).cloned()
+    };
+    if let Some(model) = turn.model_override {
+        hint.get_or_insert_with(RuntimeThreadHint::default).model = Some(model);
+    }
+    let bridge = acquire_runtime_bridge(state).await?;
+    // The inner bridge lock is held for the whole turn: one child process
+    // serves all threads and per-thread seq tracking requires ordered
+    // access. The cache slot itself stays unlocked, so config updates and
+    // bridge invalidation are never queued behind a streaming turn.
+    let mut bridge = bridge.lock().await;
+    let runtime_thread_id = bridge
+        .ensure_runtime_thread(turn.thread_key, hint)
+        .await
+        .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
+    let registration = turn
+        .interruptible
+        .then(|| (state.in_flight_turns.clone(), turn.thread_key.to_string()));
+    let result = bridge
+        .message_thread(
+            &runtime_thread_id,
+            turn.input,
+            writer,
+            registration,
+            transcript,
+        )
+        .await;
+    if turn.ephemeral {
+        // Drop the mapping while we still hold the lock, so a long-lived
+        // app-server does not accumulate one entry per one-shot prompt.
+        bridge.forget_thread(turn.thread_key);
+    }
+    result.map_err(|err| JsonRpcError::internal(err.to_string()))
+}
+
+/// Run a prompt as a genuine model turn and return what the model actually
+/// said.
+///
+/// `writer` receives the same streaming frames stdio `thread/message` emits;
+/// HTTP callers pass a sink and read the frames back out of
+/// [`PromptResponse::events`].
+async fn run_prompt_turn<W: AsyncWrite + Unpin>(
+    state: &AppState,
+    writer: &mut W,
     req: PromptRequest,
 ) -> std::result::Result<PromptResponse, JsonRpcError> {
-    let mut runtime = state.runtime.write().await;
-    runtime
-        .handle_prompt(req, &CliRuntimeOverrides::default())
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))
+    if req.prompt.trim().is_empty() {
+        return Err(JsonRpcError::invalid_params("prompt must not be empty"));
+    }
+    // The turn engine has no threadless mode, so a prompt without a thread
+    // gets a fresh one. Keying it on a uuid keeps a one-shot prompt out of
+    // any caller's history and out of the way of concurrent prompts.
+    let ephemeral = req.thread_id.is_none();
+    let thread_key = req
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| format!("prompt-{}", Uuid::new_v4()));
+
+    let mut transcript = TurnTranscript::default();
+    run_bridged_turn(
+        state,
+        writer,
+        BridgedTurn {
+            thread_key: &thread_key,
+            input: &req.prompt,
+            model_override: req.model.clone(),
+            // `thread/interrupt` addresses client-facing thread ids. A
+            // one-shot prompt has none to hand back, and a caller-supplied
+            // thread id is already interruptible through `thread/message`.
+            interruptible: false,
+            ephemeral,
+        },
+        Some(&mut transcript),
+    )
+    .await?;
+
+    // Report the model the runtime actually ran, never a locally resolved
+    // guess. The fallbacks only matter for a runtime that omits the field.
+    let model = match transcript.model {
+        Some(model) => model,
+        None => match req.model {
+            Some(model) => model,
+            None => state
+                .config
+                .read()
+                .await
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+    };
+
+    Ok(PromptResponse {
+        output: transcript.text,
+        model,
+        events: transcript.events,
+    })
+}
+
+async fn handle_prompt_request<W: AsyncWrite + Unpin>(
+    state: &AppState,
+    writer: &mut W,
+    req: PromptRequest,
+) -> std::result::Result<PromptResponse, JsonRpcError> {
+    run_prompt_turn(state, writer, req).await
+}
+
+/// HTTP `/thread` with a `Message` body: same engine as stdio
+/// `thread/message`, but the turn is collected rather than streamed because
+/// this transport is request/response.
+async fn run_http_thread_message(
+    state: &AppState,
+    thread_id: String,
+    input: String,
+) -> std::result::Result<ThreadResponse, JsonRpcError> {
+    let mut transcript = TurnTranscript::default();
+    let mut sink = tokio::io::sink();
+    let result = run_bridged_turn(
+        state,
+        &mut sink,
+        BridgedTurn {
+            thread_key: &thread_id,
+            input: &input,
+            model_override: None,
+            interruptible: false,
+            ephemeral: false,
+        },
+        Some(&mut transcript),
+    )
+    .await?;
+
+    Ok(ThreadResponse {
+        thread_id,
+        // The turn ran to a terminal state before this response was built,
+        // which is exactly what the old `accepted` did not mean.
+        status: "completed".to_string(),
+        thread: None,
+        threads: Vec::new(),
+        goal: None,
+        model: transcript.model,
+        model_provider: None,
+        cwd: None,
+        approval_policy: None,
+        sandbox: None,
+        events: transcript.events,
+        data: result.get("data").cloned().unwrap_or_else(|| json!({})),
+    })
 }
 
 async fn handle_stdio_thread_message<W: AsyncWrite + Unpin>(
@@ -726,28 +1119,34 @@ async fn handle_stdio_thread_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     parsed: ThreadMessageParams,
 ) -> std::result::Result<Value, JsonRpcError> {
-    let hint = {
-        let hints = state.stdio_thread_hints.lock().await;
-        hints.get(&parsed.thread_id).cloned()
-    };
-    let bridge = acquire_stdio_bridge(state).await?;
-    // The inner bridge lock is held for the whole turn: one child process
-    // serves all threads and per-thread seq tracking requires ordered
-    // access. The cache slot itself stays unlocked, so config updates and
-    // bridge invalidation are never queued behind a streaming turn.
-    let mut bridge = bridge.lock().await;
-    let runtime_thread_id = bridge
-        .ensure_runtime_thread(&parsed.thread_id, hint)
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-    let mut result = bridge
-        .message_thread(&runtime_thread_id, &parsed.input, writer)
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+    let mut result = run_bridged_turn(
+        state,
+        writer,
+        BridgedTurn {
+            thread_key: &parsed.thread_id,
+            input: &parsed.input,
+            model_override: None,
+            interruptible: true,
+            ephemeral: false,
+        },
+        None,
+    )
+    .await?;
     if let Some(object) = result.as_object_mut() {
         object.insert("thread_id".to_string(), Value::String(parsed.thread_id));
     }
     Ok(result)
+}
+
+/// Resuming or forking a thread the runtime reports as `missing` must fail
+/// with a named not-found error. Recording the null model/workspace of that
+/// response as a stdio hint would clobber any previously cached hint for
+/// the same thread id (#5171).
+fn ensure_thread_found(response: &ThreadResponse) -> std::result::Result<(), JsonRpcError> {
+    if response.status == "missing" {
+        return Err(JsonRpcError::thread_not_found(&response.thread_id));
+    }
+    Ok(())
 }
 
 async fn record_stdio_thread_hint(state: &AppState, response: &ThreadResponse) {
@@ -764,31 +1163,62 @@ async fn record_stdio_thread_hint(state: &AppState, response: &ThreadResponse) {
 /// Fetch the cached stdio→runtime bridge, spawning one on first use.
 ///
 /// The cache-slot lock is held only for the lookup/insert — never across
-/// the child spawn or any request traffic — so [`invalidate_stdio_bridge`]
+/// the child spawn or any request traffic — so [`invalidate_runtime_bridge`]
 /// and other slot users are never blocked behind a slow bridge operation.
-async fn acquire_stdio_bridge(
+async fn acquire_runtime_bridge(
     state: &AppState,
 ) -> std::result::Result<SharedRuntimeBridge, JsonRpcError> {
-    if let Some(bridge) = state.stdio_bridge.lock().await.as_ref() {
+    if let Some(bridge) = state.runtime_bridge.lock().await.as_ref() {
         return Ok(bridge.clone());
     }
     let bridge = Arc::new(Mutex::new(
         RuntimeBridge::start(state.config_path.as_deref())
             .await
-            .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+            .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?,
     ));
-    let mut slot = state.stdio_bridge.lock().await;
+    let mut slot = state.runtime_bridge.lock().await;
     // Prefer a bridge cached by a concurrent caller while we were spawning;
     // dropping our unused one kills the extra child via `Drop`.
     Ok(slot.get_or_insert_with(|| bridge.clone()).clone())
+}
+
+/// Ask the runtime to interrupt a turn that is streaming right now.
+///
+/// Everything this needs was copied out of the bridge when the turn started,
+/// so it never touches the bridge mutex the turn is holding. Returns whether
+/// a live turn was found for `thread_id`.
+async fn interrupt_stdio_turn(
+    state: &AppState,
+    thread_id: &str,
+) -> std::result::Result<bool, JsonRpcError> {
+    let Some(turn) = state.in_flight_turns.lock().await.get(thread_id).cloned() else {
+        return Ok(false);
+    };
+    let mut request = codewhale_release::platform_http_client_builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        .post(format!(
+            "{}/v1/threads/{}/turns/{}/interrupt",
+            turn.base_url, turn.runtime_thread_id, turn.turn_id
+        ));
+    if let Some(token) = turn.auth_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|err| JsonRpcError::internal(format!("interrupt failed: {err}")))?;
+    Ok(true)
 }
 
 /// Drop the cached runtime bridge so the next stdio thread message spawns a
 /// fresh child that re-reads the persisted config. An in-flight message
 /// keeps its own [`SharedRuntimeBridge`] clone and finishes against the old
 /// child, which is killed when the last clone drops.
-async fn invalidate_stdio_bridge(state: &AppState) {
-    let mut bridge = state.stdio_bridge.lock().await;
+async fn invalidate_runtime_bridge(state: &AppState) {
+    let mut bridge = state.runtime_bridge.lock().await;
     *bridge = None;
 }
 
@@ -821,6 +1251,10 @@ impl RuntimeBridge {
         } else {
             Command::new("codewhale")
         };
+        // Pass the runtime auth token out-of-band via env (not argv) so local
+        // `ps` cannot read credential material from the child command line.
+        // The TUI/runtime server already accepts CODEWHALE_RUNTIME_TOKEN /
+        // DEEPSEEK_RUNTIME_TOKEN when --auth-token is absent.
         command
             .arg("app-server")
             .arg("--http")
@@ -828,8 +1262,8 @@ impl RuntimeBridge {
             .arg("127.0.0.1")
             .arg("--port")
             .arg(port.to_string())
-            .arg("--auth-token")
-            .arg(auth_token)
+            .env("CODEWHALE_RUNTIME_TOKEN", auth_token)
+            .env("DEEPSEEK_RUNTIME_TOKEN", auth_token)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -906,6 +1340,14 @@ impl RuntimeBridge {
         Ok(runtime_thread_id)
     }
 
+    /// Drop a thread mapping (and its seq cursor) once no caller can name
+    /// the client-facing key again.
+    fn forget_thread(&mut self, stdio_thread_id: &str) {
+        if let Some(runtime_thread_id) = self.thread_map.remove(stdio_thread_id) {
+            self.last_seq_by_thread.remove(&runtime_thread_id);
+        }
+    }
+
     async fn create_runtime_thread(
         &mut self,
         model: Option<String>,
@@ -929,11 +1371,18 @@ impl RuntimeBridge {
         Ok(thread_id)
     }
 
+    /// Run one turn to completion, streaming its events to `writer`.
+    ///
+    /// `registration` is `Some` on the stdio path: it publishes the live turn
+    /// so an `thread/interrupt` arriving mid-stream can reach the runtime
+    /// without waiting on the bridge mutex this call holds.
     async fn message_thread<W: AsyncWrite + Unpin>(
         &mut self,
         thread_id: &str,
         input: &str,
         writer: &mut W,
+        registration: Option<(TurnRegistry, String)>,
+        mut transcript: Option<&mut TurnTranscript>,
     ) -> Result<Value> {
         let turn = self
             .request_json(
@@ -951,6 +1400,16 @@ impl RuntimeBridge {
             .to_string();
         let response_id = format!("{thread_id}:{turn_id}");
 
+        if let Some(transcript) = transcript.as_deref_mut() {
+            transcript.model = turn
+                .pointer("/thread/model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            transcript.events.push(EventFrame::ResponseStart {
+                response_id: response_id.clone(),
+            });
+        }
+
         emit_stdio_event(
             writer,
             json!({
@@ -960,10 +1419,36 @@ impl RuntimeBridge {
         )
         .await?;
 
+        // Publish the turn only for the streaming window, and take it back
+        // before any `?` below: a turn that has already finished must never
+        // look cancellable.
+        if let Some((registry, key)) = registration.as_ref() {
+            registry.lock().await.insert(
+                key.clone(),
+                InFlightTurn {
+                    base_url: self.base_url.clone(),
+                    auth_token: self.auth_token.clone(),
+                    runtime_thread_id: thread_id.to_string(),
+                    turn_id: turn_id.clone(),
+                },
+            );
+        }
+
         let since_seq = self.last_seq_by_thread.get(thread_id).copied().unwrap_or(0);
         let stream_result = self
-            .stream_turn_events(thread_id, &turn_id, &response_id, writer, since_seq)
+            .stream_turn_events(
+                thread_id,
+                &turn_id,
+                &response_id,
+                writer,
+                since_seq,
+                transcript.as_deref_mut(),
+            )
             .await;
+
+        if let Some((registry, key)) = registration.as_ref() {
+            registry.lock().await.remove(key);
+        }
 
         let _ = emit_stdio_event(
             writer,
@@ -973,6 +1458,11 @@ impl RuntimeBridge {
             }),
         )
         .await;
+        if let Some(transcript) = transcript {
+            transcript.events.push(EventFrame::ResponseEnd {
+                response_id: response_id.clone(),
+            });
+        }
 
         let (last_seq, status, error) = stream_result?;
         self.last_seq_by_thread
@@ -1014,6 +1504,7 @@ impl RuntimeBridge {
         response_id: &str,
         writer: &mut W,
         since_seq: u64,
+        mut transcript: Option<&mut TurnTranscript>,
     ) -> Result<(u64, TurnTerminalStatus, Option<String>)> {
         let mut response = self
             .authed(self.client.get(format!(
@@ -1066,6 +1557,14 @@ impl RuntimeBridge {
                                 }),
                             )
                             .await?;
+                            if let Some(transcript) = transcript.as_deref_mut() {
+                                transcript.text.push_str(delta);
+                                transcript.events.push(EventFrame::ResponseDelta {
+                                    response_id: response_id.to_string(),
+                                    delta: delta.to_string(),
+                                    channel: ResponseChannel::Text,
+                                });
+                            }
                         }
                     }
                     "turn.completed" => {
@@ -1244,6 +1743,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                     "thread/archive",
                     "thread/unarchive",
                     "thread/message",
+                    "thread/interrupt",
                     "app/capabilities",
                     "app/request",
                     "app/config/get",
@@ -1277,7 +1777,8 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                     "thread/goal/clear",
                     "thread/archive",
                     "thread/unarchive",
-                    "thread/message"
+                    "thread/message",
+                    "thread/interrupt"
                 ]
             }),
             should_exit: false,
@@ -1347,6 +1848,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
         "thread/resume" => {
             let request = ThreadRequest::Resume(parse_params(params_or_object(params))?);
             let response = handle_thread_request(state, request).await?;
+            ensure_thread_found(&response)?;
             record_stdio_thread_hint(state, &response).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
@@ -1357,6 +1859,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
         "thread/fork" => {
             let request = ThreadRequest::Fork(parse_params(params_or_object(params))?);
             let response = handle_thread_request(state, request).await?;
+            ensure_thread_found(&response)?;
             record_stdio_thread_hint(state, &response).await;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
@@ -1500,15 +2003,34 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
         },
         "prompt/request" | "prompt/run" => {
             let request: PromptRequest = parse_params(params)?;
-            let response = handle_prompt_request(state, request).await?;
+            let response = handle_prompt_request(state, writer, request).await?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
                 should_exit: false,
             }
         }
+        "thread/interrupt" => {
+            let parsed: ThreadInterruptParams = parse_params(params_or_object(params))?;
+            let interrupted = interrupt_stdio_turn(state, &parsed.thread_id).await?;
+            StdioDispatchResult {
+                result: json!({
+                    "thread_id": parsed.thread_id,
+                    "interrupted": interrupted,
+                }),
+                should_exit: false,
+            }
+        }
         "shutdown" => {
-            if let Some(bridge) = state.stdio_bridge.lock().await.take() {
+            // A turn streaming right now holds the bridge mutex, so taking it
+            // to kill the child would block until that turn ends — the exact
+            // deadlock that made shutdown useless against a runaway turn.
+            // Interrupt live turns first; they release the mutex promptly.
+            let live: Vec<String> = state.in_flight_turns.lock().await.keys().cloned().collect();
+            for thread_id in live {
+                let _ = interrupt_stdio_turn(state, &thread_id).await;
+            }
+            if let Some(bridge) = state.runtime_bridge.lock().await.take() {
                 bridge.lock().await.shutdown_child();
             }
             StdioDispatchResult {
@@ -1555,7 +2077,16 @@ async fn process_app_request(
             };
             let ok = result.is_ok();
             let message = result.err().map(|e| e.to_string());
-            apply_config_update(state, snapshot, None, true).await;
+            // Only propagate a mutation that actually happened. `set_value`
+            // leaves the config untouched on an unknown key or invalid value,
+            // so this is a no-op from the caller's point of view — but
+            // `apply_config_update` invalidates the cached stdio bridge
+            // regardless, and dropping the last reference kills the running
+            // child runtime along with its thread map. A single typo'd key
+            // would orphan every in-flight thread on that bridge.
+            if ok {
+                apply_config_update(state, snapshot, None, true).await;
+            }
             AppResponse {
                 ok,
                 data: json!({ "key": key, "value": value, "error": message }),
@@ -1570,7 +2101,11 @@ async fn process_app_request(
             };
             let ok = result.is_ok();
             let message = result.err().map(|e| e.to_string());
-            apply_config_update(state, snapshot, None, true).await;
+            // See ConfigSet: a failed unset changed nothing and must not tear
+            // down the runtime bridge.
+            if ok {
+                apply_config_update(state, snapshot, None, true).await;
+            }
             AppResponse {
                 ok,
                 data: json!({ "key": key, "error": message }),
@@ -1647,30 +2182,31 @@ async fn process_app_request(
                 },
             }
         }
-        AppRequest::SubmitUserInput {
-            request_id,
-            answers,
-        } => {
-            // Record the user's answers against the pending clarification
-            // request so a driver can retrieve them. The headless runtime does
-            // not block on `request_user_input` (fire-and-return, like
-            // approval), so there is no in-flight turn to resume here — the
-            // caller is expected to feed these answers into the next turn.
-            let mut pending = state.pending_user_input.lock().await;
-            if pending.contains_key(&request_id) {
-                return AppResponse {
-                    ok: false,
-                    data: json!({
-                        "error": "request_id already resolved",
-                        "request_id": request_id,
-                    }),
-                    events: Vec::new(),
-                };
-            }
-            pending.insert(request_id.clone(), answers);
+        AppRequest::SubmitUserInput { request_id, .. } => {
+            // This transport cannot deliver a clarification answer, and
+            // saying otherwise was the bug: the previous implementation
+            // reported `resolved: true` and filed the answers in a map with
+            // no reader anywhere in this crate.
+            //
+            // It cannot be made to work here. `handle_line_during_turn`
+            // executes exactly one method while a turn is streaming —
+            // `thread/interrupt`. Everything else, `app/request` included,
+            // queues until the turn ends, so an answer sent over this
+            // transport would wait on the very turn that is waiting for it.
+            // The runtime API owns the pending request and can resume the
+            // turn, so that is where the reply belongs.
             AppResponse {
-                ok: true,
-                data: json!({ "request_id": request_id, "resolved": true }),
+                ok: false,
+                data: json!({
+                    "error": "user_input_reply_unsupported",
+                    "request_id": request_id,
+                    "message": concat!(
+                        "the app-server control transport cannot deliver clarification answers: ",
+                        "only `thread/interrupt` runs while a turn is streaming, so an answer sent ",
+                        "here would queue behind the turn waiting for it. Reply on the runtime API ",
+                        "instead: POST /v1/user-input/{thread_id}/{request_id}."
+                    ),
+                }),
                 events: Vec::new(),
             }
         }
@@ -1703,8 +2239,8 @@ async fn apply_config_update(
     }
     // Sync into the live Runtime so the next turn picks up the change
     // without a restart. MCP server connections are NOT refreshed here —
-    // see `Runtime::reload_config_and_policy` for the rationale and the
-    // matching TUI `mcp_restart_required` note.
+    // see `Runtime::reload_config_and_policy` for the headless boundary;
+    // the TUI's explicit `/mcp reload` operation is a separate path.
     {
         let mut runtime = state.runtime.write().await;
         match exec_policy {
@@ -1712,7 +2248,7 @@ async fn apply_config_update(
             None => runtime.update_config(snapshot),
         }
     }
-    invalidate_stdio_bridge(state).await;
+    invalidate_runtime_bridge(state).await;
 }
 
 async fn persist_config(state: &AppState, config: codewhale_config::ConfigToml) -> Result<()> {
@@ -1722,6 +2258,18 @@ async fn persist_config(state: &AppState, config: codewhale_config::ConfigToml) 
     let mut store = ConfigStore::load(state.config_path.clone())?;
     store.config = config;
     store.save()
+}
+
+/// Install the process-wide rustls crypto provider once for tests that build
+/// an HTTP client. Production installs it at startup; each test must do the
+/// same instead of relying on another test in the process having run first
+/// (nextest runs every test in its own process).
+#[cfg(test)]
+pub(crate) fn install_test_crypto_provider() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 #[cfg(test)]
@@ -1766,6 +2314,27 @@ mod tests {
                     .expect("canonical config")
                     .as_path()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_never_registers_the_stdout_hook_sink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
+
+        let http_state =
+            build_state_with_transport(Some(config_path.clone()), None, AppTransport::Http)
+                .expect("http state");
+        let stdio_state = build_state_with_transport(Some(config_path), None, AppTransport::Stdio)
+            .expect("stdio state");
+
+        let http_sinks = http_state.runtime.read().await.hooks.sink_count();
+        let stdio_sinks = stdio_state.runtime.read().await.hooks.sink_count();
+        assert_eq!(
+            http_sinks,
+            stdio_sinks + 1,
+            "HTTP mode keeps StdoutHookSink + JsonlHookSink; stdio must drop the stdout sink (#5165)"
         );
     }
 
@@ -2015,6 +2584,90 @@ mod tests {
         assert!(persisted.contains("deepseek-reasoner"));
     }
 
+    /// A bridge stand-in with no child process: this test only cares about
+    /// whether the cache slot survives, not about talking to a runtime.
+    fn sentinel_bridge() -> SharedRuntimeBridge {
+        Arc::new(Mutex::new(RuntimeBridge {
+            base_url: "http://127.0.0.1:0".to_string(),
+            client: reqwest::Client::new(),
+            auth_token: None,
+            child: None,
+            thread_map: HashMap::from([("stdio-1".to_string(), "runtime-1".to_string())]),
+            last_seq_by_thread: HashMap::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn failed_config_set_keeps_the_stdio_bridge() {
+        crate::install_test_crypto_provider();
+        // #4737: `set_value` rejects an invalid value before assigning, so the
+        // request is a no-op — but `apply_config_update` ran anyway and
+        // invalidated the cached bridge, dropping the child runtime along with
+        // its thread map. A single bad value orphaned every in-flight stdio
+        // thread, behind a response that correctly reported `ok: false`.
+        //
+        // Only `set_value` is exercised: an unknown key lands in `extras` and
+        // succeeds, and `unset_value` has no failing input today, so its
+        // identical guard has nothing to assert against.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+        *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+
+        let response = process_app_request(
+            &state,
+            AppRequest::ConfigSet {
+                key: "telemetry".to_string(),
+                value: "not-a-bool".to_string(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+        assert!(!response.ok, "invalid value must fail: {response:?}");
+
+        let slot = state.runtime_bridge.lock().await;
+        let kept = slot
+            .as_ref()
+            .expect("bridge must survive a failed config/set");
+        assert_eq!(
+            kept.lock()
+                .await
+                .thread_map
+                .get("stdio-1")
+                .map(String::as_str),
+            Some("runtime-1"),
+            "the live thread map must be intact",
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_config_set_still_invalidates_the_stdio_bridge() {
+        crate::install_test_crypto_provider();
+        // The other half of #4737: a mutation that *did* happen must still
+        // rebuild the bridge, or the runtime keeps serving the old config.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
+        let state = build_state(Some(config_path.clone()), None).expect("state");
+        *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+
+        let response = process_app_request(
+            &state,
+            AppRequest::ConfigSet {
+                key: "model".to_string(),
+                value: "deepseek-reasoner".to_string(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+        assert!(response.ok, "valid set should succeed: {response:?}");
+        assert!(
+            state.runtime_bridge.lock().await.is_none(),
+            "a successful config change must invalidate the cached bridge",
+        );
+    }
+
     #[tokio::test]
     async fn config_unset_propagates_to_runtime_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2102,7 +2755,7 @@ mod tests {
         let bridge = Arc::new(Mutex::new(RuntimeBridge::from_base_url_for_test(
             "http://127.0.0.1:9".to_string(),
         )));
-        *state.stdio_bridge.lock().await = Some(bridge.clone());
+        *state.runtime_bridge.lock().await = Some(bridge.clone());
         bridge
     }
 
@@ -2127,7 +2780,7 @@ mod tests {
 
         // The cached bridge child must be dropped so the next stdio request
         // spawns a fresh runtime that reads the persisted config.
-        assert!(state.stdio_bridge.lock().await.is_none());
+        assert!(state.runtime_bridge.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -2142,7 +2795,7 @@ mod tests {
             process_app_request(&state, AppRequest::ConfigReload, AppTransport::Stdio).await;
         assert!(response.ok, "reload should succeed");
 
-        assert!(state.stdio_bridge.lock().await.is_none());
+        assert!(state.runtime_bridge.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -2155,10 +2808,10 @@ mod tests {
 
         // Invalidation only touches the cache slot, so it must complete
         // without waiting for the in-flight turn to release the bridge.
-        tokio::time::timeout(Duration::from_secs(1), invalidate_stdio_bridge(&state))
+        tokio::time::timeout(Duration::from_secs(1), invalidate_runtime_bridge(&state))
             .await
             .expect("invalidation must not wait on bridge traffic");
-        assert!(state.stdio_bridge.lock().await.is_none());
+        assert!(state.runtime_bridge.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -2305,8 +2958,233 @@ mod tests {
         assert_eq!(cleared.result["data"]["cleared"], true);
     }
 
+    #[tokio::test]
+    async fn stdio_resume_of_missing_thread_fails_without_clobbering_the_hint() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+
+        // A cached hint for a thread the runtime no longer knows: the exact
+        // clobber scenario from #5171.
+        let workspace = tmp.path().join("ws");
+        {
+            let mut hints = state.stdio_thread_hints.lock().await;
+            hints.insert(
+                "ghost-thread".to_string(),
+                RuntimeThreadHint {
+                    model: Some("deepseek-v4-pro".to_string()),
+                    workspace: Some(workspace.clone()),
+                },
+            );
+        }
+
+        let err = dispatch_stdio_request(
+            &state,
+            "thread/resume",
+            json!({ "thread_id": "ghost-thread" }),
+        )
+        .await
+        .expect_err("resuming a missing thread must fail with a named not-found error");
+        assert_eq!(err.code, -32004);
+        assert!(err.message.contains("ghost-thread"), "{}", err.message);
+
+        let fork_err = dispatch_stdio_request(
+            &state,
+            "thread/fork",
+            json!({ "thread_id": "ghost-thread" }),
+        )
+        .await
+        .expect_err("forking a missing thread must fail with a named not-found error");
+        assert_eq!(fork_err.code, -32004);
+
+        let hints = state.stdio_thread_hints.lock().await;
+        let hint = hints.get("ghost-thread").expect("cached hint survives");
+        assert_eq!(hint.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(hint.workspace.as_deref(), Some(workspace.as_path()));
+    }
+
     fn sse_frame(event: &str, payload: Value) -> String {
         format!("event: {event}\ndata: {payload}\n\n")
+    }
+    /// A runtime whose turn never ends on its own — only an interrupt stops
+    /// it. That is the shape of the runaway turn this protects against.
+    async fn spawn_uninterruptible_until_asked_runtime() -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::body::Body;
+        use axum::extract::Path as AxumPath;
+
+        let interrupted = Arc::new(tokio::sync::Notify::new());
+
+        async fn create_turn(AxumPath(_thread_id): AxumPath<String>) -> Json<Value> {
+            Json(json!({ "turn": { "id": "turn_runaway" } }))
+        }
+        async fn create_thread() -> Json<Value> {
+            Json(json!({ "id": "thr_runaway" }))
+        }
+        async fn interrupt(
+            State(notify): State<Arc<tokio::sync::Notify>>,
+            AxumPath((_thread_id, _turn_id)): AxumPath<(String, String)>,
+        ) -> Json<Value> {
+            notify.notify_waiters();
+            Json(json!({ "ok": true }))
+        }
+        async fn thread_events(
+            State(notify): State<Arc<tokio::sync::Notify>>,
+            AxumPath(_thread_id): AxumPath<String>,
+        ) -> ([(header::HeaderName, &'static str); 1], Body) {
+            // Hold the event response open until something interrupts the
+            // turn. Nothing else can end it, which is the point.
+            notify.notified().await;
+            let body = [
+                sse_frame(
+                    "item.delta",
+                    json!({
+                        "seq": 1,
+                        "turn_id": "turn_runaway",
+                        "payload": { "kind": "agent_message", "delta": "thinking" }
+                    }),
+                ),
+                sse_frame(
+                    "turn.completed",
+                    json!({
+                        "seq": 2,
+                        "turn_id": "turn_runaway",
+                        "payload": { "turn": { "status": "interrupted" } }
+                    }),
+                ),
+            ]
+            .concat();
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from(body),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let app = Router::new()
+            .route("/v1/threads", post(create_thread))
+            .route("/v1/threads/{thread_id}/turns", post(create_turn))
+            .route(
+                "/v1/threads/{thread_id}/turns/{turn_id}/interrupt",
+                post(interrupt),
+            )
+            .route("/v1/threads/{thread_id}/events", get(thread_events))
+            .with_state(interrupted.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test runtime");
+        });
+        (format!("http://{addr}"), interrupted, server)
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_a_turn_that_would_otherwise_stream_forever() {
+        let (base_url, _notify, server) = spawn_uninterruptible_until_asked_runtime().await;
+        let (state, _tmp) = capability_test_state();
+        *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(
+            RuntimeBridge::from_base_url_for_test(base_url),
+        )));
+
+        let (client, server_side) = tokio::io::duplex(16 * 1024);
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+
+        let loop_state = state.clone();
+        let loop_handle = tokio::spawn(async move {
+            let (rx, tx) = tokio::io::split(server_side);
+            run_stdio_loop(&loop_state, BufReader::new(rx).lines(), tx).await
+        });
+
+        // Start the runaway turn.
+        client_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"thread/message\",\
+                  \"params\":{\"thread_id\":\"thr_a\",\"input\":\"go\"}}\n",
+            )
+            .await
+            .expect("send thread/message");
+
+        // Wait until the turn is genuinely in flight before cancelling, so the
+        // test exercises mid-stream cancellation rather than a race.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.in_flight_turns.lock().await.contains_key("thr_a") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("turn should register itself as in flight");
+
+        // The read loop must accept this while the turn holds the bridge.
+        client_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"thread/interrupt\",\
+                  \"params\":{\"thread_id\":\"thr_a\"}}\n",
+            )
+            .await
+            .expect("send thread/interrupt");
+        client_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"shutdown\"}\n")
+            .await
+            .expect("send shutdown");
+
+        let finished = tokio::time::timeout(Duration::from_secs(20), loop_handle)
+            .await
+            .expect("the loop must exit rather than hang on the runaway turn");
+        finished.expect("join loop").expect("loop result");
+
+        let mut output = String::new();
+        let mut lines = BufReader::new(client_reader);
+        lines
+            .read_to_string(&mut output)
+            .await
+            .expect("read stdio output");
+
+        let responses: Vec<Value> = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        let by_id = |id: u64| {
+            responses
+                .iter()
+                .find(|value| value["id"] == json!(id))
+                .unwrap_or_else(|| panic!("no response for id {id} in {output}"))
+                .clone()
+        };
+
+        // The turn ended as interrupted rather than running to completion.
+        assert!(
+            by_id(1)["error"].is_object(),
+            "the interrupted turn should report an error, got: {}",
+            by_id(1)
+        );
+        assert_eq!(by_id(2)["result"]["interrupted"], json!(true));
+        assert_eq!(by_id(3)["result"]["status"], json!("stopped"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn interrupting_an_idle_thread_is_not_an_error() {
+        let (state, _tmp) = capability_test_state();
+        let response = dispatch_stdio_request(
+            &state,
+            "thread/interrupt",
+            json!({ "thread_id": "thr_nothing_running" }),
+        )
+        .await
+        .expect("interrupt dispatch");
+        assert_eq!(response.result["interrupted"], json!(false));
     }
 
     #[tokio::test]
@@ -2373,7 +3251,7 @@ mod tests {
         let (mut reader, mut writer) = tokio::io::duplex(4096);
 
         let result = bridge
-            .message_thread("thr_test", "hello", &mut writer)
+            .message_thread("thr_test", "hello", &mut writer, None, None)
             .await
             .expect("message_thread should succeed");
         drop(writer);
@@ -2462,6 +3340,275 @@ mod tests {
         );
     }
 
+    // ── prompt routing runs a real turn ────────────────────────────────
+    //
+    // `/prompt`, `prompt/request` and `prompt/run` used to return HTTP 200
+    // with a stringified echo of the caller's own routing metadata, having
+    // called no model at all. These stand up the in-crate stub runtime and
+    // assert the response is what the model streamed — not an echo — and
+    // that an unreachable runtime is an explicit typed failure.
+
+    /// Prompts the stub runtime was actually asked to run.
+    type StubPrompts = Arc<Mutex<Vec<String>>>;
+
+    /// A minimal but honest runtime: it creates threads, starts turns, and
+    /// streams `agent_message` deltas followed by `turn.completed`.
+    async fn spawn_stub_runtime() -> (String, StubPrompts, tokio::task::JoinHandle<()>) {
+        async fn create_thread(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "thr_stub",
+                "model": body["model"].as_str().unwrap_or("stub-model-v1"),
+            }))
+        }
+
+        async fn create_turn(
+            State(prompts): State<StubPrompts>,
+            AxumPath(thread_id): AxumPath<String>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            prompts
+                .lock()
+                .await
+                .push(body["prompt"].as_str().unwrap_or_default().to_string());
+            Json(json!({
+                "thread": { "id": thread_id, "model": "stub-model-v1" },
+                "turn": { "id": "turn_stub" },
+            }))
+        }
+
+        async fn thread_events(
+            AxumPath(_thread_id): AxumPath<String>,
+        ) -> ([(header::HeaderName, &'static str); 1], String) {
+            let body = [
+                sse_frame(
+                    "item.delta",
+                    json!({
+                        "seq": 1,
+                        "turn_id": "turn_stub",
+                        "payload": { "kind": "agent_message", "delta": "the answer" }
+                    }),
+                ),
+                sse_frame(
+                    "item.delta",
+                    json!({
+                        "seq": 2,
+                        "turn_id": "turn_stub",
+                        "payload": { "kind": "agent_message", "delta": " is 4" }
+                    }),
+                ),
+                sse_frame(
+                    "turn.completed",
+                    json!({
+                        "seq": 3,
+                        "turn_id": "turn_stub",
+                        "payload": { "turn": { "status": "completed" } }
+                    }),
+                ),
+            ]
+            .concat();
+            ([(header::CONTENT_TYPE, "text/event-stream")], body)
+        }
+
+        let prompts: StubPrompts = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub runtime");
+        let addr = listener.local_addr().expect("listener addr");
+        let app = Router::new()
+            .route("/v1/threads", post(create_thread))
+            .route("/v1/threads/{thread_id}/turns", post(create_turn))
+            .route("/v1/threads/{thread_id}/events", get(thread_events))
+            .with_state(prompts.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), prompts, server)
+    }
+
+    async fn seed_bridge_at(state: &AppState, base_url: String) -> SharedRuntimeBridge {
+        let bridge = Arc::new(Mutex::new(RuntimeBridge::from_base_url_for_test(base_url)));
+        *state.runtime_bridge.lock().await = Some(bridge.clone());
+        bridge
+    }
+
+    #[tokio::test]
+    async fn prompt_request_executes_a_genuine_model_turn() {
+        let (state, _tmp) = capability_test_state();
+        let (base_url, prompts, server) = spawn_stub_runtime().await;
+        let bridge = seed_bridge_at(&state, base_url).await;
+
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let dispatched = dispatch_stdio_request_with_writer(
+            &state,
+            &mut writer,
+            "prompt/request",
+            json!({ "prompt": "what is 2+2" }),
+        )
+        .await
+        .expect("prompt/request dispatch");
+        drop(writer);
+
+        let response: PromptResponse =
+            serde_json::from_value(dispatched.result).expect("prompt response");
+
+        // The model's words, not a restatement of the request.
+        assert_eq!(response.output, "the answer is 4");
+        assert!(
+            !response.output.contains("what is 2+2"),
+            "prompt echo leaked into the output: {}",
+            response.output
+        );
+        assert_eq!(response.model, "stub-model-v1");
+        assert_eq!(
+            prompts.lock().await.as_slice(),
+            ["what is 2+2".to_string()],
+            "the prompt must reach the runtime's turn endpoint"
+        );
+
+        // Real streaming frames, not three canned ones.
+        let deltas: Vec<String> = response
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                EventFrame::ResponseDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["the answer".to_string(), " is 4".to_string()]);
+        assert!(matches!(
+            response.events.first(),
+            Some(EventFrame::ResponseStart { .. })
+        ));
+        assert!(matches!(
+            response.events.last(),
+            Some(EventFrame::ResponseEnd { .. })
+        ));
+
+        // The stdio transport sees the same turn stream `thread/message` emits.
+        let mut stdout = Vec::new();
+        reader.read_to_end(&mut stdout).await.expect("read stdout");
+        let stdout = String::from_utf8(stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains("\"type\":\"response_delta\"") && stdout.contains("the answer"),
+            "stdio prompt turn must stream its deltas, got: {stdout}"
+        );
+
+        // A prompt without a thread_id must not leave a mapping behind.
+        assert!(
+            bridge.lock().await.thread_map.is_empty(),
+            "one-shot prompt threads must not accumulate in the bridge"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn prompt_without_a_reachable_runtime_fails_explicitly() {
+        let (state, _tmp) = capability_test_state();
+        // Port 9 (discard) refuses immediately: no runtime is listening.
+        seed_bridge_at(&state, "http://127.0.0.1:9".to_string()).await;
+
+        let err = dispatch_stdio_request(&state, "prompt/run", json!({ "prompt": "hello" }))
+            .await
+            .expect_err("a prompt with no reachable runtime must fail, not echo");
+        assert_eq!(err.code, RUNTIME_UNAVAILABLE_CODE);
+
+        let (status, Json(body)) = http_error_from_jsonrpc(err);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "runtime_unavailable");
+        assert!(
+            body.get("output").is_none(),
+            "a failure must not be shaped like a PromptResponse: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_is_rejected_before_any_runtime_work() {
+        let (state, _tmp) = capability_test_state();
+        let err = dispatch_stdio_request(&state, "prompt/request", json!({ "prompt": "   " }))
+            .await
+            .expect_err("an empty prompt must be rejected");
+        assert_eq!(err.code, -32602);
+        assert!(
+            state.runtime_bridge.lock().await.is_none(),
+            "a rejected prompt must not start a runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_thread_message_runs_the_turn_instead_of_queueing_it() {
+        let (state, _tmp) = capability_test_state();
+        let (base_url, prompts, server) = spawn_stub_runtime().await;
+        seed_bridge_at(&state, base_url).await;
+
+        let response = run_http_thread_message(&state, "thr_http".to_string(), "go".to_string())
+            .await
+            .expect("http thread message");
+
+        assert_eq!(response.status, "completed");
+        assert_eq!(response.thread_id, "thr_http");
+        assert_eq!(response.data["turn_id"], "turn_stub");
+        assert_eq!(prompts.lock().await.as_slice(), ["go".to_string()]);
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|event| matches!(event, EventFrame::ResponseDelta { .. })),
+            "a completed turn must carry the deltas it streamed"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn http_thread_message_without_a_runtime_is_a_typed_error() {
+        let (state, _tmp) = capability_test_state();
+        seed_bridge_at(&state, "http://127.0.0.1:9".to_string()).await;
+
+        let err = run_http_thread_message(&state, "thr_http".to_string(), "go".to_string())
+            .await
+            .expect_err("no runtime means no turn");
+        assert_eq!(err.code, RUNTIME_UNAVAILABLE_CODE);
+    }
+
+    #[tokio::test]
+    async fn submit_user_input_refuses_instead_of_claiming_resolution() {
+        let (state, _tmp) = capability_test_state();
+        let response = process_app_request(
+            &state,
+            AppRequest::SubmitUserInput {
+                request_id: "user-input-1".to_string(),
+                answers: Vec::new(),
+            },
+            AppTransport::Stdio,
+        )
+        .await;
+
+        assert!(!response.ok, "this transport cannot deliver the answer");
+        assert_eq!(response.data["error"], "user_input_reply_unsupported");
+        assert!(
+            response.data.get("resolved").is_none(),
+            "nothing was resolved: {}",
+            response.data
+        );
+        assert!(
+            response.data["message"]
+                .as_str()
+                .expect("message")
+                .contains("/v1/user-input/"),
+            "the refusal must name the transport that can accept the answer"
+        );
+        assert!(
+            !response.data["message"]
+                .as_str()
+                .expect("message")
+                .contains("  "),
+            "the refusal must not expose source-formatting whitespace"
+        );
+    }
+
     // ── capability drift guard ─────────────────────────────────────────
     //
     // The stdio `capabilities` method is the benchmark/SDK contract: external
@@ -2487,6 +3634,7 @@ mod tests {
         "thread/archive",
         "thread/unarchive",
         "thread/message",
+        "thread/interrupt",
         "app/capabilities",
         "app/request",
         "app/config/get",
@@ -2573,6 +3721,43 @@ mod tests {
         let token = resolve_auth_token(&options).unwrap();
         assert!(token.is_some());
         assert!(token.unwrap().starts_with("cwapp_"));
+    }
+
+    #[test]
+    fn runtime_bridge_command_keeps_auth_token_out_of_argv() {
+        // FR001-C001: runtime auth token must not appear on the child argv
+        // (visible via local `ps`); pass it via env instead.
+        let token = "cwrt_unit_test_secret_token_not_for_argv";
+        let cmd = RuntimeBridge::runtime_command(None, 18787, token).expect("command");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains(token) || a == "--auth-token"),
+            "auth token must not be present in child argv: {argv:?}"
+        );
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "CODEWHALE_RUNTIME_TOKEN" && v == token),
+            "token must be carried via CODEWHALE_RUNTIME_TOKEN: {envs:?}"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "DEEPSEEK_RUNTIME_TOKEN" && v == token),
+            "legacy alias DEEPSEEK_RUNTIME_TOKEN must also carry the token: {envs:?}"
+        );
     }
 
     #[test]

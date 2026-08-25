@@ -58,6 +58,10 @@ impl ToolSpec for WaitForDevServerTool {
         "wait_for_dev_server"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Wait for a local dev server to become ready. Polls a loopback TCP port, optionally then an HTTP(S) health URL on the same port, with bounded timeout and structured success/failure output."
     }
@@ -110,14 +114,14 @@ impl ToolSpec for WaitForDevServerTool {
 }
 
 fn parse_request(input: &Value) -> Result<ReadinessRequest, ToolError> {
-    let host = normalize_loopback_host(optional_str(input, "host").unwrap_or(DEFAULT_HOST))?;
+    let host = normalize_loopback_host(optional_str(input, "host")?.unwrap_or(DEFAULT_HOST))?;
     let port = parse_port(input)?;
     let url = parse_healthcheck_url(input, port)?;
     let timeout = Duration::from_millis(
-        optional_u64(input, "timeout_ms", DEFAULT_TIMEOUT_MS).min(HARD_MAX_TIMEOUT_MS),
+        optional_u64(input, "timeout_ms", DEFAULT_TIMEOUT_MS)?.min(HARD_MAX_TIMEOUT_MS),
     );
     let poll_interval = Duration::from_millis(
-        optional_u64(input, "poll_interval_ms", DEFAULT_POLL_INTERVAL_MS)
+        optional_u64(input, "poll_interval_ms", DEFAULT_POLL_INTERVAL_MS)?
             .clamp(MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS),
     );
 
@@ -165,7 +169,7 @@ fn normalize_loopback_host(host: &str) -> Result<String, ToolError> {
 }
 
 fn parse_healthcheck_url(input: &Value, port: u16) -> Result<Option<reqwest::Url>, ToolError> {
-    let Some(url) = optional_str(input, "url")
+    let Some(url) = optional_str(input, "url")?
         .map(str::trim)
         .filter(|url| !url.is_empty())
     else {
@@ -380,7 +384,7 @@ async fn sleep_until_next_poll(
     let delay = remaining.min(poll_interval);
     if let Some(token) = context.cancel_token.as_ref() {
         tokio::select! {
-            () = token.cancelled() => Err(ToolError::execution_failed("wait_for_dev_server cancelled")),
+            () = token.cancelled() => Err(ToolError::cancelled("wait_for_dev_server cancelled")),
             () = sleep(delay) => Ok(()),
         }
     } else {
@@ -395,7 +399,7 @@ fn check_cancelled(context: &ToolContext) -> Result<(), ToolError> {
         .as_ref()
         .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
     {
-        return Err(ToolError::execution_failed("wait_for_dev_server cancelled"));
+        return Err(ToolError::cancelled("wait_for_dev_server cancelled"));
     }
     Ok(())
 }
@@ -441,7 +445,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
     use tokio::task::JoinHandle;
 
     fn ctx() -> ToolContext {
@@ -459,6 +463,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, port)
+    }
+
+    fn reserve_unlistened_tcp_port() -> (TcpSocket, u16) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
     }
 
     fn spawn_http_server(status: &'static str) -> (u16, JoinHandle<()>) {
@@ -551,8 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn reports_timeout_for_refused_tcp_port() {
-        let (listener, port) = bind_tcp_listener().await;
-        drop(listener);
+        // Keep the port reserved without listening. Dropping a listener first
+        // lets a parallel test or process claim the port before this probe.
+        let (_reservation, port) = reserve_unlistened_tcp_port();
 
         let (result, payload) = run_tool(json!({
             "host": "127.0.0.1",

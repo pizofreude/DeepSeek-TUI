@@ -13,7 +13,7 @@ Feature: Core command visible surfaces
     When the user runs the core command "/workspace"
     Then the message window should include "Current workspace:"
     When the user runs the core command "/home"
-    Then the message window should include "codewhale Home Dashboard"
+    Then the message window should include "Codewhale"
     And the message window should include "/links"
 
   Scenario: Core state commands report visible changes
@@ -37,6 +37,7 @@ Feature: Core command visible surfaces
     When the user runs the core command "/agent 2 summarize logs"
     Then the message window should include "Opening persistent sub-agent at depth 2"
     When the user runs the core command "/rlm 1 inspect command extraction"
-    Then the message window should include "Opening persistent RLM context at depth 1"
+    Then the message window should include "Loading that into a persistent working context"
     When the user runs the core command "/fleet help"
-    Then the message window should include "/fleet status shows live Fleet worker status"
+    Then the message window should include "/fleet workers (and /subagents) shows sub-agents in the current TUI session only"
+    And the message window should include "CLI: codewhale fleet status"

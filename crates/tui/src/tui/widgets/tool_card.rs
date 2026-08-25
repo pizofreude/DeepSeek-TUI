@@ -67,7 +67,7 @@ pub fn tool_family_for_title(title: &str) -> ToolFamily {
         "Patch" | "Diff" => ToolFamily::Patch,
         "Workspace" | "Image" => ToolFamily::Read,
         "Search" => ToolFamily::Find,
-        "Plan" | "Strategy" | "Review" => ToolFamily::Generic,
+        "Plan" | "Legacy plan" | "Review" => ToolFamily::Generic,
         _ => ToolFamily::Generic,
     }
 }
@@ -79,17 +79,19 @@ pub fn tool_family_for_title(title: &str) -> ToolFamily {
 #[must_use]
 pub fn tool_family_for_name(name: &str) -> ToolFamily {
     match name {
-        "read_file" | "list_dir" | "view_image" | "git_log" | "git_show" | "git_blame" => {
-            ToolFamily::Read
-        }
+        "read_file" | "list_dir" | "view_image" | "git_status" | "git_diff" | "git_log"
+        | "git_show" | "git_blame" => ToolFamily::Read,
         "edit_file" | "apply_patch" | "write_file" => ToolFamily::Patch,
         "exec_shell"
         | "exec_shell_wait"
         | "exec_shell_interact"
         | "exec_shell_cancel"
         | "task_shell_start"
-        | "task_shell_wait" => ToolFamily::Run,
-        "grep_files" | "file_search" | "web_search" | "fetch_url" => ToolFamily::Find,
+        | "task_shell_wait"
+        | "start_registry_mcp_server" => ToolFamily::Run,
+        "grep_files" | "file_search" | "web_search" | "fetch_url" | "registry_sync" => {
+            ToolFamily::Find
+        }
         "agent" => ToolFamily::Delegate,
         "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close" | "rlm" => ToolFamily::Rlm,
         "run_tests"
@@ -103,6 +105,16 @@ pub fn tool_family_for_name(name: &str) -> ToolFamily {
         "workflow" => ToolFamily::Fanout,
         _ => ToolFamily::Generic,
     }
+}
+
+/// Resolve an action-parameterized model tool before assigning its visual
+/// family. Legacy names pass through unchanged.
+#[cfg(test)]
+#[must_use]
+pub fn tool_family_for_call(name: &str, input: &serde_json::Value) -> ToolFamily {
+    tool_family_for_name(crate::tools::canonical_action::canonical_action_alias(
+        name, input,
+    ))
 }
 
 /// User-facing label for an arbitrary tool name. Known tools collapse to the
@@ -333,10 +345,11 @@ pub fn rail_glyph(rail: CardRail) -> &'static str {
 mod tests {
     use super::{
         CardRail, ToolFamily, family_glyph, family_label, rail_glyph, tool_activity_label_for_name,
-        tool_display_label_for_name, tool_family_for_name, tool_family_for_title,
-        tool_header_summary_for_name,
+        tool_display_label_for_name, tool_family_for_call, tool_family_for_name,
+        tool_family_for_title, tool_header_summary_for_name,
     };
     use crate::localization::{Locale, MessageId, tr};
+    use serde_json::json;
 
     #[test]
     fn legacy_titles_route_to_expected_families() {
@@ -346,7 +359,7 @@ mod tests {
         assert_eq!(tool_family_for_title("Search"), ToolFamily::Find);
         assert_eq!(tool_family_for_title("Diff"), ToolFamily::Patch);
         assert_eq!(tool_family_for_title("Plan"), ToolFamily::Generic);
-        assert_eq!(tool_family_for_title("Strategy"), ToolFamily::Generic);
+        assert_eq!(tool_family_for_title("Legacy plan"), ToolFamily::Generic);
         assert_eq!(tool_family_for_title("unknown title"), ToolFamily::Generic);
     }
 
@@ -369,6 +382,41 @@ mod tests {
             tool_family_for_name("totally_new_tool"),
             ToolFamily::Generic
         );
+    }
+
+    #[test]
+    fn canonical_actions_route_to_the_same_families_as_legacy_aliases() {
+        let cases = [
+            ("Bash", "run", ToolFamily::Run),
+            ("Bash", "wait", ToolFamily::Run),
+            ("Bash", "interact", ToolFamily::Run),
+            ("Bash", "cancel", ToolFamily::Run),
+            ("File", "read", ToolFamily::Read),
+            ("File", "list", ToolFamily::Read),
+            ("File", "search_name", ToolFamily::Find),
+            ("File", "search_content", ToolFamily::Find),
+            ("File", "write", ToolFamily::Patch),
+            ("File", "edit", ToolFamily::Patch),
+            ("File", "patch", ToolFamily::Patch),
+            ("Git", "status", ToolFamily::Read),
+            ("Git", "diff", ToolFamily::Read),
+            ("Git", "log", ToolFamily::Read),
+            ("Git", "show", ToolFamily::Read),
+            ("Git", "blame", ToolFamily::Read),
+            ("Run", "tests", ToolFamily::Verify),
+            ("Run", "verifiers", ToolFamily::Verify),
+            ("Web", "search", ToolFamily::Find),
+            ("Web", "fetch", ToolFamily::Find),
+            ("Web", "wait", ToolFamily::Verify),
+        ];
+
+        for (family, action, expected) in cases {
+            assert_eq!(
+                tool_family_for_call(family, &json!({"action": action})),
+                expected,
+                "{family}.{action}"
+            );
+        }
     }
 
     #[test]
@@ -520,6 +568,13 @@ mod tests {
             Locale::PtBr,
             Locale::Es419,
             Locale::Vi,
+            Locale::Ca,
+            Locale::De,
+            Locale::Fr,
+            Locale::Id,
+            Locale::Hi,
+            Locale::Ru,
+            Locale::Uk,
         ] {
             for (id, eng, _) in checks {
                 let msg = tr(locale, *id);
@@ -551,6 +606,13 @@ mod tests {
             Locale::PtBr,
             Locale::Es419,
             Locale::Vi,
+            Locale::Ca,
+            Locale::De,
+            Locale::Fr,
+            Locale::Id,
+            Locale::Hi,
+            Locale::Ru,
+            Locale::Uk,
         ] {
             for (tool, eng) in known.iter().zip(english_labels.iter()) {
                 let label = tool_activity_label_for_name(tool, locale);

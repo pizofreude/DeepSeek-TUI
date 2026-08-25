@@ -1,5 +1,10 @@
+pub mod app_mode;
 pub mod auth_source;
+pub mod auto_model;
 pub mod catalog;
+mod config_document;
+pub mod device_code;
+pub mod external_credentials;
 mod harness;
 pub mod model_reference;
 pub mod models_dev;
@@ -8,9 +13,15 @@ pub mod pricing;
 pub mod provider;
 mod provider_defaults;
 mod provider_kind;
+pub mod provider_templates;
 pub mod route;
 pub mod setup_state;
 pub mod user_constitution;
+mod xai_credentials;
+pub use config_document::{
+    create_config_document, mutate_config_document, replace_config_document_if_unchanged,
+    set_config_document_value, unset_config_document_value,
+};
 pub use harness::{
     HarnessCompactionStrategy, HarnessPosture, HarnessPostureKind, HarnessProfile,
     HarnessSafetyPosture, HarnessToolSurface, built_in_harness_profiles,
@@ -18,12 +29,29 @@ pub use harness::{
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
 pub use provider_kind::ProviderKind;
+pub use provider_templates::{
+    AGNES_TEMPLATE_ID, ProviderSetupApply, ProviderSetupTemplate, SENSENOVA_API_KEY_ENV,
+    SENSENOVA_BASE_URL, SENSENOVA_DEFAULT_MODEL, SENSENOVA_MODELS, SENSENOVA_TEMPLATE_ID,
+    compatible_provider_setup_templates, provider_setup_template, provider_setup_templates,
+};
 pub use setup_state::{
     ConstitutionAuthoring, ConstitutionChoice, ConstitutionSource, ConstitutionValidity,
     InheritedConfigFacts, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
+    TELEMETRY_NOTICE_VERSION,
 };
 pub use user_constitution::{
-    AutonomyPreference, UntrustedDraftParse, UserConstitution, UserConstitutionLoad,
+    APPROX_BYTES_PER_TOKEN, AutonomyPreference, CacheProjection, ClauseOrigin, ClauseStatus,
+    ConstitutionClause, ConstitutionRecommendation, MigrationOutcome, MigrationReceipt,
+    MigrationRejection, Ratification, RatificationError, RecommendationParse,
+    USER_CONSTITUTION_SCHEMA_VERSION, USER_CONSTITUTION_SCHEMA_VERSION_V1, UntrustedDraftParse,
+    UserConstitution, UserConstitutionLoad,
+};
+pub use xai_credentials::{
+    LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX, XAI_OAUTH_GENERATION_SUFFIX,
+    XaiOAuthCredentialStore, XaiOAuthRevocation, clear_all_xai_oauth_credentials,
+    is_valid_xai_oauth_generation, legacy_xai_oauth_path, remove_xai_oauth_generation,
+    validate_xai_oauth_generation, with_xai_oauth_lifecycle_lock,
+    with_xai_oauth_revocation_transaction, xai_oauth_credentials_dir, xai_oauth_generation_path,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,12 +65,21 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+pub use app_mode::AppMode;
 pub use auth_source::{AuthSourceKind, ProviderAuthSourceToml};
 pub use codewhale_execpolicy::ToolAskRule;
-use codewhale_execpolicy::{ExecPolicyEngine, Ruleset};
+use codewhale_execpolicy::{ExecPolicyEngine, PermissionAction, Ruleset};
 use codewhale_secrets::SecretSource;
 pub use codewhale_secrets::Secrets;
+pub use external_credentials::{
+    EXTERNAL_CREDENTIAL_CONSENT_VERSION, EXTERNAL_CREDENTIAL_READ_ONLY_SEMANTICS,
+    ExternalCredentialAccess, ExternalCredentialConsentStatus, ExternalCredentialConsentToml,
+    ExternalCredentialReadGrant, ExternalCredentialSource, default_agy_credentials_path,
+    default_dsh_credentials_path, external_credential_consent_status, quote_os_path,
+    resolve_external_credential_path,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -50,10 +87,46 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PERMISSIONS_FILE_NAME: &str = "permissions.toml";
 
+/// Secret-store routing metadata; never credential material.
+pub const API_KEYRING_SENTINEL: &str = "__KEYRING__";
+
+/// Canonical structural classification for configured API-key values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigApiKeyValueKind {
+    Empty,
+    SecretStoreSentinel,
+    Literal,
+}
+
+#[must_use]
+pub fn classify_config_api_key_value(value: &str) -> ConfigApiKeyValueKind {
+    match value.trim() {
+        "" => ConfigApiKeyValueKind::Empty,
+        API_KEYRING_SENTINEL => ConfigApiKeyValueKind::SecretStoreSentinel,
+        _ => ConfigApiKeyValueKind::Literal,
+    }
+}
+
 fn http_headers_are_effectively_empty(headers: &BTreeMap<String, String>) -> bool {
     !headers
         .iter()
         .any(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+}
+
+/// Whether an HTTP header can carry the model provider's primary credential.
+///
+/// Header names are case-insensitive. Keeping this classifier in shared config
+/// prevents `auth_mode = "none"` from disabling a generated bearer token while
+/// still leaking the same credential through a configured alternate dialect.
+#[must_use]
+pub fn is_upstream_auth_header(name: &str) -> bool {
+    let name = name.trim();
+    // Configured gateways use more credential dialects than the three headers
+    // generated by Codewhale itself. `auth_mode = "none"` is an endpoint
+    // contract, so suppress every credential-shaped request header instead of
+    // allowing the same secret through Proxy-Authorization, X-Auth-Token,
+    // X-Access-Token, X-Goog-Api-Key, or another *-token/*-api-key spelling.
+    is_sensitive_config_key(name) || name.eq_ignore_ascii_case("cookie")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -76,6 +149,18 @@ pub struct ProviderConfigToml {
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Wire dialect preference for dual-protocol vendors (DeepSeek, MiniMax,
+    /// Model Studio): `openai` (Chat Completions, default) or `anthropic`
+    /// (Messages). Not a separate catalog provider — a power-user toggle.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "api_style",
+        alias = "protocol",
+        alias = "wire_format",
+        alias = "dialect"
+    )]
+    pub wire: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +171,19 @@ pub struct ProviderConfigToml {
     pub path_suffix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ProviderAuthSourceToml>,
+    /// Explicit consent for reading one exact credential file owned by
+    /// another CLI. Absence means disabled and must not trigger discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_credentials: Option<ExternalCredentialConsentToml>,
+    /// Codewhale-owned xAI OAuth generation selected by config. The value is a
+    /// validated basename under `$CODEWHALE_HOME/credentials`, never an
+    /// arbitrary path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_credential_generation: Option<String>,
+    /// Preserve provider fields introduced by newer Codewhale versions and by
+    /// custom provider adapters when an older typed writer saves this file.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, toml::Value>,
 }
 
 impl ProviderConfigToml {
@@ -98,11 +196,15 @@ impl ProviderConfigToml {
             && blank(self.model.as_ref())
             && self.context_window.is_none()
             && blank(self.mode.as_ref())
+            && blank(self.wire.as_ref())
             && blank(self.auth_mode.as_ref())
             && self.insecure_skip_tls_verify.is_none()
             && http_headers_are_effectively_empty(&self.http_headers)
             && blank(self.path_suffix.as_ref())
             && self.auth.is_none()
+            && self.external_credentials.is_none()
+            && self.oauth_credential_generation.is_none()
+            && self.extras.is_empty()
     }
 }
 
@@ -119,21 +221,40 @@ pub struct ProvidersToml {
         alias = "deepseek_claude"
     )]
     pub deepseek_anthropic: ProviderConfigToml,
-    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        // The canonical provider id is the kebab `nvidia-nim` (see
+        // `provider.rs`); without these aliases a `[providers.nvidia-nim]`
+        // TOML section was silently dropped (2026-08-04 review).
+        alias = "nvidia-nim",
+        alias = "nvidia",
+        alias = "nim"
+    )]
     pub nvidia_nim: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub openai: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub atlascloud: ProviderConfigToml,
-    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "wanjie-ark",
+        alias = "wanjie",
+        alias = "ark-wanjie",
+        alias = "ark_wanjie"
+    )]
     pub wanjie_ark: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub volcengine: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub openrouter: ProviderConfigToml,
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
+    pub orcarouter: ProviderConfigToml,
     #[serde(
         default,
         skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "xiaomi-mimo",
         alias = "xiaomi",
         alias = "mimo",
         alias = "xiaomimimo"
@@ -162,6 +283,12 @@ pub struct ProvidersToml {
     pub vllm: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub ollama: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "ollama-cloud"
+    )]
+    pub ollama_cloud: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub huggingface: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
@@ -259,6 +386,22 @@ pub struct ProvidersToml {
     #[serde(
         default,
         skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "opencode-go",
+        alias = "opencodego"
+    )]
+    pub opencode_go: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "opencode-zen",
+        alias = "opencodezen",
+        alias = "zen",
+        alias = "opencode"
+    )]
+    pub opencode_zen: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
         alias = "meta-ai",
         alias = "meta_ai",
         alias = "meta-model-api",
@@ -275,6 +418,90 @@ pub struct ProvidersToml {
         alias = "grok"
     )]
     pub xai: ProviderConfigToml,
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "mistral-ai",
+        alias = "mistral_ai",
+        alias = "mistralai",
+        alias = "la-plateforme",
+        alias = "la_plateforme"
+    )]
+    pub mistral: ProviderConfigToml,
+    /// Google Gemini — official OpenAI-compatible endpoint with thought
+    /// signatures on tool calls.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "google-gemini",
+        alias = "google_gemini",
+        alias = "gemini"
+    )]
+    pub google: ProviderConfigToml,
+    /// Google Antigravity (`agy`) — consent-gated credential import only;
+    /// sends fail closed until the cloud-code wire protocol exists.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "agy"
+    )]
+    pub antigravity: ProviderConfigToml,
+    /// Jiangsu Telecom TokenHub — OpenAI-compatible AI gateway.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "telecom-js",
+        alias = "telecom_js",
+        alias = "telecomjs-cn",
+        alias = "tokenhub"
+    )]
+    pub telecomjs: ProviderConfigToml,
+    /// Eden AI — OpenAI-compatible AI gateway (aggregator).
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "eden-ai",
+        alias = "eden_ai"
+    )]
+    pub edenai: ProviderConfigToml,
+    /// Alibaba Cloud Model Studio — Token Plan (OpenAI-compatible endpoint).
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "modelstudio-token-plan",
+        alias = "modelstudio_token_plan",
+        alias = "alibaba-token-plan",
+        alias = "dashscope-token-plan"
+    )]
+    pub modelstudio_token_plan: ProviderConfigToml,
+    /// Alibaba Cloud Model Studio — Token Plan Anthropic-compatible endpoint.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "modelstudio-token-plan-anthropic",
+        alias = "modelstudio_token_plan_anthropic",
+        alias = "alibaba-token-plan-anthropic"
+    )]
+    pub modelstudio_token_plan_anthropic: ProviderConfigToml,
+    /// Alibaba Cloud Model Studio — Coding Plan (OpenAI-compatible endpoint).
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "modelstudio-coding-plan",
+        alias = "modelstudio_coding_plan",
+        alias = "alibaba-coding-plan",
+        alias = "dashscope-coding-plan"
+    )]
+    pub modelstudio_coding_plan: ProviderConfigToml,
+    /// Alibaba Cloud Model Studio — Coding Plan Anthropic-compatible endpoint.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "modelstudio-coding-plan-anthropic",
+        alias = "modelstudio_coding_plan_anthropic",
+        alias = "alibaba-coding-plan-anthropic"
+    )]
+    pub modelstudio_coding_plan_anthropic: ProviderConfigToml,
     /// Catch-all table for the dynamic OpenAI-compatible custom provider
     /// identity (#1519). Arbitrary `[providers.<name>]` tables are handled by
     /// the tui-side flatten map; this named slot keeps the canonical
@@ -282,18 +509,80 @@ pub struct ProvidersToml {
     /// provider's config.
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub custom: ProviderConfigToml,
+    /// Preserve dynamically named provider tables and providers added by a
+    /// newer Codewhale version.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, toml::Value>,
 }
 
 /// Sibling `permissions.toml` schema.
 ///
 /// Each rule is a typed condition that can deny, allow, or ask before a tool
-/// invocation. UI actions that persist deny/allow rules are future work; the
-/// approval card still saves ask rules.
+/// invocation. The approval card persists ask rules and narrowly scoped,
+/// exact allow grants; deny rules remain manually authored.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionsToml {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<ToolAskRule>,
+}
+
+/// On-disk state of the active sibling `permissions.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionsFileState {
+    /// No sibling permission file exists.
+    Missing,
+    /// The sibling permission file exists but contains no TOML content.
+    Empty,
+    /// The sibling permission file contains a parsed TOML document.
+    Present,
+}
+
+/// A parsed, read-only view of the active sibling `permissions.toml`.
+///
+/// Removal tokens bind a displayed rule index to the exact file bytes that
+/// produced this snapshot. A later editor must present the rule again when
+/// another process changed the file instead of deleting whichever rule moved
+/// into the old index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionsSnapshot {
+    path: PathBuf,
+    file_state: PermissionsFileState,
+    permissions: PermissionsToml,
+    removal_tokens: Vec<String>,
+}
+
+impl PermissionsSnapshot {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn file_exists(&self) -> bool {
+        self.file_state != PermissionsFileState::Missing
+    }
+
+    #[must_use]
+    pub fn file_state(&self) -> PermissionsFileState {
+        self.file_state
+    }
+
+    #[must_use]
+    pub fn permissions(&self) -> &PermissionsToml {
+        &self.permissions
+    }
+
+    #[must_use]
+    pub fn rules(&self) -> &[ToolAskRule] {
+        &self.permissions.rules
+    }
+
+    /// Return the opaque confirmation token for a zero-based rule index.
+    #[must_use]
+    pub fn removal_token(&self, index: usize) -> Option<&str> {
+        self.removal_tokens.get(index).map(String::as_str)
+    }
 }
 
 impl PermissionsToml {
@@ -304,7 +593,6 @@ impl PermissionsToml {
 
     #[must_use]
     pub fn ruleset(&self) -> Ruleset {
-        use codewhale_execpolicy::PermissionAction;
         let mut denied = Vec::new();
         let mut trusted = Vec::new();
         let mut ask_rules = Vec::new();
@@ -314,7 +602,10 @@ impl PermissionsToml {
                 PermissionAction::Deny => {
                     // Command-based deny rules are promoted to denied_prefixes
                     // so they are caught by execpolicy's deny-always-wins check.
-                    if let Some(cmd) = &rule.command {
+                    if let Some(cmd) = &rule.command
+                        && !rule.command_exact
+                        && rule.workspace.is_none()
+                    {
                         denied.push(cmd.clone());
                     }
                     // Always keep in ask_rules for path-based and tool-only matching.
@@ -324,7 +615,10 @@ impl PermissionsToml {
                     // Command-based allow rules are promoted to trusted_prefixes
                     // for arity-aware matching.  Path-only allow rules are
                     // handled through ask_rules (they skip the approval prompt).
-                    if let Some(cmd) = &rule.command {
+                    if let Some(cmd) = &rule.command
+                        && !rule.command_exact
+                        && rule.workspace.is_none()
+                    {
                         trusted.push(cmd.clone());
                     }
                     // Keep in ask_rules so path-only allow rules also work.
@@ -343,9 +637,10 @@ impl PermissionsToml {
 impl ProvidersToml {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        ProviderKind::all()
-            .iter()
-            .all(|provider| self.for_provider(*provider).is_empty())
+        self.extras.is_empty()
+            && ProviderKind::all()
+                .iter()
+                .all(|provider| self.for_provider(*provider).is_empty())
     }
 
     #[must_use]
@@ -359,6 +654,7 @@ impl ProvidersToml {
             ProviderKind::WanjieArk => &self.wanjie_ark,
             ProviderKind::Volcengine => &self.volcengine,
             ProviderKind::Openrouter => &self.openrouter,
+            ProviderKind::Orcarouter => &self.orcarouter,
             ProviderKind::XiaomiMimo => &self.xiaomi_mimo,
             ProviderKind::Novita => &self.novita,
             ProviderKind::Fireworks => &self.fireworks,
@@ -369,6 +665,7 @@ impl ProvidersToml {
             ProviderKind::Sglang => &self.sglang,
             ProviderKind::Vllm => &self.vllm,
             ProviderKind::Ollama => &self.ollama,
+            ProviderKind::OllamaCloud => &self.ollama_cloud,
             ProviderKind::Huggingface => &self.huggingface,
             ProviderKind::Together => &self.together,
             ProviderKind::Qianfan => &self.qianfan,
@@ -382,8 +679,19 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &self.deepinfra,
             ProviderKind::Sakana => &self.sakana,
             ProviderKind::LongCat => &self.longcat,
+            ProviderKind::OpencodeGo => &self.opencode_go,
+            ProviderKind::OpencodeZen => &self.opencode_zen,
             ProviderKind::Meta => &self.meta,
             ProviderKind::Xai => &self.xai,
+            ProviderKind::Mistral => &self.mistral,
+            ProviderKind::Google => &self.google,
+            ProviderKind::Antigravity => &self.antigravity,
+            ProviderKind::Telecomjs => &self.telecomjs,
+            ProviderKind::Edenai => &self.edenai,
+            ProviderKind::ModelstudioTokenPlan => &self.modelstudio_token_plan,
+            ProviderKind::ModelstudioTokenPlanAnthropic => &self.modelstudio_token_plan_anthropic,
+            ProviderKind::ModelstudioCodingPlan => &self.modelstudio_coding_plan,
+            ProviderKind::ModelstudioCodingPlanAnthropic => &self.modelstudio_coding_plan_anthropic,
             ProviderKind::Custom => &self.custom,
         }
     }
@@ -398,6 +706,7 @@ impl ProvidersToml {
             ProviderKind::WanjieArk => &mut self.wanjie_ark,
             ProviderKind::Volcengine => &mut self.volcengine,
             ProviderKind::Openrouter => &mut self.openrouter,
+            ProviderKind::Orcarouter => &mut self.orcarouter,
             ProviderKind::XiaomiMimo => &mut self.xiaomi_mimo,
             ProviderKind::Novita => &mut self.novita,
             ProviderKind::Fireworks => &mut self.fireworks,
@@ -408,6 +717,7 @@ impl ProvidersToml {
             ProviderKind::Sglang => &mut self.sglang,
             ProviderKind::Vllm => &mut self.vllm,
             ProviderKind::Ollama => &mut self.ollama,
+            ProviderKind::OllamaCloud => &mut self.ollama_cloud,
             ProviderKind::Huggingface => &mut self.huggingface,
             ProviderKind::Together => &mut self.together,
             ProviderKind::Qianfan => &mut self.qianfan,
@@ -421,11 +731,35 @@ impl ProvidersToml {
             ProviderKind::Deepinfra => &mut self.deepinfra,
             ProviderKind::Sakana => &mut self.sakana,
             ProviderKind::LongCat => &mut self.longcat,
+            ProviderKind::OpencodeGo => &mut self.opencode_go,
+            ProviderKind::OpencodeZen => &mut self.opencode_zen,
             ProviderKind::Meta => &mut self.meta,
             ProviderKind::Xai => &mut self.xai,
+            ProviderKind::Mistral => &mut self.mistral,
+            ProviderKind::Google => &mut self.google,
+            ProviderKind::Antigravity => &mut self.antigravity,
+            ProviderKind::Telecomjs => &mut self.telecomjs,
+            ProviderKind::Edenai => &mut self.edenai,
+            ProviderKind::ModelstudioTokenPlan => &mut self.modelstudio_token_plan,
+            ProviderKind::ModelstudioTokenPlanAnthropic => {
+                &mut self.modelstudio_token_plan_anthropic
+            }
+            ProviderKind::ModelstudioCodingPlan => &mut self.modelstudio_coding_plan,
+            ProviderKind::ModelstudioCodingPlanAnthropic => {
+                &mut self.modelstudio_coding_plan_anthropic
+            }
             ProviderKind::Custom => &mut self.custom,
         }
     }
+}
+
+fn deserialize_root_provider<'de, D>(deserializer: D) -> std::result::Result<ProviderKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let strict = serde::de::value::StringDeserializer::<D::Error>::new(value);
+    Ok(ProviderKind::deserialize(strict).unwrap_or(ProviderKind::Custom))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -440,14 +774,40 @@ pub struct ConfigToml {
     pub http_headers: BTreeMap<String, String>,
     /// TUI-compatible default DeepSeek model.
     pub default_text_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_root_provider")]
     pub provider: ProviderKind,
+    /// Exact id for a dynamically named root provider.
+    ///
+    /// This is runtime parse state rather than a second on-disk key. The
+    /// serialized `provider` value is restored by [`ConfigStore`] so a typed
+    /// dispatcher read/write cannot collapse `[providers.<name>]` back to the
+    /// legacy literal `custom` route.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub selected_provider_id: Option<String>,
     pub model: Option<String>,
     pub auth_mode: Option<String>,
     pub output_mode: Option<String>,
     pub verbosity: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: Option<bool>,
+    /// Where telemetry batches are sent, when telemetry is enabled at all.
+    ///
+    /// Unset here means "take the shipped default",
+    /// [`DEFAULT_TELEMETRY_ENDPOINT`] — not "send nowhere". Setting it to the
+    /// empty string is the way to say send nowhere: that resolves to no
+    /// endpoint, which appends batches to `dryrun.jsonl` and constructs no HTTP
+    /// client. Either way a persistent or run-scoped opt-out still prevents any
+    /// batch from being constructed.
+    ///
+    /// Kept as a scalar sibling of `telemetry` rather than folded into a
+    /// `[telemetry]` table. `telemetry` is already a scalar and every section
+    /// table is declared after it, so a table of that name would be a hard
+    /// `toml::from_str` failure — and one whose cause `ConfigStore::load`
+    /// deliberately hides, leaving the user with an unloadable config and no
+    /// explanation. It would also be a `ValueAfterTable` serialization hazard
+    /// against the scalars that follow.
+    pub telemetry_endpoint: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
     /// Native tool catalog controls shared with `codewhale-tui`.
@@ -497,6 +857,17 @@ pub struct ConfigToml {
     /// workers inherit conservative Sandbox defaults.
     #[serde(default)]
     pub fleet: Option<FleetConfigToml>,
+    /// Multiple named operator-scoped Fleet configurations (#5039).
+    ///
+    /// Each key is a unique fleet name; the associated value is a
+    /// [`NamedFleetConfigToml`] that carries the operator identity and its
+    /// own trust/role/profile/exec policy. The existing `[fleet]` table is the
+    /// backward-compatible default and is always accessible without a name.
+    ///
+    /// Use [`ConfigToml::resolve_fleet`] to select a fleet by name,
+    /// [`ConfigToml::resolve_fleet_for_operator`] to select by operator identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fleets: BTreeMap<String, NamedFleetConfigToml>,
     /// Workflow automatic-launch, approval, isolation, and activity
     /// persistence knobs (#4128 / Section 2.11). When absent, consumers use
     /// [`WorkflowConfigToml::default`].
@@ -513,6 +884,7 @@ enum ProviderConfigField {
     Model,
     ContextWindow,
     Mode,
+    Wire,
     AuthMode,
     InsecureSkipTlsVerify,
     HttpHeaders,
@@ -527,6 +899,7 @@ impl ProviderConfigField {
             "model" => Self::Model,
             "context_window" | "context_window_tokens" => Self::ContextWindow,
             "mode" => Self::Mode,
+            "wire" | "api_style" | "protocol" | "wire_format" | "dialect" => Self::Wire,
             "auth_mode" => Self::AuthMode,
             "insecure_skip_tls_verify" => Self::InsecureSkipTlsVerify,
             "http_headers" => Self::HttpHeaders,
@@ -542,6 +915,7 @@ impl ProviderConfigField {
             Self::Model => "model",
             Self::ContextWindow => "context_window",
             Self::Mode => "mode",
+            Self::Wire => "wire",
             Self::AuthMode => "auth_mode",
             Self::InsecureSkipTlsVerify => "insecure_skip_tls_verify",
             Self::HttpHeaders => "http_headers",
@@ -554,12 +928,34 @@ fn parse_provider_config_key(key: &str) -> Option<(ProviderKind, ProviderConfigF
     let suffix = key.strip_prefix("providers.")?;
     let (provider_key, field_key) = suffix.split_once('.')?;
     let field = ProviderConfigField::parse(field_key)?;
-    let provider = ProviderKind::ALL
+    // Full registry, not ProviderKind::ALL: legacy dialect/plan kinds keep
+    // their own [providers.*] tables even though they left the catalog.
+    let provider = provider::all_providers()
         .iter()
-        .copied()
+        .map(|p| p.kind())
         .find(|kind| kind.provider().provider_config_key() == provider_key)?;
     Some((provider, field))
 }
+
+/// Split a `providers.<id>.<field>` key without resolving the provider. Used
+/// for custom providers, whose ids live in `[providers.<id>]` tables inside
+/// `ProvidersToml::extras` rather than in [`ProviderKind::ALL`].
+fn parse_custom_provider_config_key(key: &str) -> Option<(&str, &str)> {
+    let suffix = key.strip_prefix("providers.")?;
+    let (provider_id, field_key) = suffix.split_once('.')?;
+    (!provider_id.is_empty()).then_some((provider_id, field_key))
+}
+
+fn is_builtin_provider_config_id(provider_id: &str) -> bool {
+    provider::all_providers()
+        .iter()
+        .any(|p| p.provider_config_key() == provider_id)
+}
+
+/// Field legs a `[providers.<id>]` custom table accepts through
+/// `config set`, including the required `kind` marker.
+const CUSTOM_PROVIDER_FIELD_HINT: &str = "api_key, base_url, model, context_window, mode, wire, auth_mode, \
+     insecure_skip_tls_verify, http_headers, path_suffix, kind";
 
 fn provider_config_key(provider: ProviderKind, field: ProviderConfigField) -> String {
     format!(
@@ -579,6 +975,7 @@ fn get_provider_config_value(
         ProviderConfigField::Model => config.model.clone(),
         ProviderConfigField::ContextWindow => config.context_window.map(|value| value.to_string()),
         ProviderConfigField::Mode => config.mode.clone(),
+        ProviderConfigField::Wire => config.wire.clone(),
         ProviderConfigField::AuthMode => config.auth_mode.clone(),
         ProviderConfigField::InsecureSkipTlsVerify => config
             .insecure_skip_tls_verify
@@ -646,6 +1043,9 @@ fn set_provider_config_value(
         ProviderConfigField::Mode => {
             config.providers.for_provider_mut(provider).mode = Some(value.to_string());
         }
+        ProviderConfigField::Wire => {
+            config.providers.for_provider_mut(provider).wire = Some(value.to_string());
+        }
         ProviderConfigField::AuthMode => {
             config.providers.for_provider_mut(provider).auth_mode = Some(value.to_string());
         }
@@ -698,6 +1098,9 @@ fn unset_provider_config_value(
         }
         ProviderConfigField::Mode => {
             config.providers.for_provider_mut(provider).mode = None;
+        }
+        ProviderConfigField::Wire => {
+            config.providers.for_provider_mut(provider).wire = None;
         }
         ProviderConfigField::AuthMode => {
             config.providers.for_provider_mut(provider).auth_mode = None;
@@ -812,6 +1215,82 @@ impl ConfigToml {
     pub fn resolve_hotbar_bindings(&self, known_action_ids: &[&str]) -> HotbarConfigResolution {
         resolve_hotbar_bindings(self.hotbar.as_deref(), known_action_ids)
     }
+
+    /// Resolve a named Fleet configuration by fleet name (#5039).
+    ///
+    /// # Precedence
+    ///
+    /// 1. If `name` matches a key in `[fleets.*]`, returns that fleet.
+    /// 2. Returns [`FleetResolutionError::UnknownFleet`] with the list of
+    ///    available fleet names so the user can correct the reference.
+    ///
+    /// To access the global default fleet use `config.fleet` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetResolutionError::UnknownFleet`] if `name` is not defined.
+    pub fn resolve_fleet(&self, name: &str) -> Result<&NamedFleetConfigToml, FleetResolutionError> {
+        self.fleets
+            .get(name)
+            .ok_or_else(|| FleetResolutionError::UnknownFleet {
+                name: name.to_string(),
+                available: self.fleets.keys().cloned().collect(),
+            })
+    }
+
+    /// Resolve the unique Fleet owned by `operator` (#5039).
+    ///
+    /// # Precedence
+    ///
+    /// 1. Collects every `[fleets.*]` entry whose `operator` field matches
+    ///    (case-sensitive).
+    /// 2. If exactly one fleet matches, returns it.
+    /// 3. If zero match, returns [`FleetResolutionError::UnknownOperator`] with
+    ///    the list of operators that do own a fleet.
+    /// 4. If more than one match, returns [`FleetResolutionError::AmbiguousOperator`]
+    ///    with the fleet names so the caller can request a specific one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetResolutionError::UnknownOperator`] or
+    /// [`FleetResolutionError::AmbiguousOperator`] on failure.
+    pub fn resolve_fleet_for_operator(
+        &self,
+        operator: &str,
+    ) -> Result<(&str, &NamedFleetConfigToml), FleetResolutionError> {
+        let matches: Vec<(&str, &NamedFleetConfigToml)> = self
+            .fleets
+            .iter()
+            .filter(|(_, fleet)| fleet.operator == operator)
+            .map(|(name, fleet)| (name.as_str(), fleet))
+            .collect();
+
+        match matches.len() {
+            0 => {
+                let mut available: Vec<String> = self
+                    .fleets
+                    .values()
+                    .map(|f| f.operator.clone())
+                    .filter(|op| !op.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                available.sort();
+                Err(FleetResolutionError::UnknownOperator {
+                    operator: operator.to_string(),
+                    available,
+                })
+            }
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => Err(FleetResolutionError::AmbiguousOperator {
+                operator: operator.to_string(),
+                fleet_names: matches
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect(),
+            }),
+        }
+    }
 }
 
 /// Ordered primary-plus-fallback provider list for future provider routing.
@@ -827,14 +1306,14 @@ pub struct ProviderChain {
 pub const HOTBAR_SLOT_COUNT: u8 = 8;
 
 pub const DEFAULT_HOTBAR_ACTIONS: [&str; HOTBAR_SLOT_COUNT as usize] = [
-    "voice.toggle",
-    "session.compact",
+    "slash.workflow",
+    "slash.goal",
+    "slash.auto",
     "mode.plan",
     "mode.agent",
     "mode.operate",
     "palette.open",
     "sidebar.toggle",
-    "trust.toggle",
 ];
 
 /// On-disk schema for one `[[hotbar]]` table.
@@ -1123,33 +1602,119 @@ impl Default for SnapshotsToml {
     }
 }
 
+/// Error returned when a named Fleet or operator cannot be resolved (#5039).
+///
+/// Every variant carries a self-contained, human-readable `guidance` string so
+/// callers can surface actionable help without inspecting error details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetResolutionError {
+    /// The requested fleet name is not defined under `[fleets.<name>]`.
+    UnknownFleet {
+        /// The fleet name that was requested.
+        name: String,
+        /// Names of all fleets currently defined.
+        available: Vec<String>,
+    },
+    /// The requested operator has no fleets under `[fleets.*]`.
+    UnknownOperator {
+        /// The operator name that was requested.
+        operator: String,
+        /// All operators that currently own at least one fleet.
+        available: Vec<String>,
+    },
+    /// The operator owns more than one fleet and no fleet name was given.
+    AmbiguousOperator {
+        /// The operator with multiple fleets.
+        operator: String,
+        /// All fleet names owned by that operator.
+        fleet_names: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for FleetResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownFleet { name, available } => {
+                write!(f, "fleet `{name}` is not defined")?;
+                if available.is_empty() {
+                    write!(
+                        f,
+                        ". No named fleets are configured. Add `[fleets.{name}]` to your \
+                         config.toml or use the default `[fleet]` table."
+                    )
+                } else {
+                    write!(
+                        f,
+                        ". Available named fleets: {}. Check your config.toml `[fleets.*]` \
+                         tables.",
+                        available.join(", ")
+                    )
+                }
+            }
+            Self::UnknownOperator {
+                operator,
+                available,
+            } => {
+                write!(f, "no fleet is owned by operator `{operator}`")?;
+                if available.is_empty() {
+                    write!(
+                        f,
+                        ". No named fleets define an operator. Add \
+                         `operator = \"{operator}\"` inside a `[fleets.<name>]` table."
+                    )
+                } else {
+                    write!(
+                        f,
+                        ". Operators with configured fleets: {}.",
+                        available.join(", ")
+                    )
+                }
+            }
+            Self::AmbiguousOperator {
+                operator,
+                fleet_names,
+            } => {
+                write!(
+                    f,
+                    "operator `{operator}` owns multiple fleets ({}); specify a fleet name \
+                     explicitly.",
+                    fleet_names.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FleetResolutionError {}
+
 /// On-disk schema for the `[fleet]` table (#3165). See `config.example.toml`
 /// and `docs/FLEET.md` for documentation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FleetConfigToml {
-    /// Default trust level for fleet workers. One of `"sandbox"`, `"local"`,
-    /// `"remote-verified"`, or `"operator"`. Defaults to `"sandbox"`.
-    #[serde(default = "default_fleet_trust_level_str")]
+    /// Legacy ignored input retained only so pre-0.9.11 configuration can be
+    /// read without failing. Fleet does not own Runtime trust or authority.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub default_trust_level: String,
-    /// Require identity verification for remote (SSH) workers before
-    /// granting them `remote-verified` trust. Defaults to true.
-    #[serde(default = "default_fleet_require_identity")]
+    /// Legacy ignored input; host identity verification belongs to Runtime.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub require_identity_verification: bool,
-    /// Maximum trust level any worker may have (`"sandbox"`, `"local"`,
-    /// `"remote-verified"`, or `"operator"`). Defaults to `"operator"`.
-    #[serde(default = "default_fleet_max_trust_level_str")]
+    /// Legacy ignored input; Fleet membership never grants Runtime trust.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub max_trust_level: String,
     /// User-defined and built-in role presets.
     ///
-    /// Each role defines default tool profiles, capabilities, budgets, and
-    /// trust settings that task specs can reference by name. Built-in roles
+    /// Each role defines default tool profiles, capabilities, and execution
+    /// requests that task specs can reference by name. Built-in roles
     /// (`smoke-runner`, `reviewer`, `builder`, `read-only`) are always
     /// available; user-defined roles in config override or extend them.
     #[serde(default)]
     pub roles: BTreeMap<String, FleetRolePreset>,
     /// Fleet profile vocabulary (#3167). Profiles group role semantics,
-    /// loadout hints, permission defaults, and delegation bounds. They are
-    /// config-only in this slice; executor/model routing wiring lands later.
+    /// loadout hints, route identity, and delegation bounds. Runtime authority
+    /// is intentionally not a profile property.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, FleetProfile>,
     /// Headless worker execution hardening (#3027).
@@ -1195,8 +1760,9 @@ pub struct FleetExecConfig {
     /// Tools that are always disallowed, overriding role and task spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disallowed_tools: Vec<String>,
-    /// Hard ceiling on sub-agent steps (tool calls + model turns).
-    /// Workers that exceed this are terminated. Default: unbounded (u32::MAX).
+    /// Optional hard ceiling on sub-agent steps (tool calls + model turns).
+    /// Zero keeps the normal agent loop unbounded; a positive value terminates
+    /// workers that exceed the explicit operator cap.
     #[serde(default = "default_fleet_max_turns")]
     pub max_turns: u32,
     /// Recursive child-agent budget for headless fleet workers.
@@ -1216,8 +1782,14 @@ pub struct FleetExecConfig {
     pub output_format: String,
 }
 
+/// Fleet workers run until the model finishes unless an operator supplies a
+/// positive `max_turns` value. Individual task budgets may still opt into a
+/// narrower explicit model-turn cap through `budget.max_steps`; tool-call
+/// admission is enforced independently through `budget.max_tool_calls`.
+pub const FLEET_DEFAULT_MAX_TURNS: u32 = 0;
+
 fn default_fleet_max_turns() -> u32 {
-    u32::MAX
+    FLEET_DEFAULT_MAX_TURNS
 }
 
 fn default_fleet_max_spawn_depth() -> u32 {
@@ -1284,8 +1856,11 @@ pub struct FleetProfile {
     /// TUI loader before they are used at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// Permission defaults requested by the profile.
-    #[serde(default)]
+    /// Legacy ignored input retained for old Fleet-profile files. Runtime
+    /// authority is derived after identity selection and is never persisted in
+    /// this profile.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub permissions: FleetProfilePermissions,
     /// Delegation hints for future manager policy.
     #[serde(default)]
@@ -1360,6 +1935,7 @@ impl<'de> Deserialize<'de> for FleetRole {
 pub enum FleetSlot {
     Manager,
     Scout,
+    Planner,
     Implementer,
     Reviewer,
     Verifier,
@@ -1376,6 +1952,7 @@ impl FleetSlot {
         match self {
             Self::Manager => "manager",
             Self::Scout => "scout",
+            Self::Planner => "planner",
             Self::Implementer => "implementer",
             Self::Reviewer => "reviewer",
             Self::Verifier => "verifier",
@@ -1391,6 +1968,7 @@ impl FleetSlot {
         match value.trim() {
             "manager" | "coordinator" => Self::Manager,
             "scout" | "research" | "research-worker" => Self::Scout,
+            "planner" | "plan" | "awaiter" => Self::Planner,
             "implementer" | "builder" => Self::Implementer,
             "reviewer" => Self::Reviewer,
             "verifier" | "tester" => Self::Verifier,
@@ -1480,17 +2058,18 @@ impl<'de> Deserialize<'de> for FleetLoadout {
     }
 }
 
-/// Safe permission defaults attached to a fleet profile.
+/// Legacy Fleet-profile permission payload retained only for source and input
+/// compatibility. Runtime ignores it; Fleet identity cannot grant authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetProfilePermissions {
-    /// Permit shell-capable tools for this profile when later consumed.
-    #[serde(default)]
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub allow_shell: bool,
-    /// Permit trusted/elevated execution for this profile when later consumed.
-    #[serde(default)]
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub trust: bool,
-    /// Require approval by default. This intentionally defaults on.
-    #[serde(default = "default_fleet_profile_approval_required")]
+    #[doc(hidden)]
+    #[serde(default = "default_fleet_profile_approval_required", skip_serializing)]
     pub approval_required: bool,
 }
 
@@ -1549,34 +2128,11 @@ pub struct FleetRolePreset {
     /// Default timeout in seconds for tasks using this role.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
-    /// Default trust level override for this role.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy ignored input retained for old config deserialization. Runtime
+    /// derives execution authority independently of Fleet role identity.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub trust_level: Option<String>,
-}
-
-fn default_fleet_trust_level_str() -> String {
-    "sandbox".to_string()
-}
-
-fn default_fleet_require_identity() -> bool {
-    true
-}
-
-fn default_fleet_max_trust_level_str() -> String {
-    "operator".to_string()
-}
-
-impl Default for FleetConfigToml {
-    fn default() -> Self {
-        Self {
-            default_trust_level: default_fleet_trust_level_str(),
-            require_identity_verification: default_fleet_require_identity(),
-            max_trust_level: default_fleet_max_trust_level_str(),
-            roles: BTreeMap::new(),
-            profiles: BTreeMap::new(),
-            exec: FleetExecConfig::default(),
-        }
-    }
 }
 
 impl FleetConfigToml {
@@ -1588,6 +2144,83 @@ impl FleetConfigToml {
             .get(name)
             .cloned()
             .or_else(|| built_in_role_presets().get(name).cloned())
+    }
+}
+
+/// On-disk schema for a single named Fleet entry under `[fleets.<name>]` (#5039).
+///
+/// A named Fleet carries a mandatory `operator` identity plus independently
+/// configured roles, profiles, and execution requests. Multiple named Fleets
+/// may coexist; each is uniquely addressed by its TOML key. Runtime trust and
+/// authority are deliberately not Fleet variables.
+///
+/// # TOML example
+///
+/// ```toml
+/// [fleets.alice-team]
+/// operator = "alice"
+/// [fleets.alice-team.exec]
+/// max_turns = 200
+///
+/// [fleets.alice-team.profiles.fast-verifier]
+/// slot = "verifier"
+/// loadout = "fast"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedFleetConfigToml {
+    /// The operator/leader identity for this Fleet.
+    ///
+    /// Used to scope fleet selection: `config.resolve_fleet_for_operator("alice")`
+    /// returns the fleet whose `operator` field matches. Must be non-empty.
+    pub operator: String,
+    /// Legacy ignored input retained only for pre-0.9.11 config reads.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub default_trust_level: String,
+    /// Legacy ignored input; Runtime owns host identity verification.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub require_identity_verification: bool,
+    /// Legacy ignored input; Fleet identity never grants Runtime trust.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub max_trust_level: String,
+    /// User-defined and built-in role presets for this fleet.
+    #[serde(default)]
+    pub roles: BTreeMap<String, FleetRolePreset>,
+    /// Fleet profile vocabulary for this fleet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, FleetProfile>,
+    /// Headless worker execution constraints for this fleet.
+    #[serde(default)]
+    pub exec: FleetExecConfig,
+}
+
+impl NamedFleetConfigToml {
+    /// Resolve a role preset by name. Checks user-defined roles first,
+    /// then falls back to built-in role defaults.
+    #[must_use]
+    pub fn resolve_role(&self, name: &str) -> Option<FleetRolePreset> {
+        self.roles
+            .get(name)
+            .cloned()
+            .or_else(|| built_in_role_presets().get(name).cloned())
+    }
+
+    /// Borrow this named Fleet's settings as a `FleetConfigToml` view.
+    ///
+    /// Useful when callers need a unified type regardless of whether the fleet
+    /// was selected by name or the legacy `[fleet]` default was used.
+    #[must_use]
+    pub fn as_fleet_config(&self) -> FleetConfigToml {
+        FleetConfigToml {
+            default_trust_level: self.default_trust_level.clone(),
+            require_identity_verification: self.require_identity_verification,
+            max_trust_level: self.max_trust_level.clone(),
+            roles: self.roles.clone(),
+            profiles: self.profiles.clone(),
+            exec: self.exec.clone(),
+        }
     }
 }
 
@@ -1622,7 +2255,10 @@ pub struct WorkflowConfigToml {
     /// Maximum concurrently live agents inside one Workflow run (product: 16).
     #[serde(default = "default_workflow_max_concurrent")]
     pub max_concurrent: u32,
-    /// Maximum nested Workflow / child-orchestration depth.
+    /// Maximum structural nesting depth accepted for Workflow IR.
+    ///
+    /// This is independent of Runtime child delegation, whose default is 3
+    /// and whose opt-in hard ceiling is 8.
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
     /// Default shared token budget for a Workflow run and its children.
@@ -1668,7 +2304,7 @@ fn default_workflow_max_concurrent() -> u32 {
 }
 
 fn default_workflow_max_depth() -> u32 {
-    2
+    5
 }
 
 fn default_workflow_default_token_budget() -> u64 {
@@ -1718,7 +2354,7 @@ pub fn built_in_role_presets() -> BTreeMap<String, FleetRolePreset> {
                 tools: vec![],
                 capabilities: vec![],
                 timeout_seconds: Some(300),
-                trust_level: Some("local".to_string()),
+                trust_level: None,
             },
         ),
         (
@@ -1742,7 +2378,7 @@ pub fn built_in_role_presets() -> BTreeMap<String, FleetRolePreset> {
                 tools: vec![],
                 capabilities: vec![],
                 timeout_seconds: Some(1800),
-                trust_level: Some("local".to_string()),
+                trust_level: None,
             },
         ),
         (
@@ -1755,7 +2391,7 @@ pub fn built_in_role_presets() -> BTreeMap<String, FleetRolePreset> {
                 tools: vec![],
                 capabilities: vec![],
                 timeout_seconds: Some(300),
-                trust_level: Some("sandbox".to_string()),
+                trust_level: None,
             },
         ),
     ]
@@ -1796,6 +2432,63 @@ impl Default for VerifierConfigToml {
     }
 }
 
+/// On-disk schema for `[advisor]` (#3982).
+///
+/// Advisor mode is **off by default**. When enabled, the engine spawns a
+/// short-lived background reviewer after each turn that contained tool calls.
+/// The reviewer reads a bounded slice of recent tool calls, makes a concise
+/// LLM advisory call, and emits the note as an `AdvisoryNote` event without
+/// blocking the parent turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdvisorConfigToml {
+    /// Master on/off switch. `false` by default — no background reviewer is
+    /// spawned until the user opts in via `[advisor] enabled = true` or
+    /// `/advisor on`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of recent tool-call/result pairs to include in each
+    /// advisory review. Keeps the reviewer's context window bounded regardless
+    /// of turn length. Defaults to 10; clamped to 1–50.
+    #[serde(default = "advisor_default_max_tool_calls")]
+    pub max_tool_calls: u32,
+    /// Minimum wall-clock seconds between two consecutive advisor emissions.
+    /// Prevents noise on rapid multi-turn sequences. Defaults to 60 seconds;
+    /// clamped to 5–3600.
+    #[serde(default = "advisor_default_rate_limit_secs")]
+    pub rate_limit_secs: u64,
+    /// Deduplication window in seconds. An advisory note whose content hash
+    /// matches the previous note within this window is silently dropped.
+    /// Defaults to 300 seconds (5 minutes).
+    #[serde(default = "advisor_default_dedup_window_secs")]
+    pub dedup_window_secs: u64,
+    /// Optional model override for the advisor LLM call. When absent, the
+    /// advisor reuses the session's current model.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn advisor_default_max_tool_calls() -> u32 {
+    10
+}
+fn advisor_default_rate_limit_secs() -> u64 {
+    60
+}
+fn advisor_default_dedup_window_secs() -> u64 {
+    300
+}
+
+impl Default for AdvisorConfigToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_tool_calls: advisor_default_max_tool_calls(),
+            rate_limit_secs: advisor_default_rate_limit_secs(),
+            dedup_window_secs: advisor_default_dedup_window_secs(),
+            model: None,
+        }
+    }
+}
+
 /// On-disk schema for the `[network]` table (#135). See `config.example.toml`
 /// for documentation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1815,6 +2508,10 @@ pub struct NetworkPolicyToml {
     /// explicitly trusted proxy setup. Literal IP URLs remain blocked.
     #[serde(default)]
     pub proxy: Vec<String>,
+    /// Explicit fake-IP placeholder CIDRs for those proxy hosts. The runtime
+    /// accepts only subnets contained by `198.18.0.0/15`.
+    #[serde(default)]
+    pub proxy_fake_ip_cidrs: Vec<String>,
     /// Whether to record one audit-log line per outbound network call.
     #[serde(default = "default_network_audit")]
     pub audit: bool,
@@ -1835,6 +2532,7 @@ impl Default for NetworkPolicyToml {
             allow: Vec::new(),
             deny: Vec::new(),
             proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
             audit: default_network_audit(),
         }
     }
@@ -1874,6 +2572,179 @@ pub struct LspConfigToml {
 }
 
 impl ConfigToml {
+    /// Exact configured provider id, including a dynamically named custom
+    /// provider selected by the TUI.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        self.named_custom_provider_id()
+            .unwrap_or_else(|| self.provider.as_str())
+    }
+
+    /// Return the exact id only when the root selection names a dynamic custom
+    /// provider rather than the legacy literal `custom` route.
+    #[must_use]
+    pub fn named_custom_provider_id(&self) -> Option<&str> {
+        (self.provider == ProviderKind::Custom)
+            .then_some(self.selected_provider_id.as_deref())
+            .flatten()
+    }
+
+    fn named_custom_provider_table(&self, provider_id: &str) -> Result<&toml::value::Table> {
+        let table = self
+            .providers
+            .extras
+            .get(provider_id)
+            .and_then(toml::Value::as_table)
+            .with_context(|| {
+                format!(
+                    "custom provider '{provider_id}' requires a matching [providers.{provider_id}] table"
+                )
+            })?;
+        let compatible = table
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|kind| {
+                kind.trim()
+                    .to_ascii_lowercase()
+                    .replace('_', "-")
+                    .eq("openai-compatible")
+            });
+        if !compatible {
+            bail!(
+                "custom provider '{provider_id}' must set [providers.{provider_id}].kind = \"openai-compatible\""
+            );
+        }
+        Ok(table)
+    }
+
+    fn named_custom_provider_config(&self) -> Option<ProviderConfigToml> {
+        let provider_id = self.named_custom_provider_id()?;
+        self.named_custom_provider_table(provider_id).ok()?;
+        self.providers
+            .extras
+            .get(provider_id)
+            .cloned()?
+            .try_into()
+            .ok()
+    }
+
+    /// Mutable access to a custom provider's `[providers.<id>]` table,
+    /// creating it on the first `config set providers.<id>.<field>`.
+    fn custom_provider_table_mut(&mut self, provider_id: &str) -> Result<&mut toml::value::Table> {
+        let entry = self
+            .providers
+            .extras
+            .entry(provider_id.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        entry.as_table_mut().with_context(|| {
+            format!("custom provider '{provider_id}' must be a [providers.{provider_id}] table")
+        })
+    }
+
+    /// Write one leg of a custom provider table. Named custom providers are
+    /// not in [`ProviderKind::ALL`], so without this path
+    /// `config set providers.<custom>.<field>` fell through to a literal
+    /// top-level extras key and silently never took effect (#5167).
+    fn set_custom_provider_value(
+        &mut self,
+        provider_id: &str,
+        field_key: &str,
+        value: &str,
+    ) -> Result<()> {
+        if is_builtin_provider_config_id(provider_id) {
+            bail!(
+                "unknown field '{field_key}' for built-in provider '{provider_id}': \
+                 expected one of api_key, base_url, model, context_window, mode, auth_mode, \
+                 insecure_skip_tls_verify, http_headers, path_suffix"
+            );
+        }
+        if field_key == "kind" {
+            let compatible =
+                value.trim().to_ascii_lowercase().replace('_', "-") == "openai-compatible";
+            if !compatible {
+                bail!(
+                    "custom provider '{provider_id}' must set [providers.{provider_id}].kind = \"openai-compatible\""
+                );
+            }
+            self.custom_provider_table_mut(provider_id)?.insert(
+                "kind".to_string(),
+                toml::Value::String(value.trim().to_string()),
+            );
+            return Ok(());
+        }
+        let Some(field) = ProviderConfigField::parse(field_key) else {
+            bail!(
+                "unknown field '{field_key}' for custom provider '{provider_id}': \
+                 expected one of {CUSTOM_PROVIDER_FIELD_HINT}"
+            );
+        };
+        let toml_value = match field {
+            ProviderConfigField::ApiKey
+            | ProviderConfigField::BaseUrl
+            | ProviderConfigField::Model
+            | ProviderConfigField::Mode
+            | ProviderConfigField::Wire
+            | ProviderConfigField::AuthMode
+            | ProviderConfigField::PathSuffix => toml::Value::String(value.to_string()),
+            ProviderConfigField::ContextWindow => {
+                toml::Value::Integer(i64::from(parse_context_window(value)?))
+            }
+            ProviderConfigField::InsecureSkipTlsVerify => toml::Value::Boolean(parse_bool(value)?),
+            ProviderConfigField::HttpHeaders => toml::Value::Table(
+                parse_http_headers(value)?
+                    .into_iter()
+                    .map(|(name, header)| (name, toml::Value::String(header)))
+                    .collect(),
+            ),
+        };
+        self.custom_provider_table_mut(provider_id)?
+            .insert(field.key().to_string(), toml_value);
+        Ok(())
+    }
+
+    fn get_custom_provider_value_with(
+        &self,
+        provider_id: &str,
+        field_key: &str,
+        render: fn(&ProviderConfigToml, ProviderConfigField) -> Option<String>,
+    ) -> Option<String> {
+        let table = self.providers.extras.get(provider_id)?.as_table()?;
+        if field_key == "kind" {
+            return table.get("kind")?.as_str().map(str::to_string);
+        }
+        let field = ProviderConfigField::parse(field_key)?;
+        let config: ProviderConfigToml = toml::Value::Table(table.clone()).try_into().ok()?;
+        render(&config, field)
+    }
+
+    fn unset_custom_provider_value(&mut self, provider_id: &str, field_key: &str) {
+        let Some(table) = self
+            .providers
+            .extras
+            .get_mut(provider_id)
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return;
+        };
+        let leg = if field_key == "kind" {
+            "kind"
+        } else {
+            ProviderConfigField::parse(field_key).map_or(field_key, |field| field.key())
+        };
+        table.remove(leg);
+    }
+
+    fn bind_persisted_provider_id(&mut self, provider_id: &str) -> Result<()> {
+        self.selected_provider_id = None;
+        if self.provider != ProviderKind::Custom || provider_id == ProviderKind::Custom.as_str() {
+            return Ok(());
+        }
+
+        self.named_custom_provider_table(provider_id)?;
+        self.selected_provider_id = Some(provider_id.to_string());
+        Ok(())
+    }
+
     /// Merge safe project-level overrides from `$WORKSPACE/.codewhale/config.toml`
     /// or legacy `$WORKSPACE/.deepseek/config.toml`.
     ///
@@ -1911,7 +2782,7 @@ impl ConfigToml {
         if project.tools.is_some() {
             self.tools = project.tools;
         }
-        for provider in ProviderKind::ALL {
+        for provider in provider::all_providers().iter().map(|p| p.kind()) {
             merge_project_provider_config(
                 self.providers.for_provider_mut(provider),
                 project.providers.for_provider(provider),
@@ -1924,9 +2795,16 @@ impl ConfigToml {
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return get_provider_config_value(self.providers.for_provider(provider), field);
         }
+        if let Some((provider_id, field_key)) = parse_custom_provider_config_key(key) {
+            return self.get_custom_provider_value_with(
+                provider_id,
+                field_key,
+                get_provider_config_value,
+            );
+        }
 
         match key {
-            "provider" => Some(self.provider.as_str().to_string()),
+            "provider" => Some(self.provider_id().to_string()),
             "stream_chunk_timeout_secs" | "tui.stream_chunk_timeout_secs" => {
                 Some(self.stream_chunk_timeout_secs().to_string())
             }
@@ -1940,6 +2818,7 @@ impl ConfigToml {
             "verbosity" => self.verbosity.clone(),
             "log_level" => self.log_level.clone(),
             "telemetry" => self.telemetry.map(|v| v.to_string()),
+            "telemetry_endpoint" => self.telemetry_endpoint.clone(),
             "approval_policy" => self.approval_policy.clone(),
             "sandbox_mode" => self.sandbox_mode.clone(),
             "tools.always_load" => self.tools.as_ref().map(|tools| tools.always_load.join(",")),
@@ -1952,10 +2831,43 @@ impl ConfigToml {
         }
     }
 
+    /// The unquoted contents of an extras key that holds a TOML string.
+    ///
+    /// [`ConfigToml::get_value`] renders extras through `toml::Value::to_string`,
+    /// which re-applies TOML quoting — and switches to a single-quoted literal
+    /// string whenever the payload contains a `"`. A JSON blob written with
+    /// [`ConfigToml::set_value`] therefore comes back as `'[{"a":1}]'` and no
+    /// longer parses as JSON (#4727). Callers that stored structured text want
+    /// the payload, not its TOML rendering.
+    #[must_use]
+    pub fn get_raw_string(&self, key: &str) -> Option<&str> {
+        self.extras.get(key).and_then(toml::Value::as_str)
+    }
+
     #[must_use]
     pub fn get_display_value(&self, key: &str) -> Option<String> {
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return get_provider_config_display_value(self.providers.for_provider(provider), field);
+        }
+        if let Some((provider_id, field_key)) = parse_custom_provider_config_key(key) {
+            return self.get_custom_provider_value_with(
+                provider_id,
+                field_key,
+                get_provider_config_display_value,
+            );
+        }
+
+        if key == "telemetry" {
+            // #5441: telemetry resolves ON by default, so an unset file key
+            // must not read "key not found" (or as a bare file value) on a
+            // machine whose batches ship. Show the resolved consent with its
+            // source — a truth change, not a behaviour change.
+            let (on, source) = resolved_telemetry_consent(self.telemetry);
+            return Some(format!(
+                "{} ({})",
+                if on { "on" } else { "off" },
+                source.as_str()
+            ));
         }
 
         if key == "http_headers" {
@@ -2005,15 +2917,27 @@ impl ConfigToml {
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return set_provider_config_value(self, provider, field, value);
         }
+        if let Some((provider_id, field_key)) = parse_custom_provider_config_key(key) {
+            return self.set_custom_provider_value(provider_id, field_key, value);
+        }
 
         match key {
             "provider" => {
-                self.provider = ProviderKind::parse(value).with_context(|| {
-                    format!(
-                        "unknown provider '{value}': expected {}",
-                        ProviderKind::names_hint()
-                    )
-                })?;
+                if let Some(provider) = ProviderKind::parse_config_identity(value) {
+                    self.provider = provider;
+                    self.selected_provider_id = None;
+                } else {
+                    let provider_id = value.trim();
+                    self.named_custom_provider_table(provider_id)
+                        .with_context(|| {
+                            format!(
+                                "unknown provider '{value}': expected {} or a configured custom provider",
+                                ProviderKind::names_hint()
+                            )
+                        })?;
+                    self.provider = ProviderKind::Custom;
+                    self.selected_provider_id = Some(provider_id.to_string());
+                }
             }
             "api_key" => self.api_key = Some(value.to_string()),
             "base_url" => self.base_url = Some(value.to_string()),
@@ -2027,6 +2951,10 @@ impl ConfigToml {
             "telemetry" => {
                 self.telemetry = Some(parse_bool(value)?);
             }
+            // Scheme rules (HTTPS, or loopback HTTP) are enforced where a
+            // batch would actually be sent, not here: a user must be able to
+            // stage a value before the machinery that reads it exists.
+            "telemetry_endpoint" => self.telemetry_endpoint = Some(value.to_string()),
             "approval_policy" => self.approval_policy = Some(value.to_string()),
             "sandbox_mode" => self.sandbox_mode = Some(value.to_string()),
             "hook_sinks.unix_socket_path" => {
@@ -2047,9 +2975,16 @@ impl ConfigToml {
             unset_provider_config_value(self, provider, field);
             return Ok(());
         }
+        if let Some((provider_id, field_key)) = parse_custom_provider_config_key(key) {
+            self.unset_custom_provider_value(provider_id, field_key);
+            return Ok(());
+        }
 
         match key {
-            "provider" => self.provider = ProviderKind::Deepseek,
+            "provider" => {
+                self.provider = ProviderKind::Deepseek;
+                self.selected_provider_id = None;
+            }
             "api_key" => self.api_key = None,
             "base_url" => self.base_url = None,
             "http_headers" => self.http_headers.clear(),
@@ -2060,6 +2995,7 @@ impl ConfigToml {
             "verbosity" => self.verbosity = None,
             "log_level" => self.log_level = None,
             "telemetry" => self.telemetry = None,
+            "telemetry_endpoint" => self.telemetry_endpoint = None,
             "approval_policy" => self.approval_policy = None,
             "sandbox_mode" => self.sandbox_mode = None,
             "hook_sinks.unix_socket_path" => {
@@ -2077,7 +3013,7 @@ impl ConfigToml {
     #[must_use]
     pub fn list_values(&self) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        out.insert("provider".to_string(), self.provider.as_str().to_string());
+        out.insert("provider".to_string(), self.provider_id().to_string());
 
         if let Some(v) = self.api_key.as_ref() {
             out.insert("api_key".to_string(), redact_secret(v));
@@ -2109,6 +3045,9 @@ impl ConfigToml {
         if let Some(v) = self.telemetry {
             out.insert("telemetry".to_string(), v.to_string());
         }
+        if let Some(v) = self.telemetry_endpoint.as_ref() {
+            out.insert("telemetry_endpoint".to_string(), v.clone());
+        }
         if let Some(v) = self.approval_policy.as_ref() {
             out.insert("approval_policy".to_string(), v.clone());
         }
@@ -2126,7 +3065,7 @@ impl ConfigToml {
             );
         }
 
-        for provider in ProviderKind::ALL {
+        for provider in provider::all_providers().iter().map(|p| p.kind()) {
             insert_provider_config_values(
                 &mut out,
                 provider,
@@ -2175,7 +3114,14 @@ impl ConfigToml {
             (self.provider, ProviderSource::Config)
         };
 
-        let mut provider_cfg = self.providers.for_provider(provider).clone();
+        let mut provider_cfg = if provider == ProviderKind::Custom
+            && matches!(provider_source, ProviderSource::Config)
+        {
+            self.named_custom_provider_config()
+                .unwrap_or_else(|| self.providers.for_provider(provider).clone())
+        } else {
+            self.providers.for_provider(provider).clone()
+        };
         if provider == ProviderKind::SiliconflowCN {
             let fb = &self.providers.siliconflow;
             if provider_cfg.api_key.is_none() {
@@ -2191,12 +3137,17 @@ impl ConfigToml {
         let root_deepseek_api_key = (provider == ProviderKind::Deepseek)
             .then(|| self.api_key.clone())
             .flatten();
-        let root_deepseek_base_url = (provider == ProviderKind::Deepseek)
-            .then(|| self.base_url.clone())
-            .flatten();
-        let root_deepseek_model = (provider == ProviderKind::Deepseek)
-            .then(|| self.default_text_model.clone())
-            .flatten();
+        // Root `base_url` is the legacy DeepSeek field, but Xiaomi MiMo and
+        // OpenAI Codex also honour it when the per-provider table has no
+        // endpoint of its own. Silently ignoring a configured root URL while
+        // also dropping the root model made both routes unusable from a
+        // minimal top-level config.
+        let root_base_url = matches!(
+            provider,
+            ProviderKind::Deepseek | ProviderKind::XiaomiMimo | ProviderKind::OpenaiCodex
+        )
+        .then(|| self.base_url.clone())
+        .flatten();
         let auth_mode = cli
             .auth_mode
             .clone()
@@ -2204,12 +3155,12 @@ impl ConfigToml {
             .or_else(|| provider_cfg.auth_mode.clone())
             .or_else(|| self.auth_mode.clone());
         let from_file = provider_cfg.api_key.clone().or(root_deepseek_api_key);
-        let configured_base_url = cli
-            .base_url
-            .clone()
-            .or_else(|| env.base_url_for(provider))
-            .or_else(|| provider_cfg.base_url.clone())
-            .or(root_deepseek_base_url);
+        let cli_base_url = cli.base_url.clone();
+        let env_base_url = env.base_url_for(provider);
+        let file_base_url = provider_cfg.base_url.clone().or(root_base_url);
+        let base_url_from_file =
+            cli_base_url.is_none() && env_base_url.is_none() && file_base_url.is_some();
+        let configured_base_url = cli_base_url.or(env_base_url).or(file_base_url);
         let xiaomi_mimo_mode = if provider == ProviderKind::XiaomiMimo {
             env.xiaomi_mimo_mode
                 .clone()
@@ -2228,14 +3179,34 @@ impl ConfigToml {
         let explicit_api_key_for_endpoint = cli
             .api_key
             .as_deref()
-            .or(from_file.as_deref())
+            .or(from_file.as_deref().filter(|value| {
+                classify_config_api_key_value(value) == ConfigApiKeyValueKind::Literal
+            }))
             .or(xiaomi_mimo_env_api_key.as_deref());
+        let provider_wire = provider_cfg.wire.as_deref();
         let base_url = if provider == ProviderKind::XiaomiMimo {
             resolve_xiaomi_mimo_base_url(
                 configured_base_url,
                 explicit_api_key_for_endpoint,
                 xiaomi_mimo_mode.as_deref(),
             )
+        } else if is_modelstudio_family(provider) {
+            resolve_modelstudio_base_url(
+                configured_base_url,
+                provider,
+                provider_cfg.mode.as_deref(),
+                provider_wire,
+            )
+        } else if matches!(
+            provider,
+            ProviderKind::Minimax | ProviderKind::MinimaxAnthropic
+        ) {
+            resolve_minimax_base_url(configured_base_url, provider, provider_wire)
+        } else if matches!(
+            provider,
+            ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+        ) {
+            resolve_deepseek_base_url(configured_base_url, provider, provider_wire)
         } else {
             configured_base_url.unwrap_or_else(|| match provider {
                 ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL.to_string(),
@@ -2246,6 +3217,7 @@ impl ConfigToml {
                 ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL.to_string(),
                 ProviderKind::Volcengine => DEFAULT_VOLCENGINE_BASE_URL.to_string(),
                 ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL.to_string(),
+                ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_BASE_URL.to_string(),
                 ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_BASE_URL.to_string(),
                 ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL.to_string(),
                 ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL.to_string(),
@@ -2253,7 +3225,10 @@ impl ConfigToml {
                 ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_CN_BASE_URL.to_string(),
                 ProviderKind::Arcee => DEFAULT_ARCEE_BASE_URL.to_string(),
                 ProviderKind::Moonshot => {
-                    if auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth) {
+                    if auth_mode
+                        .as_deref()
+                        .is_some_and(auth_mode_uses_kimi_imported_token)
+                    {
                         DEFAULT_KIMI_CODE_BASE_URL.to_string()
                     } else {
                         DEFAULT_MOONSHOT_BASE_URL.to_string()
@@ -2262,6 +3237,7 @@ impl ConfigToml {
                 ProviderKind::Sglang => DEFAULT_SGLANG_BASE_URL.to_string(),
                 ProviderKind::Vllm => DEFAULT_VLLM_BASE_URL.to_string(),
                 ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL.to_string(),
+                ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL.to_string(),
                 ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL.to_string(),
                 ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL.to_string(),
                 ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL.to_string(),
@@ -2275,36 +3251,75 @@ impl ConfigToml {
                 ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL.to_string(),
                 ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL.to_string(),
                 ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL.to_string(),
+                ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL.to_string(),
+                ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_BASE_URL.to_string(),
                 ProviderKind::Meta => DEFAULT_META_BASE_URL.to_string(),
                 ProviderKind::Xai => DEFAULT_XAI_BASE_URL.to_string(),
+                ProviderKind::Mistral => DEFAULT_MISTRAL_BASE_URL.to_string(),
+                ProviderKind::Google => DEFAULT_GOOGLE_BASE_URL.to_string(),
+                ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_BASE_URL.to_string(),
+                ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL.to_string(),
+                ProviderKind::Edenai => DEFAULT_EDENAI_BASE_URL.to_string(),
+                ProviderKind::ModelstudioTokenPlan
+                | ProviderKind::ModelstudioTokenPlanAnthropic
+                | ProviderKind::ModelstudioCodingPlan
+                | ProviderKind::ModelstudioCodingPlanAnthropic => {
+                    DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL.to_string()
+                }
                 // The custom provider has no built-in endpoint; fall back to its
                 // descriptor placeholder so the lookup is total. Real custom
                 // routes always supply a configured base_url before this point.
                 ProviderKind::Custom => provider.provider().default_base_url().to_string(),
             })
         };
-        // CLI flag wins outright. Otherwise: config-file → injected secrets/env.
-        // This makes `deepseek auth set` a reliable fix even when the user's
-        // shell still exports an old key. When the file is empty, the injected
-        // secrets façade recovers configured secret-store credentials before
-        // falling back to ambient env.
-        let uses_kimi_oauth = provider == ProviderKind::Moonshot
-            && auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth);
-        let (api_key, api_key_source) = if let Some(value) = cli.api_key.clone() {
-            (Some(value), Some(RuntimeApiKeySource::Cli))
-        } else if uses_kimi_oauth {
+        // Released builds represented Ollama Cloud as the local `ollama`
+        // identity plus one exact hosted base URL. Upgrade only that tuple in
+        // memory: the parsed config and secret store are never rewritten, and
+        // neighboring/custom routes retain the local/custom identity.
+        let legacy_ollama_cloud = provider::migrates_legacy_ollama_cloud_route(provider, &base_url);
+        let provider = if legacy_ollama_cloud {
+            ProviderKind::OllamaCloud
+        } else {
+            provider
+        };
+        // `auth_mode = "none"` is an endpoint contract, so it suppresses every
+        // credential source (including explicit CLI/config values). Otherwise
+        // CLI and route-local config win outright. Ambient provider credentials
+        // are allowed only on the provider's official endpoint family: a saved
+        // OpenRouter key must never follow `provider = "openrouter"` to an
+        // unrelated custom gateway merely because the provider id stayed the
+        // same.
+        let uses_kimi_imported_token = provider == ProviderKind::Moonshot
+            && auth_mode
+                .as_deref()
+                .is_some_and(auth_mode_uses_kimi_imported_token);
+        let auth_disabled = auth_mode_disables_api_key(auth_mode.as_deref());
+        let custom_endpoint = provider_preserves_custom_base_url_model(provider, &base_url);
+        let (api_key, api_key_source) = if auth_disabled {
             (None, None)
-        } else if let Some(value) = from_file.clone().filter(|v| !v.trim().is_empty()) {
+        } else if let Some(value) = cli.api_key.clone() {
+            (Some(value), Some(RuntimeApiKeySource::Cli))
+        } else if uses_kimi_imported_token && !custom_endpoint {
+            (None, None)
+        } else if (!custom_endpoint || base_url_from_file)
+            && let Some(value) = from_file.clone().filter(|value| {
+                classify_config_api_key_value(value) == ConfigApiKeyValueKind::Literal
+            })
+        {
             (Some(value), Some(RuntimeApiKeySource::ConfigFile))
-        } else if let Some(value) = xiaomi_mimo_env_api_key.filter(|v| !v.trim().is_empty()) {
+        } else if !custom_endpoint
+            && let Some(value) = xiaomi_mimo_env_api_key.filter(|v| !v.trim().is_empty())
+        {
             (Some(value), Some(RuntimeApiKeySource::Env))
+        } else if custom_endpoint {
+            (None, None)
         } else if should_skip_secret_store_for_provider(provider, &base_url, auth_mode.as_deref()) {
             match env_api_key_for_provider(provider) {
                 Some(value) => (Some(value), Some(RuntimeApiKeySource::Env)),
                 None => (None, None),
             }
         } else {
-            match secrets.resolve_with_source(provider.as_str()) {
+            match stored_api_key_for_provider(secrets, provider, legacy_ollama_cloud) {
                 Some((value, source)) => {
                     let source = match source {
                         SecretSource::Keyring => RuntimeApiKeySource::Keyring,
@@ -2320,23 +3335,51 @@ impl ConfigToml {
         };
 
         let env_provider_model = env.model_for(provider, &base_url);
-        let explicit_model = cli.model.is_some()
-            || env.model.is_some()
-            || env_provider_model.is_some()
-            || provider_cfg.model.is_some()
-            || root_deepseek_model.is_some()
-            || self.model.is_some();
+        // Root `default_text_model` is the key `codewhale model set` writes and
+        // the setup wizard writes, for every provider. It used to enter this
+        // chain only when `provider == Deepseek`, which made this resolver
+        // disagree with `Config::default_model()` in the TUI — the chain that
+        // actually builds the request — for every non-DeepSeek provider
+        // (#4832, #4838). The user's model still shipped; only this resolver,
+        // and therefore `codewhale model resolve`, reported a provider default.
+        //
+        // It is honoured for any provider now, minus the one case the DeepSeek
+        // gate was accidentally covering: a stale DeepSeek id left behind by a
+        // provider switch must not be forwarded to an endpoint that cannot
+        // serve it.
+        let root_default_model = self
+            .default_text_model
+            .clone()
+            .filter(|model| !root_default_model_is_foreign_to_provider(provider, model, &base_url));
+        // Derived from the same chain as `model` below so the reported
+        // provenance cannot drift from the id that is actually used.
+        let model_source = if cli.model.is_some() {
+            ModelSource::Cli
+        } else if env.model.is_some() || env_provider_model.is_some() {
+            ModelSource::Env
+        } else if provider_cfg.model.is_some() {
+            ModelSource::ProviderConfig
+        } else if root_default_model.is_some() {
+            ModelSource::RootDefaultTextModel
+        } else if self.model.is_some() {
+            ModelSource::RootModel
+        } else {
+            ModelSource::ProviderDefault
+        };
+        let explicit_model = model_source.is_explicit();
         let model = cli
             .model
             .clone()
             .or_else(|| env.model.clone())
             .or(env_provider_model)
             .or_else(|| provider_cfg.model.clone())
-            .or(root_deepseek_model)
+            .or(root_default_model)
             .or_else(|| self.model.clone())
             .unwrap_or_else(|| {
                 if provider == ProviderKind::Moonshot
-                    && (auth_mode.as_deref().is_some_and(auth_mode_uses_kimi_oauth)
+                    && (auth_mode
+                        .as_deref()
+                        .is_some_and(auth_mode_uses_kimi_imported_token)
                         || moonshot_base_url_uses_kimi_code(&base_url))
                 {
                     DEFAULT_KIMI_CODE_MODEL.to_string()
@@ -2344,12 +3387,17 @@ impl ConfigToml {
                     default_model_for_provider(provider).to_string()
                 }
             });
-        let model =
-            if explicit_model && provider_preserves_custom_base_url_model(provider, &base_url) {
-                model.trim().to_string()
-            } else {
-                normalize_model_for_provider(provider, &model)
-            };
+        let model = if provider == ProviderKind::OpencodeGo {
+            // OpenCode Go's `/models` response also contains models that only
+            // speak Anthropic Messages. This provider is deliberately bound to
+            // Chat Completions, so even custom endpoint/env overrides cannot
+            // promote an incompatible id onto `/chat/completions`.
+            normalize_model_for_provider(provider, &model)
+        } else if explicit_model && provider_preserves_custom_base_url_model(provider, &base_url) {
+            model.trim().to_string()
+        } else {
+            normalize_model_for_provider(provider, &model)
+        };
 
         let mut http_headers = self.http_headers.clone();
         http_headers.extend(provider_cfg.http_headers.clone());
@@ -2357,6 +3405,9 @@ impl ConfigToml {
             http_headers.extend(env_headers);
         }
         http_headers.retain(|name, value| !name.trim().is_empty() && !value.trim().is_empty());
+        if auth_disabled {
+            http_headers.retain(|name, _| !is_upstream_auth_header(name));
+        }
 
         let output_mode = cli
             .output_mode
@@ -2368,11 +3419,60 @@ impl ConfigToml {
             .clone()
             .or_else(|| env.log_level.clone())
             .or_else(|| self.log_level.clone());
-        let telemetry = cli
-            .telemetry
-            .or(env.telemetry)
-            .or(self.telemetry)
-            .unwrap_or(false);
+        // Telemetry consent resolves once, in the shared core behind
+        // [`resolved_telemetry_consent`], so the runtime and the
+        // doctor/config provenance surfaces cannot disagree about what is
+        // shipping (#5441). The comments that matter live there: the
+        // environment/file/default chain, and why every kill switch is a
+        // floor (`telemetry = false` persisted in the file is the *persistent*
+        // off switch; an explicit env "off", an unreadable env value, or a
+        // dispatcher-declared floor forces off regardless of CLI flag or
+        // config file).
+        let (telemetry_env_file, telemetry_source_env_file) = telemetry_consent_from_env(
+            env.telemetry,
+            env.telemetry_env_invalid,
+            env.telemetry_floor,
+            self.telemetry,
+        );
+        // The CLI flag is a run-scoped term on top: `--telemetry false` stops
+        // this run; `--telemetry true` can never climb over a kill switch.
+        // The source names the CLI only when the CLI term actually decided
+        // the outcome — a flag that lost to a kill switch is not the provenance.
+        let telemetry = telemetry_env_file && cli.telemetry != Some(false);
+        let telemetry_source = if cli.telemetry == Some(false)
+            || (cli.telemetry == Some(true) && telemetry_env_file)
+        {
+            TelemetrySource::Cli
+        } else {
+            telemetry_source_env_file
+        };
+        let telemetry_persisted_off = self.telemetry == Some(false);
+        // Only a *persisted* off is an answer. `--telemetry false` and
+        // `CODEWHALE_TELEMETRY=0` are run-scoped kill switches: they must stop
+        // this run without deleting the identity and buffered events of a user
+        // who never revoked consent — the dispatcher forwards a resolved
+        // `false` on every ordinary run, so treating an environment "off" as an
+        // answer would also make the default state indistinguishable from a
+        // revocation.
+        let telemetry_explicit_off = telemetry_persisted_off;
+        // The shipped default is [`DEFAULT_TELEMETRY_ENDPOINT`], and it is a
+        // default rather than a floor: an explicit value in the environment or
+        // the config file wins outright. An explicit *empty* value is not a
+        // missing value — it is the local dry-run sink, and it stays reachable
+        // by resolving to `None` instead of falling through to the default.
+        //
+        // None of this changes the user's opt-out. A session only reaches an
+        // endpoint after `telemetry` above resolved true; every persistent and
+        // run-scoped kill switch is upstream of this line.
+        let telemetry_endpoint = match env
+            .telemetry_endpoint
+            .clone()
+            .or_else(|| self.telemetry_endpoint.clone())
+        {
+            Some(configured) if configured.trim().is_empty() => None,
+            Some(configured) => Some(configured),
+            None => Some(DEFAULT_TELEMETRY_ENDPOINT.to_string()),
+        };
         let approval_policy = cli
             .approval_policy
             .clone()
@@ -2394,6 +3494,7 @@ impl ConfigToml {
             provider,
             provider_source,
             model,
+            model_source,
             api_key,
             api_key_source,
             base_url,
@@ -2402,6 +3503,9 @@ impl ConfigToml {
             output_mode,
             log_level,
             telemetry,
+            telemetry_source,
+            telemetry_explicit_off,
+            telemetry_endpoint,
             approval_policy,
             sandbox_mode,
             yolo,
@@ -2415,6 +3519,168 @@ fn merge_project_provider_config(target: &mut ProviderConfigToml, source: &Provi
     if source.model.is_some() {
         target.model = source.model.clone();
     }
+}
+
+/// Where an enabled session's batches go when nobody has said otherwise.
+///
+/// The first-party ingest service — a Cloudflare Worker that appends to Workers
+/// Analytics Engine and stores nothing else. See `docs/TELEMETRY.md` for what a
+/// batch contains and `telemetry-ingest/` for the handler.
+///
+/// This is a *default*, not a floor, and it changes nothing about permission:
+/// `CODEWHALE_TELEMETRY=0`, `telemetry = false`, and a recorded decline all
+/// stop the session long before an endpoint is read.
+///
+/// An explicit value — `CODEWHALE_TELEMETRY_ENDPOINT` or `telemetry_endpoint` in
+/// the config file — wins outright, and an explicit *empty* value resolves to no
+/// endpoint at all, which is the local dry-run sink: batches are serialized
+/// exactly as a server would see them and appended to
+/// `$CODEWHALE_HOME/telemetry/dryrun.jsonl`, and no HTTP client is constructed.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "https://telemetry.codewhale.net/v1/telemetry";
+
+/// Provider-neutral credential value forwarded from the CLI dispatcher to the
+/// in-process TUI when `--api-key` must survive profile-late route selection.
+pub const CLI_API_KEY_ENV: &str = "CODEWHALE_CLI_API_KEY";
+
+/// Source marker paired with [`CLI_API_KEY_ENV`] on the CLI-to-TUI boundary.
+pub const CLI_API_KEY_SOURCE_ENV: &str = "CODEWHALE_CLI_API_KEY_SOURCE";
+
+/// Read-only compatibility alias used by dispatchers before v0.9.12.
+pub const LEGACY_CLI_API_KEY_SOURCE_ENV: &str = "DEEPSEEK_API_KEY_SOURCE";
+
+/// The dispatcher's statement to the TUI child about *why* telemetry is off.
+///
+/// Private to the `codewhale` → `codewhale-tui` hop, in the same spirit as
+/// [`CLI_API_KEY_SOURCE_ENV`]. Set to `1`/`0` on every delegated run.
+pub const TELEMETRY_FLOOR_ENV: &str = "CODEWHALE_TELEMETRY_FLOOR";
+
+/// Whether an environment-level kill switch forces telemetry off here.
+///
+/// A floor is *not* the same as "telemetry resolved to false": off is the
+/// default, and the dispatcher forwards a resolved `CODEWHALE_TELEMETRY=false`
+/// on every ordinary run, so a child reading only that value cannot tell an
+/// operator's declared kill switch from the shipped default. That distinction
+/// matters exactly once — the first-run notice must not ask a question whose
+/// answer this environment overrides — so the dispatcher states it outright in
+/// [`TELEMETRY_FLOOR_ENV`] and the child believes the statement.
+///
+/// With no statement (a directly launched `codewhale-tui`) the raw environment
+/// is read instead, where an explicit "off" or an unreadable value is a floor.
+#[must_use]
+pub fn telemetry_floor_in_force() -> bool {
+    if let Ok(raw) = std::env::var(TELEMETRY_FLOOR_ENV)
+        && let Ok(declared) = parse_bool(&raw)
+    {
+        return declared;
+    }
+    let Ok(raw) =
+        std::env::var("CODEWHALE_TELEMETRY").or_else(|_| std::env::var("DEEPSEEK_TELEMETRY"))
+    else {
+        return false;
+    };
+    !matches!(parse_bool(&raw), Ok(true))
+}
+
+/// Where resolved telemetry consent came from (#5441).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetrySource {
+    /// `--telemetry` on this run's command line.
+    Cli,
+    /// `CODEWHALE_TELEMETRY`/`DEEPSEEK_TELEMETRY`, including the dispatcher's
+    /// floor statement and every environment kill switch.
+    Env,
+    /// `telemetry = …` written to the config file.
+    Config,
+    /// Nobody said anything; the shipped default (`on`) applies silently.
+    Default,
+}
+
+impl TelemetrySource {
+    /// Stable label for the doctor row and config display.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Read the telemetry environment override, reporting an unreadable value
+/// instead of swallowing it.
+///
+/// Returns `(value, invalid)`. `invalid` is `true` only when the variable
+/// was set to something [`parse_bool`] rejected; an unset variable is
+/// simply `(None, false)`. Shared by the runtime resolver and the
+/// provenance surfaces so they cannot drift.
+fn read_telemetry_env() -> (Option<bool>, bool) {
+    let Some(raw) = std::env::var("CODEWHALE_TELEMETRY")
+        .or_else(|_| std::env::var("DEEPSEEK_TELEMETRY"))
+        .ok()
+    else {
+        return (None, false);
+    };
+    match parse_bool(&raw) {
+        Ok(value) => (Some(value), false),
+        Err(_) => {
+            tracing::warn!(
+                "Invalid CODEWHALE_TELEMETRY/DEEPSEEK_TELEMETRY value '{raw}'; expected one of \
+                 1/0, true/false, yes/no, on/off, enabled/disabled. Telemetry is forced off."
+            );
+            (None, true)
+        }
+    }
+}
+
+/// Resolved telemetry consent with its source, for surfaces that hold the
+/// config-file value but not the full CLI/env resolution chain — the doctor
+/// runtime-posture row and the `config get telemetry` display (#5441).
+///
+/// This is the same resolution [`ConfigToml::resolve_runtime_options`]
+/// applies without its CLI term: environment first (an explicit value, an
+/// unreadable one, or a dispatcher floor), then the file, then the shipped
+/// default of `on`; a persisted `telemetry = false` is a floor no later
+/// term can climb over. The runtime resolver calls this directly, so the
+/// surfaces and the shipped batches can never disagree.
+#[must_use]
+pub fn resolved_telemetry_consent(file_telemetry: Option<bool>) -> (bool, TelemetrySource) {
+    let (env_telemetry, env_invalid) = read_telemetry_env();
+    telemetry_consent_from_env(
+        env_telemetry,
+        env_invalid,
+        telemetry_floor_in_force(),
+        file_telemetry,
+    )
+}
+
+/// The decision core shared by [`resolved_telemetry_consent`] and the runtime
+/// resolver, which already holds a snapshot of the same environment facts.
+#[must_use]
+fn telemetry_consent_from_env(
+    env_telemetry: Option<bool>,
+    env_invalid: bool,
+    floor: bool,
+    file_telemetry: Option<bool>,
+) -> (bool, TelemetrySource) {
+    let persisted_off = file_telemetry == Some(false);
+    let allowed = env_telemetry.or(file_telemetry).unwrap_or(true);
+    let on = allowed && env_telemetry != Some(false) && !env_invalid && !floor && !persisted_off;
+    let source = if !on && (env_telemetry == Some(false) || env_invalid || floor) {
+        // An environment kill switch decided the outcome.
+        TelemetrySource::Env
+    } else if !on && persisted_off {
+        // The persistent opt-out outranked everything else in play.
+        TelemetrySource::Config
+    } else if env_telemetry.is_some() {
+        TelemetrySource::Env
+    } else if file_telemetry.is_some() {
+        TelemetrySource::Config
+    } else {
+        TelemetrySource::Default
+    };
+    (on, source)
 }
 
 #[must_use]
@@ -2465,12 +3731,56 @@ fn sandbox_mode_rank(value: &str) -> Option<u8> {
     }
 }
 
-/// Load a project-level config from the workspace.
+/// What [`load_project_config_outcome`] found in the workspace.
+///
+/// The distinction between "no project config" and "a project config that is
+/// broken" is security-relevant, so it is in the type rather than in a log
+/// line. A project config can only *tighten* `approval_policy` /
+/// `sandbox_mode` beyond the user's baseline; if a typo makes it unparseable
+/// and that is reported as absence, the project silently loses its
+/// restrictions and falls back to the user's more permissive baseline.
+#[derive(Debug, Clone)]
+pub enum ProjectConfigOutcome {
+    /// No project config file exists in this workspace.
+    Missing,
+    /// A project config was found and parsed.
+    Loaded(Box<ConfigToml>),
+    /// A project config file exists but could not be used. Its contents are
+    /// deliberately not included — a config file holds credentials.
+    Invalid {
+        /// The offending file.
+        path: PathBuf,
+        /// Why it could not be used, safe to display.
+        reason: String,
+    },
+}
+
+impl ProjectConfigOutcome {
+    /// The parsed config, discarding the reason a broken one was rejected.
+    #[must_use]
+    pub fn into_config(self) -> Option<ConfigToml> {
+        match self {
+            Self::Loaded(config) => Some(*config),
+            Self::Missing | Self::Invalid { .. } => None,
+        }
+    }
+
+    /// The path and reason when a project config exists but is unusable.
+    #[must_use]
+    pub fn invalid(&self) -> Option<(&Path, &str)> {
+        match self {
+            Self::Invalid { path, reason } => Some((path.as_path(), reason.as_str())),
+            Self::Missing | Self::Loaded(_) => None,
+        }
+    }
+}
+
+/// Load a project-level config from the workspace, reporting why a file that
+/// exists could not be used.
 ///
 /// Checks `$WORKSPACE/.codewhale/config.toml` first, falling back to
 /// `$WORKSPACE/.deepseek/config.toml` for backward compatibility.
-/// Returns `None` if neither file exists or can't be parsed.
-pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
+pub fn load_project_config_outcome(workspace: &Path) -> ProjectConfigOutcome {
     for dir in [CODEWHALE_APP_DIR, LEGACY_APP_DIR] {
         let path = workspace.join(dir).join(CONFIG_FILE_NAME);
         if !project_config_candidate_exists(&path) {
@@ -2480,18 +3790,64 @@ pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
             Ok(raw) => raw,
             Err(e) => {
                 tracing::warn!("Failed to read project config {}: {e:#}", path.display());
-                return None;
+                return ProjectConfigOutcome::Invalid {
+                    path,
+                    reason: format!("could not be read: {e}"),
+                };
             }
         };
-        match toml::from_str(&raw) {
-            Ok(config) => return Some(config),
-            Err(e) => {
-                tracing::warn!("Failed to parse project config {}: {e}", path.display());
-                return None;
+        match toml::from_str::<ConfigToml>(&raw) {
+            Ok(config) => {
+                let raw_provider = toml::from_str::<toml::Value>(&raw)
+                    .ok()
+                    .and_then(|document| document.get("provider").cloned())
+                    .and_then(|provider| provider.as_str().map(str::to_string));
+                if config.provider == ProviderKind::Custom
+                    && raw_provider.as_deref() != Some(ProviderKind::Custom.as_str())
+                {
+                    // An unrecognized provider name deserializes to `Custom`
+                    // rather than failing, so a typo would otherwise be
+                    // accepted as a deliberate custom-provider selection.
+                    tracing::warn!(
+                        "Failed to parse project config {}; file contents were omitted",
+                        quote_os_path(&path)
+                    );
+                    return ProjectConfigOutcome::Invalid {
+                        path,
+                        reason: match raw_provider {
+                            Some(name) => format!("unknown provider '{name}'"),
+                            None => "unknown provider".to_string(),
+                        },
+                    };
+                }
+                return ProjectConfigOutcome::Loaded(Box::new(config));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to parse project config {}; file contents were omitted",
+                    quote_os_path(&path)
+                );
+                return ProjectConfigOutcome::Invalid {
+                    path,
+                    // `toml`'s message names the offending key and span
+                    // without echoing the file, so it is safe to surface.
+                    reason: err.message().to_string(),
+                };
             }
         }
     }
-    None
+    ProjectConfigOutcome::Missing
+}
+
+/// Load a project-level config from the workspace.
+///
+/// Returns `None` both when no project config exists and when one exists but
+/// is unusable. Callers that act on the *absence* of project restrictions —
+/// anything deciding whether a project tightens `approval_policy` or
+/// `sandbox_mode` — should use [`load_project_config_outcome`] instead, so a
+/// broken file is not read as "this project asked for nothing."
+pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
+    load_project_config_outcome(workspace).into_config()
 }
 
 fn project_config_candidate_exists(path: &Path) -> bool {
@@ -2501,7 +3857,171 @@ fn project_config_candidate_exists(path: &Path) -> bool {
     })
 }
 
+/// Canonical id for a DeepSeek-family model name, or `None` for anything else.
+///
+/// Kept behaviourally identical to `normalize_model_name` in
+/// `crates/tui/src/config.rs`, which is the definition the TUI's own model
+/// chain uses. It exists here only so this crate can answer "is this root
+/// default a DeepSeek id?" without depending on the TUI.
+fn deepseek_family_model_id(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "pro" | "deepseek-v4pro" => return Some("deepseek-v4-pro".to_string()),
+        "flash" | "deepseek-v4flash" => return Some("deepseek-v4-flash".to_string()),
+        "flash-vision" | "deepseek-v4flashvisionexp" => {
+            return Some("deepseek-v4-flash-vision-exp".to_string());
+        }
+        _ => {}
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if !normalized.starts_with("deepseek") && !normalized.contains("/deepseek") {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
+    {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Providers whose model id is forwarded verbatim, because the upstream
+/// service — not this crate — is the authority on what ids it serves.
+///
+/// Mirrors `provider_passes_model_through` in `crates/tui/src/config.rs`.
+fn provider_passes_model_through(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::Openai
+            | ProviderKind::Atlascloud
+            | ProviderKind::WanjieArk
+            | ProviderKind::Volcengine
+            | ProviderKind::XiaomiMimo
+            | ProviderKind::Moonshot
+            | ProviderKind::Qianfan
+            | ProviderKind::Openmodel
+            | ProviderKind::Ollama
+            | ProviderKind::OllamaCloud
+            | ProviderKind::Huggingface
+            | ProviderKind::Meta
+            | ProviderKind::Xai
+            | ProviderKind::Telecomjs
+            | ProviderKind::Edenai
+            | ProviderKind::ModelstudioTokenPlan
+            | ProviderKind::ModelstudioTokenPlanAnthropic
+            | ProviderKind::ModelstudioCodingPlan
+            | ProviderKind::ModelstudioCodingPlanAnthropic
+            | ProviderKind::Custom
+    )
+}
+
+/// Whether a root `default_text_model` would be foreign to the active
+/// provider's endpoint, i.e. honouring it would send an id the endpoint cannot
+/// serve.
+///
+/// This is the narrow case the old `provider == Deepseek` gate was covering by
+/// accident: a user switches `provider` and leaves a DeepSeek id behind in
+/// `default_text_model`. Forwarding `deepseek-chat` to Z.ai fails every
+/// request, so the root default is dropped and the provider default used
+/// instead — matching the decision `Config::default_model()` makes via
+/// `root_deepseek_model_is_foreign_to_direct_provider`
+/// (`crates/tui/src/config.rs`), whose provider lists this mirrors.
+fn root_default_model_is_foreign_to_provider(
+    provider: ProviderKind,
+    model: &str,
+    base_url: &str,
+) -> bool {
+    // Not a DeepSeek id at all: nothing to protect against here. A model the
+    // provider does not serve for some other reason is the provider's error to
+    // report, not ours to silently rewrite.
+    if deepseek_family_model_id(model).is_none() {
+        return false;
+    }
+    // DeepSeek's own endpoints serve DeepSeek ids.
+    if matches!(
+        provider,
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    ) {
+        return false;
+    }
+    // A custom base URL may be any OpenAI-compatible proxy, and a proxy may
+    // legitimately serve DeepSeek ids (#1519). Full pass-through.
+    if provider_preserves_custom_base_url_model(provider, base_url) {
+        return false;
+    }
+    // Vendor-locked official endpoints. These pass model ids through, but
+    // api.x.ai will never answer to `deepseek-v4-pro`, so pass-through does not
+    // make the id servable — this is the #3227 contamination case.
+    if matches!(
+        provider,
+        ProviderKind::Xai | ProviderKind::Openai | ProviderKind::Moonshot
+    ) {
+        return true;
+    }
+    // Remaining pass-through providers forward the id verbatim to a service
+    // that is the authority on its own catalog.
+    if provider_passes_model_through(provider) {
+        return false;
+    }
+    // Aggregators, local runtimes, and multi-vendor clouds host DeepSeek
+    // models under their own catalogs, so a DeepSeek id is valid there.
+    if matches!(
+        provider,
+        ProviderKind::NvidiaNim
+            | ProviderKind::Openrouter
+            | ProviderKind::Orcarouter
+            | ProviderKind::Novita
+            | ProviderKind::Fireworks
+            | ProviderKind::Siliconflow
+            | ProviderKind::SiliconflowCN
+            | ProviderKind::Deepinfra
+            | ProviderKind::Together
+            | ProviderKind::Sglang
+            | ProviderKind::Vllm
+            | ProviderKind::Volcengine
+            | ProviderKind::Atlascloud
+            | ProviderKind::OpencodeGo
+            | ProviderKind::WanjieArk
+    ) {
+        return false;
+    }
+    // Everything else is a vendor serving only its own family (Z.ai, Stepfun,
+    // MiniMax, Anthropic, …): a DeepSeek id there is the stale-config case.
+    true
+}
+
+/// A provider owner that Codewhale can identify with high confidence when an
+/// official route is handed a foreign model id.
+///
+/// This intentionally reuses the conservative stale-root-model guard instead
+/// of treating the partial provider catalog as a closed-world allowlist.
+/// Unknown ids, custom endpoints, local runtimes, and multi-model gateways
+/// therefore remain provider-authoritative.
+#[must_use]
+pub fn known_foreign_model_owner(
+    provider: ProviderKind,
+    model: &str,
+    base_url: &str,
+) -> Option<ProviderKind> {
+    root_default_model_is_foreign_to_provider(provider, model, base_url)
+        .then_some(ProviderKind::Deepseek)
+}
+
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
+    if matches!(provider, ProviderKind::OpencodeGo) {
+        // Canonicalize known Chat Completions ids. Unknown / Messages-only ids
+        // must never be rewritten to the provider default — substituting a
+        // different model is worse than letting the route layer reject the
+        // request by the name the user actually configured.
+        return opencode_go_chat_model_id(model)
+            .map(str::to_string)
+            .unwrap_or_else(|| model.trim().to_string());
+    }
     if matches!(provider, ProviderKind::XiaomiMimo)
         && let Some(canonical) = canonical_xiaomi_mimo_model_id(model)
     {
@@ -2532,6 +4052,7 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             | ProviderKind::MinimaxAnthropic
             | ProviderKind::Qianfan
             | ProviderKind::Ollama
+            | ProviderKind::OllamaCloud
             | ProviderKind::Meta
             | ProviderKind::Xai
     ) {
@@ -2541,6 +4062,11 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     let normalized = model.trim().to_ascii_lowercase();
     if provider == ProviderKind::Openrouter
         && let Some(canonical) = canonical_openrouter_recent_model_id(&normalized)
+    {
+        return canonical.to_string();
+    }
+    if provider == ProviderKind::Orcarouter
+        && let Some(canonical) = canonical_orcarouter_recent_model_id(&normalized)
     {
         return canonical.to_string();
     }
@@ -2561,6 +4087,14 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
             "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
             | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_OPENROUTER_FLASH_MODEL.to_string(),
+        (ProviderKind::Orcarouter, "deepseek-v4-pro" | "deepseek-v4pro") => {
+            DEFAULT_ORCAROUTER_MODEL.to_string()
+        }
+        (
+            ProviderKind::Orcarouter,
+            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
+            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+        ) => DEFAULT_ORCAROUTER_FLASH_MODEL.to_string(),
         (ProviderKind::Novita, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_NOVITA_MODEL.to_string()
         }
@@ -2646,6 +4180,61 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
     }
+}
+
+/// OpenCode Go models documented for its OpenAI Chat Completions endpoint.
+///
+/// Keep config validation, picker/catalog projections, and live-roster
+/// sanitization on this one protocol-scoped contract. The provider's combined
+/// `/models` roster also contains Anthropic-Messages-only models, which are
+/// deliberately absent here.
+///
+/// `glm-5.3` is also deliberately absent (2026-08-03): OpenCode Go documents no
+/// glm-5.3 row. The direct Z.ai and OpenRouter glm-5.3 rows inherit their
+/// metadata from glm-5.2, but that inheritance says nothing about which
+/// subscription gateways carry the model. Add it here only against an OpenCode
+/// Go roster listing.
+pub const OPENCODE_GO_CHAT_MODELS: &[&str] = &[
+    DEFAULT_OPENCODE_GO_MODEL,
+    OPENCODE_GO_GROK_4_5_MODEL,
+    OPENCODE_GO_GLM_5_2_MODEL,
+    OPENCODE_GO_GLM_5_1_MODEL,
+    OPENCODE_GO_KIMI_K3_MODEL,
+    OPENCODE_GO_KIMI_K2_7_CODE_MODEL,
+    OPENCODE_GO_KIMI_K2_6_MODEL,
+    OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL,
+    OPENCODE_GO_MIMO_V2_5_MODEL,
+    OPENCODE_GO_MIMO_V2_5_PRO_MODEL,
+];
+
+/// Canonicalize an OpenCode Go model that is documented for the OpenAI Chat
+/// Completions endpoint. The live `/models` roster also contains
+/// Anthropic-Messages-only models; returning `None` for those is the protocol
+/// cutline shared by config and the TUI live-catalog paths.
+#[must_use]
+pub fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    let normalized = normalized
+        .strip_prefix("opencode-go/")
+        .unwrap_or(&normalized);
+    let familiar_alias = match normalized {
+        "grok-4-5" => Some(OPENCODE_GO_GROK_4_5_MODEL),
+        "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
+        "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
+        "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
+        "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
+        "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
+        "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
+        "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
+        "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
+        _ => None,
+    };
+    familiar_alias.or_else(|| {
+        OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == normalized)
+    })
 }
 
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
@@ -2738,7 +4327,11 @@ fn canonical_zai_model_id(model: &str) -> Option<&'static str> {
     let normalized = normalized.replace(['_', ' '], "-");
     match normalized.as_str() {
         "glm-5.1" | "glm-5-1" | "zai-glm-5.1" | "zai-glm-5-1" => Some(ZAI_GLM_5_1_MODEL),
-        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(DEFAULT_ZAI_MODEL),
+        // Every alias resolves to its own id, never through DEFAULT_ZAI_MODEL:
+        // moving the default (now GLM-5.3) must not silently re-point an
+        // explicit GLM-5.2 route.
+        "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => Some(ZAI_GLM_5_2_MODEL),
+        "glm-5.3" | "glm-5-3" | "zai-glm-5.3" | "zai-glm-5-3" => Some(ZAI_GLM_5_3_MODEL),
         "glm-5-turbo" | "glm-5turbo" | "zai-glm-5-turbo" => Some(ZAI_GLM_5_TURBO_MODEL),
         _ => None,
     }
@@ -2764,6 +4357,9 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         }
         OPENROUTER_GLM_5_2_MODEL | "glm-5.2" | "glm-5-2" | "zai-glm-5.2" | "zai-glm-5-2" => {
             Some(OPENROUTER_GLM_5_2_MODEL)
+        }
+        OPENROUTER_GLM_5_3_MODEL | "glm-5.3" | "glm-5-3" | "zai-glm-5.3" | "zai-glm-5-3" => {
+            Some(OPENROUTER_GLM_5_3_MODEL)
         }
         OPENROUTER_KIMI_K2_7_CODE_MODEL
         | "kimi"
@@ -2808,6 +4404,9 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
         OPENROUTER_QWEN_3_6_PLUS_MODEL | "qwen3.6-plus" | "qwen-3.6-plus" => {
             Some(OPENROUTER_QWEN_3_6_PLUS_MODEL)
         }
+        OPENROUTER_QWEN_3_7_PLUS_MODEL | "qwen3.7-plus" | "qwen-3.7-plus" => {
+            Some(OPENROUTER_QWEN_3_7_PLUS_MODEL)
+        }
         OPENROUTER_QWEN_3_7_MAX_MODEL | "qwen3.7-max" | "qwen-3.7-max" => {
             Some(OPENROUTER_QWEN_3_7_MAX_MODEL)
         }
@@ -2828,6 +4427,24 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
+/// Canonical id resolution for OrcaRouter's own auto-routing model.
+///
+/// OrcaRouter is an aggregator whose upstream catalog uses the same
+/// namespaced ids as OpenRouter, so those ids pass through verbatim. The one
+/// OrcaRouter-specific alias worth normalizing is its `orcarouter/auto`
+/// router, which is not an upstream model and needs the bare `auto` spelling
+/// (as users naturally type it) to resolve to the namespaced wire id.
+fn canonical_orcarouter_recent_model_id(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized.replace(['_', ' '], "-");
+    match normalized.as_str() {
+        ORCAROUTER_AUTO_MODEL | "auto" | "orcarouter-auto" | "orca-auto" => {
+            Some(ORCAROUTER_AUTO_MODEL)
+        }
+        _ => None,
+    }
+}
+
 fn default_model_for_provider(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL,
@@ -2838,6 +4455,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_MODEL,
         ProviderKind::Volcengine => DEFAULT_VOLCENGINE_MODEL,
         ProviderKind::Openrouter => DEFAULT_OPENROUTER_MODEL,
+        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_MODEL,
         ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_MODEL,
         ProviderKind::Novita => DEFAULT_NOVITA_MODEL,
         ProviderKind::Fireworks => DEFAULT_FIREWORKS_MODEL,
@@ -2847,6 +4465,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Sglang => DEFAULT_SGLANG_MODEL,
         ProviderKind::Vllm => DEFAULT_VLLM_MODEL,
         ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL,
+        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
         ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
         ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
@@ -2859,8 +4478,19 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
         ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
+        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
+        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_MODEL,
         ProviderKind::Meta => DEFAULT_META_MODEL,
         ProviderKind::Xai => DEFAULT_XAI_MODEL,
+        ProviderKind::Mistral => DEFAULT_MISTRAL_MODEL,
+        ProviderKind::Google => DEFAULT_GOOGLE_MODEL,
+        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_MODEL,
+        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_MODEL,
+        ProviderKind::Edenai => DEFAULT_EDENAI_MODEL,
+        ProviderKind::ModelstudioTokenPlan
+        | ProviderKind::ModelstudioTokenPlanAnthropic
+        | ProviderKind::ModelstudioCodingPlan
+        | ProviderKind::ModelstudioCodingPlanAnthropic => DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
         // No built-in default model; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_model(),
     }
@@ -2876,6 +4506,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL,
         ProviderKind::Volcengine => DEFAULT_VOLCENGINE_BASE_URL,
         ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL,
+        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_BASE_URL,
         ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_BASE_URL,
         ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL,
         ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
@@ -2886,6 +4517,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Sglang => DEFAULT_SGLANG_BASE_URL,
         ProviderKind::Vllm => DEFAULT_VLLM_BASE_URL,
         ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL,
+        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
         ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
         ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
@@ -2899,8 +4531,19 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
         ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
         ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
+        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
+        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_BASE_URL,
         ProviderKind::Meta => DEFAULT_META_BASE_URL,
         ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
+        ProviderKind::Mistral => DEFAULT_MISTRAL_BASE_URL,
+        ProviderKind::Google => DEFAULT_GOOGLE_BASE_URL,
+        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_BASE_URL,
+        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
+        ProviderKind::Edenai => DEFAULT_EDENAI_BASE_URL,
+        ProviderKind::ModelstudioTokenPlan => DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+        ProviderKind::ModelstudioTokenPlanAnthropic => MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL,
+        ProviderKind::ModelstudioCodingPlan => DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
+        ProviderKind::ModelstudioCodingPlanAnthropic => MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
         // No built-in default base URL; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_base_url(),
     }
@@ -2911,6 +4554,108 @@ fn moonshot_base_url_uses_kimi_code(base_url: &str) -> bool {
     normalized == DEFAULT_KIMI_CODE_BASE_URL
         || normalized == "https://api.kimi.com/coding"
         || normalized.starts_with("https://api.kimi.com/coding/")
+}
+
+/// Dual-wire vendors: dialect is config (`wire`), not a separate ProviderKind.
+fn wire_prefers_anthropic(kind: ProviderKind, wire: Option<&str>) -> bool {
+    if matches!(
+        kind,
+        ProviderKind::DeepseekAnthropic
+            | ProviderKind::MinimaxAnthropic
+            | ProviderKind::ModelstudioTokenPlanAnthropic
+            | ProviderKind::ModelstudioCodingPlanAnthropic
+    ) {
+        return true;
+    }
+    let Some(raw) = wire.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let normalized = raw.to_ascii_lowercase().replace(['_', ' '], "-");
+    matches!(
+        normalized.as_str(),
+        "anthropic"
+            | "anthropic-messages"
+            | "messages"
+            | "claude"
+            | "anthropic-compatible"
+            | "anthropic-compat"
+    )
+}
+
+fn modelstudio_mode_is_coding_plan(kind: ProviderKind, mode: Option<&str>) -> bool {
+    if matches!(
+        kind,
+        ProviderKind::ModelstudioCodingPlan | ProviderKind::ModelstudioCodingPlanAnthropic
+    ) {
+        return true;
+    }
+    let Some(raw) = mode.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let normalized = raw.to_ascii_lowercase().replace(['_', ' '], "-");
+    matches!(
+        normalized.as_str(),
+        "coding-plan" | "coding" | "codingplan" | "dashscope-coding" | "code"
+    )
+}
+
+fn is_modelstudio_family(kind: ProviderKind) -> bool {
+    matches!(
+        kind,
+        ProviderKind::ModelstudioTokenPlan
+            | ProviderKind::ModelstudioTokenPlanAnthropic
+            | ProviderKind::ModelstudioCodingPlan
+            | ProviderKind::ModelstudioCodingPlanAnthropic
+    )
+}
+
+fn resolve_modelstudio_base_url(
+    configured: Option<String>,
+    kind: ProviderKind,
+    mode: Option<&str>,
+    wire: Option<&str>,
+) -> String {
+    if let Some(url) = configured.filter(|value| !value.trim().is_empty()) {
+        return url;
+    }
+    let coding = modelstudio_mode_is_coding_plan(kind, mode);
+    let anthropic = wire_prefers_anthropic(kind, wire);
+    match (coding, anthropic) {
+        (true, true) => MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL.to_string(),
+        (true, false) => DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL.to_string(),
+        (false, true) => MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL.to_string(),
+        (false, false) => DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL.to_string(),
+    }
+}
+
+fn resolve_minimax_base_url(
+    configured: Option<String>,
+    kind: ProviderKind,
+    wire: Option<&str>,
+) -> String {
+    if let Some(url) = configured.filter(|value| !value.trim().is_empty()) {
+        return url;
+    }
+    if wire_prefers_anthropic(kind, wire) {
+        DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string()
+    } else {
+        DEFAULT_MINIMAX_BASE_URL.to_string()
+    }
+}
+
+fn resolve_deepseek_base_url(
+    configured: Option<String>,
+    kind: ProviderKind,
+    wire: Option<&str>,
+) -> String {
+    if let Some(url) = configured.filter(|value| !value.trim().is_empty()) {
+        return url;
+    }
+    if wire_prefers_anthropic(kind, wire) {
+        DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL.to_string()
+    } else {
+        DEFAULT_DEEPSEEK_BASE_URL.to_string()
+    }
 }
 
 fn xiaomi_mimo_base_url_for_mode(mode: &str) -> Option<&'static str> {
@@ -3045,29 +4790,70 @@ fn xiaomi_mimo_base_url_is_pay_as_you_go(base_url: &str) -> bool {
     )
 }
 
+/// Whether `base_url` belongs to the provider's official endpoint family.
+///
+/// Some providers publish multiple stable paths for the same credential and
+/// model namespace. Keep that family definition centralized so route
+/// canonicalization and credential scoping cannot disagree.
+#[must_use]
+pub fn provider_base_url_is_official(provider: ProviderKind, base_url: &str) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    match provider {
+        ProviderKind::Deepseek => matches!(
+            normalized.as_str(),
+            "https://api.deepseek.com"
+                | "https://api.deepseek.com/v1"
+                | "https://api.deepseek.com/beta"
+        ),
+        ProviderKind::DeepseekAnthropic => matches!(
+            normalized.as_str(),
+            "https://api.deepseek.com/anthropic" | "https://api.deepseek.com/anthropic/v1"
+        ),
+        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => matches!(
+            normalized.as_str(),
+            "https://api.siliconflow.com/v1" | "https://api.siliconflow.cn/v1"
+        ),
+        ProviderKind::Moonshot => {
+            normalized == DEFAULT_MOONSHOT_BASE_URL || moonshot_base_url_uses_kimi_code(base_url)
+        }
+        ProviderKind::XiaomiMimo => {
+            xiaomi_mimo_base_url_uses_token_plan(base_url)
+                || xiaomi_mimo_base_url_is_pay_as_you_go(base_url)
+        }
+        ProviderKind::Ollama => {
+            normalized == DEFAULT_OLLAMA_BASE_URL
+                || provider::is_exact_ollama_cloud_route(provider, base_url)
+        }
+        ProviderKind::OllamaCloud => provider::is_exact_ollama_cloud_route(provider, base_url),
+        ProviderKind::Edenai => matches!(
+            normalized.as_str(),
+            "https://api.edenai.run/v3" | "https://api.eu.edenai.run/v3"
+        ),
+        // Custom routes have no Codewhale-owned official endpoint. The
+        // descriptor URL is a schema placeholder, never a credential scope.
+        ProviderKind::Custom => false,
+        _ => {
+            normalized
+                == default_base_url_for_provider(provider)
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_ascii_lowercase()
+        }
+    }
+}
+
 fn base_url_is_custom_for_provider(provider: ProviderKind, base_url: &str) -> bool {
-    if provider.is_siliconflow() && siliconflow_base_url_is_official(base_url) {
-        return false;
-    }
-    if provider == ProviderKind::XiaomiMimo
-        && (xiaomi_mimo_base_url_uses_token_plan(base_url)
-            || xiaomi_mimo_base_url_is_pay_as_you_go(base_url))
-    {
-        return false;
-    }
-    let actual = base_url.trim_end_matches('/');
-    let default = default_base_url_for_provider(provider).trim_end_matches('/');
-    actual != default
+    !provider_base_url_is_official(provider, base_url)
 }
 
-fn siliconflow_base_url_is_official(base_url: &str) -> bool {
-    matches!(
-        base_url.trim_end_matches('/').to_ascii_lowercase().as_str(),
-        "https://api.siliconflow.com/v1" | "https://api.siliconflow.cn/v1"
-    )
-}
-
-fn provider_preserves_custom_base_url_model(provider: ProviderKind, base_url: &str) -> bool {
+/// Whether `base_url` is outside the provider's official endpoint family and
+/// therefore owns its model-id namespace.
+///
+/// Custom OpenAI-compatible endpoints must receive the exact model selector
+/// the user supplied. Official endpoints may safely canonicalize known aliases
+/// to their provider wire ids.
+#[must_use]
+pub fn provider_preserves_custom_base_url_model(provider: ProviderKind, base_url: &str) -> bool {
     base_url_is_custom_for_provider(provider, base_url)
 }
 
@@ -3076,17 +4862,43 @@ fn should_skip_secret_store_for_provider(
     base_url: &str,
     auth_mode: Option<&str>,
 ) -> bool {
-    if auth_mode_requires_api_key(auth_mode) {
-        return false;
-    }
     if auth_mode_disables_api_key(auth_mode) {
         return true;
     }
+    if base_url_is_custom_for_provider(provider, base_url) {
+        return true;
+    }
+    if auth_mode_requires_api_key(auth_mode) {
+        return false;
+    }
 
-    matches!(
-        provider,
-        ProviderKind::Sglang | ProviderKind::Vllm | ProviderKind::Ollama
-    ) || base_url_uses_local_host(base_url)
+    matches!(provider, ProviderKind::Sglang | ProviderKind::Vllm)
+        || (provider == ProviderKind::Ollama
+            && !provider::is_exact_ollama_cloud_route(provider, base_url))
+        || base_url_uses_local_host(base_url)
+}
+
+/// Read the durable provider slot without allowing environment fallback to
+/// jump ahead of the bounded legacy slot. The old `ollama` slot is consulted
+/// only for the exact route tuple migrated above; selecting `ollama-cloud`
+/// directly never consumes a local provider credential.
+fn stored_api_key_for_provider(
+    secrets: &Secrets,
+    provider: ProviderKind,
+    legacy_ollama_cloud: bool,
+) -> Option<(String, SecretSource)> {
+    let mut slots = vec![provider.secret_store_slot()];
+    if provider == ProviderKind::OllamaCloud && legacy_ollama_cloud {
+        slots.push(ProviderKind::Ollama.secret_store_slot());
+    }
+    slots.into_iter().find_map(|slot| {
+        secrets
+            .get(slot)
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (value, SecretSource::Keyring))
+    })
 }
 
 fn env_api_key_for_provider(provider: ProviderKind) -> Option<String> {
@@ -3104,7 +4916,9 @@ fn env_api_key_for_provider(provider: ProviderKind) -> Option<String> {
     codewhale_secrets::env_for(provider.as_str())
 }
 
-fn auth_mode_requires_api_key(auth_mode: Option<&str>) -> bool {
+/// Whether an authentication mode requires API-key material.
+#[must_use]
+pub fn auth_mode_requires_api_key(auth_mode: Option<&str>) -> bool {
     matches!(
         auth_mode
             .map(str::trim)
@@ -3118,7 +4932,9 @@ fn auth_mode_requires_api_key(auth_mode: Option<&str>) -> bool {
     )
 }
 
-fn auth_mode_disables_api_key(auth_mode: Option<&str>) -> bool {
+/// Whether an authentication mode explicitly disables upstream provider auth.
+#[must_use]
+pub fn auth_mode_disables_api_key(auth_mode: Option<&str>) -> bool {
     matches!(
         auth_mode
             .map(str::trim)
@@ -3132,7 +4948,9 @@ fn auth_mode_disables_api_key(auth_mode: Option<&str>) -> bool {
     )
 }
 
-fn auth_mode_uses_kimi_oauth(auth_mode: &str) -> bool {
+/// Whether an authentication mode selects Kimi's imported bearer token.
+#[must_use]
+pub fn auth_mode_uses_kimi_imported_token(auth_mode: &str) -> bool {
     matches!(
         auth_mode
             .trim()
@@ -3209,11 +5027,55 @@ pub enum ProviderSource {
     Config,
 }
 
+/// Where the resolved runtime model id came from.
+///
+/// This mirrors the precedence chain in
+/// [`ConfigToml::resolve_runtime_options_with_secrets`] so diagnostics can say
+/// *why* a model was chosen instead of presenting a built-in default as if the
+/// user had asked for it. [`Self::ProviderDefault`] is the only variant that
+/// means "nothing was configured".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    /// `--model` on the command line.
+    Cli,
+    /// A `CODEWHALE_*` environment variable.
+    Env,
+    /// `[providers.<name>].model`.
+    ProviderConfig,
+    /// The root `default_text_model` key, which is DeepSeek-scoped.
+    RootDefaultTextModel,
+    /// The provider-neutral root `model` key.
+    RootModel,
+    /// Nothing was configured; this is the built-in default for the provider.
+    ProviderDefault,
+}
+
+impl ModelSource {
+    /// Whether the id was chosen by the user rather than substituted by us.
+    #[must_use]
+    pub fn is_explicit(self) -> bool {
+        !matches!(self, Self::ProviderDefault)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "--model",
+            Self::Env => "environment",
+            Self::ProviderConfig => "config [providers.*].model",
+            Self::RootDefaultTextModel => "config default_text_model",
+            Self::RootModel => "config model",
+            Self::ProviderDefault => "provider default",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeOptions {
     pub provider: ProviderKind,
     pub provider_source: ProviderSource,
     pub model: String,
+    pub model_source: ModelSource,
     pub api_key: Option<String>,
     pub api_key_source: Option<RuntimeApiKeySource>,
     pub base_url: String,
@@ -3222,6 +5084,28 @@ pub struct ResolvedRuntimeOptions {
     pub output_mode: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: bool,
+    /// Where the resolved telemetry consent came from (cli | env | config |
+    /// default), so doctor and config displays can state the truth about a
+    /// machine that never opted in (#5441).
+    pub telemetry_source: TelemetrySource,
+    /// A human wrote `telemetry = false` into the config file.
+    ///
+    /// This is the *persistent* opt-out, and it is deliberately narrower than
+    /// "telemetry resolved to false". A run-scoped kill switch also resolves
+    /// false; treating that as a revocation would destroy the identity and
+    /// buffered events of a user who merely set `CODEWHALE_TELEMETRY=0` for one
+    /// command. Run-scoped kill switches
+    /// (`--telemetry false`, the environment variable) stop the run and leave
+    /// every byte on disk alone; only this flag authorizes the wipe.
+    pub telemetry_explicit_off: bool,
+    /// Where a telemetry batch would be sent, if telemetry were on.
+    ///
+    /// Already resolved: [`DEFAULT_TELEMETRY_ENDPOINT`] when nobody configured
+    /// one, the configured value when somebody did, and `None` when somebody
+    /// configured an empty one — which means the dry-run sink, not "unset".
+    /// Which schemes are actually contactable is decided where a batch would be
+    /// sent, not here — a user must be able to stage a value.
+    pub telemetry_endpoint: Option<String>,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
     pub yolo: Option<bool>,
@@ -3244,8 +5128,25 @@ impl ConfigStore {
         let path = resolve_config_path(path)?;
         let (config, original_raw) = if checked_path_exists(&path)? {
             let raw = read_checked_config_file(&path)?;
-            let parsed: ConfigToml = toml::from_str(&raw)
-                .with_context(|| format!("failed to parse config at {}", path.display()))?;
+            let mut parsed: ConfigToml = toml::from_str(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse config at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?;
+            let raw_document: toml::Value = toml::from_str(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse config at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?;
+            if let Some(provider_id) = raw_document.get("provider").and_then(toml::Value::as_str) {
+                parsed
+                    .bind_persisted_provider_id(provider_id)
+                    .with_context(|| {
+                        format!("failed to parse config at {}", quote_os_path(&path))
+                    })?;
+            }
             (parsed, Some(raw))
         } else {
             (ConfigToml::default(), None)
@@ -3266,37 +5167,40 @@ impl ConfigStore {
     /// [`persistence::SetupTransaction`] alongside sibling files and keep the
     /// comment-preserving write atomic with the rest of the transaction.
     pub fn rendered_body(&self) -> Result<String> {
-        let serialized =
+        let mut serialized =
             toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+        if let Some(provider_id) = self.config.named_custom_provider_id() {
+            let mut document = serialized
+                .parse::<toml_edit::DocumentMut>()
+                .context("failed to edit serialized config")?;
+            document["provider"] = toml_edit::value(provider_id);
+            serialized = document.to_string();
+        }
         if let Some(ref original_raw) = self.original_raw {
-            Ok(
-                merge_and_preserve_comments(&serialized, original_raw).unwrap_or_else(|e| {
-                    tracing::warn!("failed to merge config comments, saving without them: {e:#}");
-                    serialized
-                }),
-            )
+            merge_and_preserve_comments(&serialized, original_raw).with_context(|| {
+                format!(
+                    "cannot safely preserve config at {}; reload it and retry instead of replacing an unmergeable snapshot",
+                    quote_os_path(&self.path)
+                )
+            })
         } else {
             Ok(serialized)
         }
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         let path = normalize_config_file_path(self.path.clone())?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create config directory {}", parent.display())
-            })?;
-        }
         let body = self.rendered_body()?;
-        if checked_path_exists(&path)? {
-            let existing = read_checked_config_file(&path)?;
-            if existing == body {
-                return Ok(());
-            }
-            write_one_time_config_backup(&path)?;
-        }
-        persistence::atomic_write(&path, body.as_bytes())
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
+        replace_config_document_if_unchanged(&path, self.original_raw.as_deref(), &body)?;
+        self.original_raw = Some(body);
+        Ok(())
+    }
+
+    /// Refresh the typed value and byte snapshot after a targeted writer used
+    /// the shared config lock. This keeps a long-lived command process from
+    /// treating its own successful mutation as an external stale conflict.
+    pub fn reload(&mut self) -> Result<()> {
+        *self = Self::load(Some(self.path.clone()))?;
         Ok(())
     }
 
@@ -3332,58 +5236,93 @@ impl ConfigStore {
     /// are ignored, and the in-memory permissions snapshot is refreshed after
     /// a successful write.
     pub fn append_ask_rules(&mut self, rules: &[ToolAskRule]) -> Result<usize> {
+        self.append_permission_rules(rules, PermissionAction::Ask)
+    }
+
+    /// Atomically append exact, repo-scoped allow rules to the sibling
+    /// `permissions.toml` file.
+    ///
+    /// The caller is responsible for deciding which tool calls are eligible;
+    /// this boundary rejects broad or incorrectly typed records so a UI bug
+    /// cannot persist an unscoped allow grant.
+    pub fn append_allow_rules(&mut self, rules: &[ToolAskRule]) -> Result<usize> {
+        for rule in rules {
+            if rule.action != PermissionAction::Allow {
+                bail!("append_allow_rules only accepts action = \"allow\"");
+            }
+            let Some(workspace) = rule
+                .workspace
+                .as_deref()
+                .and_then(codewhale_execpolicy::normalize_workspace_scope)
+            else {
+                bail!("persistent allow rules must be scoped to a workspace");
+            };
+            if rule.command.is_some() && !rule.command_exact {
+                bail!("persistent command allow rules must use exact matching");
+            }
+            if rule.command.is_none() && rule.path.is_none() {
+                bail!("persistent allow rules must match an exact command or path");
+            }
+            if let Some(command) = rule.command.as_deref()
+                && command.trim().is_empty()
+            {
+                bail!("persistent command allow rules must not be empty");
+            }
+            if let Some(path) = rule.path.as_deref()
+                && codewhale_execpolicy::normalize_workspace_relative_path(path, &workspace)
+                    .is_none_or(|path| path.is_empty())
+            {
+                bail!("persistent path allow rules must stay within the workspace");
+            }
+        }
+        self.append_permission_rules(rules, PermissionAction::Allow)
+    }
+
+    fn append_permission_rules(
+        &mut self,
+        rules: &[ToolAskRule],
+        expected_action: PermissionAction,
+    ) -> Result<usize> {
         if rules.is_empty() {
             return Ok(0);
         }
+        if rules.iter().any(|rule| rule.action != expected_action) {
+            bail!(
+                "permission rule action does not match requested {:?} persistence",
+                expected_action
+            );
+        }
 
         let path = checked_permissions_path_for_config_path(&self.path)?;
-        let raw = if checked_path_exists(&path)? {
-            read_checked_permissions_file(&path)?
-        } else {
-            String::new()
-        };
-        let mut permissions = if raw.trim().is_empty() {
-            PermissionsToml::default()
-        } else {
-            toml::from_str(&raw)
-                .with_context(|| format!("failed to parse permissions at {}", path.display()))?
-        };
-        let mut document = if raw.trim().is_empty() {
-            toml_edit::DocumentMut::new()
-        } else {
-            raw.parse::<toml_edit::DocumentMut>()
-                .with_context(|| format!("failed to edit permissions at {}", path.display()))?
-        };
+        let (added, persisted) = config_document::with_config_write_lock(&path, |path| {
+            let (_, raw, mut permissions) = read_permissions_state(path)?;
+            let mut document = parse_permissions_document(path, &raw)?;
 
-        if !document.contains_key("rules") {
-            document["rules"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
-        }
-        let rules_item = document
-            .get_mut("rules")
-            .expect("rules entry was inserted above");
-
-        let mut added = 0;
-        for rule in rules {
-            if permissions.rules.contains(rule) {
-                continue;
+            if !document.contains_key("rules") {
+                document["rules"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
             }
-            append_ask_rule(rules_item, rule)?;
-            permissions.rules.push(rule.clone());
-            added += 1;
-        }
-        if added == 0 {
-            self.permissions = permissions;
-            return Ok(0);
-        }
+            let rules_item = document
+                .get_mut("rules")
+                .expect("rules entry was inserted above");
 
-        let body = document.to_string();
-        let persisted: PermissionsToml = toml::from_str(&body).with_context(|| {
-            format!(
-                "generated invalid permissions document for {}",
-                path.display()
-            )
+            let mut added = 0;
+            for rule in rules {
+                if permissions.rules.contains(rule) {
+                    continue;
+                }
+                append_permission_rule(rules_item, rule)?;
+                permissions.rules.push(rule.clone());
+                added += 1;
+            }
+            if added == 0 {
+                return Ok((0, permissions));
+            }
+
+            let body = document.to_string();
+            let persisted = parse_generated_permissions(path, &body)?;
+            write_permissions_atomic(path, body.as_bytes())?;
+            Ok((added, persisted))
         })?;
-        write_permissions_atomic(&path, body.as_bytes())?;
         self.permissions = persisted;
         Ok(added)
     }
@@ -3424,28 +5363,82 @@ fn checked_config_backup_path(path: &Path) -> Result<PathBuf> {
     checked_config_sibling_path(path, &config_backup_file_name(path))
 }
 
-fn write_one_time_config_backup(path: &Path) -> Result<()> {
+/// Remove plaintext `api_key` entries from the one-time config backup, if it
+/// exists.
+///
+/// Credential migration deliberately preserves the rest of `config.toml.bak`
+/// while ensuring that moving a key into the durable secret store does not
+/// leave the same credential behind in an older backup.
+pub fn scrub_plaintext_api_keys_from_config_backup(path: &Path) -> Result<()> {
     let backup = checked_config_backup_path(path)?;
-    if backup.exists() {
+    if !backup.exists() {
         return Ok(());
     }
-    fs::copy(path, &backup).with_context(|| {
+
+    let raw = read_checked_toml_file(&backup, "config backup")?;
+    let scrubbed = config_toml_without_plaintext_api_keys(&raw).with_context(|| {
         format!(
-            "failed to create config backup {} from {}",
-            backup.display(),
-            path.display()
+            "failed to scrub plaintext API keys from config backup {}",
+            backup.display()
         )
     })?;
-    #[cfg(unix)]
-    {
-        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).with_context(|| {
+    if scrubbed != raw {
+        persistence::atomic_write(&backup, scrubbed.as_bytes()).with_context(|| {
             format!(
-                "failed to set config backup permissions at {}",
+                "failed to write credential-free config backup {}",
                 backup.display()
             )
         })?;
     }
     Ok(())
+}
+
+fn write_one_time_config_backup(path: &Path) -> Result<()> {
+    let backup = checked_config_backup_path(path)?;
+    if backup.exists() {
+        return scrub_plaintext_api_keys_from_config_backup(path);
+    }
+
+    let raw = read_checked_config_file(path)?;
+    let scrubbed = config_toml_without_plaintext_api_keys(&raw).with_context(|| {
+        format!(
+            "failed to scrub plaintext API keys while creating config backup {}",
+            backup.display()
+        )
+    })?;
+    persistence::atomic_write(&backup, scrubbed.as_bytes()).with_context(|| {
+        format!(
+            "failed to create credential-free config backup {} from {}",
+            backup.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
+    let mut document = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse config TOML while removing plaintext API keys; file contents were omitted"
+            )
+        })?;
+    remove_plaintext_api_keys_recursive(document.as_table_mut());
+    Ok(document.to_string())
+}
+
+fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
+    table.remove("api_key");
+    for (_, item) in table.iter_mut() {
+        if let toml_edit::Item::ArrayOfTables(tables) = item {
+            for nested in tables.iter_mut() {
+                remove_plaintext_api_keys_recursive(nested);
+            }
+        } else if let Some(nested) = item.as_table_like_mut() {
+            remove_plaintext_api_keys_recursive(nested);
+        }
+    }
 }
 
 /// Merge comments and formatting from an original TOML file into a
@@ -3458,11 +5451,17 @@ fn write_one_time_config_backup(path: &Path) -> Result<()> {
 pub fn merge_and_preserve_comments(serialized: &str, original_raw: &str) -> Result<String> {
     let original = original_raw
         .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse original config for comment merge")?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse original config for comment merge; file contents were omitted"
+            )
+        })?;
 
-    let mut new_doc = serialized
-        .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse serialized config for comment merge")?;
+    let mut new_doc = serialized.parse::<toml_edit::DocumentMut>().map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse serialized config for comment merge; file contents were omitted"
+        )
+    })?;
 
     // Reuse the original document’s trailing text (file-footer comments /
     // disabled keys) so they survive the rewrite.
@@ -3564,32 +5563,16 @@ pub fn default_secrets() -> &'static Secrets {
 // New installs write to ~/.codewhale/. Existing installs with only
 // ~/.deepseek/ continue working without data loss.
 
-/// Canonical CodeWhale app directory name under $HOME.
-pub const CODEWHALE_APP_DIR: &str = ".codewhale";
-
-/// Legacy DeepSeek-branded app directory name (compatibility fallback).
-pub const LEGACY_APP_DIR: &str = ".deepseek";
+pub use codewhale_paths::{CODEWHALE_APP_DIR, LEGACY_APP_DIR};
 
 /// Resolve the primary CodeWhale home directory.
 ///
 /// `$CODEWHALE_HOME` takes precedence when set. Otherwise defaults to
 /// `$HOME/.codewhale`. This is the write target for new product state.
 pub fn codewhale_home() -> Result<PathBuf> {
-    if let Some(path) = codewhale_home_env_override() {
-        return Ok(path);
-    }
-    let home = effective_home_dir().context("failed to resolve home directory")?;
-    Ok(home.join(CODEWHALE_APP_DIR))
-}
-
-fn codewhale_home_env_override() -> Option<PathBuf> {
-    let val = std::env::var("CODEWHALE_HOME").ok()?;
-    let trimmed = val.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
+    codewhale_paths::codewhale_home()
+        .map_err(anyhow::Error::new)?
+        .context("failed to resolve home directory")
 }
 
 /// Whether `$CODEWHALE_HOME` is set to a non-empty value.
@@ -3597,22 +5580,14 @@ fn codewhale_home_env_override() -> Option<PathBuf> {
 /// An explicit CodeWhale home is an isolation boundary: state/config resolvers
 /// must not fall back to ambient legacy `~/.deepseek` data outside that root.
 pub fn codewhale_home_is_explicit() -> bool {
-    codewhale_home_env_override().is_some()
+    codewhale_paths::codewhale_home_is_explicit()
 }
 
 /// Resolve the legacy DeepSeek home directory (`$HOME/.deepseek`).
 ///
 /// Always returns the legacy path regardless of whether it exists.
 pub fn legacy_deepseek_home() -> Result<PathBuf> {
-    let home = effective_home_dir().context("failed to resolve home directory")?;
-    Ok(home.join(LEGACY_APP_DIR))
-}
-
-fn effective_home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+    codewhale_paths::legacy_deepseek_home().context("failed to resolve home directory")
 }
 
 /// Reject state subdirs that could escape the state root via path injection.
@@ -3655,7 +5630,7 @@ fn ensure_safe_state_subdir(subdir: &str) -> Result<()> {
 /// from the legacy path for users who haven't migrated yet.
 pub fn resolve_state_dir(subdir: &str) -> Result<PathBuf> {
     ensure_safe_state_subdir(subdir)?;
-    let explicit_codewhale_home = codewhale_home_env_override().is_some();
+    let explicit_codewhale_home = codewhale_home_is_explicit();
     let primary = codewhale_home()?.join(subdir);
     if explicit_codewhale_home || primary.exists() {
         return Ok(primary);
@@ -3715,7 +5690,7 @@ impl StateMigration {
         };
 
         format!(
-            "CodeWhale migrated legacy state ({action}):\n  {} -> {}\nYour data was preserved. Use .codewhale as the canonical state location from now on.\n{legacy_detail}\nIf no other apps use it, you can remove the legacy .deepseek tree after confirming everything looks right.",
+            "Codewhale migrated legacy state ({action}):\n  {} -> {}\nYour data was preserved. Use .codewhale as the canonical state location from now on.\n{legacy_detail}\nIf no other apps use it, you can remove the legacy .deepseek tree after confirming everything looks right.",
             self.legacy_path.display(),
             self.primary_path.display(),
         )
@@ -3727,7 +5702,7 @@ impl StateMigration {
 /// tests and future UI surfaces that want to render the notice themselves.
 pub fn ensure_state_dir_with_migration(subdir: &str) -> Result<(PathBuf, Option<StateMigration>)> {
     ensure_safe_state_subdir(subdir)?;
-    let explicit_codewhale_home = codewhale_home_env_override().is_some();
+    let explicit_codewhale_home = codewhale_home_is_explicit();
     let dir = codewhale_home()?.join(subdir);
     let migration = if !explicit_codewhale_home {
         migrate_legacy_state_dir(&dir, subdir)?
@@ -3872,27 +5847,200 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return normalize_config_file_path(path);
     }
-    if let Ok(path) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        if let Some(path) = config_path_from_env_value(&path)? {
-            return Ok(path);
-        }
-        return default_config_path();
-    }
-    if let Ok(path) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        if let Some(path) = config_path_from_env_value(&path)? {
-            return Ok(path);
-        }
-        return default_config_path();
+    if let Some(path) = codewhale_paths::config_path_override().map_err(anyhow::Error::new)? {
+        return normalize_config_file_path(path);
     }
     default_config_path()
 }
 
-fn config_path_from_env_value(path: &str) -> Result<Option<PathBuf>> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        normalize_config_file_path(PathBuf::from(trimmed)).map(Some)
+/// Whether `path` names a workspace-scoped config document —
+/// `<repo>/.codewhale/config.toml` (or the legacy `.deepseek` layout) inside a
+/// checkout — rather than a user-global config file.
+///
+/// Credential writes (api_key values, `auth_mode` markers, oauth/external
+/// credential pointers) must never target such a document: a key saved while
+/// working in one repo would be invisible from every other repo, and the repo
+/// file stores it in plaintext where it is easy to commit by accident (#5045,
+/// #5193).
+///
+/// A path is classified workspace-scoped only when its parent directory is a
+/// `.codewhale`/`.deepseek` app dir outside the user's home AND the document
+/// belongs to a workspace: it is relative (resolves against the process cwd),
+/// its base directory contains the process cwd, or its base directory is a
+/// checkout (has a `.git` entry). An explicit `$CODEWHALE_HOME` config is
+/// user-global wherever that home points, even when the directory itself
+/// happens to be named `.codewhale`; other custom locations (for example
+/// `CODEWHALE_CONFIG_PATH=~/team.toml` or an isolated test directory) stay
+/// honored as deliberate user-scoped choices.
+#[must_use]
+pub fn config_path_is_workspace_scoped(path: &Path) -> bool {
+    config_path_is_workspace_scoped_with_context(
+        path,
+        codewhale_paths::codewhale_home_override()
+            .ok()
+            .flatten()
+            .as_deref(),
+        codewhale_paths::user_home().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// Environment-free core of [`config_path_is_workspace_scoped`], split out so
+/// scope classification is testable without mutating process-global state.
+fn config_path_is_workspace_scoped_with_context(
+    path: &Path,
+    explicit_codewhale_home: Option<&Path>,
+    user_home: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> bool {
+    if let Some(home) = explicit_codewhale_home
+        && same_lexical_or_canonical_path(path, &home.join(CONFIG_FILE_NAME))
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let parent_is_app_dir = parent
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name == CODEWHALE_APP_DIR || name == LEGACY_APP_DIR);
+    if !parent_is_app_dir {
+        return false;
+    }
+    let Some(base) = parent.parent() else {
+        return true;
+    };
+    if let Some(home) = user_home
+        && same_lexical_or_canonical_path(base, home)
+    {
+        return false;
+    }
+    if path.is_relative() {
+        // Resolves against the process cwd: repo-scoped by construction.
+        return true;
+    }
+    // The document belongs to the workspace the process is sitting in…
+    if let Some(cwd) = current_dir
+        && canonicalize_or_keep(cwd).starts_with(canonicalize_or_keep(base))
+    {
+        return true;
+    }
+    // …or to some other checkout (a `.git` entry beside the app dir).
+    base.join(".git").exists()
+}
+
+/// Lexical equality first, canonical equality as a fallback so an existing
+/// path still matches through symlinked parents (e.g. `/tmp` on macOS).
+fn same_lexical_or_canonical_path(a: &Path, b: &Path) -> bool {
+    a == b || canonicalize_or_keep(a) == canonicalize_or_keep(b)
+}
+
+fn canonicalize_or_keep(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod credential_scope_tests {
+    use super::config_path_is_workspace_scoped_with_context;
+    use std::path::Path;
+
+    #[test]
+    fn config_inside_current_workspace_is_workspace_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let cwd = repo.join("nested/dir");
+        for app_dir in [".codewhale", ".deepseek"] {
+            let config = repo.join(app_dir).join("config.toml");
+            assert!(
+                config_path_is_workspace_scoped_with_context(
+                    &config,
+                    None,
+                    Some(Path::new("/home/user")),
+                    Some(&cwd),
+                ),
+                "{} should be workspace-scoped when cwd sits inside the repo",
+                config.display()
+            );
+        }
+    }
+
+    #[test]
+    fn relative_app_dir_config_is_workspace_scoped() {
+        assert!(config_path_is_workspace_scoped_with_context(
+            Path::new(".codewhale/config.toml"),
+            None,
+            Some(Path::new("/home/user")),
+            Some(Path::new("/somewhere/else")),
+        ));
+    }
+
+    #[test]
+    fn checkout_config_outside_cwd_is_workspace_scoped_via_git_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git marker");
+        std::fs::create_dir_all(repo.join(".codewhale")).expect("app dir");
+        assert!(config_path_is_workspace_scoped_with_context(
+            &repo.join(".codewhale/config.toml"),
+            None,
+            Some(Path::new("/home/user")),
+            Some(Path::new("/somewhere/else")),
+        ));
+    }
+
+    #[test]
+    fn user_global_and_custom_locations_are_not_workspace_scoped() {
+        let home = Path::new("/home/user");
+        let elsewhere = Some(Path::new("/somewhere/else"));
+        for global_config in [
+            "/home/user/.codewhale/config.toml",
+            "/home/user/.deepseek/config.toml",
+            "/home/user/team-config.toml",
+            "/etc/codewhale/config.toml",
+        ] {
+            assert!(
+                !config_path_is_workspace_scoped_with_context(
+                    Path::new(global_config),
+                    None,
+                    Some(home),
+                    elsewhere,
+                ),
+                "{global_config} should stay user-global"
+            );
+        }
+        // An isolated app-dir-shaped location with no workspace relationship
+        // (no cwd ancestry, no checkout marker) stays honored: test harnesses
+        // and deliberate overrides point there.
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(!config_path_is_workspace_scoped_with_context(
+            &temp.path().join(".codewhale/config.toml"),
+            None,
+            Some(home),
+            elsewhere,
+        ));
+    }
+
+    #[test]
+    fn explicit_codewhale_home_config_is_user_global_even_when_dir_is_app_named() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let explicit = repo.join(".codewhale");
+        // Even with cwd inside the repo, the explicit CODEWHALE_HOME config is
+        // the user-global scope by definition.
+        assert!(!config_path_is_workspace_scoped_with_context(
+            &explicit.join("config.toml"),
+            Some(&explicit),
+            Some(Path::new("/home/user")),
+            Some(&repo),
+        ));
+        // A different repo-scoped document is still workspace-scoped.
+        assert!(config_path_is_workspace_scoped_with_context(
+            &repo.join("other/.codewhale/config.toml"),
+            Some(&explicit),
+            Some(Path::new("/home/user")),
+            Some(&repo.join("other")),
+        ));
     }
 }
 
@@ -3909,6 +6057,92 @@ pub fn resolve_permissions_path(config_path: Option<PathBuf>) -> Result<PathBuf>
     checked_permissions_path_for_config_path(&resolve_config_path(config_path)?)
 }
 
+/// Load the active sibling permission rules with confirmation tokens suitable
+/// for a later compare-and-remove operation.
+pub fn load_permissions_snapshot(config_path: Option<PathBuf>) -> Result<PermissionsSnapshot> {
+    let path = resolve_permissions_path(config_path)?;
+    let (file_exists, raw, permissions) = read_permissions_state(&path)?;
+    let file_state = if !file_exists {
+        PermissionsFileState::Missing
+    } else if raw.is_empty() {
+        PermissionsFileState::Empty
+    } else {
+        PermissionsFileState::Present
+    };
+    let removal_tokens = (0..permissions.rules.len())
+        .map(|index| permission_removal_token(&path, &raw, index))
+        .collect();
+    Ok(PermissionsSnapshot {
+        path,
+        file_state,
+        permissions,
+        removal_tokens,
+    })
+}
+
+/// Remove one zero-based permission rule if `expected_token` still describes
+/// that exact index in the current file.
+///
+/// The file is re-read only after acquiring the same adjacent lock used by
+/// append operations. This makes the token check and atomic replacement one
+/// transaction, preventing stale list views from deleting a different rule.
+pub fn remove_permission_rule(
+    config_path: Option<PathBuf>,
+    index: usize,
+    expected_token: &str,
+) -> Result<ToolAskRule> {
+    let path = resolve_permissions_path(config_path)?;
+    config_document::with_config_write_lock(&path, |path| {
+        let (file_exists, raw, permissions) = read_permissions_state(path)?;
+        if !file_exists {
+            bail!(
+                "permissions changed after they were listed; reload {} and retry",
+                quote_os_path(path)
+            );
+        }
+        let rule = permissions.rules.get(index).cloned().with_context(|| {
+            format!(
+                "permission rule {} no longer exists in {}; list rules again",
+                index + 1,
+                quote_os_path(path)
+            )
+        })?;
+        let current_token = permission_removal_token(path, &raw, index);
+        if current_token != expected_token {
+            bail!(
+                "permissions changed after they were listed; reload {} and retry",
+                quote_os_path(path)
+            );
+        }
+
+        let mut document = parse_permissions_document(path, &raw)?;
+        let rules_item = document.get_mut("rules").with_context(|| {
+            format!(
+                "permissions at {} no longer contain a rules array",
+                quote_os_path(path)
+            )
+        })?;
+        let orphaned_header = remove_permission_rule_item(rules_item, index)?;
+        if let Some(header) = orphaned_header {
+            let trailing = format!(
+                "{header}{}",
+                document.trailing().as_str().unwrap_or_default()
+            );
+            document.set_trailing(trailing);
+        }
+        let body = document.to_string();
+        let persisted = parse_generated_permissions(path, &body)?;
+        if persisted.rules.len() + 1 != permissions.rules.len() {
+            bail!(
+                "refusing inconsistent permission removal at {}",
+                quote_os_path(path)
+            );
+        }
+        write_permissions_atomic(path, body.as_bytes())?;
+        Ok(rule)
+    })
+}
+
 /// Read a resolved `permissions.toml` path using the same checked/no-follow
 /// path handling as config loading.
 pub fn read_permissions_file(path: &Path) -> Result<String> {
@@ -3917,56 +6151,183 @@ pub fn read_permissions_file(path: &Path) -> Result<String> {
 
 fn load_sibling_permissions(config_path: &Path) -> Result<PermissionsToml> {
     let permissions_path = checked_permissions_path_for_config_path(config_path)?;
-    if !checked_path_exists(&permissions_path)? {
-        return Ok(PermissionsToml::default());
-    }
+    let (_, _, permissions) = read_permissions_state(&permissions_path)?;
+    Ok(permissions)
+}
 
-    let raw = read_checked_permissions_file(&permissions_path)?;
-    toml::from_str(&raw).with_context(|| {
-        format!(
-            "failed to parse permissions at {}",
-            permissions_path.display()
+fn read_permissions_state(path: &Path) -> Result<(bool, String, PermissionsToml)> {
+    let file_exists = checked_path_exists(path)?;
+    let raw = if file_exists {
+        read_checked_permissions_file(path)?
+    } else {
+        String::new()
+    };
+    let permissions = if raw.trim().is_empty() {
+        PermissionsToml::default()
+    } else {
+        toml::from_str(&raw).map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse permissions at {}; file contents were omitted",
+                quote_os_path(path)
+            )
+        })?
+    };
+    Ok((file_exists, raw, permissions))
+}
+
+fn parse_permissions_document(path: &Path, raw: &str) -> Result<toml_edit::DocumentMut> {
+    if raw.trim().is_empty() {
+        Ok(toml_edit::DocumentMut::new())
+    } else {
+        raw.parse::<toml_edit::DocumentMut>().map_err(|_| {
+            anyhow::anyhow!(
+                "failed to edit permissions at {}; file contents were omitted",
+                quote_os_path(path)
+            )
+        })
+    }
+}
+
+fn parse_generated_permissions(path: &Path, body: &str) -> Result<PermissionsToml> {
+    toml::from_str(body).map_err(|_| {
+        anyhow::anyhow!(
+            "generated invalid permissions document for {}; file contents were omitted",
+            quote_os_path(path)
         )
     })
 }
 
-fn append_ask_rule(item: &mut toml_edit::Item, rule: &ToolAskRule) -> Result<()> {
+fn permission_removal_token(path: &Path, raw: &str, index: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codewhale-permission-removal-v1\0");
+    hasher.update(quote_os_path(path).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(index.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    let mut token = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut token, "{byte:02x}");
+    }
+    token
+}
+
+fn append_permission_rule(item: &mut toml_edit::Item, rule: &ToolAskRule) -> Result<()> {
     match item {
         toml_edit::Item::ArrayOfTables(rules) => {
-            rules.push(ask_rule_table(rule));
+            rules.push(permission_rule_table(rule));
             Ok(())
         }
         toml_edit::Item::Value(value) => {
             let Some(rules) = value.as_array_mut() else {
                 bail!("`rules` in permissions.toml must be an array");
             };
-            rules.push(toml_edit::Value::InlineTable(ask_rule_inline_table(rule)));
+            rules.push(toml_edit::Value::InlineTable(permission_rule_inline_table(
+                rule,
+            )));
             Ok(())
         }
         _ => bail!("`rules` in permissions.toml must be an array"),
     }
 }
 
-fn ask_rule_table(rule: &ToolAskRule) -> toml_edit::Table {
+fn remove_permission_rule_item(item: &mut toml_edit::Item, index: usize) -> Result<Option<String>> {
+    match item {
+        toml_edit::Item::ArrayOfTables(rules) => {
+            if index >= rules.len() {
+                bail!("permission rule index changed before removal");
+            }
+            let file_header = if index == 0 {
+                rules
+                    .get(index)
+                    .and_then(|rule| rule.decor().prefix())
+                    .and_then(toml_edit::RawString::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            rules.remove(index);
+            if let Some(header) = file_header.as_deref()
+                && let Some(next_rule) = rules.get_mut(0)
+            {
+                let next_prefix = next_rule
+                    .decor()
+                    .prefix()
+                    .and_then(toml_edit::RawString::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                next_rule
+                    .decor_mut()
+                    .set_prefix(format!("{header}{next_prefix}"));
+                return Ok(None);
+            }
+            Ok(file_header)
+        }
+        toml_edit::Item::Value(value) => {
+            let Some(rules) = value.as_array_mut() else {
+                bail!("`rules` in permissions.toml must be an array");
+            };
+            if index >= rules.len() {
+                bail!("permission rule index changed before removal");
+            }
+            rules.remove(index);
+            Ok(None)
+        }
+        _ => bail!("`rules` in permissions.toml must be an array"),
+    }
+}
+
+fn permission_rule_table(rule: &ToolAskRule) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     table["tool"] = toml_edit::value(rule.tool.clone());
     if let Some(command) = rule.command.as_deref() {
         table["command"] = toml_edit::value(command);
     }
+    if rule.command_exact {
+        table["command_exact"] = toml_edit::value(true);
+    }
     if let Some(path) = rule.path.as_deref() {
         table["path"] = toml_edit::value(path);
+    }
+    if let Some(workspace) = rule.workspace.as_deref() {
+        table["workspace"] = toml_edit::value(workspace);
+    }
+    if rule.action != PermissionAction::Ask {
+        table["action"] = toml_edit::value(match rule.action {
+            PermissionAction::Allow => "allow",
+            PermissionAction::Ask => "ask",
+            PermissionAction::Deny => "deny",
+        });
     }
     table
 }
 
-fn ask_rule_inline_table(rule: &ToolAskRule) -> toml_edit::InlineTable {
+fn permission_rule_inline_table(rule: &ToolAskRule) -> toml_edit::InlineTable {
     let mut table = toml_edit::InlineTable::new();
     table.insert("tool", toml_edit::Value::from(rule.tool.clone()));
     if let Some(command) = rule.command.as_deref() {
         table.insert("command", toml_edit::Value::from(command));
     }
+    if rule.command_exact {
+        table.insert("command_exact", toml_edit::Value::from(true));
+    }
     if let Some(path) = rule.path.as_deref() {
         table.insert("path", toml_edit::Value::from(path));
+    }
+    if let Some(workspace) = rule.workspace.as_deref() {
+        table.insert("workspace", toml_edit::Value::from(workspace));
+    }
+    if rule.action != PermissionAction::Ask {
+        table.insert(
+            "action",
+            toml_edit::Value::from(match rule.action {
+                PermissionAction::Allow => "allow",
+                PermissionAction::Ask => "ask",
+                PermissionAction::Deny => "deny",
+            }),
+        );
     }
     table
 }
@@ -4389,6 +6750,7 @@ struct EnvRuntimeOverrides {
     volcengine_model: Option<String>,
     wanjie_ark_model: Option<String>,
     openrouter_model: Option<String>,
+    orcarouter_model: Option<String>,
     moonshot_model: Option<String>,
     xiaomi_mimo_model: Option<String>,
     xiaomi_mimo_mode: Option<String>,
@@ -4399,6 +6761,20 @@ struct EnvRuntimeOverrides {
     auth_mode: Option<String>,
     log_level: Option<String>,
     telemetry: Option<bool>,
+    /// `CODEWHALE_TELEMETRY`/`DEEPSEEK_TELEMETRY` was set to something
+    /// [`parse_bool`] could not read. A typo in a kill switch must never
+    /// resolve to "on", so this forces telemetry off the same way an explicit
+    /// `false` does.
+    telemetry_env_invalid: bool,
+    /// An environment-level kill switch is in force for this process.
+    ///
+    /// See [`telemetry_floor_in_force`] for what sets it and why the dispatcher
+    /// has to state it rather than let the child infer it.
+    telemetry_floor: bool,
+    /// `CODEWHALE_TELEMETRY_ENDPOINT`/`DEEPSEEK_TELEMETRY_ENDPOINT`. Overrides
+    /// the config file. A workspace `.env` cannot reach this — the dotenv
+    /// allowlist admits only built-in provider credential names.
+    telemetry_endpoint: Option<String>,
     approval_policy: Option<String>,
     sandbox_mode: Option<String>,
     yolo: Option<bool>,
@@ -4412,6 +6788,7 @@ struct EnvRuntimeOverrides {
     volcengine_base_url: Option<String>,
     wanjie_ark_base_url: Option<String>,
     openrouter_base_url: Option<String>,
+    orcarouter_base_url: Option<String>,
     xiaomi_mimo_base_url: Option<String>,
     novita_base_url: Option<String>,
     fireworks_base_url: Option<String>,
@@ -4422,6 +6799,8 @@ struct EnvRuntimeOverrides {
     sglang_base_url: Option<String>,
     vllm_base_url: Option<String>,
     ollama_base_url: Option<String>,
+    ollama_cloud_base_url: Option<String>,
+    ollama_cloud_model: Option<String>,
     huggingface_base_url: Option<String>,
     huggingface_model: Option<String>,
     together_base_url: Option<String>,
@@ -4447,15 +6826,35 @@ struct EnvRuntimeOverrides {
     sakana_model: Option<String>,
     longcat_base_url: Option<String>,
     longcat_model: Option<String>,
+    opencode_go_base_url: Option<String>,
+    opencode_go_model: Option<String>,
+    opencode_zen_base_url: Option<String>,
+    opencode_zen_model: Option<String>,
     meta_base_url: Option<String>,
     meta_model: Option<String>,
     xai_base_url: Option<String>,
     xai_model: Option<String>,
+    mistral_base_url: Option<String>,
+    mistral_model: Option<String>,
+    google_base_url: Option<String>,
+    google_model: Option<String>,
+    antigravity_base_url: Option<String>,
+    antigravity_model: Option<String>,
+    telecomjs_base_url: Option<String>,
+    telecomjs_model: Option<String>,
+    edenai_base_url: Option<String>,
+    edenai_model: Option<String>,
+    modelstudio_token_plan_base_url: Option<String>,
+    modelstudio_token_plan_model: Option<String>,
+    modelstudio_coding_plan_base_url: Option<String>,
+    modelstudio_coding_plan_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
     fn load() -> Self {
         let (provider, provider_source) = Self::load_provider();
+        let (telemetry, telemetry_env_invalid) = Self::load_telemetry();
+        let telemetry_floor = telemetry_floor_in_force();
         Self {
             provider,
             provider_source,
@@ -4474,6 +6873,9 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             openrouter_model: std::env::var("OPENROUTER_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            orcarouter_model: std::env::var("ORCAROUTER_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             moonshot_model: std::env::var("MOONSHOT_MODEL")
@@ -4501,35 +6903,50 @@ impl EnvRuntimeOverrides {
             verbosity: std::env::var("CODEWHALE_VERBOSITY")
                 .or_else(|_| std::env::var("DEEPSEEK_VERBOSITY"))
                 .ok(),
-            output_mode: std::env::var("DEEPSEEK_OUTPUT_MODE").ok(),
-            auth_mode: std::env::var("DEEPSEEK_AUTH_MODE").ok(),
-            log_level: std::env::var("DEEPSEEK_LOG_LEVEL").ok(),
-            telemetry: std::env::var("DEEPSEEK_TELEMETRY")
+            output_mode: std::env::var("CODEWHALE_OUTPUT_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_OUTPUT_MODE"))
+                .ok(),
+            auth_mode: std::env::var("CODEWHALE_AUTH_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_AUTH_MODE"))
+                .ok(),
+            log_level: std::env::var("CODEWHALE_LOG_LEVEL")
+                .or_else(|_| std::env::var("DEEPSEEK_LOG_LEVEL"))
+                .ok(),
+            telemetry,
+            telemetry_env_invalid,
+            telemetry_floor,
+            // Empty is kept, not discarded. Since the config file's *absent*
+            // endpoint now resolves to `DEFAULT_TELEMETRY_ENDPOINT`, dropping
+            // an explicitly emptied variable here would make
+            // `CODEWHALE_TELEMETRY_ENDPOINT=` select the shipped endpoint —
+            // the opposite of what anyone typing it means. Resolution reads an
+            // empty override as "contact nobody, write the dry-run file".
+            telemetry_endpoint: std::env::var("CODEWHALE_TELEMETRY_ENDPOINT")
+                .or_else(|_| std::env::var("DEEPSEEK_TELEMETRY_ENDPOINT"))
+                .ok(),
+            approval_policy: std::env::var("CODEWHALE_APPROVAL_POLICY")
+                .or_else(|_| std::env::var("DEEPSEEK_APPROVAL_POLICY"))
+                .ok(),
+            sandbox_mode: std::env::var("CODEWHALE_SANDBOX_MODE")
+                .or_else(|_| std::env::var("DEEPSEEK_SANDBOX_MODE"))
+                .ok(),
+            yolo: std::env::var("CODEWHALE_YOLO")
+                .or_else(|_| std::env::var("DEEPSEEK_YOLO"))
                 .ok()
                 .and_then(|v| match parse_bool(&v) {
                     Ok(b) => Some(b),
                     Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_TELEMETRY value '{v}', expected true/false");
+                        tracing::warn!("Invalid CODEWHALE_YOLO/DEEPSEEK_YOLO value '{v}', expected true/false");
                         None
                     }
                 }),
-            approval_policy: std::env::var("DEEPSEEK_APPROVAL_POLICY").ok(),
-            sandbox_mode: std::env::var("DEEPSEEK_SANDBOX_MODE").ok(),
-            yolo: std::env::var("DEEPSEEK_YOLO")
-                .ok()
-                .and_then(|v| match parse_bool(&v) {
-                    Ok(b) => Some(b),
-                    Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_YOLO value '{v}', expected true/false");
-                        None
-                    }
-                }),
-            http_headers: std::env::var("DEEPSEEK_HTTP_HEADERS")
+            http_headers: std::env::var("CODEWHALE_HTTP_HEADERS")
+                .or_else(|_| std::env::var("DEEPSEEK_HTTP_HEADERS"))
                 .ok()
                 .and_then(|value| match parse_http_headers(&value) {
                     Ok(h) => Some(h),
                     Err(_) => {
-                        tracing::warn!("Invalid DEEPSEEK_HTTP_HEADERS value, expected format: header1=val1,header2=val2");
+                        tracing::warn!("Invalid CODEWHALE_HTTP_HEADERS/DEEPSEEK_HTTP_HEADERS value, expected format: header1=val1,header2=val2");
                         None
                     }
                 })
@@ -4566,6 +6983,9 @@ impl EnvRuntimeOverrides {
             openrouter_base_url: std::env::var("OPENROUTER_BASE_URL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            orcarouter_base_url: std::env::var("ORCAROUTER_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             xiaomi_mimo_base_url: std::env::var("XIAOMI_MIMO_BASE_URL")
                 .or_else(|_| std::env::var("MIMO_BASE_URL"))
                 .ok()
@@ -4596,6 +7016,12 @@ impl EnvRuntimeOverrides {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            ollama_cloud_base_url: std::env::var("OLLAMA_CLOUD_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            ollama_cloud_model: std::env::var("OLLAMA_CLOUD_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             huggingface_base_url: std::env::var("HUGGINGFACE_BASE_URL")
@@ -4698,6 +7124,18 @@ impl EnvRuntimeOverrides {
             longcat_model: std::env::var("LONGCAT_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            opencode_go_base_url: std::env::var("OPENCODE_GO_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            opencode_go_model: std::env::var("OPENCODE_GO_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            opencode_zen_base_url: std::env::var("OPENCODE_ZEN_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            opencode_zen_model: std::env::var("OPENCODE_ZEN_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             meta_base_url: std::env::var("META_MODEL_API_BASE_URL")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
@@ -4720,21 +7158,79 @@ impl EnvRuntimeOverrides {
             xai_model: std::env::var("XAI_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            antigravity_base_url: std::env::var("ANTIGRAVITY_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            antigravity_model: std::env::var("ANTIGRAVITY_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            google_base_url: std::env::var("GOOGLE_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("GEMINI_BASE_URL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
+            google_model: std::env::var("GOOGLE_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("GEMINI_MODEL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                }),
+            mistral_base_url: std::env::var("MISTRAL_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            mistral_model: std::env::var("MISTRAL_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            telecomjs_base_url: std::env::var("TELECOMJS_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            telecomjs_model: std::env::var("TELECOMJS_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            edenai_base_url: std::env::var("EDENAI_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            edenai_model: std::env::var("EDENAI_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelstudio_token_plan_base_url: std::env::var("MODELSTUDIO_TOKEN_PLAN_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelstudio_token_plan_model: std::env::var("MODELSTUDIO_TOKEN_PLAN_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelstudio_coding_plan_base_url: std::env::var("MODELSTUDIO_CODING_PLAN_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelstudio_coding_plan_model: std::env::var("MODELSTUDIO_CODING_PLAN_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
     fn load_provider() -> (Option<ProviderKind>, Option<&'static str>) {
         if let Ok(value) = std::env::var("CODEWHALE_PROVIDER") {
-            let parsed = ProviderKind::parse(&value);
+            let parsed = ProviderKind::parse_config_identity(&value);
             return (parsed, parsed.map(|_| "CODEWHALE_PROVIDER"));
         }
 
         if let Ok(value) = std::env::var("DEEPSEEK_PROVIDER") {
-            let parsed = ProviderKind::parse(&value);
+            let parsed = ProviderKind::parse_config_identity(&value);
             return (parsed, parsed.map(|_| "DEEPSEEK_PROVIDER"));
         }
 
         (None, None)
+    }
+
+    /// Read the telemetry kill switch, reporting an unreadable value instead of
+    /// swallowing it. See [`read_telemetry_env`].
+    fn load_telemetry() -> (Option<bool>, bool) {
+        read_telemetry_env()
     }
 
     fn base_url_for(&self, provider: ProviderKind) -> Option<String> {
@@ -4749,6 +7245,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::WanjieArk => self.wanjie_ark_base_url.clone(),
             ProviderKind::Volcengine => self.volcengine_base_url.clone(),
             ProviderKind::Openrouter => self.openrouter_base_url.clone(),
+            ProviderKind::Orcarouter => self.orcarouter_base_url.clone(),
             ProviderKind::XiaomiMimo => self.xiaomi_mimo_base_url.clone(),
             ProviderKind::Novita => self.novita_base_url.clone(),
             ProviderKind::Fireworks => self.fireworks_base_url.clone(),
@@ -4760,6 +7257,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Sglang => self.sglang_base_url.clone(),
             ProviderKind::Vllm => self.vllm_base_url.clone(),
             ProviderKind::Ollama => self.ollama_base_url.clone(),
+            ProviderKind::OllamaCloud => self.ollama_cloud_base_url.clone(),
             ProviderKind::Huggingface => self.huggingface_base_url.clone(),
             ProviderKind::Together => self.together_base_url.clone(),
             ProviderKind::Qianfan => self.qianfan_base_url.clone(),
@@ -4773,8 +7271,21 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_base_url.clone(),
             ProviderKind::Sakana => self.sakana_base_url.clone(),
             ProviderKind::LongCat => self.longcat_base_url.clone(),
+            ProviderKind::OpencodeGo => self.opencode_go_base_url.clone(),
+            ProviderKind::OpencodeZen => self.opencode_zen_base_url.clone(),
             ProviderKind::Meta => self.meta_base_url.clone(),
             ProviderKind::Xai => self.xai_base_url.clone(),
+            ProviderKind::Mistral => self.mistral_base_url.clone(),
+            ProviderKind::Google => self.google_base_url.clone(),
+            ProviderKind::Antigravity => self.antigravity_base_url.clone(),
+            ProviderKind::Telecomjs => self.telecomjs_base_url.clone(),
+            ProviderKind::Edenai => self.edenai_base_url.clone(),
+            ProviderKind::ModelstudioTokenPlan | ProviderKind::ModelstudioTokenPlanAnthropic => {
+                self.modelstudio_token_plan_base_url.clone()
+            }
+            ProviderKind::ModelstudioCodingPlan | ProviderKind::ModelstudioCodingPlanAnthropic => {
+                self.modelstudio_coding_plan_base_url.clone()
+            }
             // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
             // provider's base URL comes from its `[providers.<name>]` table.
             ProviderKind::Custom => None,
@@ -4786,6 +7297,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::WanjieArk => self.wanjie_ark_model.clone(),
             ProviderKind::Volcengine => self.volcengine_model.clone(),
             ProviderKind::Openrouter => self.openrouter_model.clone(),
+            ProviderKind::Orcarouter => self.orcarouter_model.clone(),
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => {
                 self.siliconflow_model.clone()
             }
@@ -4806,8 +7318,22 @@ impl EnvRuntimeOverrides {
             ProviderKind::Deepinfra => self.deepinfra_model.clone(),
             ProviderKind::Sakana => self.sakana_model.clone(),
             ProviderKind::LongCat => self.longcat_model.clone(),
+            ProviderKind::OpencodeGo => self.opencode_go_model.clone(),
+            ProviderKind::OpencodeZen => self.opencode_zen_model.clone(),
             ProviderKind::Meta => self.meta_model.clone(),
             ProviderKind::Xai => self.xai_model.clone(),
+            ProviderKind::Mistral => self.mistral_model.clone(),
+            ProviderKind::Google => self.google_model.clone(),
+            ProviderKind::Antigravity => self.antigravity_model.clone(),
+            ProviderKind::Telecomjs => self.telecomjs_model.clone(),
+            ProviderKind::Edenai => self.edenai_model.clone(),
+            ProviderKind::ModelstudioTokenPlan | ProviderKind::ModelstudioTokenPlanAnthropic => {
+                self.modelstudio_token_plan_model.clone()
+            }
+            ProviderKind::ModelstudioCodingPlan | ProviderKind::ModelstudioCodingPlanAnthropic => {
+                self.modelstudio_coding_plan_model.clone()
+            }
+            ProviderKind::OllamaCloud => self.ollama_cloud_model.clone(),
             _ => None,
         }?;
 

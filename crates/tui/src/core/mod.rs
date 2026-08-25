@@ -15,7 +15,12 @@
 #![deny(clippy::print_stderr)]
 
 pub mod authority;
+// `crates/core` now owns the engine (issue #5261). The TUI's `engine`
+// consumes the core boundary directly so headless and TUI share one
+// `Op`-in / `EventMsg`-out API, one `ThreadId`/`SessionId` type, and one
+// `Journal` shape. New code should import from `codewhale_core`.
 pub mod engine;
+pub(crate) use engine::tool_catalog::allowlist_is_native_file_and_shell_only;
 pub mod events;
 // The first production consumer of the staged runtime contract is the
 // provider-neutral model boundary. Keep the remaining contract files staged
@@ -29,7 +34,9 @@ pub mod termination;
 // scaffolding and remains deliberately uncompiled until it has production
 // consumers (TUI-DOG-017).
 pub mod session;
-pub mod tool_parser;
+// Moved to `codewhale_core::tool_parser` (zero crate-internal dependencies);
+// re-exported so `crate::core::tool_parser` keeps working.
+pub use codewhale_core::tool_parser;
 pub mod turn;
 
 // Re-exports

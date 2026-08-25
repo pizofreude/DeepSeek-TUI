@@ -1,111 +1,79 @@
-<!-- source: README.md sha256:561a074b0e36 -->
-# CodeWhale
+<!-- source: README.md sha256:a56bca473dbd -->
+# Codewhale
 
-Một coding agent cho terminal của bạn. Hoạt động với mọi model; ưu tiên model mở.
+Codewhale là tác nhân lập trình mã nguồn mở dành cho terminal, được xây dựng bằng Rust và được cải thiện công khai cùng những người sử dụng nó.
 
-Bạn đưa cho nó một provider, một model và một nhiệm vụ. Nó đọc code, sửa file,
-chạy lệnh, kiểm tra kết quả, và tiếp tục cho đến khi nhiệm vụ hoàn thành hoặc
-cần đến bạn. TUI cho công việc tương tác, `codewhale exec` cho script và CI.
-Viết bằng Rust, giấy phép MIT, chạy hoàn toàn trên máy của bạn.
+![Codewhale đang chạy trong terminal](assets/screenshot.webp)
 
-Dự án khởi đầu là `deepseek-tui`. Cộng đồng hình thành quanh nó cần nhiều
-provider hơn, nên giờ đây DeepSeek, Claude, GPT, Kimi, GLM và hơn 30 model
-khác chạy qua cùng một runtime và bộ công cụ.
-
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
 [![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
 [![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-
-![CodeWhale chạy trong terminal](assets/screenshot.png)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 ## Cài đặt
 
 ```bash
 npm install -g codewhale
+codewhale
 ```
 
-Cargo, Docker, Nix, Scoop, archive dựng sẵn, Android/Termux, và một mirror CNB
-cho người dùng không truy cập được GitHub đều được hướng dẫn trong
-[docs/INSTALL.md](docs/INSTALL.md). Chuyển từ `deepseek-tui` sang? Cấu hình và
-session của bạn được giữ nguyên — xem [docs/REBRAND.md](docs/REBRAND.md).
+Trong lần chạy đầu tiên, Codewhale sẽ giúp bạn kết nối với nhà cung cấp hoặc tiếp tục làm việc ngoại tuyến. Codewhale cũng hỗ trợ Cargo, Docker, Nix, Scoop, các gói dựng sẵn, Android/Termux và bản sao CNB. Xem [hướng dẫn cài đặt](docs/INSTALL.md).
+
+Mỗi shell chỉ cần một lệnh để bật tính năng hoàn thành bằng phím Tab — `codewhale completion bash|zsh|fish|powershell|elvish`. Xem [tính năng hoàn thành của shell](docs/INSTALL.md#8-shell-completions).
 
 ## Sử dụng
 
-```bash
-codewhale auth set --provider deepseek   # or export ANTHROPIC_API_KEY, etc.
-codewhale                                # open the TUI
-codewhale exec "fix the failing test"    # headless
+Hãy trò chuyện với Codewhale như khi bạn trao đổi với một đồng đội:
+
+```text
+Fix the failing tests and explain what changed.
 ```
 
-Trong TUI: `/model` đổi provider và model cùng lúc, `/fleet` chạy một đội
-worker, `/restore` hoàn tác một lượt, `Tab` chuyển vòng qua Plan / Act /
-Operate, `Shift+Tab` chuyển vòng qua mức phê duyệt Ask / Auto-Review / Full
-Access, và `!` chạy một lệnh shell qua đường phê duyệt bình thường.
+Hoặc chạy tác vụ mà không cần mở TUI:
 
-## Nó làm gì
+```bash
+codewhale exec "fix the failing tests and explain what changed"
+```
 
-- Phân giải lựa chọn provider + model của bạn thành một route cụ thể:
-  endpoint, giao thức wire, giới hạn context, giá. Ngân sách context và phần
-  hiển thị chi phí lấy từ route thật; giá chưa biết được hiển thị là chưa
-  biết, không phải $0. ([docs/PROVIDERS.md](docs/PROVIDERS.md))
-- Nói chuyện với các provider model mở dạng hosted (`deepseek`, `openrouter`,
-  `moonshot`, `zai`, `minimax`, `nvidia-nim`, …), với `vllm` / `sglang` /
-  `ollama` của riêng bạn mà không cần key, và với Anthropic một cách native
-  qua Messages API với thinking và prompt caching.
-- Chạy nhiều worker một cách bền vững: Fleet ghi công việc vào một ledger chỉ
-  ghi thêm (append-only), nên các lượt chạy sống sót qua restart và
-  `fleet resume` tiếp tục từ chỗ đã dừng. Workflow lập kế hoạch cho những việc
-  lớn hơn thành các lane có thể tiếp tục và kiểm chứng được.
-  ([docs/FLEET.md](docs/FLEET.md))
-- Chặn rủi ro bằng code, không bằng cảm tính: ba chế độ (Plan chỉ đọc), mức
-  phê duyệt tách riêng, sandbox cấp hệ điều hành (Seatbelt, Landlock +
-  seccomp, bwrap), hook có thể allow/deny/ask cho từng lần gọi công cụ, và
-  snapshot side-git để `/restore` không bao giờ chạm vào lịch sử thật của bạn.
-- Cho phép repo tự tuyên bố luật của mình: các bất biến trong
-  `.codewhale/constitution.json` được biên dịch thành các chốt chặn ghi mà
-  ngay cả Full Access cũng không thể bỏ qua.
-  ([docs/CONFIGURATION.md](docs/CONFIGURATION.md))
-- Nói MCP theo cả hai chiều, nạp các skill tái sử dụng, cung cấp runtime API
-  HTTP/SSE và ACP, và làm nền cho một
-  [GUI VS Code](https://github.com/HengQuWorld/CodeWhale-VSCode) của cộng đồng.
-- TUI hiển thị công việc dưới dạng những biên nhận bạn có thể kiểm tra, giữ
-  đúng một dòng live chuyển động, có trình kiểm tra context thực thụ, 12
-  theme, chế độ giảm chuyển động và chế độ ASCII an toàn, và có sẵn tiếng Anh,
-  tiếng Trung giản thể, tiếng Nhật, tiếng Việt, tiếng Tây Ban Nha, tiếng Bồ
-  Đào Nha, tiếng Hàn, và một phần tiếng Trung phồn thể.
+Codewhale có thể đọc kho mã nguồn, chỉnh sửa tệp, chạy lệnh, kiểm tra kết quả và tiếp tục làm việc hướng đến mục tiêu. Bạn quyết định mức quyền truy cập dành cho nó.
 
-Mọi thứ còn lại — cấu hình, phím tắt, chi tiết sandbox, kiến trúc — nằm trong
-[docs](docs) và trên [codewhale.net](https://codewhale.net/).
+## Vì sao chọn Codewhale
 
-## Đóng góp
+- **Dùng mô hình bạn muốn.** Kết nối với nhà cung cấp được lưu trữ hoặc với mô hình cục bộ thông qua Ollama, vLLM hay SGLang. Chuyển nhà cung cấp và mô hình bằng `/model`.
+- **Luôn nắm quyền kiểm soát.** Plan chỉ cho phép đọc. Ask, Auto-Review và Full Access hiển thị rõ cách hoạt động của việc phê duyệt. `/undo` hoàn tác lượt gần nhất, còn `/restore` đưa không gian làm việc về một ảnh chụp trước đó.
+- **Sắp xếp công việc dài hạn.** Lưu phiên, đặt `/goal` lâu dài, xem lại quy trình trước khi chạy và phối hợp các tác nhân mà không đưa chỉ dẫn nội bộ của chúng vào bản ghi hội thoại của bạn.
+- **Mở rộng tác nhân bạn đang có.** Kết nối máy chủ MCP và kỹ năng, cấu hình hook, đồng thời lưu vai trò tác nhân dưới dạng các tệp dễ đọc trong dự án hoặc phần cài đặt cá nhân.
 
-Mọi phản hồi đều là một món quà. Issue, PR, các bước tái hiện lỗi, log, yêu
-cầu tính năng và những đóng góp đầu tiên đều là công việc thực sự của dự án.
-Khi một PR không thể merge nguyên trạng, maintainer sẽ harvest phần dùng được
-và tác giả vẫn được ghi công — trong commit, trong changelog và trong
-[docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md). Nếu một model hay provider bạn
-dùng còn thiếu, hoặc có gì đó hỏng trên máy của bạn, báo cho chúng tôi biết là
-điều hữu ích nhất bạn có thể làm.
+Chạy `/help` trong TUI để xem các lệnh và phím tắt.
 
-- [Issue đang mở](https://github.com/Hmbown/CodeWhale/issues) — những đóng góp
-  đầu tiên phù hợp nằm ở đây
-- [CONTRIBUTING.md](CONTRIBUTING.md) — thiết lập môi trường dev và quy trình PR
-- [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) — tất cả những người đã góp
-  phần định hình dự án
-- [Buy me a coffee](https://www.buymeacoffee.com/hmbown)
+## An toàn
 
-Cảm ơn [DeepSeek](https://github.com/deepseek-ai) vì các model và sự hỗ trợ đã
-khởi đầu dự án, [DataWhale](https://github.com/datawhalechina) 🐋 vì đã chào
-đón chúng tôi vào đại gia đình Whale Brother, và
-[OpenWarp](https://github.com/zerx-lab/warp) cùng
-[Open Design](https://github.com/nexu-io/open-design) vì đã hợp tác xây dựng
-trải nghiệm agent trên terminal.
+Codewhale chạy trên máy của bạn với quyền truy cập do bạn cấp. Chế độ phê duyệt và quy tắc kho mã nguồn giới hạn những gì tác nhân được phép làm; cơ chế sandbox tùy chọn của hệ điều hành tạo thêm một ranh giới thực thi vững chắc hơn ở nơi được hỗ trợ. Giá mô hình chưa xác định sẽ vẫn được ghi là chưa xác định thay vì bị báo là miễn phí.
+
+Đọc [thứ tự cấp quyền](docs/AUTHORIZATION_ORDER.md) để biết chính xác các lớp chính sách và [cấu hình](docs/CONFIGURATION.md) để biết các cài đặt cục bộ.
+
+## Tài liệu
+
+- [Nhà cung cấp và mô hình cục bộ](docs/PROVIDERS.md)
+- [Nhóm tác nhân](docs/FLEET.md)
+- [MCP](docs/MCP.md), [hook](docs/HOOKS.md) và [cấu hình](docs/CONFIGURATION.md)
+- [Ứng dụng web cục bộ](docs/WEB.md)
+- [Toàn bộ tài liệu](docs)
+
+## Tham gia cộng đồng
+
+Codewhale trở nên tốt hơn khi mọi người sử dụng, phản hồi những điểm chưa ổn và cùng khắc phục. Nếu thiếu một nhà cung cấp, quy trình còn bất tiện hoặc giao diện terminal cản trở công việc, hãy [mở issue](https://github.com/Hmbown/CodeWhale/issues). Nếu bạn biết cách cải thiện, hãy [mở pull request](CONTRIBUTING.md). Chúng tôi chào đón những đóng góp đầu tiên và người đóng góp luôn được ghi nhận cho phần việc đã được hợp nhất.
+
+Tham gia [Discord](https://discord.gg/37gfS3ksug), hoặc thêm Hunter trên WeChat (`hunterbown`) và đề nghị tham gia nhóm Whale Brothers.
+
+## Lịch sử dự án
+
+Codewhale bắt đầu với tên `deepseek-tui` và vẫn duy trì khả năng tương thích với cấu hình cùng phiên làm việc của dự án đó. Hiện nay Codewhale không phụ thuộc vào nhà cung cấp nào, được duy trì độc lập và không liên kết với bất kỳ nhà cung cấp mô hình nào.
+
+Cảm ơn mọi người đóng góp và các cộng đồng mã nguồn mở đã giúp dự án phát triển. Xem [danh sách người đóng góp](docs/CONTRIBUTORS.md).
 
 ## Giấy phép
 
-[MIT](LICENSE). Dự án cộng đồng độc lập; không trực thuộc bất kỳ nhà cung cấp
-model nào.
-
-[![Biểu đồ Star History](https://api.star-history.com/chart?repos=Hmbown/CodeWhale&type=date&legend=top-left)](https://www.star-history.com/?repos=Hmbown%2FCodeWhale&type=date)
+[MIT](LICENSE). Các phần được điều chỉnh từ những dự án nguồn mở khác được ghi trong [thông báo của bên thứ ba](docs/THIRD_PARTY_NOTICES.md).

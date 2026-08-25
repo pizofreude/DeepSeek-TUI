@@ -197,31 +197,17 @@ mod tests {
     use crate::config::Config;
     use crate::test_support::lock_test_env;
     use crate::tui::app::TuiOptions;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     fn make_app(tmp: &TempDir, yolo: bool) -> App {
         let workspace = tmp.path().to_path_buf();
         let options = TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace,
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
             skills_dir: tmp.path().join("skills"),
             memory_path: tmp.path().join("memory.md"),
             notes_path: tmp.path().join("notes.txt"),
             mcp_config_path: tmp.path().join("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
             yolo,
-            resume_session_id: None,
-            initial_input: None,
+            ..crate::test_support::test_tui_options(workspace)
         };
         App::new(options, &Config::default())
     }
@@ -231,7 +217,7 @@ mod tests {
     struct ScopedHome {
         prev: Option<std::ffi::OsString>,
         _home: TempDir,
-        _guard: MutexGuard<'static, ()>,
+        _guard: crate::test_support::TestEnvLock,
     }
     impl Drop for ScopedHome {
         fn drop(&mut self) {
@@ -311,6 +297,7 @@ mod tests {
             id: crate::snapshot::SnapshotId("abcdef123456".to_string()),
             label: "turn:demo".to_string(),
             timestamp: 1_700_000_000,
+            session_id: None,
         }];
 
         let msg = format_listing(&snapshots);

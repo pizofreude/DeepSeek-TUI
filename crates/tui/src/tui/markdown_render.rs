@@ -26,9 +26,15 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cell::RefCell;
+use std::sync::OnceLock;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, HighlightState, Theme, ThemeSet};
+use syntect::parsing::{ParseState as SyntectParseState, SyntaxSet};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
@@ -71,8 +77,16 @@ pub enum Block {
     HorizontalRule,
     /// A bullet (`-`/`*`) or ordered (`1.`) list item with its prefix and body.
     ListItem { bullet: String, text: String },
-    /// A line inside a fenced code block. Fences themselves are dropped.
-    Code { line: String },
+    /// A `>` quote line with its nesting depth (1 = single `>`). The text has
+    /// the quote markers stripped; depth is capped at [`MAX_QUOTE_DEPTH`].
+    Quote { depth: usize, text: String },
+    /// A line inside a fenced code block. Fences themselves are dropped, but
+    /// their language token and block identity stay available to syntect.
+    Code {
+        line: String,
+        language: Option<String>,
+        block_id: usize,
+    },
     /// A table row: cells split on `|`.
     TableRow(Vec<String>),
     /// A table separator row (`|---|---|`). Kept so the renderer can draw
@@ -109,6 +123,27 @@ pub struct RenderedMarkdownLine {
     pub copy_separator_after: CopyLineSeparator,
 }
 
+static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+static COLOR_DEPTH: OnceLock<palette::ColorDepth> = OnceLock::new();
+static PALETTE_MODE: OnceLock<palette::PaletteMode> = OnceLock::new();
+
+fn syntax_set() -> &'static SyntaxSet {
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme_set() -> &'static ThemeSet {
+    THEME_SET.get_or_init(ThemeSet::load_defaults)
+}
+
+fn syntax_color_depth() -> palette::ColorDepth {
+    *COLOR_DEPTH.get_or_init(palette::ColorDepth::detect)
+}
+
+pub(crate) fn detected_palette_mode() -> palette::PaletteMode {
+    *PALETTE_MODE.get_or_init(palette::PaletteMode::detect)
+}
+
 /// Parse markdown source into a width-independent block AST.
 ///
 /// This is a small line-oriented parser tuned for the patterns we render:
@@ -121,71 +156,440 @@ pub fn parse(content: &str) -> ParsedMarkdown {
     #[cfg(test)]
     PARSE_INVOCATIONS.with(|c| c.set(c.get() + 1));
 
-    let mut blocks = Vec::new();
-    let mut in_code_block = false;
-
-    for raw_line in content.lines() {
-        let trimmed = raw_line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
+    STREAM_PARSE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        // Reuse the committed prefix when this call continues the same source
+        // (the streaming case). Anything else — a different cell, a shrunk
+        // buffer, an edit to earlier bytes — fails the check and starts clean.
+        let state = memo.get_or_insert_with(ParseState::default);
+        if !state.can_resume_from(content) {
+            *state = ParseState::default();
         }
-
-        if in_code_block {
-            blocks.push(Block::Code {
-                line: raw_line.to_string(),
-            });
-            continue;
+        state.commit_complete_lines(content);
+        let parsed = state.snapshot(content);
+        // Don't hold a whole large message alive between unrelated renders.
+        if state.consumed > MAX_MEMOIZED_PREFIX_BYTES {
+            *state = ParseState::default();
         }
+        parsed
+    })
+}
 
-        if let Some((level, text)) = parse_heading(trimmed) {
-            blocks.push(Block::Heading {
-                level,
-                text: text.to_string(),
-            });
-            if level == 1 {
-                blocks.push(Block::HeadingRule);
-            }
-            continue;
+/// Upper bound on the source we keep memoized between `parse` calls. Streaming
+/// messages are the reason this exists; past this size the memory cost of
+/// holding the prefix outweighs the re-parse it saves.
+const MAX_MEMOIZED_PREFIX_BYTES: usize = 1024 * 1024;
+
+thread_local! {
+    /// Single-entry resume memo for the streaming re-parse (#3897).
+    ///
+    /// Deliberately one entry and thread-local: the hot path is one cell
+    /// growing chunk by chunk on the render thread. A miss costs exactly what
+    /// the old code always paid, so this can only make things faster or
+    /// identical — never wrong, because [`ParseState::can_resume_from`]
+    /// verifies the prefix byte-for-byte before reusing anything.
+    static STREAM_PARSE_MEMO: RefCell<Option<ParseState>> = const { RefCell::new(None) };
+}
+
+/// Resumable parser state.
+///
+/// The parser is strictly line-oriented: each source line maps to blocks using
+/// only a three-field carry (`open_fence_len`, `code_language`,
+/// `code_block_id`). That is what makes resuming *exact* rather than
+/// approximate — appending text can never change how an earlier complete line
+/// parsed, so committed blocks never need revisiting.
+///
+/// Streaming is the case that matters (#3897): the renderer re-parses the whole
+/// growing message on every chunk, which is quadratic over message length.
+#[derive(Debug, Clone, Default)]
+pub struct ParseState {
+    blocks: Vec<Block>,
+    /// The exact source bytes already folded into `blocks`. Kept verbatim so
+    /// resumption is *verified* against the new content rather than assumed —
+    /// a caller that hands over unrelated text gets a full re-parse, not
+    /// silently wrong output.
+    prefix: String,
+    /// Length of `prefix`. Always ends just past a newline, so only whole
+    /// lines are ever committed.
+    consumed: usize,
+    /// Length of the opening code fence in backticks while inside a fenced
+    /// code block (`None` outside). A closing fence must be at least this
+    /// long per CommonMark; shorter backtick lines are code content.
+    open_fence_len: Option<usize>,
+    code_language: Option<String>,
+    code_block_id: usize,
+}
+
+impl ParseState {
+    /// Fold every *complete* line after `consumed` into `blocks`.
+    ///
+    /// The trailing partial line is deliberately left uncommitted: streaming
+    /// can still extend it, and committing it early would be the one way this
+    /// could diverge from a full re-parse.
+    fn commit_complete_lines(&mut self, content: &str) {
+        let Some(rest) = content.get(self.consumed..) else {
+            return;
+        };
+        let Some(last_newline) = rest.rfind('\n') else {
+            return;
+        };
+        let complete = &rest[..=last_newline];
+        for raw_line in complete.lines() {
+            push_parsed_line(
+                raw_line,
+                &mut self.blocks,
+                &mut self.open_fence_len,
+                &mut self.code_language,
+                &mut self.code_block_id,
+            );
         }
-
-        if let Some((bullet, text)) = parse_list_item(trimmed) {
-            blocks.push(Block::ListItem {
-                bullet,
-                text: text.to_string(),
-            });
-            continue;
-        }
-
-        if is_horizontal_rule(trimmed) {
-            blocks.push(Block::HorizontalRule);
-            continue;
-        }
-
-        match parse_table_row(trimmed) {
-            Some(cells) => {
-                blocks.push(Block::TableRow(cells));
-                continue;
-            }
-            None if trimmed.starts_with('|') => {
-                blocks.push(Block::TableSeparator);
-                continue;
-            }
-            None => {}
-        }
-
-        if trimmed.is_empty() {
-            // Whitespace-only lines are blank paragraphs.
-            blocks.push(Block::Blank);
-            continue;
-        }
-
-        blocks.push(Block::Paragraph {
-            text: raw_line.to_string(),
-        });
+        self.prefix.push_str(complete);
+        self.consumed += complete.len();
     }
 
-    ParsedMarkdown { blocks }
+    /// The full AST: committed blocks plus the trailing partial line, parsed
+    /// against a throwaway copy of the carry so `self` stays resumable.
+    fn snapshot(&self, content: &str) -> ParsedMarkdown {
+        let tail = content.get(self.consumed..).unwrap_or_default();
+        if tail.is_empty() {
+            return ParsedMarkdown {
+                blocks: self.blocks.clone(),
+            };
+        }
+        let mut blocks = self.blocks.clone();
+        let mut open_fence_len = self.open_fence_len;
+        let mut code_language = self.code_language.clone();
+        let mut code_block_id = self.code_block_id;
+        for raw_line in tail.lines() {
+            push_parsed_line(
+                raw_line,
+                &mut blocks,
+                &mut open_fence_len,
+                &mut code_language,
+                &mut code_block_id,
+            );
+        }
+        ParsedMarkdown { blocks }
+    }
+
+    /// True when `content` still starts with everything already committed.
+    ///
+    /// Streaming only ever appends, so this is the common case. An edit that
+    /// rewrites earlier bytes (a re-render of a different cell, a retry) fails
+    /// here and the caller falls back to a full parse — correctness never
+    /// depends on the caller guessing right.
+    fn can_resume_from(&self, content: &str) -> bool {
+        content.len() >= self.consumed
+            && content.is_char_boundary(self.consumed)
+            && self.committed_prefix_matches(content)
+    }
+
+    /// Resume after the caller has proved that the only source mutation was an
+    /// append. The live transcript obtains that proof at the `push_str` seam;
+    /// avoiding a byte-for-byte prefix comparison is essential because such a
+    /// comparison on every chunk would itself retain the quadratic curve.
+    fn can_resume_verified_append(&self, content: &str) -> bool {
+        content.len() >= self.consumed && content.is_char_boundary(self.consumed)
+    }
+
+    fn committed_prefix_matches(&self, content: &str) -> bool {
+        self.prefix == content[..self.consumed]
+    }
+}
+
+/// Deterministic work receipts for the live incremental renderer.
+///
+/// These count source lines classified and stable/tail blocks rendered. They
+/// deliberately do not use wall-clock time, allocator counters, or sampling,
+/// so regression tests are stable on every machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MarkdownRenderWork {
+    pub classified_lines: u64,
+    pub stable_blocks_rendered: u64,
+    pub tail_blocks_rendered: u64,
+    pub invalidations: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncrementalRenderKey {
+    width: u16,
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
+}
+
+#[derive(Debug, Clone)]
+struct IncrementalCodeHighlighter {
+    block_id: usize,
+    language: Option<String>,
+    state: Option<(HighlightState, SyntectParseState)>,
+}
+
+/// Persistent state for the one changing Markdown cell in the transcript.
+///
+/// Stable rendered lines live in the owning `CachedCell`; this object retains
+/// only parser/highlighter carry plus the line index at which its replaceable
+/// tail begins. That lets each append truncate and replace the old tail without
+/// cloning or re-rendering the committed prefix.
+#[derive(Debug, Default)]
+pub(crate) struct IncrementalMarkdownRenderCache {
+    parser: ParseState,
+    key: Option<IncrementalRenderKey>,
+    source_len: usize,
+    stable_rendered_line_count: usize,
+    code_highlighter: Option<IncrementalCodeHighlighter>,
+    work: MarkdownRenderWork,
+}
+
+pub(crate) struct IncrementalMarkdownRenderDelta {
+    pub replace_from: usize,
+    pub lines: Vec<RenderedMarkdownLine>,
+}
+
+impl IncrementalMarkdownRenderCache {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn work(&self) -> MarkdownRenderWork {
+        self.work
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn retained_source_bytes(&self) -> usize {
+        self.parser.prefix.len()
+    }
+
+    /// Update from a source mutation whose append-only provenance was recorded
+    /// by the live event loop. `verified_append` must be false for edits,
+    /// replacement text, cell reuse, or any unknown mutation.
+    pub(crate) fn update(
+        &mut self,
+        content: &str,
+        width: u16,
+        base_style: Style,
+        palette_mode: palette::PaletteMode,
+        verified_append: bool,
+    ) -> IncrementalMarkdownRenderDelta {
+        let key = IncrementalRenderKey {
+            width: width.max(1),
+            base_style,
+            palette_mode,
+        };
+
+        let can_resume = self.key == Some(key)
+            && verified_append
+            && content.len() >= self.source_len
+            && self.parser.can_resume_verified_append(content);
+        let replace_from = if can_resume {
+            self.stable_rendered_line_count
+        } else {
+            self.reset_for_invalidation();
+            self.work.invalidations = self.work.invalidations.saturating_add(1);
+            0
+        };
+        self.key = Some(key);
+
+        let before_consumed = self.parser.consumed;
+        self.parser.commit_complete_lines(content);
+        self.work.classified_lines = self.work.classified_lines.saturating_add(
+            content[before_consumed..self.parser.consumed]
+                .lines()
+                .count() as u64,
+        );
+        self.source_len = content.len();
+        // Append provenance is carried by the event-loop receipt, so the live
+        // cache does not need a second copy of already committed source. The
+        // absolute byte offset and parser carry are enough to resume.
+        self.parser.prefix.clear();
+
+        let stable_end = stable_block_prefix_len(&self.parser.blocks);
+        let mut lines = self.render_stable_prefix(stable_end, key);
+        self.stable_rendered_line_count =
+            self.stable_rendered_line_count.saturating_add(lines.len());
+
+        let mut tail_blocks = self.parser.blocks.clone();
+        tail_blocks.extend(self.parser.snapshot_tail(content));
+        if !tail_blocks.is_empty() {
+            self.work.tail_blocks_rendered = self
+                .work
+                .tail_blocks_rendered
+                .saturating_add(tail_blocks.len() as u64);
+            let mut tail_highlighter = self.code_highlighter.clone();
+            lines.extend(render_incremental_blocks(
+                &tail_blocks,
+                key,
+                &mut tail_highlighter,
+            ));
+        }
+
+        if lines.is_empty() && self.stable_rendered_line_count == 0 {
+            lines.push(empty_rendered_markdown_line());
+        }
+
+        IncrementalMarkdownRenderDelta {
+            replace_from,
+            lines,
+        }
+    }
+
+    fn render_stable_prefix(
+        &mut self,
+        end: usize,
+        key: IncrementalRenderKey,
+    ) -> Vec<RenderedMarkdownLine> {
+        if end == 0 {
+            return Vec::new();
+        }
+        self.work.stable_blocks_rendered =
+            self.work.stable_blocks_rendered.saturating_add(end as u64);
+        let lines =
+            render_incremental_blocks(&self.parser.blocks[..end], key, &mut self.code_highlighter);
+        self.parser.blocks.drain(..end);
+        lines
+    }
+
+    fn reset_for_invalidation(&mut self) {
+        self.parser = ParseState::default();
+        self.key = None;
+        self.source_len = 0;
+        self.stable_rendered_line_count = 0;
+        self.code_highlighter = None;
+    }
+}
+
+impl ParseState {
+    fn snapshot_tail(&self, content: &str) -> Vec<Block> {
+        let tail = content.get(self.consumed..).unwrap_or_default();
+        let mut blocks = Vec::new();
+        let mut open_fence_len = self.open_fence_len;
+        let mut code_language = self.code_language.clone();
+        let mut code_block_id = self.code_block_id;
+        for raw_line in tail.lines() {
+            push_parsed_line(
+                raw_line,
+                &mut blocks,
+                &mut open_fence_len,
+                &mut code_language,
+                &mut code_block_id,
+            );
+        }
+        blocks
+    }
+}
+
+fn stable_block_prefix_len(blocks: &[Block]) -> usize {
+    let Some(last_non_table) = blocks
+        .iter()
+        .rposition(|block| !matches!(block, Block::TableRow(_) | Block::TableSeparator))
+    else {
+        return 0;
+    };
+    if last_non_table + 1 == blocks.len() {
+        blocks.len()
+    } else {
+        last_non_table + 1
+    }
+}
+
+/// Classify one source line into blocks, advancing the fenced-code carry.
+///
+/// Extracted from the original loop body unchanged so the batch and streaming
+/// paths cannot drift: both call exactly this.
+fn push_parsed_line(
+    raw_line: &str,
+    blocks: &mut Vec<Block>,
+    open_fence_len: &mut Option<usize>,
+    code_language: &mut Option<String>,
+    code_block_id: &mut usize,
+) {
+    let trimmed = raw_line.trim_start();
+    let fence_len = trimmed.chars().take_while(|c| *c == '`').count();
+    if fence_len >= 3 {
+        match *open_fence_len {
+            // Inside a code block: a fence at least as long as the opener
+            // closes it; a shorter backtick line is code content per
+            // CommonMark and must not flip the state or escape the block.
+            Some(open) if fence_len >= open && trimmed[fence_len..].trim().is_empty() => {
+                *open_fence_len = None;
+                *code_language = None;
+            }
+            Some(_) => {
+                blocks.push(Block::Code {
+                    line: raw_line.to_string(),
+                    language: code_language.clone(),
+                    block_id: *code_block_id,
+                });
+            }
+            None => {
+                *open_fence_len = Some(fence_len);
+                *code_block_id = code_block_id.saturating_add(1);
+                *code_language = normalized_fence_language(&trimmed[fence_len..]);
+            }
+        }
+        return;
+    }
+
+    if open_fence_len.is_some() {
+        blocks.push(Block::Code {
+            line: raw_line.to_string(),
+            language: code_language.clone(),
+            block_id: *code_block_id,
+        });
+        return;
+    }
+
+    if let Some((depth, text)) = parse_blockquote(trimmed) {
+        blocks.push(Block::Quote {
+            depth,
+            text: text.to_string(),
+        });
+        return;
+    }
+
+    if let Some((level, text)) = parse_heading(trimmed) {
+        blocks.push(Block::Heading {
+            level,
+            text: text.to_string(),
+        });
+        if level == 1 {
+            blocks.push(Block::HeadingRule);
+        }
+        return;
+    }
+
+    if let Some((bullet, text)) = parse_list_item(trimmed) {
+        blocks.push(Block::ListItem {
+            bullet,
+            text: text.to_string(),
+        });
+        return;
+    }
+
+    if is_horizontal_rule(trimmed) {
+        blocks.push(Block::HorizontalRule);
+        return;
+    }
+
+    match parse_table_row(trimmed) {
+        Some(cells) => {
+            blocks.push(Block::TableRow(cells));
+            return;
+        }
+        None if trimmed.starts_with('|') => {
+            blocks.push(Block::TableSeparator);
+            return;
+        }
+        None => {}
+    }
+
+    if trimmed.is_empty() {
+        // Whitespace-only lines are blank paragraphs.
+        blocks.push(Block::Blank);
+        return;
+    }
+
+    blocks.push(Block::Paragraph {
+        text: raw_line.to_string(),
+    });
 }
 
 /// Render a parsed-markdown AST at the given terminal width.
@@ -196,18 +600,33 @@ pub fn parse(content: &str) -> ParsedMarkdown {
 /// skip the parse step entirely.
 #[must_use]
 pub fn render_parsed(parsed: &ParsedMarkdown, width: u16, base_style: Style) -> Vec<Line<'static>> {
-    render_parsed_tagged(parsed, width, base_style)
+    render_parsed_tagged_with_palette(parsed, width, base_style, detected_palette_mode())
         .into_iter()
         .map(|line| line.line)
         .collect()
 }
 
 /// Render a parsed-markdown AST and preserve per-line source metadata.
+#[cfg(test)]
 #[must_use]
 pub fn render_parsed_tagged(
     parsed: &ParsedMarkdown,
     width: u16,
     base_style: Style,
+) -> Vec<RenderedMarkdownLine> {
+    render_parsed_tagged_with_palette(parsed, width, base_style, detected_palette_mode())
+}
+
+/// Render parsed markdown using the caller's resolved UI palette mode.
+///
+/// The live transcript uses this entry point so an explicit theme selection
+/// wins over terminal/OS auto-detection and participates in cache invalidation.
+#[must_use]
+pub(crate) fn render_parsed_tagged_with_palette(
+    parsed: &ParsedMarkdown,
+    width: u16,
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
 ) -> Vec<RenderedMarkdownLine> {
     let width = width.max(1) as usize;
     let mut out: Vec<RenderedMarkdownLine> = Vec::with_capacity(parsed.blocks.len());
@@ -238,6 +657,37 @@ pub fn render_parsed_tagged(
                         copy_separator_after: CopyLineSeparator::Newline,
                     }),
             );
+            continue;
+        }
+
+        if let Block::Code {
+            language, block_id, ..
+        } = &parsed.blocks[i]
+        {
+            let start = i;
+            while i < parsed.blocks.len()
+                && matches!(
+                    &parsed.blocks[i],
+                    Block::Code {
+                        block_id: candidate,
+                        ..
+                    } if candidate == block_id
+                )
+            {
+                i += 1;
+            }
+            let source_lines = parsed.blocks[start..i]
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Code { line, .. } => Some(line.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let highlighted =
+                highlight_code_block(language.as_deref(), &source_lines, base_style, palette_mode);
+            for spans in highlighted {
+                out.extend(render_wrapped_code_spans_tagged(spans, width));
+            }
             continue;
         }
 
@@ -282,17 +732,17 @@ pub fn render_parsed_tagged(
                     base_style,
                 ));
             }
-            Block::Code { line } => {
-                let code_style = Style::default()
-                    .fg(palette::WHALE_INFO)
-                    .add_modifier(Modifier::ITALIC);
-                out.extend(render_wrapped_line_tagged(
-                    line, width, code_style, true, true,
+            Block::Code { .. } => unreachable!(),
+            Block::Quote { depth, text } => {
+                let rail_style = Style::default().fg(palette::WHALE_INFO);
+                let text_style = Style::default().fg(palette::TEXT_DIM);
+                out.extend(render_quote_line_tagged(
+                    text, *depth, width, rail_style, text_style,
                 ));
             }
             Block::Paragraph { text } => {
                 let link_style = Style::default()
-                    .fg(palette::WHALE_ACCENT_PRIMARY)
+                    .fg(palette::WHALE_ACTION)
                     .add_modifier(Modifier::UNDERLINED);
                 out.extend(render_line_with_links_tagged(
                     text, width, base_style, link_style,
@@ -325,6 +775,120 @@ pub fn render_parsed_tagged(
     out
 }
 
+fn empty_rendered_markdown_line() -> RenderedMarkdownLine {
+    RenderedMarkdownLine {
+        line: Line::from(""),
+        links: Vec::new(),
+        is_code: false,
+        copy_prefix_width: 0,
+        copy_separator_after: CopyLineSeparator::Newline,
+    }
+}
+
+/// Render a block suffix while carrying syntax state across calls.
+///
+/// Non-code blocks use the canonical batch renderer unchanged. Code lines are
+/// the only group whose styling depends on preceding blocks, so their syntect
+/// parse/highlight state is retained explicitly and cloned for the replaceable
+/// tail. This keeps an open fence incremental without sacrificing exact final
+/// highlighting.
+fn render_incremental_blocks(
+    blocks: &[Block],
+    key: IncrementalRenderKey,
+    code_highlighter: &mut Option<IncrementalCodeHighlighter>,
+) -> Vec<RenderedMarkdownLine> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        if let Block::Code {
+            line,
+            language,
+            block_id,
+        } = &blocks[index]
+        {
+            let spans = highlight_incremental_code_line(
+                *block_id,
+                language.as_deref(),
+                line,
+                key.base_style,
+                key.palette_mode,
+                code_highlighter,
+            );
+            out.extend(render_wrapped_code_spans_tagged(
+                spans,
+                usize::from(key.width),
+            ));
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < blocks.len() && !matches!(blocks[index], Block::Code { .. }) {
+            index += 1;
+        }
+        out.extend(render_parsed_tagged_with_palette(
+            &ParsedMarkdown {
+                blocks: blocks[start..index].to_vec(),
+            },
+            key.width,
+            key.base_style,
+            key.palette_mode,
+        ));
+    }
+    out
+}
+
+fn highlight_incremental_code_line(
+    block_id: usize,
+    language: Option<&str>,
+    line: &str,
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
+    cache: &mut Option<IncrementalCodeHighlighter>,
+) -> Vec<Span<'static>> {
+    let language_owned = language.map(str::to_owned);
+    let needs_reset = cache
+        .as_ref()
+        .is_none_or(|current| current.block_id != block_id || current.language != language_owned);
+    if needs_reset {
+        let state = language
+            .and_then(find_code_syntax)
+            .map(|syntax| HighlightLines::new(syntax, selected_syntax_theme(palette_mode)).state());
+        *cache = Some(IncrementalCodeHighlighter {
+            block_id,
+            language: language_owned,
+            state,
+        });
+    }
+
+    let plain_style = base_style.fg(palette::TEXT_TOOL_OUTPUT);
+    let Some(current) = cache.as_mut() else {
+        return vec![Span::styled(line.to_string(), plain_style)];
+    };
+    let Some((highlight_state, parse_state)) = current.state.take() else {
+        return vec![Span::styled(line.to_string(), plain_style)];
+    };
+    let mut highlighter = HighlightLines::from_state(
+        selected_syntax_theme(palette_mode),
+        highlight_state,
+        parse_state,
+    );
+    let highlighted = match highlighter.highlight_line(line, syntax_set()) {
+        Ok(ranges) if !ranges.is_empty() => ranges
+            .into_iter()
+            .map(|(style, text)| {
+                Span::styled(
+                    text.to_string(),
+                    syntax_style_to_ratatui(style, base_style, palette_mode),
+                )
+            })
+            .collect(),
+        _ => vec![Span::styled(line.to_string(), plain_style)],
+    };
+    current.state = Some(highlighter.state());
+    highlighted
+}
+
 /// Convenience wrapper: parse + render in one call.
 ///
 /// Equivalent to `render_parsed(&parse(content), width, base_style)`. Callers
@@ -337,6 +901,7 @@ pub fn render_markdown(content: &str, width: u16, base_style: Style) -> Vec<Line
 }
 
 /// Convenience wrapper: parse + render while keeping per-line source metadata.
+#[cfg(test)]
 #[must_use]
 pub fn render_markdown_tagged(
     content: &str,
@@ -345,6 +910,18 @@ pub fn render_markdown_tagged(
 ) -> Vec<RenderedMarkdownLine> {
     let parsed = parse(content);
     render_parsed_tagged(&parsed, width, base_style)
+}
+
+/// Parse and render markdown using an already-resolved UI palette mode.
+#[must_use]
+pub(crate) fn render_markdown_tagged_with_palette(
+    content: &str,
+    width: u16,
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
+) -> Vec<RenderedMarkdownLine> {
+    let parsed = parse(content);
+    render_parsed_tagged_with_palette(&parsed, width, base_style, palette_mode)
 }
 
 /// Render plain text: split on newlines, word-wrap each line independently,
@@ -379,10 +956,10 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
     let mut current_width = 0usize;
     let mut last_break_pos = None;
 
-    for ch in line.chars() {
+    for grapheme in line.graphemes(true) {
         loop {
-            let ch_width = char_display_width(ch, current_width);
-            if current_width + ch_width <= width || current.is_empty() {
+            let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+            if current_width + grapheme_width <= width || current.is_empty() {
                 break;
             }
 
@@ -410,10 +987,10 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
             break;
         }
 
-        let ch_width = char_display_width(ch, current_width);
-        current.push(ch);
-        current_width += ch_width;
-        if ch.is_whitespace() {
+        let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+        current.push_str(grapheme);
+        current_width += grapheme_width;
+        if grapheme.chars().all(char::is_whitespace) {
             last_break_pos = Some(current.len());
         }
     }
@@ -434,8 +1011,8 @@ fn wrap_plain_line(line: &str, width: usize, style: Style) -> Vec<Line<'static>>
 
 fn plain_display_width(text: &str) -> usize {
     let mut width = 0usize;
-    for ch in text.chars() {
-        width += char_display_width(ch, width);
+    for grapheme in text.graphemes(true) {
+        width += markdown_grapheme_width(grapheme, width);
     }
     width
 }
@@ -478,6 +1055,262 @@ fn parse_list_item(line: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((format!("{}.", &trimmed[..idx]), rest.trim_start()))
+}
+
+/// Upper bound on the nesting depth rendered for a `>` quote. Deeper quotes
+/// are clamped and the extra markers dropped from the rendered text; capping
+/// stops a pathological input like `>>>>>>>>>>>> text` from consuming the
+/// whole line width in rails.
+const MAX_QUOTE_DEPTH: usize = 4;
+
+/// Parse a `>` blockquote line, returning `(depth, text)`.
+///
+/// CommonMark nests with `>>` or `> >`; we count every leading `>` regardless
+/// of interleaved spaces, then trim the remaining content. A lone `>` yields
+/// an empty quote line. Deliberately lenient about missing space after `>` so
+/// model output like `>note` still renders as a quote.
+fn parse_blockquote(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('>') {
+        return None;
+    }
+    let mut rest = trimmed;
+    let mut depth = 0usize;
+    while rest.starts_with('>') {
+        depth = depth.saturating_add(1);
+        rest = rest[1..].trim_start_matches([' ', '\t']);
+    }
+    Some((depth.clamp(1, MAX_QUOTE_DEPTH), rest.trim()))
+}
+
+fn normalized_fence_language(info: &str) -> Option<String> {
+    let token = info
+        .trim()
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .next()
+        .unwrap_or("")
+        .trim_matches(['{', '}', '.'])
+        .to_ascii_lowercase();
+    if token.is_empty() || matches!(token.as_str(), "text" | "txt" | "plain" | "plaintext") {
+        return None;
+    }
+    let normalized = match token.as_str() {
+        "rs" => "rust",
+        "js" | "jsx" | "node" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "py" => "python",
+        "rb" => "ruby",
+        "sh" | "shell" | "zsh" => "bash",
+        "yml" => "yaml",
+        "md" => "markdown",
+        other => other,
+    };
+    Some(normalized.to_string())
+}
+
+fn selected_syntax_theme(mode: palette::PaletteMode) -> &'static Theme {
+    let themes = theme_set();
+    let preferred = match mode {
+        palette::PaletteMode::Dark | palette::PaletteMode::Grayscale => "base16-ocean.dark",
+        palette::PaletteMode::Light => "InspiredGitHub",
+        palette::PaletteMode::SolarizedLight => "Solarized (light)",
+    };
+    themes
+        .themes
+        .get(preferred)
+        .or_else(|| themes.themes.values().next())
+        .expect("syntect ships at least one default theme")
+}
+
+fn syntax_style_to_ratatui(
+    style: syntect::highlighting::Style,
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
+) -> Style {
+    let fg = syntax_rgb_to_terminal_color(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+        palette_mode,
+        syntax_color_depth(),
+    );
+    let mut modifiers = Modifier::empty();
+    if style.font_style.contains(FontStyle::BOLD) {
+        modifiers |= Modifier::BOLD;
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    base_style.fg(fg).add_modifier(modifiers)
+}
+
+fn syntax_rgb_to_terminal_color(
+    r: u8,
+    g: u8,
+    b: u8,
+    mode: palette::PaletteMode,
+    depth: palette::ColorDepth,
+) -> Color {
+    let (r, g, b) = if mode == palette::PaletteMode::Grayscale {
+        let luma =
+            ((u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 + 500) / 1000) as u8;
+        let readable = luma.clamp(96, 232);
+        (readable, readable, readable)
+    } else {
+        (r, g, b)
+    };
+    let mut color = Color::Rgb(r, g, b);
+    if matches!(
+        color,
+        reserved if reserved == palette::WHALE_HUMAN
+            || reserved == palette::WHALE_LIVE
+            || reserved == palette::WHALE_ACTION
+            || reserved == palette::WHALE_ERROR
+    ) {
+        // Syntax colors are content, not brand/attention/work/danger state.
+        // Shift exact collisions before terminal-depth reduction so the cell
+        // cannot acquire a reserved semantic role in the color backend.
+        color = Color::Rgb(r, g, b.saturating_add(1));
+    }
+    let color = palette::adapt_color(color, depth);
+    let reserved = [
+        palette::WHALE_HUMAN,
+        palette::WHALE_LIVE,
+        palette::WHALE_ACTION,
+        palette::WHALE_ERROR,
+    ]
+    .map(|semantic| palette::adapt_color(semantic, depth));
+    if !reserved.contains(&color) {
+        return color;
+    }
+
+    // Quantization can make distinct RGB values collide again. Walk a small,
+    // deterministic neutral ramp until the terminal-level color no longer
+    // impersonates one of the four reserved semantic lanes.
+    for delta in [17_u8, 34, 51, 68, 85, 102, 119, 136] {
+        let candidate = palette::adapt_color(
+            Color::Rgb(
+                r.wrapping_add(delta),
+                g.wrapping_add(delta / 2),
+                b.wrapping_add(delta / 3),
+            ),
+            depth,
+        );
+        if !reserved.contains(&candidate) {
+            return candidate;
+        }
+    }
+    // All supported depths have more than four colors, so this is only a
+    // defensive fallback for a future adapter with a narrower gamut.
+    Color::Reset
+}
+
+fn highlight_code_block(
+    language: Option<&str>,
+    lines: &[&str],
+    base_style: Style,
+    palette_mode: palette::PaletteMode,
+) -> Vec<Vec<Span<'static>>> {
+    let plain_style = base_style.fg(palette::TEXT_TOOL_OUTPUT);
+    let Some(language) = language else {
+        return lines
+            .iter()
+            .map(|line| vec![Span::styled((*line).to_string(), plain_style)])
+            .collect();
+    };
+    let syntaxes = syntax_set();
+    let Some(syntax) = find_code_syntax(language) else {
+        return lines
+            .iter()
+            .map(|line| vec![Span::styled((*line).to_string(), plain_style)])
+            .collect();
+    };
+
+    let mut highlighter = HighlightLines::new(syntax, selected_syntax_theme(palette_mode));
+    lines
+        .iter()
+        .map(|line| match highlighter.highlight_line(line, syntaxes) {
+            Ok(ranges) if !ranges.is_empty() => ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    Span::styled(
+                        text.to_string(),
+                        syntax_style_to_ratatui(style, base_style, palette_mode),
+                    )
+                })
+                .collect(),
+            _ => vec![Span::styled((*line).to_string(), plain_style)],
+        })
+        .collect()
+}
+
+fn find_code_syntax(language: &str) -> Option<&'static syntect::parsing::SyntaxReference> {
+    let syntaxes = syntax_set();
+    syntaxes
+        .find_syntax_by_token(language)
+        .or_else(|| syntaxes.find_syntax_by_extension(language))
+        .or_else(|| {
+            syntaxes
+                .syntaxes()
+                .iter()
+                .find(|syntax| syntax.name.eq_ignore_ascii_case(language))
+        })
+}
+
+fn render_wrapped_code_spans_tagged(
+    spans: Vec<Span<'static>>,
+    width: usize,
+) -> Vec<RenderedMarkdownLine> {
+    let prefix = "  ";
+    let prefix_width = prefix.width();
+    let available = width.saturating_sub(prefix_width).max(1);
+    let mut rows: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    let mut current_width = 0usize;
+
+    for span in spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+            if current_width + grapheme_width > available && current_width > 0 {
+                rows.push(Vec::new());
+                current_width = 0;
+            }
+            let row = rows.last_mut().expect("code rows are never empty");
+            if let Some((text, style)) = row.last_mut()
+                && *style == span.style
+            {
+                text.push_str(grapheme);
+            } else {
+                row.push((grapheme.to_string(), span.style));
+            }
+            current_width += markdown_grapheme_width(grapheme, current_width);
+        }
+    }
+
+    let last_index = rows.len().saturating_sub(1);
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let mut rendered = vec![Span::raw(prefix)];
+            rendered.extend(
+                row.into_iter()
+                    .map(|(text, style)| Span::styled(text, style)),
+            );
+            RenderedMarkdownLine {
+                line: Line::from(rendered),
+                links: Vec::new(),
+                is_code: true,
+                copy_prefix_width: prefix_width,
+                copy_separator_after: if idx == last_index {
+                    CopyLineSeparator::Newline
+                } else {
+                    CopyLineSeparator::None
+                },
+            }
+        })
+        .collect()
 }
 
 fn render_wrapped_line_tagged(
@@ -572,6 +1405,55 @@ fn render_list_line_tagged(
     out
 }
 
+/// Render a `>` quote line: a vertical-rule rail per nesting depth plus the
+/// quote text with inline formatting (bold, code, links).
+///
+/// The rail is display chrome, not source markup. On the first row the
+/// transcript rail-scan (`compute_rail_prefix_width`) already strips it along
+/// with the assistant glyph, so `copy_prefix_width` must be `0` there — like
+/// list items — or selection copy would strip the rail twice and lose quote
+/// text. Wrapped continuation rows have no rail scan (plain spaces), so they
+/// report the rail width so selection copy skips their alignment.
+fn render_quote_line_tagged(
+    text: &str,
+    depth: usize,
+    width: usize,
+    rail_style: Style,
+    text_style: Style,
+) -> Vec<RenderedMarkdownLine> {
+    let depth = depth.clamp(1, MAX_QUOTE_DEPTH);
+    let rail = "│ ".repeat(depth);
+    let rail_width = rail.width();
+    let available = width.saturating_sub(rail_width).max(1);
+    let wrapped = render_line_with_links_tagged(text, available, text_style, link_style());
+
+    let mut out = Vec::new();
+    for (idx, rendered) in wrapped.into_iter().enumerate() {
+        let links = rendered
+            .links
+            .iter()
+            .map(|link| link.shifted(rail_width))
+            .collect();
+        let mut spans = if idx == 0 {
+            (0..depth).map(|_| Span::styled("│ ", rail_style)).collect()
+        } else {
+            vec![Span::raw(" ".repeat(rail_width))]
+        };
+        spans.extend(rendered.line.spans);
+        out.push(RenderedMarkdownLine {
+            line: Line::from(spans),
+            links,
+            is_code: false,
+            // First row: the transcript rail-scan strips the visible rail
+            // (mirror `render_list_line_tagged`); continuation rows: report
+            // the alignment width so selection copy skips it.
+            copy_prefix_width: if idx == 0 { 0 } else { rail_width },
+            copy_separator_after: rendered.copy_separator_after,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 fn render_line_with_links(
     line: &str,
@@ -646,7 +1528,7 @@ fn render_line_with_links_tagged(
             continue;
         }
         // If the word itself is wider than an entire line, hard-break it at
-        // character boundaries so wrapping always makes progress (#1344,
+        // grapheme boundaries so wrapping always makes progress (#1344,
         // #1351). Without this, long URLs / paths / hashes were placed on
         // their own line whole and silently overflowed the right edge of
         // the transcript.
@@ -666,9 +1548,9 @@ fn render_line_with_links_tagged(
             // current line so the next word can pack onto it.
             let mut chunk = String::new();
             let mut chunk_w = 0usize;
-            for ch in word.text.chars() {
-                let cw = ch.width().unwrap_or(1);
-                if chunk_w + cw > width && chunk_w > 0 {
+            for grapheme in word.text.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if chunk_w + grapheme_width > width && chunk_w > 0 {
                     let chunk = std::mem::take(&mut chunk);
                     let mut links = Vec::new();
                     record_inline_link(&mut links, &word, 0, chunk_w);
@@ -681,8 +1563,8 @@ fn render_line_with_links_tagged(
                     });
                     chunk_w = 0;
                 }
-                chunk.push(ch);
-                chunk_w += cw;
+                chunk.push_str(grapheme);
+                chunk_w += grapheme_width;
             }
             if !chunk.is_empty() {
                 record_inline_link(&mut current_links, &word, 0, chunk_w);
@@ -897,7 +1779,7 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
                 out.push(InlineToken::new(
                     text.to_string(),
                     link_style,
-                    normalized_http_link_target(url),
+                    normalized_link_target(url),
                 ));
                 rest = &after_bracket[paren_end + 1..];
                 continue;
@@ -933,11 +1815,35 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
     out
 }
 
+/// Normalize an explicit markdown link destination, the only construct the
+/// renderer treats as a structured reference. Prose is never scanned for
+/// path-shaped text: that linkifies identifiers and version strings, and points
+/// at files that do not exist.
+fn normalized_link_target(target: &str) -> Option<String> {
+    normalized_http_link_target(target).or_else(|| normalized_file_link_target(target))
+}
+
+/// A destination that is already an absolute path, with or without the `file:`
+/// scheme. Relative destinations stay inert because this layer has no workspace
+/// root to resolve them against, and a `file://host/...` form is rejected rather
+/// than reinterpreted as local. Windows paths must therefore arrive pre-formed
+/// as `file:///C:/…`.
+fn normalized_file_link_target(target: &str) -> Option<String> {
+    let path = match target.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("file://") => &target[7..],
+        _ => target,
+    };
+    if !path.starts_with('/') || path.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return None;
+    }
+    Some(format!("file://{path}"))
+}
+
 /// OSC 8 targets produced by markdown are deliberately limited to ordinary
 /// web URLs. The browser-opening gesture is user-initiated, but accepting
 /// arbitrary schemes here would still turn untrusted model output into a
-/// `file:`, `javascript:`, or application-protocol link. Normalize the scheme
-/// and reject whitespace/control characters before metadata reaches a frame.
+/// `javascript:` or application-protocol link. Normalize the scheme and reject
+/// whitespace/control characters before metadata reaches a frame.
 fn normalized_http_link_target(target: &str) -> Option<String> {
     let (scheme, rest) = if target
         .get(..8)
@@ -1076,7 +1982,7 @@ fn split_table_cells(inner: &str) -> Vec<String> {
 
 /// Word-wrap a single cell's text into one or more visual lines, each
 /// constrained to `col_width` display columns. Whitespace is the preferred
-/// break point; words wider than `col_width` are hard-broken at character
+/// break point; words wider than `col_width` are hard-broken at grapheme
 /// boundaries so wrapping always makes progress (no infinite loop on URLs
 /// or paths). Returns at least one segment.
 fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
@@ -1091,7 +1997,13 @@ fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
         let word_w = word.width();
         if current_w == 0 {
             if word_w > col_width {
-                push_word_breaking_chars(word, col_width, &mut current, &mut current_w, &mut lines);
+                push_word_breaking_graphemes(
+                    word,
+                    col_width,
+                    &mut current,
+                    &mut current_w,
+                    &mut lines,
+                );
             } else {
                 current.push_str(word);
                 current_w = word_w;
@@ -1104,7 +2016,13 @@ fn wrap_cell_text(cell: &str, col_width: usize) -> Vec<String> {
             lines.push(std::mem::take(&mut current));
             current_w = 0;
             if word_w > col_width {
-                push_word_breaking_chars(word, col_width, &mut current, &mut current_w, &mut lines);
+                push_word_breaking_graphemes(
+                    word,
+                    col_width,
+                    &mut current,
+                    &mut current_w,
+                    &mut lines,
+                );
             } else {
                 current.push_str(word);
                 current_w = word_w;
@@ -1248,25 +2166,39 @@ fn render_table_group(blocks: &[Block], width: usize, base_style: Style) -> Vec<
 
 fn link_style() -> Style {
     Style::default()
-        .fg(palette::WHALE_ACCENT_PRIMARY)
+        .fg(palette::WHALE_ACTION)
         .add_modifier(Modifier::UNDERLINED)
 }
 
-/// Hard-wrap a code line at `width` display columns, preserving all
-/// whitespace (including leading indentation). Unlike [`wrap_text`], this
-/// does not split on word boundaries — code indentation is semantic.
-/// Display-column width of a single character for the purposes of terminal
-/// line-wrap calculations.
+/// Display-column width of one extended grapheme for terminal line-wrap
+/// calculations.
 ///
-/// `UnicodeWidthChar::width` returns `None` for control characters, which
-/// includes `\t`. A tab advances to the next 8-column tab stop, so we model
-/// it as 8 columns here (a safe over-estimate that avoids terminal overflow).
-/// Other control characters are counted as 1 column.
-fn char_display_width(ch: char, col: usize) -> usize {
-    match ch {
-        '\t' => 8 - (col % 8), // advance to next 8-column tab stop
-        _ => ch.width().unwrap_or(1),
+/// A tab advances to the next 8-column tab stop. Single-codepoint characters
+/// retain the previous one-column fallback (with an override for enclosed
+/// alphanumerics that render as 2 columns in CJK terminals). Multi-codepoint
+/// emoji, keycaps, and combining sequences use the same string-level width
+/// contract as Ratatui, with an override for keycap sequences containing
+/// U+20E3 that unicode-width undercounts. (#4479)
+fn markdown_grapheme_width(grapheme: &str, col: usize) -> usize {
+    if grapheme == "\t" {
+        return 8 - (col % 8); // advance to next 8-column tab stop
     }
+    if let Some(ch) = grapheme.chars().next()
+        && ch.len_utf8() == grapheme.len()
+    {
+        return match ch {
+            // Enclosed alphanumerics, dingbat circled digits, and circled
+            // numbers on black square render as 2 columns in CJK terminals
+            // even though unicode-width reports 1. (#4479)
+            '\u{2460}'..='\u{24FF}' | '\u{2776}'..='\u{2793}' | '\u{3248}'..='\u{324F}' => 2,
+            _ => ch.width().unwrap_or(1),
+        };
+    }
+    // Keycap sequences (with or without FE0F) render as 2 columns.
+    if grapheme.contains('\u{20e3}') {
+        return 2;
+    }
+    grapheme.width()
 }
 
 /// Hard-wrap a code line at `width` display columns, preserving all
@@ -1280,15 +2212,15 @@ fn wrap_code_line(line: &str, width: usize) -> Vec<String> {
     let mut current = String::new();
     let mut current_width = 0usize;
 
-    for ch in line.chars() {
-        let ch_width = char_display_width(ch, current_width);
-        if current_width + ch_width > width && !current.is_empty() {
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = markdown_grapheme_width(grapheme, current_width);
+        if current_width + grapheme_width > width && !current.is_empty() {
             chunks.push(current);
             current = String::new();
             current_width = 0;
         }
-        current.push(ch);
-        current_width += ch_width;
+        current.push_str(grapheme);
+        current_width += grapheme_width;
     }
     chunks.push(current);
     chunks
@@ -1305,7 +2237,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         let word_width = word.width();
         // If this single word is wider than the entire line, hard-break it
-        // at character boundaries so wrapping always makes progress
+        // at grapheme boundaries so wrapping always makes progress
         // (#1344, #1351). Without this, long URLs / paths / hashes overflow
         // the right edge silently.
         if word_width > width {
@@ -1313,7 +2245,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 lines.push(std::mem::take(&mut current));
                 current_width = 0;
             }
-            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            push_word_breaking_graphemes(word, width, &mut current, &mut current_width, &mut lines);
             continue;
         }
         let additional = if current.is_empty() {
@@ -1344,26 +2276,26 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Push characters from `word` into `current`, flushing to `lines` when the
-/// running display width would exceed `width`. Width is computed at the
-/// `unicode-width` char level, matching the rest of the rendering pipeline.
+/// Push graphemes from `word` into `current`, flushing to `lines` when the
+/// running display width would exceed `width`. String-level Unicode width
+/// matches Ratatui for emoji and combining sequences.
 /// Used by `wrap_text` and `wrap_cell_text` so a word longer than the
 /// allotted width never silently overflows the right edge.
-fn push_word_breaking_chars(
+fn push_word_breaking_graphemes(
     word: &str,
     width: usize,
     current: &mut String,
     current_width: &mut usize,
     lines: &mut Vec<String>,
 ) {
-    for ch in word.chars() {
-        let cw = ch.width().unwrap_or(1);
-        if *current_width + cw > width && *current_width > 0 {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && *current_width > 0 {
             lines.push(std::mem::take(current));
             *current_width = 0;
         }
-        current.push(ch);
-        *current_width += cw;
+        current.push_str(grapheme);
+        *current_width += grapheme_width;
     }
 }
 
@@ -1382,6 +2314,206 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn rendered_fingerprint(lines: &[RenderedMarkdownLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                format!(
+                    "{:?}|{:?}|{}|{}|{:?}",
+                    line.line,
+                    line.links,
+                    line.is_code,
+                    line.copy_prefix_width,
+                    line.copy_separator_after
+                )
+            })
+            .collect()
+    }
+
+    fn update_incremental_render(
+        cache: &mut IncrementalMarkdownRenderCache,
+        rendered: &mut Vec<RenderedMarkdownLine>,
+        source: &str,
+        width: u16,
+        palette_mode: palette::PaletteMode,
+        verified_append: bool,
+    ) {
+        update_incremental_render_with_style(
+            cache,
+            rendered,
+            source,
+            width,
+            Style::default(),
+            palette_mode,
+            verified_append,
+        );
+    }
+
+    fn update_incremental_render_with_style(
+        cache: &mut IncrementalMarkdownRenderCache,
+        rendered: &mut Vec<RenderedMarkdownLine>,
+        source: &str,
+        width: u16,
+        base_style: Style,
+        palette_mode: palette::PaletteMode,
+        verified_append: bool,
+    ) {
+        let delta = cache.update(source, width, base_style, palette_mode, verified_append);
+        rendered.truncate(delta.replace_from);
+        rendered.extend(delta.lines);
+    }
+
+    #[test]
+    fn incremental_render_is_exact_and_linear_for_unicode_fences_and_tables() {
+        let mut cache = IncrementalMarkdownRenderCache::default();
+        let mut rendered = Vec::new();
+        let mut source = String::new();
+        let chunks = 80usize;
+
+        for index in 0..chunks {
+            source.push_str(&format!(
+                "## 段落 {index}\nUnicode e\u{301} 世界 🚀\n```rust\nlet 値_{index}: usize = {index}; // 注釈\n```\n| key | value |\n|---|---|\n| {index} | 世界 |\n\n"
+            ));
+            update_incremental_render(
+                &mut cache,
+                &mut rendered,
+                &source,
+                96,
+                palette::PaletteMode::Dark,
+                index > 0,
+            );
+            let cold = render_markdown_tagged_with_palette(
+                &source,
+                96,
+                Style::default(),
+                palette::PaletteMode::Dark,
+            );
+            assert_eq!(
+                rendered_fingerprint(&rendered),
+                rendered_fingerprint(&cold),
+                "incremental output diverged after chunk {index}"
+            );
+        }
+
+        let work = cache.work();
+        let parsed = reference_parse(&source);
+        assert_eq!(work.classified_lines as usize, source.lines().count());
+        assert_eq!(work.stable_blocks_rendered as usize, parsed.blocks.len());
+        assert_eq!(work.tail_blocks_rendered, 0);
+        assert_eq!(work.invalidations, 1);
+    }
+
+    #[test]
+    fn incremental_render_invalidates_on_mutation_width_theme_and_style() {
+        let mut cache = IncrementalMarkdownRenderCache::default();
+        let mut rendered = Vec::new();
+        let mut source = "alpha\n```rust\nlet value = 1;\n```\n".to_string();
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            &source,
+            80,
+            palette::PaletteMode::Dark,
+            false,
+        );
+
+        source.push_str("tail 世界\n");
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            &source,
+            80,
+            palette::PaletteMode::Dark,
+            true,
+        );
+
+        source.replace_range(..5, "ALPHA");
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            &source,
+            80,
+            palette::PaletteMode::Dark,
+            false,
+        );
+        let mutated = render_markdown_tagged_with_palette(
+            &source,
+            80,
+            Style::default(),
+            palette::PaletteMode::Dark,
+        );
+        assert_eq!(
+            rendered_fingerprint(&rendered),
+            rendered_fingerprint(&mutated)
+        );
+
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            &source,
+            37,
+            palette::PaletteMode::Dark,
+            true,
+        );
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            &source,
+            37,
+            palette::PaletteMode::Light,
+            true,
+        );
+
+        let changed_style = Style::default().add_modifier(Modifier::ITALIC);
+        update_incremental_render_with_style(
+            &mut cache,
+            &mut rendered,
+            &source,
+            37,
+            changed_style,
+            palette::PaletteMode::Light,
+            true,
+        );
+        let rethemed = render_markdown_tagged_with_palette(
+            &source,
+            37,
+            changed_style,
+            palette::PaletteMode::Light,
+        );
+        assert_eq!(
+            rendered_fingerprint(&rendered),
+            rendered_fingerprint(&rethemed)
+        );
+        assert_eq!(cache.work().invalidations, 5);
+    }
+
+    #[test]
+    fn incremental_render_drops_committed_source_without_a_large_answer_cliff() {
+        let line = format!("{}\n", "x".repeat(16 * 1024));
+        let mut source = String::new();
+        let mut cache = IncrementalMarkdownRenderCache::default();
+        let mut rendered = Vec::new();
+
+        for index in 0..80 {
+            source.push_str(&line);
+            update_incremental_render(
+                &mut cache,
+                &mut rendered,
+                &source,
+                u16::MAX,
+                palette::PaletteMode::Dark,
+                index > 0,
+            );
+            assert_eq!(cache.retained_source_bytes(), 0);
+        }
+
+        assert!(source.len() > 1024 * 1024);
+        assert_eq!(cache.retained_source_bytes(), 0);
+        assert_eq!(cache.work().classified_lines, 80);
+        assert_eq!(cache.work().stable_blocks_rendered, 80);
+        assert_eq!(cache.work().invalidations, 1);
     }
 
     #[test]
@@ -1516,19 +2648,266 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    //  #3897 — streaming re-parse is incremental, not quadratic
+    // -----------------------------------------------------------------
+
+    /// Markdown corpus chosen to hit every carry-state transition the parser
+    /// has: fences opened and closed across chunk boundaries, an unterminated
+    /// fence, headings, nested lists, tables, rules, blanks, CRLF, and CJK.
+    fn streaming_corpus() -> Vec<&'static str> {
+        vec![
+            "# Title\n\nSome prose that wraps.\n\n- alpha\n- beta\n",
+            "text\n```rust\nlet x = 1;\nlet y = 2;\n```\nafter\n",
+            "```\nunterminated fence never closes\nstill inside\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\ndone\n",
+            "1. one\n2. two\n   * nested\n\n## Sub\n\n***\n",
+            "混合 CJK 内容\n\n```python\nprint(\"中文\")\n```\n尾部\n",
+            "crlf lines\r\nsecond\r\n\r\n```go\nfmt.Println()\r\n```\r\n",
+            "no trailing newline at all",
+            "",
+        ]
+    }
+
+    /// The acceptance guarantee: streaming a message chunk by chunk produces,
+    /// at every intermediate prefix, exactly what a full re-parse of that
+    /// prefix produces. Byte-for-byte on the AST, so a divergence in any field
+    /// of any block fails here rather than showing up as a render artifact.
+    #[test]
+    fn incremental_parse_matches_a_full_reparse_at_every_prefix() {
+        for source in streaming_corpus() {
+            // Grow one byte at a time (respecting char boundaries) — the
+            // worst case for a parser that commits too eagerly.
+            for end in 0..=source.len() {
+                if !source.is_char_boundary(end) {
+                    continue;
+                }
+                let prefix = &source[..end];
+                let streamed = parse(prefix);
+
+                // A cold parser is the reference: no memo, no resumption.
+                let mut cold = ParseState::default();
+                cold.commit_complete_lines(prefix);
+                let reference = cold.snapshot(prefix);
+
+                assert_eq!(
+                    streamed, reference,
+                    "prefix {end} of {source:?} diverged from a full re-parse"
+                );
+            }
+        }
+    }
+
+    /// The performance guarantee: work per chunk must not grow with the
+    /// message. Counted in lines actually classified, which is the quantity
+    /// that was quadratic — the old code re-classified every line on every
+    /// chunk.
+    #[test]
+    fn streaming_does_not_reclassify_committed_lines() {
+        let chunk = "a line of prose\n";
+        let chunks = 400;
+
+        let mut content = String::new();
+        let mut state = ParseState::default();
+        let mut total_committed = 0usize;
+
+        for _ in 0..chunks {
+            content.push_str(chunk);
+            assert!(
+                state.can_resume_from(&content),
+                "an append-only stream must always be resumable"
+            );
+            let before = state.blocks.len();
+            state.commit_complete_lines(&content);
+            total_committed += state.blocks.len() - before;
+        }
+
+        // Quadratic would be chunks * (chunks + 1) / 2 = 80,200 classifications.
+        assert_eq!(
+            total_committed, chunks,
+            "each line must be classified exactly once across the whole stream"
+        );
+        assert_eq!(state.blocks.len(), chunks);
+    }
+
+    /// Resumption is verified, never assumed. Content that does not extend the
+    /// committed prefix must fall back to a full parse rather than splice
+    /// unrelated blocks together.
+    #[test]
+    fn a_changed_prefix_is_not_resumable() {
+        let mut state = ParseState::default();
+        state.commit_complete_lines("first line\nsecond line\n");
+
+        assert!(state.can_resume_from("first line\nsecond line\nthird\n"));
+        // Earlier bytes rewritten.
+        assert!(!state.can_resume_from("FIRST line\nsecond line\nthird\n"));
+        // Buffer shrank (a different, shorter cell).
+        assert!(!state.can_resume_from("first line\n"));
+        // Entirely unrelated content.
+        assert!(!state.can_resume_from("something else\n"));
+    }
+
+    /// Interleaving two different sources through the shared memo must not
+    /// contaminate either — this is the multi-cell render-loop case.
+    #[test]
+    fn interleaved_sources_do_not_contaminate_each_other() {
+        let a = "# Alpha\n\nalpha body\n";
+        let b = "```rust\nlet b = 1;\n```\n";
+        for _ in 0..5 {
+            assert_eq!(parse(a), reference_parse(a));
+            assert_eq!(parse(b), reference_parse(b));
+        }
+    }
+
+    fn reference_parse(content: &str) -> ParsedMarkdown {
+        let mut cold = ParseState::default();
+        cold.commit_complete_lines(content);
+        cold.snapshot(content)
+    }
+
     #[test]
     fn fenced_code_block_collected_in_parse() {
-        let parsed = parse("text\n```\ncode line one\ncode line two\n```\nmore\n");
+        let parsed = parse("text\n```rust\ncode line one\ncode line two\n```\nmore\n");
         let blocks = &parsed.blocks;
         // text paragraph, two code lines, more paragraph (fences are dropped)
         let code_lines: Vec<_> = blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Code { line } => Some(line.as_str()),
+                Block::Code {
+                    line,
+                    language,
+                    block_id,
+                } => Some((line.as_str(), language.as_deref(), *block_id)),
                 _ => None,
             })
             .collect();
-        assert_eq!(code_lines, vec!["code line one", "code line two"]);
+        assert_eq!(
+            code_lines,
+            vec![
+                ("code line one", Some("rust"), 1),
+                ("code line two", Some("rust"), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn adjacent_code_fences_keep_distinct_highlighter_state() {
+        let parsed = parse("```rust\n/* open\n```\n```rust\nlet x = 1;\n```\n");
+        let ids = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Code { block_id, .. } => Some(*block_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn rust_fence_renders_multiple_syntax_foregrounds_without_reserved_rgb() {
+        let rendered = render_markdown_tagged(
+            "```rust\nfn main() {\n    let answer: u32 = 42; // comment\n}\n```",
+            100,
+            Style::default(),
+        );
+        let colors = rendered
+            .iter()
+            .flat_map(|line| line.line.spans.iter())
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(colors.len() > 1, "expected syntax colors, got: {colors:?}");
+        for color in colors {
+            assert_ne!(color, palette::WHALE_HUMAN);
+            assert_ne!(color, palette::WHALE_LIVE);
+            assert_ne!(color, palette::WHALE_ACTION);
+            assert_ne!(color, palette::WHALE_ERROR);
+        }
+    }
+
+    #[test]
+    fn syntax_colors_use_existing_depth_quantizer_and_grayscale_path() {
+        assert!(matches!(
+            syntax_rgb_to_terminal_color(
+                120,
+                80,
+                200,
+                palette::PaletteMode::Dark,
+                palette::ColorDepth::Ansi256,
+            ),
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            syntax_rgb_to_terminal_color(
+                120,
+                80,
+                200,
+                palette::PaletteMode::Dark,
+                palette::ColorDepth::Ansi16,
+            ),
+            Color::Black
+                | Color::Red
+                | Color::Green
+                | Color::Yellow
+                | Color::Blue
+                | Color::Magenta
+                | Color::Cyan
+                | Color::Gray
+                | Color::DarkGray
+                | Color::LightRed
+                | Color::LightGreen
+                | Color::LightYellow
+                | Color::LightBlue
+                | Color::LightMagenta
+                | Color::LightCyan
+                | Color::White
+        ));
+        let gray = syntax_rgb_to_terminal_color(
+            120,
+            80,
+            200,
+            palette::PaletteMode::Grayscale,
+            palette::ColorDepth::TrueColor,
+        );
+        assert!(matches!(gray, Color::Rgb(r, g, b) if r == g && g == b));
+    }
+
+    #[test]
+    fn syntax_assets_are_lazy_singletons_and_explicit_modes_select_themes() {
+        assert!(std::ptr::eq(syntax_set(), syntax_set()));
+        assert!(std::ptr::eq(theme_set(), theme_set()));
+        assert!(!std::ptr::eq(
+            selected_syntax_theme(palette::PaletteMode::Dark),
+            selected_syntax_theme(palette::PaletteMode::Light),
+        ));
+    }
+
+    #[test]
+    fn depth_quantization_cannot_reintroduce_reserved_semantic_colors() {
+        let reserved = [
+            palette::WHALE_HUMAN,
+            palette::WHALE_LIVE,
+            palette::WHALE_ACTION,
+            palette::WHALE_ERROR,
+        ];
+        for depth in [
+            palette::ColorDepth::TrueColor,
+            palette::ColorDepth::Ansi256,
+            palette::ColorDepth::Ansi16,
+        ] {
+            let reserved_at_depth = reserved.map(|color| palette::adapt_color(color, depth));
+            for semantic in reserved {
+                let Color::Rgb(r, g, b) = semantic else {
+                    panic!("reserved syntax guard expects RGB semantic colors");
+                };
+                let syntax =
+                    syntax_rgb_to_terminal_color(r, g, b, palette::PaletteMode::Dark, depth);
+                assert!(
+                    !reserved_at_depth.contains(&syntax),
+                    "{syntax:?} reintroduced a reserved color at {depth:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1591,15 +2970,17 @@ mod tests {
     }
 
     #[test]
-    fn char_display_width_tab_uses_tab_stop() {
+    fn markdown_grapheme_width_uses_tab_stop_and_string_width() {
         // At column 0 a tab fills to column 8.
-        assert_eq!(char_display_width('\t', 0), 8);
+        assert_eq!(markdown_grapheme_width("\t", 0), 8);
         // At column 4 a tab fills to column 8 (4 remaining).
-        assert_eq!(char_display_width('\t', 4), 4);
+        assert_eq!(markdown_grapheme_width("\t", 4), 4);
         // At column 8 a tab fills to the next stop at 16 (8 columns).
-        assert_eq!(char_display_width('\t', 8), 8);
+        assert_eq!(markdown_grapheme_width("\t", 8), 8);
         // Regular ASCII is 1.
-        assert_eq!(char_display_width('a', 0), 1);
+        assert_eq!(markdown_grapheme_width("a", 0), 1);
+        // A fully-qualified keycap is one two-column grapheme.
+        assert_eq!(markdown_grapheme_width("1\u{fe0f}\u{20e3}", 0), 2);
     }
 
     #[test]
@@ -1614,6 +2995,232 @@ mod tests {
             })
             .collect();
         assert_eq!(items, vec![("-", "alpha"), ("-", "beta"), ("1.", "gamma")]);
+    }
+
+    #[test]
+    fn blockquote_lines_parse_with_depth() {
+        let parsed =
+            parse("> hello\n>\n>> nested\n> > spaced\n>no-space\n>\t tabbed\nlone > arrow\n");
+        let quotes: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Quote { depth, text } => Some((*depth, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            quotes,
+            vec![
+                (1, "hello"),
+                (1, ""),
+                (2, "nested"),
+                (2, "spaced"),
+                (1, "no-space"),
+                (1, "tabbed"),
+            ]
+        );
+        // `lone > arrow` starts with prose, so it stays a paragraph.
+        assert_eq!(parsed.blocks.len(), 7);
+    }
+
+    #[test]
+    fn code_fence_contains_quote_lines_untouched() {
+        // Fenced-code lines are collected before blockquote classification, so
+        // `>` inside a fence must stay literal code content.
+        let parsed = parse("```\n> not a quote\n\n> but this is\n```\n");
+        let code: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Code { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, vec!["> not a quote", "", "> but this is"]);
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .all(|b| !matches!(b, Block::Quote { .. })),
+            "lines inside a fence must stay code, never quotes"
+        );
+    }
+
+    #[test]
+    fn four_backtick_fence_keeps_shorter_fence_and_quotes_as_code() {
+        // A ```` opener must not be closed by a shorter ``` line: the shorter
+        // fence and any `>` lines after it stay code content (CommonMark
+        // fence-length rule), and the block only closes on a fence >= opener.
+        let parsed = parse("````\n```\n> still code\n`````\n> now a quote\n");
+        let code: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Code { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, vec!["```", "> still code"]);
+        let quotes: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Quote { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quotes, vec!["now a quote"]);
+    }
+
+    #[test]
+    fn longer_fence_closes_shorter_opener() {
+        // CommonMark: a closing fence may be longer than the opener; only the
+        // opener's length is the minimum.
+        let parsed = parse("```\ncode\n````\nplain\n");
+        let code: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Code { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(code, vec!["code"]);
+        let paragraphs: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paragraphs, vec!["plain"]);
+    }
+
+    #[test]
+    fn backticks_with_info_do_not_close_an_open_fence() {
+        let parsed = parse("```\n```rust\n> still code\n```\n");
+        let code: Vec<_> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Code { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(code, vec!["```rust", "> still code"]);
+        assert!(
+            parsed
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, Block::Quote { .. }))
+        );
+    }
+
+    #[test]
+    fn blockquote_renders_rail_and_inline_formatting() {
+        let rendered = render_markdown_tagged(
+            "> **bold** `code` and see https://example.com",
+            80,
+            Style::default(),
+        );
+        assert_eq!(
+            tagged_visible(&rendered),
+            vec!["│ bold code and see https://example.com"]
+        );
+        let spans = &rendered[0].line.spans;
+        assert_eq!(spans[0].content, "│ ");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD)),
+            "inline bold must survive inside a quote"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "code"
+                    && span.style.bg == Some(palette::SURFACE_ELEVATED)),
+            "inline code is styled distinctly from plain text"
+        );
+        // First-row rail is stripped by the transcript rail-scan along with
+        // the assistant glyph, so copy must report 0 here (mirror list items)
+        // — reporting the rail width would strip it twice and lose text.
+        assert_eq!(rendered[0].copy_prefix_width, 0);
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 20,
+                col_end: 38,
+                target: "https://example.com".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_blockquote_renders_multiple_rails_capped() {
+        let rendered =
+            render_markdown_tagged(">>> deep\n>>>>>>>>>> too deep\n", 80, Style::default());
+        assert_eq!(
+            tagged_visible(&rendered),
+            vec!["│ │ │ deep", "│ │ │ │ too deep"]
+        );
+        assert_eq!(
+            rendered[0]
+                .line
+                .spans
+                .iter()
+                .take(3)
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["│ ", "│ ", "│ "],
+            "each rail must remain independently discoverable by selection copy"
+        );
+    }
+
+    #[test]
+    fn blockquote_wraps_with_continuation_rail_indent() {
+        let source = "> alpha beta gamma delta epsilon zeta";
+        let rendered = render_markdown_tagged(source, 12, Style::default());
+        let visible = tagged_visible(&rendered);
+        assert!(visible.len() > 1, "fixture must wrap: {visible:?}");
+        assert!(visible[0].starts_with("│ "), "first row starts with rail");
+        // Copy-prefix accounting: first row reports 0 (rail-scan strips it),
+        // continuation rows report the rail width (plain spaces are not
+        // stripped by the rail-scan).
+        assert_eq!(rendered[0].copy_prefix_width, 0);
+        for row in rendered.iter().skip(1) {
+            assert_eq!(row.copy_prefix_width, 2);
+        }
+        for row in &visible[1..] {
+            assert!(
+                row.starts_with("  "),
+                "continuation rows keep the rail width indent: {row:?}"
+            );
+            assert!(
+                !row.starts_with('│'),
+                "rail appears only on the first row: {row:?}"
+            );
+        }
+        for width in rendered.iter().map(|row| {
+            row.line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref().width())
+                .sum::<usize>()
+        }) {
+            assert!(width <= 12, "rendered width {width} exceeds budget");
+        }
+        // Rows re-join into the quote content (rail and alignment stripped).
+        let combined = visible
+            .iter()
+            .map(|row| row.trim_start_matches('│').trim_start())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(combined, &source[2..]);
     }
 
     fn tagged_visible(lines: &[RenderedMarkdownLine]) -> Vec<String> {
@@ -1718,6 +3325,62 @@ mod tests {
             render_markdown_tagged("[docs](HTTPS://example.com/guide)", 80, Style::default());
         assert_eq!(tagged_visible(&web_link), vec!["docs"]);
         assert_eq!(web_link[0].links[0].target, "https://example.com/guide");
+    }
+
+    #[test]
+    fn named_links_target_absolute_paths_with_the_file_scheme() {
+        let rendered = render_markdown_tagged(
+            "edit [main.rs](/repo/src/main.rs) now",
+            80,
+            Style::default(),
+        );
+        assert_eq!(tagged_visible(&rendered), vec!["edit main.rs now"]);
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 5,
+                col_end: 11,
+                target: "file:///repo/src/main.rs".to_string(),
+            }]
+        );
+
+        let explicit =
+            render_markdown_tagged("[main.rs](FILE:///repo/src/main.rs)", 80, Style::default());
+        assert_eq!(explicit[0].links[0].target, "file:///repo/src/main.rs");
+    }
+
+    #[test]
+    fn named_links_reject_relative_paths_and_smuggled_control_bytes() {
+        // Nothing here resolves a relative path against a workspace root, so a
+        // relative destination would link to whatever the terminal's cwd is.
+        let relative = render_markdown_tagged("[main.rs](src/main.rs)", 80, Style::default());
+        assert_eq!(tagged_visible(&relative), vec!["main.rs"]);
+        assert!(relative.iter().all(|line| line.links.is_empty()));
+
+        let hostile = render_markdown_tagged(
+            "[log](/tmp/a\x07b\x1b]8;;https://evil.test\x1b\\c)",
+            80,
+            Style::default(),
+        );
+        assert!(
+            hostile.iter().all(|line| line.links.is_empty()),
+            "control bytes must not reach a link target: {hostile:?}"
+        );
+
+        // A `file://host/share` destination is a remote reference, not a local
+        // path, and must not be rewritten into one.
+        let host = render_markdown_tagged("[share](file://evil.test/etc)", 80, Style::default());
+        assert!(host.iter().all(|line| line.links.is_empty()));
+    }
+
+    #[test]
+    fn bare_paths_in_prose_are_never_linkified() {
+        let rendered = render_markdown_tagged(
+            "the fix landed in /repo/src/main.rs today",
+            80,
+            Style::default(),
+        );
+        assert!(rendered.iter().all(|line| line.links.is_empty()));
     }
 
     #[test]
@@ -1931,7 +3594,7 @@ mod tests {
     // width was placed alone on a line and silently overflowed the right
     // edge of the transcript. Long URLs / paths / hashes / no-whitespace
     // CJK runs all hit this. The fix hard-breaks overlong words at
-    // character boundaries; these tests pin that across widths 40/60/80/120.
+    // grapheme boundaries; these tests pin that across widths 40/60/80/120.
 
     fn rendered_widths(rendered: &[Line<'static>]) -> Vec<usize> {
         rendered

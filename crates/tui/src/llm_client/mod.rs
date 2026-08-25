@@ -76,6 +76,53 @@ pub trait LlmClient: Send + Sync {
     fn health_check(&self) -> impl Future<Output = Result<bool>> + Send {
         async { Ok(true) }
     }
+
+    /// The concrete base URL requests go to, when the implementation knows it.
+    ///
+    /// Background cost accrual uses this for billing provenance only: it is
+    /// reduced to a non-secret surface classification and a SHA-256 fingerprint
+    /// before being recorded, and the URL itself is never persisted or logged
+    /// (#4318). The default is `None` so an implementation that cannot report a
+    /// stable endpoint yields "unknown endpoint" — which fails closed — rather
+    /// than being assumed to be the provider's public API.
+    fn billing_base_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Non-secret limits frozen with the resolved route, when available.
+    fn route_limits(&self) -> Option<codewhale_config::route::RouteLimits> {
+        None
+    }
+
+    /// Output cap for a request sent through this exact client route.
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        let route = self.effective_route_envelope(requested_model, chrono::Utc::now());
+        crate::route_budget::effective_max_output_tokens_for_route(
+            route.provider,
+            &route.model,
+            self.route_limits(),
+        )
+    }
+
+    /// Freeze the non-secret effective route immediately before a request is
+    /// dispatched. Implementations with richer configured identity/billing
+    /// facts should override this fail-closed default.
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        let provider = crate::config::ApiProvider::parse(self.provider_name())
+            .unwrap_or(crate::config::ApiProvider::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture(
+            None,
+            provider,
+            self.provider_name(),
+            requested_model,
+            self.billing_base_url(),
+            dispatched_at,
+        )
+    }
 }
 
 // === Authentication diagnostics ===
@@ -268,6 +315,24 @@ fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
 
 // === LlmError - Classified Error Types ===
 
+/// Evidence captured when an HTTP response explicitly identifies plan quota
+/// exhaustion. The private field prevents callers outside this parser module
+/// from manufacturing the durable classification from arbitrary text.
+#[derive(Debug)]
+pub struct QuotaExhaustionError {
+    message: String,
+}
+
+impl QuotaExhaustionError {
+    fn from_http_message(message: String) -> Self {
+        Self { message }
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
+    }
+}
+
 /// Classified LLM errors with retryability information.
 ///
 /// This enum categorizes API errors to enable smart retry decisions.
@@ -281,6 +346,13 @@ pub enum LlmError {
         message: String,
         retry_after: Option<Duration>,
     },
+
+    /// The provider explicitly reported that the account's plan quota is exhausted.
+    ///
+    /// Unlike an ordinary 429 rate limit, retrying the same request after a short
+    /// backoff cannot resolve this condition. This variant is constructed only at
+    /// the provider HTTP response boundary from explicit quota evidence.
+    QuotaExhausted(QuotaExhaustionError),
 
     /// Server error (HTTP 5xx)
     ServerError { status: u16, message: String },
@@ -320,6 +392,9 @@ impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::RateLimited { message, .. } => write!(f, "Rate limit exceeded: {message}"),
+            LlmError::QuotaExhausted(error) => {
+                write!(f, "Provider plan quota exhausted: {}", error.message)
+            }
             LlmError::ServerError { status, message } => {
                 write!(f, "Server error ({status}): {message}")
             }
@@ -353,6 +428,7 @@ impl LlmError {
     /// - Timeouts
     ///
     /// Non-retryable errors:
+    /// - Provider plan quota exhaustion
     /// - Authentication failures
     /// - Invalid requests
     /// - Content policy violations
@@ -381,9 +457,15 @@ impl LlmError {
     /// Constructs an `LlmError` from HTTP status code and response body.
     ///
     /// Performs heuristic classification based on:
-    /// - Status code (429 = rate limit, 401/403 = auth, 5xx = server error)
+    /// - Status code (429 = rate limit, 401/403 = auth, 499/5xx = transient upstream error)
     /// - Response body keywords (`context_length`, `content_policy`, safety, etc.)
     pub fn from_http_response(status: u16, body: &str) -> Self {
+        if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
+            return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
+                body.to_string(),
+            ));
+        }
+
         match status {
             429 => LlmError::RateLimited {
                 message: body.to_string(),
@@ -400,14 +482,19 @@ impl LlmError {
             400 => {
                 // Classify 400 errors by examining the response body
                 let body_lower = body.to_lowercase();
-                if body_lower.contains("insufficientquota")
-                    || body_lower.contains("insufficient_quota")
-                    || body_lower.contains("exceeded your current quota")
-                    || body_lower.contains("quota exceeded")
+                // An "unsupported parameter" 400 names the offending field
+                // (often `max_output_tokens` or another *token* field), which
+                // the generic keyword rules below would misread as a context
+                // window overflow. Parameter shape errors are invalid
+                // requests, not prompt-size errors, so they get their own
+                // branch ahead of the heuristic.
+                if body_lower.contains("unsupported parameter")
+                    || body_lower.contains("invalid_request_error")
+                        && body_lower.contains("parameter")
                 {
-                    LlmError::RateLimited {
+                    LlmError::InvalidRequest {
+                        status,
                         message: body.to_string(),
-                        retry_after: None,
                     }
                 } else if body_lower.contains("context_length")
                     || body_lower.contains("token")
@@ -440,7 +527,12 @@ impl LlmError {
                     }
                 }
             }
-            500..=599 => LlmError::ServerError {
+            // Several OpenAI-compatible gateways use nginx's non-standard
+            // 499 for an upstream request that was cancelled before response
+            // streaming began. At this boundary no response body stream has
+            // been exposed, so it is eligible for the same bounded retry
+            // policy as a 5xx gateway failure.
+            499..=599 => LlmError::ServerError {
                 status,
                 message: body.to_string(),
             },
@@ -548,7 +640,11 @@ pub(crate) fn sanitize_http_error_body(
     body: &str,
 ) -> String {
     if let Some(message) = extract_json_error_message(body) {
-        return truncate_for_error(&collapse_whitespace(&message), 2_000);
+        let message = truncate_for_error(&collapse_whitespace(&message), 2_000);
+        if let Some(code) = explicit_quota_code(body) {
+            return format!("{message} (provider error code: {code})");
+        }
+        return message;
     }
 
     if is_probably_html(body) {
@@ -603,6 +699,93 @@ fn looks_like_authentication_failure(body: &str) -> bool {
         || lower.contains("invalid token")
         || lower.contains("bearer token")
         || lower.contains("missing token")
+}
+
+/// Quota exhaustion is a durable account state, not a generic rate-limit
+/// synonym. Accept only explicit provider evidence at the HTTP/parser boundary;
+/// callers holding a stringified error must never promote it to this type.
+fn has_explicit_quota_evidence(body: &str) -> bool {
+    explicit_quota_code(body).is_some()
+        || has_explicit_quota_code_marker(body)
+        || has_explicit_quota_phrase(body)
+}
+
+fn explicit_quota_code(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    [
+        "/error/code",
+        "/error/type",
+        "/error/error_code",
+        "/code",
+        "/type",
+        "/error_code",
+    ]
+    .into_iter()
+    .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .find(|code| is_explicit_quota_code(code))
+    .map(ToOwned::to_owned)
+}
+
+fn is_explicit_quota_code(code: &str) -> bool {
+    let normalized: String = code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "insufficientquota"
+            | "quotaexceeded"
+            | "quotaexhausted"
+            | "billinghardlimitreached"
+            | "billinglimitreached"
+            | "creditbalanceexhausted"
+    )
+}
+
+fn has_explicit_quota_code_marker(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let Some((_, suffix)) = lower.split_once("provider error code:") else {
+        return false;
+    };
+    let code = suffix
+        .trim_start()
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .next()
+        .unwrap_or_default();
+    is_explicit_quota_code(code)
+}
+
+fn has_explicit_quota_phrase(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let current_quota_exhausted = lower.contains("exceeded your current quota")
+        || lower.contains("current quota has been exceeded");
+    let plan_and_billing_guidance = lower.contains("plan") && lower.contains("billing");
+    let durable_scope_exhausted = [
+        "billing quota exceeded",
+        "billing quota exhausted",
+        "billing quota is exhausted",
+        "billing quota has been exceeded",
+        "billing quota has been exhausted",
+        "account quota exceeded",
+        "account quota exhausted",
+        "account quota is exhausted",
+        "account quota has been exceeded",
+        "account quota has been exhausted",
+        "plan quota exceeded",
+        "plan quota exhausted",
+        "plan quota is exhausted",
+        "plan quota has been exceeded",
+        "plan quota has been exhausted",
+    ]
+    .into_iter()
+    .any(|phrase| lower.contains(phrase));
+
+    lower.contains("billing hard limit has been reached")
+        || lower.contains("credit balance exhausted")
+        || lower.contains("credit balance is exhausted")
+        || durable_scope_exhausted
+        || (current_quota_exhausted && plan_and_billing_guidance)
 }
 
 fn extract_json_error_message(body: &str) -> Option<String> {
@@ -749,7 +932,7 @@ impl From<serde_json::Error> for LlmError {
 /// - `exponential_base`: 2.0
 /// - `jitter`: true (adds randomness to prevent thundering herd)
 /// - `jitter_factor`: 0.1 (10% variation)
-/// - `retryable_status_codes`: [429, 500, 502, 503, 504]
+/// - `retryable_status_codes`: [429, 499, 500, 502, 503, 504]
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Whether retry logic is enabled
@@ -799,7 +982,7 @@ impl Default for RetryConfig {
             jitter: true,
             jitter_factor: 0.1,
             respect_retry_after: true,
-            retryable_status_codes: vec![429, 500, 502, 503, 504],
+            retryable_status_codes: vec![429, 499, 500, 502, 503, 504],
             request_timeout: 120.0,
             total_timeout: 0.0, // No total timeout by default
         }
@@ -995,6 +1178,10 @@ pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 ///     })),
 /// ).await;
 /// ```
+// Keep the structured error inline: this is a public compatibility surface and
+// boxing it in a patch release would force every caller to change ownership
+// handling for `last_error`.
+#[allow(clippy::result_large_err)]
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
     mut operation: F,
@@ -1088,20 +1275,39 @@ where
 
 // === Utility Functions ===
 
+/// The longest a `Retry-After` value is ever believed. A server (or a proxy
+/// in front of it) can send an arbitrarily large delay; without a ceiling a
+/// single `Retry-After: 86400` would wedge the turn for a day. One hour is
+/// well past any legitimate rate-limit window.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(3600);
+
 /// Parses the Retry-After header value into a Duration.
 ///
 /// Supports both:
 /// - Seconds as integer: "120" -> 120 seconds
 /// - HTTP-date format: "Wed, 21 Oct 2015 07:28:00 GMT" (not implemented, returns None)
+///
+/// The value is server-controlled, so this never panics and never returns an
+/// unbounded delay: negative / NaN / infinite / absurd floats are rejected
+/// (`Duration::from_secs_f64` panics on a negative — a remote-triggerable
+/// crash before this guard), and any result is clamped to [`RETRY_AFTER_MAX`].
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     // Try parsing as seconds
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+        return Some(Duration::from_secs(seconds).min(RETRY_AFTER_MAX));
     }
 
-    // Try parsing as float seconds
-    if let Ok(seconds) = value.parse::<f64>() {
-        return Some(Duration::from_secs_f64(seconds));
+    // Try parsing as float seconds. Only a finite, non-negative value is a
+    // meaningful delay; everything else (`-5`, `nan`, `inf`) is "no usable
+    // hint". Clamp to the ceiling BEFORE `from_secs_f64` so an out-of-range
+    // float can never reach its overflow-panic path, while keeping the
+    // sub-second precision a legitimate `1.5` carries.
+    if let Ok(seconds) = value.parse::<f64>()
+        && seconds.is_finite()
+        && seconds >= 0.0
+    {
+        let clamped = seconds.min(RETRY_AFTER_MAX.as_secs_f64());
+        return Some(Duration::from_secs_f64(clamped));
     }
 
     // HTTP-date format not supported yet
@@ -1116,6 +1322,10 @@ pub fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Durat
         .and_then(|v| v.to_str().ok())
         .and_then(parse_retry_after)
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod quota_tests;
 
 // === Tests ===
 
@@ -1221,6 +1431,7 @@ mod tests {
         let config = RetryConfig::default();
 
         assert!(config.is_retryable_status(429)); // Rate limit
+        assert!(config.is_retryable_status(499)); // Upstream request cancelled
         assert!(config.is_retryable_status(500)); // Internal server error
         assert!(config.is_retryable_status(502)); // Bad gateway
         assert!(config.is_retryable_status(503)); // Service unavailable
@@ -1230,84 +1441,6 @@ mod tests {
         assert!(!config.is_retryable_status(401)); // Unauthorized
         assert!(!config.is_retryable_status(403)); // Forbidden
         assert!(!config.is_retryable_status(404)); // Not found
-    }
-
-    #[test]
-    fn test_llm_error_retryable() {
-        // Retryable errors
-        assert!(
-            LlmError::RateLimited {
-                message: "too many requests".to_string(),
-                retry_after: None
-            }
-            .is_retryable()
-        );
-        assert!(
-            LlmError::ServerError {
-                status: 500,
-                message: "internal error".to_string()
-            }
-            .is_retryable()
-        );
-        assert!(LlmError::NetworkError("connection refused".to_string()).is_retryable());
-        assert!(LlmError::Timeout(Duration::from_secs(30)).is_retryable());
-
-        // Non-retryable errors
-        assert!(!LlmError::authentication_error("invalid key").is_retryable());
-        assert!(!LlmError::AuthorizationError("blocked".to_string()).is_retryable());
-        assert!(
-            !LlmError::InvalidRequest {
-                status: 400,
-                message: "bad json".to_string()
-            }
-            .is_retryable()
-        );
-        assert!(!LlmError::ContentPolicyError("unsafe content".to_string()).is_retryable());
-        assert!(!LlmError::ContextLengthError("too long".to_string()).is_retryable());
-    }
-
-    #[test]
-    fn test_llm_error_from_http_response() {
-        // Rate limit
-        let err = LlmError::from_http_response(429, "rate limit exceeded");
-        assert!(matches!(err, LlmError::RateLimited { .. }));
-
-        // Auth errors
-        let err = LlmError::from_http_response(401, "invalid api key");
-        assert!(matches!(err, LlmError::AuthenticationError(_)));
-
-        let err = LlmError::from_http_response(403, "forbidden");
-        assert!(matches!(err, LlmError::AuthorizationError(_)));
-
-        let err = LlmError::from_http_response(403, "invalid api key");
-        assert!(matches!(err, LlmError::AuthenticationError(_)));
-
-        // Server errors
-        let err = LlmError::from_http_response(500, "internal server error");
-        assert!(matches!(err, LlmError::ServerError { status: 500, .. }));
-
-        let err = LlmError::from_http_response(503, "service unavailable");
-        assert!(matches!(err, LlmError::ServerError { status: 503, .. }));
-
-        // Context length
-        let err = LlmError::from_http_response(400, "context_length_exceeded");
-        assert!(matches!(err, LlmError::ContextLengthError(_)));
-
-        // Some OpenAI-compatible gateways return quota/rate-limit errors as HTTP 400.
-        let err = LlmError::from_http_response(
-            400,
-            r#"{"error":{"code":"insufficientquota","message":"You exceeded your current quota"}}"#,
-        );
-        assert!(matches!(err, LlmError::RateLimited { .. }));
-        assert!(err.is_retryable());
-
-        // Content policy
-        let err = LlmError::from_http_response(400, "content_policy_violation");
-        assert!(matches!(err, LlmError::ContentPolicyError(_)));
-
-        // Generic 400
-        let err = LlmError::from_http_response(400, "invalid json");
-        assert!(matches!(err, LlmError::InvalidRequest { status: 400, .. }));
     }
 
     #[test]
@@ -1505,12 +1638,35 @@ mod tests {
         assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
         assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
 
-        // Float seconds
+        // Float seconds keep sub-second precision
         assert_eq!(parse_retry_after("1.5"), Some(Duration::from_secs_f64(1.5)));
 
         // Invalid
         assert_eq!(parse_retry_after("invalid"), None);
         assert_eq!(parse_retry_after(""), None);
+    }
+
+    /// A `Retry-After` value is server-controlled. Malformed floats used to
+    /// reach `Duration::from_secs_f64`, which panics on a negative — a
+    /// remote-triggerable crash in the request path (2026-08-04 review).
+    #[test]
+    fn parse_retry_after_never_panics_and_is_bounded_on_hostile_input() {
+        // None of these may panic.
+        assert_eq!(parse_retry_after("-5"), None, "negative is not a delay");
+        assert_eq!(parse_retry_after("nan"), None);
+        assert_eq!(parse_retry_after("inf"), None);
+        assert_eq!(parse_retry_after("-inf"), None);
+        // Absurdly large values clamp to the ceiling rather than overflowing
+        // or wedging the turn for a day.
+        assert_eq!(parse_retry_after("1e300"), Some(RETRY_AFTER_MAX));
+        assert_eq!(parse_retry_after("86400"), Some(RETRY_AFTER_MAX));
+        assert_eq!(
+            parse_retry_after("999999999999"),
+            Some(RETRY_AFTER_MAX),
+            "integer path is clamped too"
+        );
+        // A normal value still passes through untouched.
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -1578,25 +1734,6 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(call_count, 1); // No retries when disabled
-    }
-
-    #[tokio::test]
-    async fn test_with_retry_non_retryable_error() {
-        let config = RetryConfig::default();
-        let mut call_count = 0;
-
-        let result: RetryResult<i32> = with_retry(
-            &config,
-            || {
-                call_count += 1;
-                async { Err(LlmError::authentication_error("bad key")) }
-            },
-            None,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(call_count, 1); // Auth errors are not retried
     }
 
     #[tokio::test]

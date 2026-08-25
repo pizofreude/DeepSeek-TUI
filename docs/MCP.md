@@ -1,20 +1,24 @@
 # MCP (External Tool Servers)
 
+> 阅读简体中文版：[zh_hans/MCP.md](zh_hans/MCP.md)
+
 codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback.
 
 Browsing note:
-- `web.run` is the canonical built-in browsing tool.
-- `web_search` remains available as a compatibility alias for older prompts and integrations.
+- `Web` is the canonical, deferred built-in browsing tool; it provides
+  `search`, `fetch`, and `wait` actions when network policy permits.
+- `web_search`, `fetch_url`, and `wait_for_dev_server` are hidden replay-only
+  aliases. New prompts and integrations should use `Web`.
 
 Server mode note:
-- `codewhale-tui serve --mcp` runs the MCP stdio server.
-- `codewhale-tui serve --http` runs the runtime HTTP/SSE API (separate mode).
-- The `codewhale` dispatcher exposes `codewhale mcp-server` as an equivalent stdio
-  entrypoint used by the split CLI.
+- `codewhale serve --mcp` runs the MCP stdio server.
+- `codewhale serve --http` runs the runtime HTTP/SSE API (separate mode).
+- `codewhale mcp-server` is an equivalent stdio entrypoint on the same
+  consolidated runtime.
 
 ## Setup wizard vs manual MCP setup (#3407)
 
-The constitution-first `/setup` wizard includes an optional **Tools and MCP**
+The `/setup` hub includes an optional **Tools and MCP**
 step. That step is discovery/readiness only:
 
 | Wizard can do | Still requires manual / explicit action |
@@ -36,30 +40,58 @@ Summaries redact commands, args, env, headers, and tokens.
 optional-surface intent (paths, counts, static checks) so wizard and doctor
 stay consistent.
 
+## Plugin-contributed MCP
+
+A reviewed local plugin bundle may contribute MCP servers without creating a
+second transport or approval system. The servers use the same MCP manager,
+tool approval, resource, prompt, timeout, and network-policy paths documented
+here, and appear under namespaced `<plugin>-<server>` identities.
+
+The bundle boundary is intentionally stricter than user-authored `mcp.json`:
+unknown fields and ambiguous transports fail closed; stdio environment values
+must be exact environment-source references; remote literal headers and
+secret-bearing URLs are rejected; declared network hosts must exactly match
+the normalized endpoint host set; and redirects remain on the reviewed origin.
+Reviewed plugin remotes also bypass ambient HTTP proxy configuration entirely;
+proxy credentials and proxy-observed traffic are not part of the v1 review.
+The plugin review discloses local host-user authority, structural argv,
+environment provenance, endpoint, auth source names, scopes, and tool filters
+without reading or printing secret values.
+
+Trust stages reviewed content but does not enable it. Enablement attaches that
+staged snapshot to the current workspace's MCP pool. Disable, revoke, and other
+cross-process generation changes remove catalog entries, cancel in-flight
+operations, and terminate plugin stdio children. Source or staged-tree drift is
+fully revalidated before each dispatch/catalogue boundary and fails the next
+boundary closed; v0.9.1 does not continuously hash mutable trees during an
+already-running call and therefore does not promise drift-triggered mid-call
+cancellation. MCP subscriptions are not exposed through plugin bundles. See
+[Plugin bundles](PLUGIN_BUNDLES.md) for the complete lifecycle contract.
+
 ## Bootstrap MCP Config
 
 Create a starter MCP config at your resolved MCP path:
 
 ```bash
-codewhale-tui mcp init
+codewhale mcp init
 ```
 
-`codewhale-tui setup --mcp` performs the same MCP bootstrap alongside skills setup.
+`codewhale setup --mcp` performs the same MCP bootstrap alongside skills setup.
 
 Common management commands:
 
 ```bash
-codewhale-tui mcp list
-codewhale-tui mcp tools [server]
-codewhale-tui mcp add <name> --command "<cmd>" --arg "<arg>"
-codewhale-tui mcp add <name> --url "http://localhost:3000/mcp"
-codewhale-tui mcp add <name> --url "https://example.com/mcp" --bearer-token-env-var MCP_TOKEN
-codewhale-tui mcp login <name>
-codewhale-tui mcp logout <name>
-codewhale-tui mcp enable <name>
-codewhale-tui mcp disable <name>
-codewhale-tui mcp remove <name>
-codewhale-tui mcp validate
+codewhale mcp list
+codewhale mcp tools [server]
+codewhale mcp add <name> --command "<cmd>" --arg "<arg>"
+codewhale mcp add <name> --url "http://localhost:3000/mcp"
+codewhale mcp add <name> --url "https://example.com/mcp" --bearer-token-env-var MCP_TOKEN
+codewhale mcp login <name>
+codewhale mcp logout <name>
+codewhale mcp enable <name>
+codewhale mcp disable <name>
+codewhale mcp remove <name>
+codewhale mcp validate
 ```
 
 ## In-TUI Manager
@@ -74,6 +106,9 @@ Supported in-TUI actions:
 ```text
 /mcp init
 /mcp init --force
+/mcp import
+/mcp recommendations
+/mcp add recommended <id>
 /mcp add stdio <name> <command> [args...]
 /mcp add http <name> <url>
 /mcp login <name> [--scope scope]
@@ -85,10 +120,56 @@ Supported in-TUI actions:
 /mcp reload
 ```
 
-`/mcp validate` and `/mcp reload` reconnect for UI discovery and refresh the
-manager snapshot. Config edits made from the TUI are written immediately, but
-the model-visible MCP tool pool is not hot-reloaded; the manager marks this as
-restart-required until the TUI is restarted.
+### Suggested plugins and companion integrations
+
+`/mcp recommendations` is Codewhale's native, curated suggestions surface.
+The entries are described as product plugins, with their component type and
+provenance, but `/mcp add recommended <id>` still writes only the named MCP
+server component. Viewing recommendations never fetches, installs, trusts, or
+enables anything. Adding one writes configuration; the server is first started
+only after an explicit `/mcp restart`.
+
+The v0.9.10 product suggestions use these reviewed, pinned definitions. The
+Plugins view is the product/install surface; MCP, Skills, and sandbox adapters
+are transparent component kinds and their own tabs remain operational and
+diagnostic surfaces:
+
+| Plugin | Component | Pinned definition | Provenance and maturity | Installation boundary |
+| --- | --- | --- | --- | --- |
+| Chrome DevTools | MCP server (stdio) | `npx -y chrome-devtools-mcp@1.7.0` (`npx.cmd` on Windows) | [Official ChromeDevTools project](https://github.com/ChromeDevTools/chrome-devtools-mcp) | npm may download the pinned package when the user restarts MCP. |
+| Playwright | MCP server (stdio) | `npx -y @playwright/mcp@0.0.79 --isolated` (`npx.cmd` on Windows) | [Official Microsoft project](https://github.com/microsoft/playwright-mcp) | `--isolated` starts a fresh browser profile; npm may download the pinned package only after an explicit restart. |
+| Cua Computer Use | MCP server (stdio) | `cua-driver mcp`; Driver `0.20.0` reviewed for this release | [Official Cua project](https://github.com/trycua/cua); preview integration | The signed driver and OS permissions are separate, explicit installs. `/mcp add recommended cua` only writes config and never installs or grants either. |
+| Browser Use | Skill plus separately installed Python runtime | Skill/runtime release `0.13.8` | [Official browser-use project](https://github.com/browser-use/browser-use) | Optional companion: not an MCP server. Codewhale does not auto-run the upstream Skill installer or install its browser/runtime dependencies. |
+| Anthropic Sandbox Runtime | Sandbox adapter companion | `@anthropic-ai/sandbox-runtime@0.0.73` | [Official anthropic-experimental project](https://github.com/anthropic-experimental/sandbox-runtime); beta | Documentation-only adapter candidate in v0.9.10: not an MCP server and not an active Codewhale plugin adapter. It does not replace Codewhale's sandbox policy. |
+
+[Container Use](https://github.com/dagger/container-use) remains an additional
+experimental suggestion with an MCP server component (`container-use stdio`).
+The binary must be installed separately; `/mcp add recommended container-use`
+only writes config and Codewhale never downloads it.
+
+This presentation follows the same useful boundary found in the local
+Grokbuild extensions view (one product plugin may expose MCP or Skill
+components while component tabs stay inspectable), the Kimi marketplace's
+explicit display name/tier/source fields, and the Codex marketplace's explicit
+source and install-policy fields.
+Codewhale keeps its stricter rule: provenance and foreign policy are display
+metadata only, never inherited trust or automatic installation. For full
+bundle and marketplace semantics, see [Plugin bundles](PLUGIN_BUNDLES.md).
+
+`/mcp validate` (alias `/mcp doctor`) reconnects for UI discovery only: it
+refreshes the manager snapshot you see in the pager, not the catalog the model
+gets.
+
+`/mcp reload` (aliases `/mcp reconnect`, `/mcp restart`) is the hot-reload path.
+It re-reads the MCP config sources and reconnects through the engine-owned pool,
+so the rebuilt catalog is the exact one the next model turn uses — no TUI
+restart. Config edits made from the TUI are written immediately and the manager
+marks the snapshot reload-required until you run it; a failed reload leaves the
+previous live pool intact and says so.
+
+Headless surfaces are the exception: the `ConfigReload` app-server request does
+**not** refresh MCP connections, so a headless runtime still needs a restart
+after MCP config changes.
 
 ## Remote HTTP Auth
 
@@ -116,13 +197,13 @@ For bearer-token auth, prefer env-backed config:
 For generic remote MCP OAuth, add the URL server and run login:
 
 ```bash
-codewhale-tui mcp add remote --url "https://example.com/mcp"
-codewhale-tui mcp login remote
+codewhale mcp add remote --url "https://example.com/mcp"
+codewhale mcp login remote
 ```
 
-CodeWhale discovers the server OAuth metadata, opens the authorization URL in
+Codewhale discovers the server OAuth metadata, opens the authorization URL in
 your browser, listens on a local callback, exchanges the code, and stores the
-token response through the CodeWhale secrets backend. Stored OAuth tokens are
+token response through the Codewhale secrets backend. Stored OAuth tokens are
 looked up by server name plus URL and refreshed when possible before requests.
 During login, the CLI prints the authorization URL and a waiting status while
 the local callback listener is active. If a URL-based server returns 401 or
@@ -162,20 +243,19 @@ These callback fields are ignored from project-scope config overlays.
 ## Hugging Face MCP
 
 Hugging Face provides a hosted MCP server for Hub resources, documentation,
-datasets, Spaces, and community tools. CodeWhale does not call Hugging Face's
+datasets, Spaces, and community tools. Codewhale does not call Hugging Face's
 Hub HTTP APIs from `/hf`; it only helps you inspect and set up the MCP config
 that the regular MCP manager will load.
 
 The recommended setup path is Hugging Face's settings-generated configuration:
 
 1. Visit <https://huggingface.co/settings/mcp> while signed in.
-2. Choose the MCP client closest to your CodeWhale config shape and copy the
+2. Choose the MCP client closest to your Codewhale config shape and copy the
    generated server snippet.
 3. Paste the Hugging Face server entry into your resolved MCP config file.
-4. Restart CodeWhale, or run `/mcp reload` for the manager snapshot and restart
-   if the model-visible tool pool still needs to rebuild.
+4. Run `/mcp reload` to rebuild the live model-visible tool pool.
 
-CodeWhale reads both `servers` and `mcpServers`, so settings-generated snippets
+Codewhale reads both `servers` and `mcpServers`, so settings-generated snippets
 can be adapted without changing the rest of the MCP file. A placeholder-only
 shape looks like this:
 
@@ -213,20 +293,21 @@ Official docs: <https://huggingface.co/docs/hub/hf-mcp-server>
 
 Default path:
 
-- `~/.codewhale/mcp.json` (`~/.deepseek/mcp.json` is still read when the CodeWhale file is absent)
+- `~/.codewhale/mcp.json` (`~/.deepseek/mcp.json` is still read when the Codewhale file is absent)
 
 Overrides:
 
 - Config: `mcp_config_path = "/path/to/mcp.json"`
 - Env: `DEEPSEEK_MCP_CONFIG=/path/to/mcp.json`
 
-`codewhale-tui mcp init` (and `codewhale-tui setup --mcp`) writes to this resolved path.
+`codewhale mcp init` (and `codewhale setup --mcp`) writes to this resolved path.
 
 The interactive `/config` editor also exposes `mcp_config_path`. Changing it in
-the TUI updates the path used by `/mcp`, and requires a restart before the
-model-visible MCP tool pool is rebuilt.
+the TUI updates the path used by `/mcp` and marks the pool reload-required;
+`/mcp reload` then switches the live pool to the new config source.
 
-After editing the file or changing `mcp_config_path`, restart the TUI.
+After editing the MCP file or changing `mcp_config_path`, run `/mcp reload`. No
+TUI restart is needed.
 
 ## Tool Naming
 
@@ -271,17 +352,19 @@ The CLI also exposes helper tools when MCP is enabled:
 
 You can also use `mcpServers` instead of `servers` for compatibility with other clients.
 
-## Running DeepSeek as an MCP Server
+## Running Codewhale as an MCP Server
 
-You can register your local DeepSeek binary as an MCP server so other DeepSeek sessions (or any MCP client) can call its tools.
+You can register your local Codewhale binary as an MCP server so other Codewhale sessions (or any MCP client) can call its tools.
 
 ### Quick Setup
 
 ```bash
-codewhale-tui mcp add-self
+codewhale mcp add-self
 ```
 
-This resolves the current binary path, generates a config entry that runs `codewhale-tui serve --mcp`, and writes it to your MCP config file. The default server name is `codewhale`.
+This resolves the current binary path, generates a config entry that runs
+`codewhale serve --mcp`, and writes it to your MCP config file. The default
+server name is `codewhale`.
 
 Options:
 
@@ -304,11 +387,10 @@ Equivalent manual entry in `~/.codewhale/mcp.json`:
 }
 ```
 
-The `codewhale-tui` binary supports `serve --mcp` directly. The `codewhale`
-dispatcher offers the equivalent `codewhale mcp-server` stdio entrypoint. Use
-whichever is on your `PATH` (run `which codewhale` or `which codewhale-tui` to
-find the full path). The `mcp add-self` command automatically resolves the
-correct binary.
+The consolidated `codewhale` runtime supports `serve --mcp` directly and also
+offers the equivalent `codewhale mcp-server` stdio entrypoint. Release
+installers expose the same runtime as `codew`; `mcp add-self` automatically
+resolves the command that invoked it.
 
 ### Prerequisites
 
@@ -318,32 +400,33 @@ correct binary.
 
 ### Tool Naming
 
-Tools from a self-hosted DeepSeek server follow the standard naming convention:
+Tools from an MCP server follow the standard naming convention:
 
-- `mcp_deepseek_<tool>` (if the server is named `codewhale`)
+- `mcp_<server>_<tool>`
 
-For example, the `shell` tool becomes `mcp_deepseek_shell`.
+For example, the `shell` tool from the default server (named `codewhale`)
+becomes `mcp_codewhale_shell`.
 
 ### MCP Server vs HTTP/SSE API vs ACP
 
-| | `codewhale-tui serve --mcp` | `codewhale-tui serve --http` | `codewhale-tui serve --acp` |
+| | `codewhale serve --mcp` | `codewhale serve --http` | `codewhale serve --acp` |
 |---|---|---|---|
 | **Protocol** | MCP stdio | HTTP/SSE JSON-RPC | ACP stdio |
 | **Use case** | Tool server for MCP clients | Runtime API for apps | Editor agent for Zed/custom ACP clients |
 | **Config** | `~/.codewhale/mcp.json` entry | Direct URL connection | Editor `agent_servers` custom command |
 | **Lifecycle** | Spawned per client session | Long-running daemon | Spawned per editor agent session |
 
-Use `mcp add-self` when you want DeepSeek tools available to other MCP clients.
+Use `mcp add-self` when you want Codewhale tools available to other MCP clients.
 Use `serve --http` when building applications that consume the API directly.
-Use `serve --acp` when an editor wants to talk to DeepSeek as an ACP agent.
+Use `serve --acp` when an editor wants to talk to Codewhale as an ACP agent.
 
 ### Verification
 
 After adding, test the connection:
 
 ```bash
-codewhale-tui mcp validate
-codewhale-tui mcp tools codewhale
+codewhale mcp validate
+codewhale mcp tools codewhale
 ```
 
 ## Server Fields
@@ -370,7 +453,10 @@ Per-server settings:
 
 ## Safety Notes
 
-MCP tools now flow through the same tool-approval framework as built-in tools. Read-only MCP helpers (resource/prompt listing and reads) can run without prompts in suggestive approval modes, while side-effectful MCP tools require approval.
+MCP tools flow through the same approval framework as built-in tools. Read-only
+MCP helpers (resource/prompt listing and reads) can run without prompts in Ask
+and Auto-Review when policy permits, while side-effectful MCP tools require
+approval. Full Access does not bypass hard policy holds.
 
 You should still only configure MCP servers you trust, and treat MCP server configuration as equivalent to running code on your machine.
 Avoid committing literal `Authorization` headers. Prefer `env_headers`,
@@ -378,7 +464,9 @@ Avoid committing literal `Authorization` headers. Prefer `env_headers`,
 
 ## Troubleshooting
 
-- Run `codewhale-tui doctor` to confirm the MCP config path it resolved and whether it exists.
+- Run `codewhale doctor` to confirm the MCP config path it resolved and whether it exists.
 - In the TUI, run `/mcp validate` to refresh the visible server/tool snapshot.
-- If the MCP config is missing, run `codewhale-tui mcp init --force` to regenerate it.
+- If tools are missing from the model's catalog after a config or credential
+  change, run `/mcp reload` — `/mcp validate` only refreshes the UI snapshot.
+- If the MCP config is missing, run `codewhale mcp init --force` to regenerate it.
 - If tools don’t appear, verify the server command works from your shell and that the server supports MCP `tools/list`.

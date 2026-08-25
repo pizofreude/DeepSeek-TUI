@@ -39,14 +39,52 @@ fn default_runtime_event_envelope_schema_version() -> u32 {
 /// All fields are required on serialization so clients can rely on the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
+    #[serde(default)]
+    pub account_session: bool,
     pub threads: bool,
     pub turns: bool,
+    /// `POST /v1/threads/{id}/turns` accepts a durable, thread-scoped
+    /// `operation_key` and returns the original turn for exact retries.
+    #[serde(default)]
+    pub turn_operation_idempotency: bool,
     pub turn_steer: bool,
     pub turn_interrupt: bool,
     pub event_replay: bool,
     pub external_tools: bool,
     pub environments: bool,
     pub worker_runtime: bool,
+    #[serde(default)]
+    pub fleet_run_create: bool,
+    #[serde(default)]
+    pub fleet_run_start: bool,
+    #[serde(default)]
+    pub fleet_event_replay: bool,
+    #[serde(default)]
+    pub fleet_event_stream: bool,
+    #[serde(default)]
+    pub fleet_local_target: bool,
+    /// `GET/PUT/DELETE /v1/threads/{id}/goal` and the `complete`/`block`
+    /// lifecycle actions are available.
+    #[serde(default)]
+    pub thread_goals: bool,
+    /// `GET /v1/memory` and `GET /v1/memory/{id}` are available for
+    /// bounded inspection of the native memory store.  `POST /v1/memory`
+    /// and `DELETE /v1/memory` are also available (auth-gated via the
+    /// standard route layer) for lifecycle controls.
+    #[serde(default)]
+    pub memory: bool,
+    /// Whether the runtime supports create/update/enable/disable/reconnect/delete
+    /// operations on MCP server configuration via the `POST|GET|PATCH|DELETE
+    /// /v1/apps/mcp/servers` family of endpoints.
+    #[serde(default)]
+    pub mcp_server_management: bool,
+    /// Skill lifecycle operations (install, update, uninstall, trust, audit)
+    /// are available via the HTTP API.
+    #[serde(default)]
+    pub skill_lifecycle: bool,
+    /// Durable, workspace-scoped cross-task Agent Mail endpoints and events.
+    #[serde(default)]
+    pub agent_mail: bool,
 }
 
 /// Experimental opt-in flags advertised by `GET /v1/runtime/info`.
@@ -329,20 +367,39 @@ mod tests {
     #[test]
     fn runtime_capabilities_serializes_expected_shape() {
         let caps = RuntimeCapabilities {
+            account_session: true,
             threads: true,
             turns: true,
+            turn_operation_idempotency: true,
             turn_steer: true,
             turn_interrupt: true,
             event_replay: true,
             external_tools: false,
             environments: false,
             worker_runtime: false,
+            fleet_run_create: true,
+            fleet_run_start: true,
+            fleet_event_replay: true,
+            fleet_event_stream: true,
+            fleet_local_target: true,
+            thread_goals: true,
+            memory: true,
+            mcp_server_management: false,
+            skill_lifecycle: false,
+            agent_mail: true,
         };
         let value = serde_json::to_value(&caps).unwrap();
         let obj = value.as_object().unwrap();
         assert_eq!(obj.get("threads").unwrap(), &json!(true));
+        assert_eq!(obj.get("account_session").unwrap(), &json!(true));
+        assert_eq!(obj.get("turn_operation_idempotency").unwrap(), &json!(true));
         assert_eq!(obj.get("external_tools").unwrap(), &json!(false));
         assert!(obj.contains_key("worker_runtime"));
+        assert_eq!(obj.get("fleet_run_create").unwrap(), &json!(true));
+        assert_eq!(obj.get("fleet_event_stream").unwrap(), &json!(true));
+        assert_eq!(obj.get("thread_goals").unwrap(), &json!(true));
+        assert_eq!(obj.get("memory").unwrap(), &json!(true));
+        assert_eq!(obj.get("agent_mail").unwrap(), &json!(true));
     }
 
     #[test]

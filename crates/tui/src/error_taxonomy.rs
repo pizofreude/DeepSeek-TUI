@@ -13,6 +13,7 @@ pub enum ErrorCategory {
     Authorization,
     RateLimit,
     Timeout,
+    Budget,
     InvalidInput,
     Parse,
     Tool,
@@ -48,6 +49,7 @@ impl fmt::Display for ErrorCategory {
             Self::Authorization => "authorization",
             Self::RateLimit => "rate_limit",
             Self::Timeout => "timeout",
+            Self::Budget => "budget",
             Self::InvalidInput => "invalid_input",
             Self::Parse => "parse",
             Self::Tool => "tool",
@@ -179,9 +181,10 @@ impl ErrorEnvelope {
         let category = classify_error_message(&message);
         let severity = match category {
             ErrorCategory::Authentication => ErrorSeverity::Critical,
-            ErrorCategory::RateLimit | ErrorCategory::Timeout | ErrorCategory::Network => {
-                ErrorSeverity::Warning
-            }
+            ErrorCategory::RateLimit
+            | ErrorCategory::Timeout
+            | ErrorCategory::Network
+            | ErrorCategory::Budget => ErrorSeverity::Warning,
             ErrorCategory::InvalidInput | ErrorCategory::Authorization | ErrorCategory::Parse => {
                 ErrorSeverity::Error
             }
@@ -212,6 +215,15 @@ impl From<LlmError> for ErrorEnvelope {
                 true,
                 "llm_rate_limited",
                 message,
+            ),
+            // Keep the broad wire-compatible category while making the typed
+            // code and recovery contract distinct from an ordinary 429.
+            LlmError::QuotaExhausted(error) => Self::new(
+                ErrorCategory::RateLimit,
+                ErrorSeverity::Error,
+                false,
+                "llm_quota_exhausted",
+                error.into_message(),
             ),
             LlmError::ServerError { status, message } => Self::new(
                 ErrorCategory::Internal,
@@ -302,7 +314,12 @@ impl From<LlmError> for ErrorEnvelope {
 pub fn classify_error_message(message: &str) -> ErrorCategory {
     let lower = message.to_lowercase();
 
-    if lower.contains("maximum context length")
+    if lower.contains("maximum model steps") || lower.contains("step budget exhausted") {
+        return ErrorCategory::Budget;
+    }
+    if lower.contains("model output truncated")
+        || lower.contains("model response incomplete")
+        || lower.contains("maximum context length")
         || lower.contains("context length")
         || lower.contains("context_length")
         || lower.contains("prompt is too long")
@@ -315,6 +332,7 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
         || lower.contains("too many requests")
         || lower.contains("429")
         || lower.contains("quota")
+        || lower.contains("usage limit")
     {
         return ErrorCategory::RateLimit;
     }
@@ -416,6 +434,13 @@ impl From<ToolError> for ErrorEnvelope {
                 "tool_timeout",
                 format!("Tool timed out after {seconds}s"),
             ),
+            ToolError::Cancelled { message } => Self::new(
+                ErrorCategory::Tool,
+                ErrorSeverity::Info,
+                false,
+                "tool_cancelled",
+                message,
+            ),
             ToolError::NotAvailable { message } => Self::new(
                 ErrorCategory::State,
                 ErrorSeverity::Error,
@@ -500,6 +525,10 @@ impl fmt::Display for StreamError {
 impl std::error::Error for StreamError {}
 
 #[cfg(test)]
+#[path = "error_taxonomy/tests.rs"]
+mod quota_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -523,22 +552,6 @@ mod tests {
                 classify(msg),
                 ErrorCategory::InvalidInput,
                 "expected InvalidInput for `{msg}`",
-            );
-        }
-    }
-
-    #[test]
-    fn rate_limit_catches_429_and_quota_phrasings() {
-        for msg in [
-            "Rate limit reached for gpt-4",
-            "Too Many Requests",
-            "HTTP 429 from upstream",
-            "Your quota has been exceeded",
-        ] {
-            assert_eq!(
-                classify(msg),
-                ErrorCategory::RateLimit,
-                "expected RateLimit for `{msg}`",
             );
         }
     }
@@ -584,35 +597,6 @@ mod tests {
                 "expected Authentication for `{msg}`",
             );
         }
-    }
-
-    #[test]
-    fn llm_auth_error_envelope_renders_context_without_secret() {
-        let api_key = "tp-secret-token-plan-value";
-        let env = ErrorEnvelope::from(LlmError::from_http_response_with_request_context(
-            401,
-            &format!("Invalid API Key: {api_key}"),
-            Some("Xiaomi MiMo"),
-            Some("https://token-plan-sgp.xiaomimimo.com/v1"),
-            Some("mimo-v2.5"),
-            Some("env"),
-            Some(api_key),
-        ));
-
-        assert_eq!(env.category, ErrorCategory::Authentication);
-        assert_eq!(env.severity, ErrorSeverity::Critical);
-        assert!(!env.recoverable);
-        assert!(env.message.contains("provider: Xiaomi MiMo"));
-        assert!(
-            env.message
-                .contains("base URL authority: token-plan-sgp.xiaomimimo.com")
-        );
-        assert!(env.message.contains("model: mimo-v2.5"));
-        assert!(env.message.contains("key source: env"));
-        assert!(env.message.contains("key fingerprint: tp-... (len=26)"));
-        assert!(env.message.contains("key type: Xiaomi MiMo Token Plan key"));
-        assert!(!env.message.contains(api_key));
-        assert!(!env.message.contains("secret-token-plan-value"));
     }
 
     #[test]

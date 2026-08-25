@@ -123,6 +123,65 @@ where
     env
 }
 
+/// Build the environment for a reviewed plugin-contributed MCP child.
+///
+/// Unlike user-authored MCP configuration, a plugin must name every extra
+/// environment source during trust review. Start from the ordinary
+/// secret-scrubbed child environment, remove ambient proxy variables whose
+/// URLs may themselves contain credentials, then apply only reviewed
+/// overrides. `NO_PROXY` remains safe routing metadata.
+#[cfg(test)]
+pub fn sanitized_plugin_mcp_env<I, K, V>(overrides: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides)
+}
+
+/// Build a reviewed plugin child environment from an immutable host snapshot.
+///
+/// This is separate from `sanitized_plugin_mcp_env` so a repository-local
+/// dotenv file loaded after startup cannot add or replace inherited values.
+pub fn sanitized_plugin_mcp_env_from<B, BK, BV, I, K, V>(
+    base_environment: B,
+    overrides: I,
+) -> Vec<(OsString, OsString)>
+where
+    B: IntoIterator<Item = (BK, BV)>,
+    BK: AsRef<OsStr>,
+    BV: AsRef<OsStr>,
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut env = Vec::new();
+    for (key, value) in base_environment {
+        if is_allowed_parent_env_key(key.as_ref()) {
+            upsert_env(
+                &mut env,
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            );
+        }
+    }
+    env.retain(|(key, _)| {
+        !matches!(
+            normalize_key(key).as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "FTP_PROXY"
+        )
+    });
+    for (key, value) in overrides {
+        upsert_env(
+            &mut env,
+            key.as_ref().to_os_string(),
+            value.as_ref().to_os_string(),
+        );
+    }
+    env
+}
+
 pub fn apply_to_tokio_command_mcp<I, K, V>(cmd: &mut tokio::process::Command, overrides: I)
 where
     I: IntoIterator<Item = (K, V)>,
@@ -218,6 +277,13 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             // piped instead of attached to a Windows console (#4202).
             | "PYTHONIOENCODING"
             | "PYTHONUTF8"
+            // Rustup installs `cargo`/`rustc` as shims and resolves the real
+            // toolchain through these non-secret bootstrap paths. Dropping
+            // them makes an otherwise working Rust toolchain unusable in
+            // official Rust containers and other non-default installations.
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "RUSTUP_TOOLCHAIN"
     ) || normalized.starts_with("LC_")
         // .NET CLI / SDK configuration (DOTNET_ROOT, DOTNET_CLI_*,
         // DOTNET_NOLOGO, DOTNET_CLI_TELEMETRY_OPTOUT, …). Paths and flags
@@ -516,12 +582,7 @@ fn normalize_key(key: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::test_support::EnvVarGuard;
 
     #[test]
     fn mcp_env_allowlist_inherits_base_keys() {
@@ -664,6 +725,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_env_allowlist_includes_rust_toolchain_bootstrap_keys() {
+        for key in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "cargo_home",
+        ] {
+            assert!(
+                is_allowed_parent_env_key(OsStr::new(key)),
+                "child env allowlist should include Rust bootstrap key {key}"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn child_env_allowlist_includes_custom_path_like_vars_without_secrets() {
@@ -702,26 +778,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sanitized_child_env_preserves_custom_sdk_root_vars() {
-        let _guard = env_lock().lock().expect("env lock");
-        let previous_sdk = std::env::var_os("BIMRV_SDK_ROOT");
-        let previous_secret = std::env::var_os("MY_SECRET_ROOT");
-        unsafe {
-            std::env::set_var("BIMRV_SDK_ROOT", r"F:\Lib\BimRv27.5");
-            std::env::set_var("MY_SECRET_ROOT", r"F:\Secrets");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _sdk = EnvVarGuard::set("BIMRV_SDK_ROOT", r"F:\Lib\BimRv27.5");
+        let _secret = EnvVarGuard::set("MY_SECRET_ROOT", r"F:\Secrets");
 
         let env = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
-
-        unsafe {
-            match previous_sdk {
-                Some(value) => std::env::set_var("BIMRV_SDK_ROOT", value),
-                None => std::env::remove_var("BIMRV_SDK_ROOT"),
-            }
-            match previous_secret {
-                Some(value) => std::env::set_var("MY_SECRET_ROOT", value),
-                None => std::env::remove_var("MY_SECRET_ROOT"),
-            }
-        }
 
         assert!(
             env.iter()
@@ -881,18 +942,10 @@ mod tests {
 
     #[test]
     fn sanitized_mcp_env_passes_through_node_bootstrap() {
-        let _guard = env_lock().lock().expect("env lock");
-        let prev = std::env::var_os("NVM_DIR");
-        unsafe {
-            std::env::set_var("NVM_DIR", "/tmp/test-nvm");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _nvm_dir = EnvVarGuard::set("NVM_DIR", "/tmp/test-nvm");
 
         let env = sanitized_mcp_env(std::iter::empty::<(OsString, OsString)>());
-
-        match prev {
-            Some(value) => unsafe { std::env::set_var("NVM_DIR", value) },
-            None => unsafe { std::env::remove_var("NVM_DIR") },
-        }
 
         let nvm_dir = env
             .iter()
@@ -903,22 +956,10 @@ mod tests {
 
     #[test]
     fn sanitized_mcp_env_drops_unrelated_secret_like_values() {
-        let _guard = env_lock().lock().expect("env lock");
-        let prev = std::env::var_os("DEEPSEEK_MCP_TEST_SECRET");
-        unsafe {
-            std::env::set_var("DEEPSEEK_MCP_TEST_SECRET", "should-not-leak");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _secret = EnvVarGuard::set("DEEPSEEK_MCP_TEST_SECRET", "should-not-leak");
 
         let env = sanitized_mcp_env(std::iter::empty::<(OsString, OsString)>());
-
-        match prev {
-            Some(value) => unsafe {
-                std::env::set_var("DEEPSEEK_MCP_TEST_SECRET", value);
-            },
-            None => unsafe {
-                std::env::remove_var("DEEPSEEK_MCP_TEST_SECRET");
-            },
-        }
 
         assert!(
             env.iter().all(|(key, _)| key != "DEEPSEEK_MCP_TEST_SECRET"),
@@ -927,23 +968,34 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_plugin_mcp_env_requires_explicit_proxy_provenance() {
+        let _guard = crate::test_support::lock_test_env();
+        let synthetic_proxy = format!(
+            "{}://{}:{}@{}",
+            "http", "fixture-user", "fixture-password", "127.0.0.1:9"
+        );
+        let _proxy = EnvVarGuard::set("HTTP_PROXY", synthetic_proxy);
+
+        let ambient = sanitized_plugin_mcp_env(std::iter::empty::<(OsString, OsString)>());
+        let explicit = sanitized_plugin_mcp_env([("HTTP_PROXY", "http://proxy.invalid")]);
+
+        assert!(
+            ambient
+                .iter()
+                .all(|(key, _)| normalize_key(key) != "HTTP_PROXY"),
+            "reviewed plugins must not inherit a credential-capable proxy URL"
+        );
+        assert!(explicit.iter().any(|(key, value)| {
+            normalize_key(key) == "HTTP_PROXY" && value == "http://proxy.invalid"
+        }));
+    }
+
+    #[test]
     fn sanitized_child_env_drops_parent_secret_like_values() {
-        let _guard = env_lock().lock().expect("env lock");
-        let previous = std::env::var_os("DEEPSEEK_CHILD_ENV_TEST_SECRET");
-        unsafe {
-            std::env::set_var("DEEPSEEK_CHILD_ENV_TEST_SECRET", "parent-secret");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _secret = EnvVarGuard::set("DEEPSEEK_CHILD_ENV_TEST_SECRET", "parent-secret");
 
         let env = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
-
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("DEEPSEEK_CHILD_ENV_TEST_SECRET", value);
-            },
-            None => unsafe {
-                std::env::remove_var("DEEPSEEK_CHILD_ENV_TEST_SECRET");
-            },
-        }
 
         assert!(
             env.iter()
@@ -953,22 +1005,10 @@ mod tests {
 
     #[test]
     fn explicit_child_env_values_win_over_parent_allowlist() {
-        let _guard = env_lock().lock().expect("env lock");
-        let previous = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", "/parent/bin");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _path = EnvVarGuard::set("PATH", "/parent/bin");
 
         let env = sanitized_child_env([(OsString::from("PATH"), OsString::from("/explicit/bin"))]);
-
-        match previous {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
 
         let path = env
             .iter()
@@ -979,37 +1019,12 @@ mod tests {
 
     #[test]
     fn sanitized_child_env_preserves_windows_toolchain_vars() {
-        let _guard = env_lock().lock().expect("env lock");
-        let prev_lib = std::env::var_os("LIB");
-        let prev_include = std::env::var_os("INCLUDE");
-        let prev_sdk = std::env::var_os("WINDOWSSDKDIR");
-        // SAFETY: serialised by env_lock above. Restoring after the
-        // assertion is also under the same guard so concurrent tests
-        // never see our staged values.
-        unsafe {
-            std::env::set_var("LIB", r"C:\sdk\lib");
-            std::env::set_var("INCLUDE", r"C:\sdk\include");
-            std::env::set_var("WINDOWSSDKDIR", r"C:\sdk");
-        }
+        let _guard = crate::test_support::lock_test_env();
+        let _lib = EnvVarGuard::set("LIB", r"C:\sdk\lib");
+        let _include = EnvVarGuard::set("INCLUDE", r"C:\sdk\include");
+        let _sdk = EnvVarGuard::set("WINDOWSSDKDIR", r"C:\sdk");
 
         let env = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
-
-        // Restore prior state before asserting so a panic still leaves
-        // the process env clean for the next test.
-        unsafe {
-            match prev_lib {
-                Some(value) => std::env::set_var("LIB", value),
-                None => std::env::remove_var("LIB"),
-            }
-            match prev_include {
-                Some(value) => std::env::set_var("INCLUDE", value),
-                None => std::env::remove_var("INCLUDE"),
-            }
-            match prev_sdk {
-                Some(value) => std::env::set_var("WINDOWSSDKDIR", value),
-                None => std::env::remove_var("WINDOWSSDKDIR"),
-            }
-        }
 
         assert!(
             env.iter()

@@ -1,7 +1,7 @@
 # Model Lab Roadmap
 
-Model Lab is the planned open-model workbench for CodeWhale. The north star is
-simple: CodeWhale should make open-source and open-weight models practical in
+Model Lab is the planned open-model workbench for Codewhale. The north star is
+simple: Codewhale should make open-source and open-weight models practical in
 terminal coding workflows across every provider that offers them. Model Lab is how
 those models become discoverable, evaluable, routable, servable, and exportable
 without weakening the current terminal-agent contract: local workspace control,
@@ -58,7 +58,7 @@ Model Lab should help users answer practical questions:
 - Can I reproduce, export, or self-host the route?
 
 It should never hide provider boundaries, silently upload local artifacts, or
-describe a model as available before CodeWhale can actually route to it.
+describe a model as available before Codewhale can actually route to it.
 
 ## Hugging Face Workset
 
@@ -123,12 +123,26 @@ Planned scope:
 
 ## Eval Workset
 
+Implemented authoring foundation:
+
+- Provider-neutral `WorkflowSearchSpec` validation and deterministic freeze
+  receipts for an experimental-search option within Workflow. The freeze binds
+  the baseline, requested and resolved model names, public evidence, and
+  evaluator identity before candidate admission.
+- The best-of-N Workflow starter can generate 2–16 structured, independent
+  worktree candidates with cache-stable shared instructions and a read-only
+  review. This is generation/review evidence, not runtime-owned hard-gate proof.
+
 Planned scope:
 
 - Reproducible task suites for coding, review, docs, release checks, and
   long-context workflows.
 - Side-by-side route comparisons where the exact model, provider, thinking
   level, prompt, and tool policy are captured.
+- Runtime-owned hard gates and command scoring after worker write authority is
+  revoked; clean-baseline replay; duplicate-patch detection; multi-round
+  Pareto/diversity promotion; aggregate receipts over Fleet receipts; and a
+  Workflow-panel leaderboard. No winner is applied or merged automatically.
 
 ## Observability Workset
 

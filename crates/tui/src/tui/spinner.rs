@@ -11,8 +11,9 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Braille bubble frames used for running tools and background jobs. Dots fill
-/// upward, then release. Eight distinct states at roughly five hertz stay
-/// readable in peripheral vision without becoming a high-frequency spinner.
+/// upward, then release. Eight distinct states at five hertz keep the motion
+/// continuous without turning the one-cell marker into a high-frequency
+/// spinner.
 pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = ["⠀", "⢀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣿"];
 pub(crate) const VERIFY_TICK_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -22,8 +23,11 @@ pub(crate) const LIVE_MARKER_DELAY_MS: u64 = 400;
 pub(crate) const LIVE_STATIC_MARKER: &str = "›";
 pub(crate) const BRAILLE_SPINNER_STILL_FRAME: &str = "⣤";
 
-/// Five stepped states per second: enough change to register peripherally,
-/// slow enough that a monospace braille cell reads as shape instead of flicker.
+/// Five stepped states per second. This is deliberately slower than the
+/// underwater field's ~8fps caustic cadence: the marker communicates active
+/// work, while the field stays subordinate atmosphere. Calmed from 8 Hz
+/// (125 ms) for v0.9.4 — at 5 Hz the fill still reads as continuous motion
+/// without the restless flicker the faster table produced.
 pub(crate) const BRAILLE_SPINNER_FRAME_MS: u64 = 200;
 
 #[must_use]
@@ -42,14 +46,6 @@ pub(crate) fn braille_spinner_frame_for_elapsed_ms(
         .checked_div(u128::from(BRAILLE_SPINNER_FRAME_MS))
         .map_or(0, |frame| frame % BRAILLE_SPINNER_FRAMES.len() as u128);
     BRAILLE_SPINNER_FRAMES[usize::try_from(idx).unwrap_or_default()]
-}
-
-#[must_use]
-pub(crate) fn braille_spinner_frame_for_duration_ms(
-    duration_ms: u64,
-    low_motion: bool,
-) -> &'static str {
-    braille_spinner_frame_for_elapsed_ms(u128::from(duration_ms), low_motion)
 }
 
 #[must_use]
@@ -114,6 +110,26 @@ mod tests {
             ),
             BRAILLE_SPINNER_FRAMES[1]
         );
+    }
+
+    #[test]
+    fn active_marker_uses_a_stable_five_hertz_wall_clock() {
+        assert_eq!(BRAILLE_SPINNER_FRAME_MS, 200);
+        for (index, frame) in BRAILLE_SPINNER_FRAMES.iter().enumerate() {
+            assert_eq!(
+                braille_spinner_frame_for_elapsed_ms(
+                    u128::from(LIVE_MARKER_DELAY_MS)
+                        + u128::from(BRAILLE_SPINNER_FRAME_MS) * index as u128,
+                    false,
+                ),
+                *frame
+            );
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(*frame),
+                1,
+                "active marker frames must never shift adjacent text"
+            );
+        }
     }
 
     #[test]

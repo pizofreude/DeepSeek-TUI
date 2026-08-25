@@ -5,6 +5,7 @@
 // migration scaffolding; see docs/architecture/command-dispatch.md.
 #[allow(clippy::module_inception)]
 pub mod config;
+mod permissions;
 mod status;
 
 use crate::commands::CommandResult;
@@ -18,8 +19,9 @@ impl CommandGroup for ConfigCommands {
     fn commands(&self) -> &'static [Box<dyn Command>] {
         cached_command_list!(vec![
             Box::new(FunctionCommand::new(&CONFIG_INFO, run_config)),
+            Box::new(FunctionCommand::new(&PERMISSIONS_INFO, run_permissions)),
             Box::new(FunctionCommand::new(&AUTH_INFO, run_auth)),
-            Box::new(FunctionCommand::new(&SIDEBAR_INFO, run_sidebar)),
+            Box::new(FunctionCommand::new(&RAIL_INFO, run_rail)),
             Box::new(FunctionCommand::new(&SETTINGS_INFO, run_settings)),
             Box::new(FunctionCommand::new(&STATUS_INFO, run_status)),
             Box::new(FunctionCommand::new(&STATUSLINE_INFO, run_statusline)),
@@ -28,7 +30,6 @@ impl CommandGroup for ConfigCommands {
             Box::new(FunctionCommand::new(&VERBOSE_INFO, run_verbose)),
             Box::new(FunctionCommand::new(&TRUST_INFO, run_trust)),
             Box::new(FunctionCommand::new(&LOGOUT_INFO, run_logout)),
-            Box::new(FunctionCommand::new(&DEBT_INFO, run_debt)),
         ])
     }
 }
@@ -41,22 +42,29 @@ static CONFIG_INFO: CommandInfo = CommandInfo {
     usage: "/config [ask-rules|status|<key> [value]]",
     description_id: MessageId::CmdConfigDescription,
 };
+static PERMISSIONS_INFO: CommandInfo = CommandInfo {
+    name: "permissions",
+    aliases: &["permission-rules", "permission_rules"],
+    usage: "/permissions [list|remove <rule-number> [--confirm <token>]]",
+    description_id: MessageId::CmdPermissionsDescription,
+};
 static AUTH_INFO: CommandInfo = CommandInfo {
     name: "auth",
     aliases: &[],
     usage: "/auth xai-device",
     description_id: MessageId::CmdAuthDescription,
 };
-static SIDEBAR_INFO: CommandInfo = CommandInfo {
-    name: "sidebar",
-    aliases: &[],
-    usage: "/sidebar [on|off|auto|work|activity|tasks|agents|context] [--save]",
+static RAIL_INFO: CommandInfo = CommandInfo {
+    name: "rail",
+    // /sidebar is the name users already know; it now drives the one rail.
+    aliases: &["sidebar"],
+    usage: "/rail [top|left|right|off|tasks|agents|context|pinned] [--save]",
     description_id: MessageId::CmdSidebarDescription,
 };
 static SETTINGS_INFO: CommandInfo = CommandInfo {
     name: "settings",
     aliases: &[],
-    usage: "/settings",
+    usage: "/settings [text]",
     description_id: MessageId::CmdSettingsDescription,
 };
 static STATUS_INFO: CommandInfo = CommandInfo {
@@ -80,7 +88,7 @@ static MODE_INFO: CommandInfo = CommandInfo {
 static THEME_INFO: CommandInfo = CommandInfo {
     name: "theme",
     aliases: &[],
-    usage: "/theme [name]",
+    usage: "/theme [name|custom:<name>|schema|path]",
     description_id: MessageId::CmdThemeDescription,
 };
 static VERBOSE_INFO: CommandInfo = CommandInfo {
@@ -101,13 +109,6 @@ static LOGOUT_INFO: CommandInfo = CommandInfo {
     usage: "/logout",
     description_id: MessageId::CmdLogoutDescription,
 };
-static DEBT_INFO: CommandInfo = CommandInfo {
-    name: "debt",
-    aliases: &["cleanup"],
-    usage: "/debt [query|export]",
-    description_id: MessageId::CmdSlopDescription,
-};
-
 fn run_registered(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult {
     dispatch(app, name, arg).expect("registered config command should dispatch")
 }
@@ -115,11 +116,14 @@ fn run_registered(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult
 fn run_config(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "config", arg)
 }
+fn run_permissions(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "permissions", arg)
+}
 fn run_auth(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "auth", arg)
 }
-fn run_sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "sidebar", arg)
+fn run_rail(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "rail", arg)
 }
 fn run_settings(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "settings", arg)
@@ -145,10 +149,6 @@ fn run_trust(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_logout(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "logout", arg)
 }
-fn run_debt(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "debt", arg)
-}
-
 pub(in crate::commands) fn dispatch(
     app: &mut App,
     command: &str,
@@ -156,14 +156,17 @@ pub(in crate::commands) fn dispatch(
 ) -> Option<CommandResult> {
     let result = match command {
         "config" | "experiments" | "experimental" => config::config_command(app, arg),
+        "permissions" | "permission-rules" | "permission_rules" => {
+            permissions::permissions_command(app, arg)
+        }
         "auth" => match arg.map(str::trim) {
             Some("xai-device") | Some("xai_device") => {
                 CommandResult::action(crate::tui::app::AppAction::StartXaiDeviceLogin)
             }
             _ => CommandResult::error("Usage: /auth xai-device"),
         },
-        "sidebar" => config::sidebar(app, arg),
-        "settings" => config::show_settings(app),
+        "rail" | "sidebar" => config::sidebar(app, arg),
+        "settings" => config::settings_command(app, arg),
         "status" => status::status(app),
         "statusline" => config::status_line(app),
         "mode" => config::mode(app, arg),
@@ -173,8 +176,61 @@ pub(in crate::commands) fn dispatch(
         "verbose" => config::verbose(app, arg),
         "trust" | "xinren" => config::trust(app, arg),
         "logout" => config::logout(app),
-        "debt" | "cleanup" | "slop" | "canzha" => config::slop(app, arg),
         _ => return None,
     };
     Some(result)
+}
+
+/// `/workflow settings` and `/config workflow`: the effective `[workflow]`
+/// and `[goal]` tables with what each value does, read from the refreshed
+/// session table after a config.toml reload (no model turn). The workflow
+/// tool reads the same table, so the two surfaces cannot disagree. This
+/// surface explains, it does not edit.
+pub(in crate::commands) fn workflow_settings(app: &App) -> CommandResult {
+    let refreshed = crate::tools::workflow::session_workflow_config(&app.workspace);
+    let cfg = refreshed.as_ref().unwrap_or(&app.workflow_config);
+    let on = |value: bool| if value { "on" } else { "off" };
+    let lines = [
+        "[workflow] — config.toml".to_string(),
+        format!(
+            "automatic = {}  · the agent may start a workflow itself for broad or staged work; off means only /workflow starts one",
+            on(cfg.automatic)
+        ),
+        format!(
+            "auto_start_read_only = {}  · read-only plans start without an approval card",
+            on(cfg.auto_start_read_only)
+        ),
+        format!(
+            "require_approval_for_writes = {}  · plans that write, use shell/network, or elevate show an approval card first",
+            on(cfg.require_approval_for_writes)
+        ),
+        format!(
+            "auto_start_child_limit = {}  · larger automatic plans ask first or use /workflow",
+            cfg.auto_start_child_limit
+        ),
+        format!(
+            "max_children = {} · max_concurrent = {} · max_depth = {}  · hard ceilings for one run",
+            cfg.max_children, cfg.max_concurrent, cfg.max_depth
+        ),
+        format!(
+            "default_token_budget = {}  · shared admission hint for a run and its children",
+            cfg.default_token_budget
+        ),
+        format!(
+            "max_parallel_writes_without_worktree = {}  · 0 forces worktree isolation for parallel writes",
+            cfg.max_parallel_writes_without_worktree
+        ),
+        format!(
+            "persist_completed_activity = {} · persist_completed_across_restarts = {}  · keep finished runs visible / across restarts (journal: .codewhale/workflow-runs.jsonl)",
+            on(cfg.persist_completed_activity),
+            on(cfg.persist_completed_across_restarts)
+        ),
+        String::new(),
+        "[goal] — config.toml".to_string(),
+        format!(
+            "max_continuations = {}  · automatic continuation passes before a goal pauses; 0 = unlimited (completion, blocked, or you stop it)",
+            app.goal_max_continuations
+        ),
+    ];
+    CommandResult::message(lines.join("\n"))
 }

@@ -1,7 +1,8 @@
 import Link from "next/link";
-import { Seal } from "@/components/seal";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
+
+export const revalidate = 300;
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -11,169 +12,258 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     locale,
     title: isZh ? "模型与提供商 · Codewhale" : "Models & providers · Codewhale",
     description: isZh
-      ? "自带密钥，没有推理加价，不会悄悄换模型。DeepSeek 一级支持，本地 vLLM / SGLang / Ollama 无需密钥，所有提供商共用同一个运行时和同一套工具。"
-      : "Bring your own key, no inference markup, no silent model switching. DeepSeek is first-class, local vLLM / SGLang / Ollama need no key, and every provider routes through the same runtime and tools.",
+      ? "Codewhale 支持的托管与本地提供商：如何配置，以及完整列表。"
+      : "Every hosted and local provider Codewhale supports, and how to configure one.",
   });
 }
-
-/** Provider ids covered by the featured cards; everything else renders as a peer card. */
-const FEATURED_IDS = new Set(["deepseek", "deepseek-anthropic", "vllm", "sglang", "ollama", "openrouter"]);
 
 export default async function ModelsPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const isZh = locale === "zh";
   const p = (path: string) => (isZh ? `/zh${path}` : `/en${path}`);
   const facts = await getFacts();
+  const providerDocs = "https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md";
 
-  const peers = facts.providers.filter((prov) => !FEATURED_IDS.has(prov.id));
+  const setupPatterns = isZh
+    ? [
+        {
+          title: "DeepSeek",
+          detail: `新配置默认使用 ${facts.defaultModel ?? "deepseek-v4-pro"}。用 --provider、/provider 或 CODEWHALE_PROVIDER 换成别的提供商。`,
+          reference: "DEEPSEEK_API_KEY",
+        },
+        {
+          title: "本地运行时",
+          detail: "vLLM、SGLang 和 Ollama 直连 localhost。设置端点和模型即可；本地部署通常不需要 API 密钥。",
+          reference: "vllm · sglang · ollama",
+        },
+        {
+          title: "OpenRouter",
+          detail: "OpenRouter 用一个托管端点访问多个模型。提供商和模型仍由你来选；模型名不会替你切换提供商。",
+          reference: "OPENROUTER_API_KEY",
+        },
+      ]
+    : [
+        {
+          title: "DeepSeek",
+          detail: `New installs default to ${facts.defaultModel ?? "deepseek-v4-pro"}. Switch with --provider, /provider, or CODEWHALE_PROVIDER.`,
+          reference: "DEEPSEEK_API_KEY",
+        },
+        {
+          title: "Local runtimes",
+          detail: "vLLM, SGLang, and Ollama connect to localhost. Set an endpoint and a model; local deployments usually need no API key.",
+          reference: "vllm · sglang · ollama",
+        },
+        {
+          title: "OpenRouter",
+          detail: "OpenRouter is one hosted endpoint for many models. You still pick the provider and the model; a model name never switches the provider for you.",
+          reference: "OPENROUTER_API_KEY",
+        },
+      ];
 
   return (
-    <>
-      {/* THE FRAMING */}
-      <section className="mx-auto max-w-[1100px] px-6 pt-12 pb-10">
-        <div className="flex items-baseline gap-4 mb-3">
-          <Seal char="模" />
-          <div className="eyebrow">{isZh ? "模型与提供商" : "Models & providers"}</div>
-        </div>
-        <h1 className="font-display tracking-crisp mb-6">
-          {isZh ? "任意模型，实话实说" : "Any model, honestly"}
-        </h1>
-        <p className={`max-w-2xl text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-          {isZh
-            ? `${facts.providers.length} 个提供商，全部经由同一个运行时、同一套工具。宪法与安全边界住在执行框架里，不在模型里——所以换提供商不是换产品。`
-            : `${facts.providers.length} providers, and every one routes through the same runtime and the same tools. The constitution and safety boundaries live in the harness, not the model — so changing providers doesn't change the product.`}
-        </p>
-
-        {/* The honest terms */}
-        <div className="mt-8 grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
-          {(isZh
-            ? [
-                { t: "自带密钥", d: "codewhale auth set --provider … 把密钥存进本机的 ~/.codewhale/config.toml。请求直达你配置的提供商。" },
-                { t: "没有推理加价", d: "Codewhale 不经手计费：没有中转、没有转售。账单在你和提供商之间，跟这个项目无关。" },
-                { t: "不会悄悄换模型", d: "提供商和模型是你显式设定的路由，不从提示词里猜。换路由是你亲手敲的命令：/provider 和 /model。" },
-              ]
-            : [
-                { t: "Bring your own key", d: "codewhale auth set --provider … stores keys in your local ~/.codewhale/config.toml. Requests go straight to the provider you configured." },
-                { t: "No inference markup", d: "Codewhale never sits in the billing path — no relay, no resale. The bill is between you and your provider; this project isn't on it." },
-                { t: "No silent model switching", d: "The provider and model are an explicit route you set, not inferred from a prompt. Changing it is a command you type: /provider and /model." },
-              ]
-          ).map((item) => (
-            <div key={item.t} className="p-6">
-              <h2 className="font-display text-xl mb-2">{item.t}</h2>
-              <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-                {item.d}
-              </p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* FEATURED ROUTES */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
-        <div className="flex items-baseline gap-4 mb-6">
-          <Seal char="先" />
-          <div className="eyebrow">{isZh ? "先说这几条路" : "Start with these routes"}</div>
-        </div>
-
-        <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
-          {/* DeepSeek — first-class and the default */}
-          <div className="p-6">
-            <div className="flex items-baseline gap-2 mb-2">
-              <h2 className="font-display text-xl">DeepSeek</h2>
-              <span className="pill pill-hot text-[0.58rem]">{isZh ? "一级支持 · 默认" : "first-class · default"}</span>
-            </div>
-            <div className="font-mono text-[0.68rem] text-ink-mute mb-3 break-all">DEEPSEEK_API_KEY</div>
-            <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-              {isZh
-                ? `默认提供商，默认模型 ${facts.defaultModel ?? "deepseek-v4-pro"}。DeepSeek API（api.deepseek.com）中国大陆直连，无需代理。另有 deepseek-anthropic——DeepSeek 可选的 Messages-API 路由。`
-                : `The default provider, with ${facts.defaultModel ?? "deepseek-v4-pro"} as the default model. The DeepSeek API (api.deepseek.com) is reachable from mainland China without a proxy. There's also deepseek-anthropic, DeepSeek's opt-in Messages-API route.`}
-            </p>
-          </div>
-
-          {/* Local runtimes — no key at all */}
-          <div className="p-6">
-            <div className="flex items-baseline gap-2 mb-2">
-              <h2 className="font-display text-xl">{isZh ? "本地运行时" : "Local runtimes"}</h2>
-              <span className="pill pill-jade text-[0.58rem]">{isZh ? "无需密钥" : "no key at all"}</span>
-            </div>
-            <div className="font-mono text-[0.68rem] text-ink-mute mb-3 break-all">vllm · sglang · ollama</div>
-            <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-              {isZh
-                ? "vLLM、SGLang、Ollama——指向你自己的 localhost 端点即可，完全不需要密钥。权重在你的机器上，请求也不出你的机器。"
-                : "vLLM, SGLang, and Ollama against your own localhost endpoints — no key required. The weights are on your machine, and the requests never leave it."}
-            </p>
-          </div>
-
-          {/* OpenRouter — one key, many models */}
-          <div className="p-6">
-            <div className="flex items-baseline gap-2 mb-2">
-              <h2 className="font-display text-xl">OpenRouter</h2>
-              <span className="pill pill-ghost text-[0.58rem]">{isZh ? "一把密钥" : "one key"}</span>
-            </div>
-            <div className="font-mono text-[0.68rem] text-ink-mute mb-3 break-all">OPENROUTER_API_KEY</div>
-            <p className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-              {isZh
-                ? "一把密钥接入众多托管模型，想把开放模型挨个试一遍时最省事。路由仍然由你显式指定——OpenRouter 换的是端点，不是规则。"
-                : "One key that reaches many hosted models — the easiest way to try open models back to back. The route is still yours to set explicitly; OpenRouter changes the endpoint, not the rules."}
-            </p>
+    <div className="models-page">
+      <section className="hero">
+        <div className="portal-current" aria-hidden="true" />
+        <div className="portal-container community-welcome-inner">
+          <div className="eyebrow">{isZh ? "模型与提供商" : "Models and providers"}</div>
+          <h1>{isZh ? "选择模型和提供商。" : "Choose a model and provider."}</h1>
+          <p>
+            {isZh
+              ? `Codewhale 内置 ${facts.providers.length} 个提供商。你来选提供商、模型和端点；每一个都跑同一套本地运行时、工具和权限。托管提供商用你的凭据；本地 vLLM、SGLang 和 Ollama 通常不需要密钥。`
+              : `Codewhale ships with ${facts.providers.length} providers. You set the provider, model, and endpoint. Every one runs through the same local runtime, tools, and permissions. Hosted providers use your credentials; local vLLM, SGLang, and Ollama usually need no key.`}
+          </p>
+          <div className="portal-actions">
+            <Link href={providerDocs} className="portal-button portal-button-primary">
+              {isZh ? "阅读提供商文档" : "Read the provider docs"}
+            </Link>
+            <Link href={p("/install")} className="portal-button portal-button-secondary">
+              {isZh ? "安装 Codewhale" : "Install Codewhale"}
+            </Link>
           </div>
         </div>
       </section>
 
-      {/* THE REST OF THE REGISTRY */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
-        <div className="flex items-baseline gap-4 mb-3">
-          <Seal char="众" />
-          <div className="eyebrow">{isZh ? "其余提供商，一视同仁" : "The rest, as peers"}</div>
+      <section className="portal-section">
+        <div className="portal-container portal-section-grid">
+          <div className="portal-section-copy">
+            <span>{isZh ? "配置" : "Configuration"}</span>
+            <h2>{isZh ? "常用提供商" : "Common providers"}</h2>
+            <p>
+              {isZh
+                ? "托管提供商的密钥用 codewhale auth set 保存，或放进配置文件或环境变量。提供商和模型分开选；模型名不会改变提供商。"
+                : "Save a hosted provider's key with codewhale auth set, or set it in config or an environment variable. Provider and model are chosen separately; a model name never changes the provider."}
+            </p>
+          </div>
+          <div className="portal-topic-list">
+            {setupPatterns.map((pattern) => (
+              <Link key={pattern.title} href={p("/docs/configuration")}>
+                <strong>{pattern.title}</strong>
+                <span>{pattern.detail}</span>
+                <span className="font-mono break-all">{pattern.reference}</span>
+              </Link>
+            ))}
+          </div>
         </div>
-        <p className={`mb-6 max-w-2xl text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-          {isZh
-            ? "这份列表由仓库的提供商注册表生成，随发布同步。托管的、闭源的、实验性的，都走同一条审批、沙箱与回滚流水线。"
-            : "This list is generated from the repo's provider registry and tracks releases. Hosted, closed, or experimental — all of them go through the same approval, sandbox, and rollback pipeline."}
-        </p>
+      </section>
 
-        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-0 hairline-t hairline-l">
-          {peers.map((prov) => (
-            <div key={prov.id} className="p-4 hairline-b hairline-r">
-              <div className="font-display text-base mb-1">{prov.label}</div>
-              <div className="font-mono text-[0.66rem] text-indigo mb-1">{prov.id}</div>
-              <div className="font-mono text-[0.62rem] text-ink-mute break-all leading-relaxed">{prov.env}</div>
+      <section className="portal-section settings-preview" aria-labelledby="settings-preview-title">
+        <div className="portal-container">
+          <div className="settings-preview-heading">
+            <div>
+              <span>{isZh ? "设置界面" : "Settings surface"}</span>
+              <h2 id="settings-preview-title">
+                {isZh ? "只读设置预览" : "Read-only settings preview"}
+              </h2>
             </div>
-          ))}
-        </div>
+            <p>
+              {isZh
+                ? "这是 Codewhale 本地设置的只读预览，不会更改你的本地配置。"
+                : "A read-only view of Codewhale's local settings. It does not change your local configuration."}
+            </p>
+          </div>
 
-        <p className={`mt-6 max-w-2xl text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
-          {isZh ? (
-            <>
-              想要的提供商不在这里？<a href="https://github.com/Hmbown/CodeWhale/issues/new" className="body-link">这正是值得开的 issue</a>。凭据、base URL 和能力边界的完整注册表见{" "}
-              <a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md" className="body-link">docs/PROVIDERS.md</a>。
-            </>
-          ) : (
-            <>
-              Don&apos;t see the provider you want? <a href="https://github.com/Hmbown/CodeWhale/issues/new" className="body-link">That&apos;s a good issue to open</a>. The full registry — credentials, base URLs, capability boundaries — lives in{" "}
-              <a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md" className="body-link">docs/PROVIDERS.md</a>.
-            </>
-          )}
-        </p>
+          <div className="settings-shell">
+            <aside className="settings-rail" aria-label={isZh ? "设置区域" : "Settings areas"}>
+              <div className="settings-rail-title">{isZh ? "设置" : "Settings"}</div>
+              <ul>
+                <li className="settings-rail-item settings-rail-item-active">
+                  <span>{isZh ? "模型与提供商" : "Models & providers"}</span>
+                  <span>{isZh ? "当前" : "Current"}</span>
+                </li>
+                <li className="settings-rail-item">{isZh ? "运行时" : "Runtime"}</li>
+                <li className="settings-rail-item">{isZh ? "模式" : "Modes"}</li>
+                <li className="settings-rail-item">{isZh ? "权限" : "Permissions"}</li>
+                <li className="settings-rail-item">{isZh ? "工具与 MCP" : "Tools & MCP"}</li>
+              </ul>
+            </aside>
+
+            <div className="settings-pane">
+              <div className="settings-pane-heading">
+                <div>
+                  <span>{isZh ? "本地设置" : "Local settings"}</span>
+                  <h3>{isZh ? "模型与提供商" : "Models & providers"}</h3>
+                </div>
+                <span className="settings-readonly-badge">{isZh ? "只读" : "Read only"}</span>
+              </div>
+
+              <dl className="settings-default-model">
+                <div>
+                  <dt>{isZh ? "默认模型" : "Default model"}</dt>
+                  <dd>
+                    <code className="settings-provider-code">{facts.defaultModel ?? "—"}</code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>{isZh ? "提供商" : "Providers"}</dt>
+                  <dd>{facts.providers.length}</dd>
+                </div>
+              </dl>
+
+              <div className="settings-provider-heading">
+                <span>{isZh ? "提供商" : "Provider"}</span>
+                <span>{isZh ? "环境变量" : "Environment variable"}</span>
+              </div>
+              <ul className="settings-provider-list">
+                {facts.providers.map((provider) => (
+                  <li key={provider.id}>
+                    <div>
+                      <strong>{provider.label}</strong>
+                      <code className="settings-provider-code">{provider.id}</code>
+                    </div>
+                    <div className="settings-provider-auth">
+                      <span className="settings-registry-marker" aria-hidden="true" />
+                      <code className="settings-provider-code">{provider.env}</code>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+
+              <div className="settings-docs-action">
+                <p>
+                  {isZh
+                    ? "要在你的机器上设置提供商、模型、端点或凭据，请看配置文档。"
+                    : "To set a provider, model, endpoint, or credentials on your machine, see the configuration docs."}
+                </p>
+                <Link href={p("/docs/configuration")}>
+                  {isZh ? "打开配置文档 ↗" : "Open configuration docs ↗"}
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
-      {/* WHERE TO GO NEXT */}
-      <section className="mx-auto max-w-[1100px] px-6 py-8 hairline-t">
-        <div className="flex flex-wrap items-center gap-3">
-          <Link
-            href={p("/install")}
-            className="px-5 py-3 bg-ink text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo transition-colors"
-          >
-            {isZh ? "安装 →" : "Install →"}
-          </Link>
-          <Link
-            href={p("/docs#providers")}
-            className="px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider hover:bg-paper-deep transition-colors"
-          >
-            {isZh ? "配置密钥：文档 →" : "Key setup: docs →"}
-          </Link>
+      <section className="portal-section portal-section-muted">
+        <div className="portal-container">
+          <div className="portal-docs-heading">
+            <div>
+              <span>{isZh ? "完整列表" : "Full list"}</span>
+              <h2>{isZh ? "内置提供商" : "Built-in providers"}</h2>
+            </div>
+            <Link href={providerDocs}>{isZh ? "打开源文档 ↗" : "Open the source document ↗"}</Link>
+          </div>
+          <p className={`mb-6 max-w-3xl text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+            {isZh
+              ? "此列表由仓库中的提供商注册表生成，随发布更新。这里列出提供商 ID 和对应的环境变量；协议、默认端点、模型解析和认证优先级见 docs/PROVIDERS.md。"
+              : "Generated from the provider registry in the repository and updated with each release. It lists each provider ID and its environment variable. docs/PROVIDERS.md covers wire protocols, default endpoints, model resolution, and authentication precedence."}
+          </p>
+          <ul className="grid gap-3 sm:grid-cols-2">
+            {facts.providers.map((provider) => (
+              <li key={provider.id} className="flex items-start gap-3 border hairline rounded-lg bg-paper px-4 py-3 min-w-0">
+                <div className="min-w-0">
+                  <div className="text-sm text-ink font-medium">{provider.label}</div>
+                  <code className="font-mono text-[0.66rem] text-indigo break-all">{provider.id}</code>
+                  <div className="mt-1 font-mono text-[0.62rem] text-ink-mute break-all leading-relaxed">
+                    <code className="inline">{provider.env}</code>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <p className={`mt-6 max-w-3xl text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
+            {isZh ? (
+              <>
+                缺你要的提供商？{" "}
+                <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="body-link">提交 issue</Link>
+                ，写明端点、认证方式和模型能力。带注册表、文档和测试的 pull request 也欢迎。
+              </>
+            ) : (
+              <>
+                Missing a provider?{" "}
+                <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="body-link">File an issue</Link>
+                {" "}with its endpoint, authentication method, and model capabilities. Pull requests that update the registry, docs, and tests are welcome.
+              </>
+            )}
+          </p>
         </div>
       </section>
-    </>
+
+      <section className="portal-section">
+        <div className="portal-container">
+          <div className="portal-docs-heading">
+            <div>
+              <span>{isZh ? "默认值" : "Defaults"}</span>
+              <h2>{isZh ? "默认模型与 crate" : "Default model and crates"}</h2>
+            </div>
+          </div>
+          <div className="grid gap-8 sm:grid-cols-2">
+            <div>
+              <div className="eyebrow mb-1">{isZh ? "默认模型" : "Default model"}</div>
+              <code className="inline font-mono text-sm break-all">{facts.defaultModel ?? "—"}</code>
+            </div>
+            <div>
+              <div className="eyebrow mb-1">{isZh ? "Crates" : "Crates"}</div>
+              <ul className="flex flex-wrap gap-1.5">
+                {facts.crates.map((crate) => (
+                  <li key={crate}>
+                    <code className="inline font-mono text-[0.68rem] break-all">{crate}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }

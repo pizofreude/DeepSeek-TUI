@@ -4,7 +4,7 @@
 //! reason?" was answered by several hard-coded sites:
 //!
 //! * [`crate::models::context_window_for_model`] /
-//!   [`crate::models::known_context_window_for_model`] for context windows,
+//!   the models module's context-window lookup for context windows,
 //! * [`crate::models::max_output_tokens_for_model`] for output caps,
 //! * [`crate::models::model_supports_reasoning`] for the reasoning flag,
 //! * the `DEFAULT_*` model-id constants in `crates/config/src/lib.rs` for the
@@ -23,14 +23,13 @@
 //! `crate::models` functions, so the registry can never silently disagree with
 //! `models.rs`. The canonical model ids come from the same provider defaults
 //! the config crate ships (see [`SEED_MODEL_IDS`]). The
-//! [`tests::registry_context_window_matches_models_rs`] drift guard then
+//! The `registry_context_window_matches_models_rs` drift guard then
 //! re-asserts the equivalence for a sample so that if a future change replaces
 //! a seed with a hard-coded literal, CI catches the drift immediately.
 //!
-//! NOTE: the public surface here is intentionally not yet consumed by
-//! production call sites (consumers are wired in a later pass), so
-//! `dead_code` is allowed at the module level until then.
-#![allow(dead_code)]
+//! Production consumers: [`crate::model_profile`] (capability bridge),
+//! `crate::tui::model_picker` (picker hints), and
+//! [`crate::fleet::capability_badges`] (Fleet setup/roster badges, #5038).
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -66,12 +65,18 @@ pub enum ModelProvider {
     Qwen,
     /// Arcee Trinity models.
     Arcee,
+    /// Together-hosted models with provider-owned wire identities.
+    Together,
     /// Xiaomi MiMo models.
     XiaomiMimo,
     /// Meta Muse models.
     Meta,
     /// xAI / Grok models.
     Xai,
+    /// Mistral AI la Plateforme models.
+    Mistral,
+    /// Google Gemini models (official OpenAI-compatible route).
+    Google,
     /// Anything not otherwise classified (still gets real metadata via the
     /// `models.rs` heuristics where possible).
     Other,
@@ -115,7 +120,7 @@ impl ModelMetadata {
 ///
 /// These mirror the provider defaults shipped by `crates/config/src/lib.rs`
 /// (the `DEFAULT_*_MODEL` constants) plus the explicitly-enumerated models in
-/// [`crate::models::known_context_window_for_model`]. Keep this list curated:
+/// the models module's context-window lookup. Keep this list curated:
 /// it is the set of models we make first-class promises about. Unknown ids are
 /// still answered by [`lookup`] via the `models.rs` heuristics, they just are
 /// not pre-seeded here.
@@ -125,6 +130,7 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // Huggingface / Together / Volcengine / WanjieArk / Ollama defaults) ---
     ("deepseek-v4-pro", ModelProvider::DeepSeek),
     ("deepseek-v4-flash", ModelProvider::DeepSeek),
+    ("deepseek-v4-flash-vision-exp", ModelProvider::DeepSeek),
     ("deepseek-ai/deepseek-v4-pro", ModelProvider::DeepSeek),
     ("deepseek-ai/deepseek-v4-flash", ModelProvider::DeepSeek),
     ("deepseek/deepseek-v4-pro", ModelProvider::DeepSeek),
@@ -133,6 +139,7 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("deepseek-coder:1.3b", ModelProvider::DeepSeek),
     // --- Anthropic (config DEFAULT_ANTHROPIC_MODEL + models.rs rows) ---
     ("claude-opus-4-8", ModelProvider::Anthropic),
+    ("claude-opus-5", ModelProvider::Anthropic),
     ("claude-sonnet-4-6", ModelProvider::Anthropic),
     ("claude-sonnet-5", ModelProvider::Anthropic),
     ("claude-fable-5", ModelProvider::Anthropic),
@@ -145,9 +152,10 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("gpt-5.6-terra", ModelProvider::OpenAi),
     ("gpt-5.6-luna", ModelProvider::OpenAi),
     ("gpt-5-codex", ModelProvider::OpenAiCodex),
-    ("gpt-5.3-codex", ModelProvider::OpenAiCodex),
+    ("gpt-5.3-codex", ModelProvider::OpenAi),
     // --- Moonshot / Kimi (config DEFAULT_MOONSHOT_MODEL / KIMI_CODE) ---
     ("kimi-k2.7-code", ModelProvider::Moonshot),
+    ("kimi-k2.7-code-highspeed", ModelProvider::Moonshot),
     ("kimi-k2.6", ModelProvider::Moonshot),
     ("kimi-for-coding", ModelProvider::Moonshot),
     ("moonshotai/kimi-k2.7-code", ModelProvider::Moonshot),
@@ -155,8 +163,10 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- Z.ai GLM (config DEFAULT_ZAI_MODEL) ---
     ("z-ai/glm-5.1", ModelProvider::Zai),
     ("z-ai/glm-5.2", ModelProvider::Zai),
+    ("z-ai/glm-5.3", ModelProvider::Zai),
     ("glm-5.1", ModelProvider::Zai),
     ("glm-5.2", ModelProvider::Zai),
+    ("glm-5.3", ModelProvider::Zai),
     // --- MiniMax (config DEFAULT_MINIMAX_MODEL) ---
     ("minimax/minimax-m3", ModelProvider::Minimax),
     ("minimax-m3", ModelProvider::Minimax),
@@ -165,11 +175,14 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- Qwen (OpenRouter routing defaults) ---
     ("qwen/qwen3.6-flash", ModelProvider::Qwen),
     ("qwen/qwen3.6-plus", ModelProvider::Qwen),
+    ("qwen/qwen3.7-plus", ModelProvider::Qwen),
     ("qwen/qwen3.6-35b-a3b", ModelProvider::Qwen),
     // --- Arcee Trinity (config DEFAULT_ARCEE_MODEL) ---
     ("trinity-large-thinking", ModelProvider::Arcee),
     ("arcee-ai/trinity-large-thinking", ModelProvider::Arcee),
     ("trinity-mini", ModelProvider::Arcee),
+    // --- Together / Thinking Machines ---
+    ("thinkingmachines/inkling", ModelProvider::Together),
     // --- Sakana / Fugu (config DEFAULT_SAKANA_MODEL) ---
     ("fugu-ultra-20260615", ModelProvider::Other),
     ("fugu-ultra", ModelProvider::Other),
@@ -181,13 +194,32 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("mimo-v2.5", ModelProvider::XiaomiMimo),
     // --- Meta Model API (config DEFAULT_META_MODEL) ---
     ("muse-spark-1.1", ModelProvider::Meta),
+    ("muse-spark-1.2", ModelProvider::Meta),
+    ("muse-spark-1.2-contributor", ModelProvider::Meta),
     // --- xAI / Grok (config DEFAULT_XAI_MODEL) ---
+    ("grok-4.6", ModelProvider::Xai),
     ("grok-4.5", ModelProvider::Xai),
     ("grok-4.3", ModelProvider::Xai),
     ("grok-build", ModelProvider::Xai),
     ("grok-composer-2.5-fast", ModelProvider::Xai),
     ("grok-4.20-0309-reasoning", ModelProvider::Xai),
     ("grok-4.20-0309-non-reasoning", ModelProvider::Xai),
+    // --- Mistral AI (current first-party roster; deprecated Magistral remains
+    // accepted through the long-tail models.rs compatibility path) ---
+    // --- Google Gemini (official OpenAI-compatible route; preview flagships
+    // as listed by Google's model pages, 2026-08).
+    ("gemini-3.1-pro-preview", ModelProvider::Google),
+    ("gemini-3-pro-preview", ModelProvider::Google),
+    ("gemini-3.7-flash", ModelProvider::Google),
+    ("gemini-3.6-flash", ModelProvider::Google),
+    ("gemini-3.5-flash", ModelProvider::Google),
+    ("gemini-3.5-flash-lite", ModelProvider::Google),
+    ("gemini-2.5-pro", ModelProvider::Google),
+    ("gemini-2.5-flash", ModelProvider::Google),
+    ("mistral-code-latest", ModelProvider::Mistral),
+    ("mistral-medium-latest", ModelProvider::Mistral),
+    ("mistral-small-latest", ModelProvider::Mistral),
+    ("mistral-large-latest", ModelProvider::Mistral),
 ];
 
 fn registry() -> &'static BTreeMap<&'static str, ModelMetadata> {
@@ -265,6 +297,7 @@ mod tests {
             ("deepseek-v4-flash", Some(1_000_000)),
             ("deepseek-coder:1.3b", Some(128_000)),
             ("claude-opus-4-8", Some(1_000_000)),
+            ("claude-opus-5", Some(1_000_000)),
             ("claude-sonnet-4-6", Some(1_000_000)),
             ("claude-sonnet-5", Some(1_000_000)),
             ("claude-fable-5", Some(1_000_000)),
@@ -274,9 +307,11 @@ mod tests {
             ("gpt-5.6-terra", Some(1_050_000)),
             ("gpt-5-codex", Some(400_000)),
             ("kimi-k2.7-code", Some(262_144)),
+            ("kimi-k2.7-code-highspeed", Some(262_144)),
             ("kimi-k2.6", Some(262_144)),
             ("z-ai/glm-5.1", Some(202_752)),
             ("z-ai/glm-5.2", Some(1_000_000)),
+            ("z-ai/glm-5.3", Some(1_000_000)),
             ("minimax/minimax-m3", Some(1_000_000)),
             ("minimax-m2.7", Some(204_800)),
             ("qwen/qwen3.6-flash", Some(1_000_000)),
@@ -287,9 +322,18 @@ mod tests {
             ("mimo-v2.5-pro-ultraspeed", Some(1_000_000)),
             ("mimo-v2.5", Some(1_000_000)),
             ("muse-spark-1.1", Some(1_000_000)),
+            ("muse-spark-1.2", Some(1_000_000)),
+            ("muse-spark-1.2-contributor", Some(1_000_000)),
+            ("grok-4.6", Some(500_000)),
             ("grok-4.5", Some(500_000)),
             ("grok-4.3", Some(1_000_000)),
             ("grok-4.20-0309-reasoning", Some(2_000_000)),
+            ("gemini-3.7-flash", Some(1_048_576)),
+            ("gemini-3.1-pro-preview", Some(1_048_576)),
+            ("mistral-code-latest", Some(256_000)),
+            ("mistral-medium-latest", Some(262_144)),
+            ("mistral-small-latest", Some(262_144)),
+            ("mistral-large-latest", Some(262_144)),
         ];
         for (model, expected) in sample {
             let meta = lookup(model)
@@ -343,7 +387,7 @@ mod tests {
 
     #[test]
     fn xai_models_are_classified_as_xai() {
-        let meta = lookup("grok-4.5").expect("xAI default should be seeded");
+        let meta = lookup("grok-4.6").expect("xAI default should be seeded");
         assert_eq!(meta.provider, ModelProvider::Xai);
         assert_eq!(meta.context_window, Some(500_000));
         assert!(meta.supports_reasoning);
@@ -355,12 +399,56 @@ mod tests {
     }
 
     #[test]
+    fn mistral_models_are_classified_with_truthful_reasoning() {
+        for (id, expected_reasoning) in [
+            ("mistral-code-latest", false),
+            ("mistral-medium-latest", true),
+            ("mistral-small-latest", true),
+            ("mistral-large-latest", false),
+        ] {
+            let meta = lookup(id).expect("Mistral model should be seeded");
+            assert_eq!(meta.provider, ModelProvider::Mistral, "{id}");
+            assert_eq!(meta.supports_reasoning, expected_reasoning, "{id}");
+        }
+    }
+
+    #[test]
     fn meta_muse_spark_is_classified_as_meta() {
         let meta = lookup("muse-spark-1.1").expect("Muse Spark default should be seeded");
         assert_eq!(meta.provider, ModelProvider::Meta);
         assert_eq!(meta.context_window, Some(1_000_000));
         assert_eq!(meta.max_output, Some(32_000));
         assert!(meta.supports_reasoning);
+        for id in ["muse-spark-1.2", "muse-spark-1.2-contributor"] {
+            let m = lookup(id).unwrap_or_else(|| panic!("{id} should be seeded"));
+            assert_eq!(m.provider, ModelProvider::Meta);
+            assert_eq!(m.context_window, Some(1_000_000));
+            assert!(m.supports_reasoning);
+        }
+    }
+
+    #[test]
+    fn v090_model_metadata_is_provider_correct_and_conservative() {
+        let gpt = lookup("gpt-5.3-codex").expect("GPT-5.3 Codex seed");
+        assert_eq!(gpt.provider, ModelProvider::OpenAi);
+
+        let qwen = lookup("qwen/qwen3.7-plus").expect("Qwen 3.7 Plus seed");
+        assert_eq!(qwen.provider, ModelProvider::Qwen);
+        assert_eq!(qwen.context_window, None);
+        assert_eq!(qwen.max_output, None);
+        assert!(qwen.supports_reasoning);
+
+        let trinity = lookup("trinity-mini").expect("Trinity Mini seed");
+        assert_eq!(trinity.provider, ModelProvider::Arcee);
+        assert_eq!(trinity.context_window, Some(128_000));
+        assert_eq!(trinity.max_output, None);
+        assert!(trinity.supports_reasoning);
+
+        let inkling = lookup("thinkingmachines/inkling").expect("Inkling seed");
+        assert_eq!(inkling.provider, ModelProvider::Together);
+        assert_eq!(inkling.context_window, None);
+        assert_eq!(inkling.max_output, None);
+        assert!(inkling.supports_reasoning);
     }
 
     #[test]

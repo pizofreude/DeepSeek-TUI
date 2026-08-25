@@ -1,27 +1,32 @@
 import type { Metadata } from "next";
-import { IBM_Plex_Sans, JetBrains_Mono, Noto_Serif_SC, Space_Grotesk } from "next/font/google";
+import { Fraunces, IBM_Plex_Sans, JetBrains_Mono, Noto_Serif_SC } from "next/font/google";
 import { Nav } from "@/components/nav";
 import { Footer } from "@/components/footer";
-import { locales, type Locale } from "@/lib/i18n/config";
+import { localeDirection, locales, type Locale } from "@/lib/i18n/config";
+import { getChrome, getHome } from "@/lib/i18n/dictionaries";
+import { serializeJsonLd } from "@/lib/json-ld";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { buildSiteJsonLd } from "@/lib/site-schema";
 import "../globals.css";
 
-const display = Space_Grotesk({
-  subsets: ["latin"],
+// Fraunces is the newspaper-era display face the community asked to keep —
+// crisp, editorial, a little futuristic. Body stays IBM Plex for instrument feel.
+const display = Fraunces({
+  subsets: ["latin", "vietnamese"],
   weight: ["400", "500", "600", "700"],
   variable: "--font-display",
   display: "swap",
 });
 
 const body = IBM_Plex_Sans({
-  subsets: ["latin"],
+  subsets: ["latin", "cyrillic", "vietnamese"],
   weight: ["400", "500", "600"],
   variable: "--font-body",
   display: "swap",
 });
 
 const mono = JetBrains_Mono({
-  subsets: ["latin"],
+  subsets: ["latin", "cyrillic"],
   weight: ["400", "500", "600"],
   variable: "--font-mono",
   display: "swap",
@@ -42,16 +47,12 @@ export function generateStaticParams() {
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const home = getHome(locale);
   return buildPageMetadata({
     path: "/",
     locale,
-    title: isZh
-      ? "Codewhale 文档与开源运行时"
-      : "Codewhale documentation and open-source runtime",
-    description: isZh
-      ? "安装 Codewhale，并查找有关模式、权限、工具、提供商、配置、运行时 API 和社区贡献的准确文档。"
-      : "Install Codewhale and find precise documentation for modes, permissions, tools, providers, configuration, the runtime API, and community contributions.",
+    title: home.metaTitle,
+    description: home.metaDescription,
   });
 }
 
@@ -63,14 +64,24 @@ export default async function LocaleLayout({
   params: Promise<{ locale: string }>;
 }) {
   const { locale } = await params;
+  const chrome = getChrome(locale);
+  // RTL locales (e.g. ar) set the document direction from the canonical
+  // registry so the browser handles bidirectional layout from the root.
+  const dir = localeDirection(locale);
+  const siteJsonLd = buildSiteJsonLd(locale);
 
   return (
     <html
-      lang={locale === "zh" ? "zh" : "en"}
+      lang={locale}
+      dir={dir}
       className={`${display.variable} ${body.variable} ${mono.variable} ${cjk.variable}`}
       suppressHydrationWarning
     >
       <body>
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: serializeJsonLd(siteJsonLd) }}
+        />
         {/* Apply the persisted docs theme before paint so there is no flash.
             "auto" leaves data-theme unset and defers to prefers-color-scheme. */}
         <script
@@ -79,8 +90,11 @@ export default async function LocaleLayout({
               "(function(){try{var t=localStorage.getItem('cw-theme');if(t==='light'||t==='dark'){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();",
           }}
         />
+        <a href="#main-content" className="skip-link">
+          {chrome.skipToContent}
+        </a>
         <Nav locale={locale as Locale} />
-        <main>{children}</main>
+        <main id="main-content">{children}</main>
         <Footer locale={locale as Locale} />
       </body>
     </html>

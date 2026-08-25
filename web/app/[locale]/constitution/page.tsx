@@ -11,7 +11,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     locale,
     title: isZh ? "三层法 · Codewhale" : "Three layers of law · Codewhale",
     description: isZh
-      ? "Codewhale 的嵌套宪法：内置基础法、你的常备法（/constitution）、仓库自己的法（.codewhale/constitution.json）。位阶由执行框架强制生效，换掉模型也不失效。"
+      ? "Codewhale 的嵌套宪章：内置基础法、你的常备法（/constitution）、仓库自己的法（.codewhale/constitution.json）。位阶由执行框架强制生效，换掉模型也不失效。"
       : "Codewhale's nested constitution: bundled base law, your standing law (/constitution), and your repo's law (.codewhale/constitution.json). Rank is enforced in the harness and survives a model swap.",
   });
 }
@@ -20,7 +20,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 const LAYERS = [
   {
     n: "01",
-    name: { en: "Bundled Constitution", zh: "内置宪法" },
+    name: { en: "Bundled Constitution", zh: "内置宪章" },
     path: "compiled into every binary",
     pathZh: "编译进每一个二进制",
     en: "The base law. Its priority article fixes the authority order for any conflict, so a stale handoff can never outrank a fresh test result by accident.",
@@ -52,7 +52,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
   return (
     <>
       {/* THE THESIS */}
-      <section className="mx-auto max-w-[1100px] px-6 pt-12 pb-10">
+      <section className="site-container section">
         <div className="flex items-baseline gap-4 mb-3">
           <Seal char="法" />
           <div className="eyebrow">{isZh ? "立论" : "The thesis"}</div>
@@ -65,23 +65,23 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
         </h1>
         <p className={`max-w-2xl text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
           {isZh
-            ? "项目一变老，指令就开始堆积、彼此冲突：最初的规格、后来推翻它的重构、陈旧的记忆、上一个智能体的交接、你此刻的要求、刚跑出的与交接说法不符的测试结果。扁平的系统提示词让模型靠猜来化解；Codewhale 用一部嵌套的宪法给出明确的位阶。顺序由执行框架强制生效——有测试断言它不会漂移——换掉模型，结构依然完好。"
+            ? "项目一变老，指令就开始堆积、彼此冲突：最初的规格、后来推翻它的重构、陈旧的记忆、上一个智能体的交接、你此刻的要求、刚跑出的与交接说法不符的测试结果。扁平的系统提示词让模型靠猜来化解；Codewhale 用一部嵌套的宪章给出明确的位阶。顺序由执行框架强制生效——有测试断言它不会漂移——换掉模型，结构依然完好。"
             : "As a project ages, instructions pile up and conflict: the original spec, a refactor that contradicts it, stale memory, a previous agent's handoff, your current request, fresh test output that doesn't match what the handoff claimed. A flat system prompt makes the model resolve that by guess. Codewhale uses a nested constitution so there is a defined rank instead of vibes — the order is enforced in the harness, with tests asserting it can't drift, and it stays intact when you swap models."}
         </p>
 
-        {/* v0.8.68 flagship framing */}
+        {/* v0.9.0 flagship framing */}
         <div className="mt-7 max-w-2xl px-4 py-3 hairline-t hairline-b hairline-l hairline-r">
-          <span className="pill pill-new mr-2">{isZh ? "v0.8.68 新增" : "New in v0.8.68"}</span>
+          <span className="pill pill-new mr-2">{isZh ? "v0.9.0 新增" : "New in v0.9.0"}</span>
           <span className={`text-sm text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
             {isZh
-              ? "宪法优先的初始设置——首次启动依次引导语言、模型、安全姿态和你的宪法；之后随时 /setup。模型可以起草，由你批准。"
+              ? "宪章优先的初始设置——首次启动依次引导语言、模型、安全姿态和你的宪章；之后随时 /setup。模型可以起草，由你批准。"
               : "Constitution-first setup — first launch walks language, model, posture, and your constitution; /setup any time. The model can draft it. You ratify it."}
           </span>
         </div>
       </section>
 
       {/* THE THREE LAYERS */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
+      <section className="site-container py-10 hairline-t">
         <div className="flex items-baseline gap-4 mb-6">
           <Seal char="序" />
           <div className="eyebrow">{isZh ? "位阶，从最稳到最活" : "The rank, most-static first"}</div>
@@ -113,14 +113,14 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
           <div className="eyebrow mb-1.5">{isZh ? "诚实的边界" : "The honest boundary"}</div>
           <p className={`text-ink-soft ${isZh ? "leading-[1.9] tracking-wide" : "leading-relaxed"}`}>
             {isZh
-              ? "审批、沙箱、网络与信任控制由代码强制执行——宪法文本永远越不过它们。"
+              ? "审批、沙箱、网络与信任控制由代码强制执行——宪章文本永远越不过它们。"
               : "Approval, sandbox, network, and trust controls are enforced in code — constitution text never overrides them."}
           </p>
         </div>
       </section>
 
       {/* OBSERVABLE IN THE REASONING */}
-      <section className="mx-auto max-w-[1100px] px-6 py-10 hairline-t">
+      <section className="site-container py-10 hairline-t">
         <div className="flex items-baseline gap-4 mb-3">
           <Seal char="证" />
           <div className="eyebrow">{isZh ? "在推理里可以被看到" : "Observable in the reasoning"}</div>
@@ -134,7 +134,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
       </section>
 
       {/* WHERE TO GO NEXT */}
-      <section className="mx-auto max-w-[1100px] px-6 py-8 hairline-t">
+      <section className="site-container py-8 hairline-t">
         <div className="flex flex-wrap items-center gap-3">
           <Link
             href={p("/install")}

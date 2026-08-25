@@ -1,4 +1,4 @@
-//! DeepSeek color palette and semantic roles.
+//! Codewhale color palette and semantic roles.
 //!
 //! This module defines the color system for the TUI in three layers:
 //!
@@ -10,9 +10,13 @@
 //!    delegate to the current Whale palette constants.
 
 mod adapt;
+mod contrast;
 mod detect;
+pub mod grammar;
+mod osc11;
 mod themes;
 mod tokens;
+mod user_theme;
 
 #[cfg(test)]
 mod tests;
@@ -20,7 +24,14 @@ mod tests;
 #[allow(unused_imports)]
 pub use adapt::*;
 #[allow(unused_imports)]
+pub use contrast::*;
+#[allow(unused_imports)]
 pub use detect::*;
+#[allow(unused_imports)]
+pub use grammar::{ChromeInk, SemanticFamily, chrome_style};
+#[allow(unused_imports)]
+pub use osc11::*;
 #[allow(unused_imports)]
 pub use themes::*;
 pub use tokens::*;
+pub use user_theme::*;

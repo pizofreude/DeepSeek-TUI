@@ -18,6 +18,38 @@ use crate::models::{MessageRequest, MessageResponse};
 pub trait ModelClient: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model(&self) -> &str;
+    /// Concrete route base for billing classification, when this client can
+    /// prove one. Provider-neutral injected clients leave it unknown.
+    fn billing_base_url(&self) -> Option<&str> {
+        None
+    }
+    fn route_limits(&self) -> Option<codewhale_config::route::RouteLimits> {
+        None
+    }
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        let route = self.effective_route_envelope(requested_model, chrono::Utc::now());
+        crate::route_budget::effective_max_output_tokens_for_route(
+            route.provider,
+            &route.model,
+            self.route_limits(),
+        )
+    }
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        let provider = crate::config::ApiProvider::parse(self.provider_name())
+            .unwrap_or(crate::config::ApiProvider::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture(
+            None,
+            provider,
+            self.provider_name(),
+            requested_model,
+            self.billing_base_url(),
+            dispatched_at,
+        )
+    }
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse>;
     async fn create_message_stream(&self, request: MessageRequest) -> Result<StreamEventBox>;
     async fn health_check(&self) -> Result<bool>;
@@ -39,6 +71,26 @@ where
 
     fn model(&self) -> &str {
         LlmClient::model(self)
+    }
+
+    fn billing_base_url(&self) -> Option<&str> {
+        LlmClient::billing_base_url(self)
+    }
+
+    fn route_limits(&self) -> Option<codewhale_config::route::RouteLimits> {
+        LlmClient::route_limits(self)
+    }
+
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        LlmClient::effective_max_output_tokens(self, requested_model)
+    }
+
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        LlmClient::effective_route_envelope(self, requested_model, dispatched_at)
     }
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {

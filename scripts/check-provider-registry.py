@@ -143,14 +143,23 @@ def provider_kind_ids(config_rs: str) -> dict[str, str]:
         provider_rs,
     )
     ids: dict[str, str] = {variant: provider_id for variant, provider_id in pairs}
-    # OpenaiCodex, Anthropic, DeepseekAnthropic, and MinimaxAnthropic use
-    # manual impls rather than the provider!() macro.
+    # Providers with non-fixed wire policy or custom auth behavior use manual
+    # impls rather than the provider!() macro.
     for variant_name, id_literal in [
+        ("Deepseek", "deepseek"),
         ("DeepseekAnthropic", "deepseek-anthropic"),
         ("OpenaiCodex", "openai-codex"),
         ("Anthropic", "anthropic"),
         ("Openmodel", "openmodel"),
         ("MinimaxAnthropic", "minimax-anthropic"),
+        ("OpencodeZen", "opencode-zen"),
+        # Alibaba Model Studio ships four plan/dialect identities, each with a
+        # hand-written impl Provider for the same reason as the rows above:
+        # the wire policy is not fixed, so provider!() cannot express them.
+        ("ModelstudioTokenPlan", "modelstudio-token-plan"),
+        ("ModelstudioTokenPlanAnthropic", "modelstudio-token-plan-anthropic"),
+        ("ModelstudioCodingPlan", "modelstudio-coding-plan"),
+        ("ModelstudioCodingPlanAnthropic", "modelstudio-coding-plan-anthropic"),
     ]:
         match = re.search(
             rf'impl\s+Provider\s+for\s+{variant_name}.*?fn\s+id.*?\"({id_literal})\"',

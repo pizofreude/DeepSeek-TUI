@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::tui::app::ReasoningEffort;
+
 #[allow(unused_imports)]
 pub use codewhale_config::{
     FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions, FleetRole, FleetSlot,
@@ -16,18 +18,69 @@ pub use codewhale_config::{
 pub use super::roster::ProfileOrigin;
 
 pub const WORKSPACE_AGENT_PROFILE_DIR: &str = ".codewhale/agents";
+pub const PERSONAL_AGENT_PROFILE_DIR: &str = "agents";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetProfileScope {
+    Project,
+    Personal,
+}
+
+impl FleetProfileScope {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Personal => "personal",
+        }
+    }
+
+    #[must_use]
+    pub fn display_dir(self) -> &'static str {
+        match self {
+            Self::Project => WORKSPACE_AGENT_PROFILE_DIR,
+            Self::Personal => "$CODEWHALE_HOME/agents",
+        }
+    }
+
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Project => Self::Personal,
+            Self::Personal => Self::Project,
+        }
+    }
+}
+
+pub fn personal_agent_profile_dir() -> Result<PathBuf> {
+    Ok(codewhale_config::codewhale_home()?.join(PERSONAL_AGENT_PROFILE_DIR))
+}
+
+pub fn agent_profile_dir_for_scope(scope: FleetProfileScope, workspace: &Path) -> Result<PathBuf> {
+    match scope {
+        FleetProfileScope::Project => Ok(workspace.join(WORKSPACE_AGENT_PROFILE_DIR)),
+        FleetProfileScope::Personal => personal_agent_profile_dir(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProfile {
     pub id: String,
     pub display_name: Option<String>,
     pub description: Option<String>,
+    /// Closed capability requirements carried by selected v2 Fleet members.
+    /// Legacy/profile sources leave this empty; consumers must never infer a
+    /// capability from the member name or model prefix.
+    pub requires: Vec<String>,
     pub profile: FleetProfile,
     pub source: PathBuf,
     /// Roster layer this profile came from (#fleet-roster cutover (v0.8.67)).
     /// File-based loading in this module always yields `Workspace`; the
     /// roster stamps `BuiltIn` / `Config` for the other layers.
     pub origin: ProfileOrigin,
+    /// Runtime authority for a profile loaded from an immutable plugin
+    /// snapshot. Rechecked at Agent spawn so another process can revoke it.
+    pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
 }
 
 /// The minimum profile information needed to prevent a save from clobbering
@@ -127,7 +180,19 @@ pub fn load_workspace_agent_profiles_tolerant(
     workspace: impl AsRef<Path>,
 ) -> Result<(Vec<AgentProfile>, Vec<String>)> {
     let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
-    let paths = agent_profile_paths(&dir)?;
+    load_agent_profiles_from_dir_tolerant(dir, ProfileOrigin::Workspace)
+}
+
+pub fn load_personal_agent_profiles_tolerant() -> Result<(Vec<AgentProfile>, Vec<String>)> {
+    load_agent_profiles_from_dir_tolerant(personal_agent_profile_dir()?, ProfileOrigin::Personal)
+}
+
+pub fn load_agent_profiles_from_dir_tolerant(
+    dir: impl AsRef<Path>,
+    origin: ProfileOrigin,
+) -> Result<(Vec<AgentProfile>, Vec<String>)> {
+    let dir = dir.as_ref();
+    let paths = agent_profile_paths(dir)?;
     let mut profiles = Vec::new();
     let mut issues = Vec::new();
     let mut seen = BTreeSet::new();
@@ -159,11 +224,40 @@ pub fn load_workspace_agent_profiles_tolerant(
             continue;
         }
         match load_agent_profile_file(&path) {
-            Ok(profile) => profiles.push(profile),
+            Ok(mut profile) => {
+                profile.origin = origin;
+                profiles.push(profile);
+            }
             Err(err) => issues.push(format!("{err:#}")),
         }
     }
 
+    Ok((profiles, issues))
+}
+
+pub(crate) fn load_plugin_agent_profiles_from_component(
+    component: &Path,
+    authority: &crate::plugins::types::PluginAuthority,
+) -> Result<(Vec<AgentProfile>, Vec<String>)> {
+    let (mut profiles, issues) = if component.is_dir() {
+        load_agent_profiles_from_dir_tolerant(component, ProfileOrigin::Plugin)?
+    } else if component.is_file() {
+        match load_agent_profile_file(component) {
+            Ok(mut profile) => {
+                profile.origin = ProfileOrigin::Plugin;
+                (vec![profile], Vec::new())
+            }
+            Err(error) => (Vec::new(), vec![format!("{error:#}")]),
+        }
+    } else {
+        return Err(anyhow!(
+            "plugin Agent component is unavailable: {}",
+            component.display()
+        ));
+    };
+    for profile in &mut profiles {
+        profile.plugin_authority = Some(authority.clone());
+    }
     Ok((profiles, issues))
 }
 
@@ -174,7 +268,14 @@ pub fn load_workspace_agent_profile_identities(
     workspace: impl AsRef<Path>,
 ) -> Result<Vec<AgentProfileIdentity>> {
     let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
-    agent_profile_paths(&dir)?
+    load_agent_profile_identities_from_dir(dir)
+}
+
+pub fn load_agent_profile_identities_from_dir(
+    dir: impl AsRef<Path>,
+) -> Result<Vec<AgentProfileIdentity>> {
+    let dir = dir.as_ref();
+    agent_profile_paths(dir)?
         .into_iter()
         .map(|path| load_agent_profile_identity_file(&path))
         .collect()
@@ -253,13 +354,14 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
         .to_string();
     validate_agent_profile_token(path, "id/name", &id)?;
 
-    let role_name = first_present([
-        parsed.base_role.as_deref(),
-        parsed.role_hint.as_deref(),
-        parsed.name.as_deref(),
-    ])
-    .unwrap_or(&id)
-    .to_string();
+    let role_name = canonical_public_role_name(
+        first_present([
+            parsed.base_role.as_deref(),
+            parsed.role_hint.as_deref(),
+            parsed.name.as_deref(),
+        ])
+        .unwrap_or(&id),
+    );
     validate_agent_profile_token(path, "base_role/role_hint", &role_name)?;
 
     let loadout = first_present([parsed.loadout.as_deref()])
@@ -302,10 +404,24 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
         id,
         display_name: non_empty_trimmed(parsed.display_name.as_deref()).map(str::to_string),
         description,
+        requires: Vec::new(),
         profile,
         source: path.to_path_buf(),
         origin: ProfileOrigin::Workspace,
+        plugin_authority: None,
     })
+}
+
+/// Canonicalize renamed public Fleet roles at profile load boundaries.
+///
+/// Profile ids remain untouched so an older file can still be addressed by
+/// its saved id. Only the semantic role is migrated; every new receipt and UI
+/// label derived from it therefore says `consultant`.
+pub(crate) fn canonical_public_role_name(role: &str) -> String {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "oracle" | "advisor" => "consultant".to_string(),
+        _ => role.to_string(),
+    }
 }
 
 fn reject_permission_expansion(
@@ -404,20 +520,20 @@ fn normalize_agent_profile_reasoning_effort(
     let Some(value) = non_empty_trimmed(value) else {
         return Ok(None);
     };
-    let normalized = match value.to_ascii_lowercase().as_str() {
-        "inherit" | "parent" | "same" | "current" | "default" | "unset" => return Ok(None),
-        "off" | "disabled" | "none" | "false" => "off",
-        "low" | "minimal" => "low",
-        "medium" | "mid" => "medium",
-        "high" => "high",
-        "auto" | "automatic" => "auto",
-        "max" | "maximum" | "xhigh" | "ultracode" => "max",
-        _ => bail!(
-            "agent profile {} reasoning_effort {value:?} must be one of: inherit, auto, off, low, medium, high, max",
-            path.display()
-        ),
-    };
-    Ok(Some(normalized.to_string()))
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "same" | "current" | "default" | "unset"
+    ) {
+        return Ok(None);
+    }
+    ReasoningEffort::parse_strict(value)
+        .map(|effort| Some(effort.as_setting().to_string()))
+        .map_err(|_| {
+            anyhow!(
+                "agent profile {} reasoning_effort {value:?} must be one of: inherit, auto, off, low, medium, high, max",
+                path.display()
+            )
+        })
 }
 
 fn is_agent_profile_token_char(ch: char) -> bool {
@@ -540,7 +656,7 @@ impl FleetProfileDraft {
             .and_then(trimmed_non_empty)
             .map(sanitize_profile_token)
         {
-            Some(token) if !token.is_empty() => token,
+            Some(token) if !token.is_empty() => canonical_public_role_name(&token),
             _ => return UntrustedProfileParse::Invalid("role_hint missing".to_string()),
         };
         let id = parsed
@@ -888,7 +1004,7 @@ mod tests {
             r#"
 id = "scout"
 role_hint = "scout"
-thinking = "xhigh"
+thinking = "ultracode"
 
 [instructions]
 text = "Scout deeply."
@@ -897,7 +1013,40 @@ text = "Scout deeply."
 
         let profiles = load_agent_profiles_from_dir(dir.path()).expect("profile TOML loads");
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].profile.reasoning_effort.as_deref(), Some("max"));
+        // `xhigh` used to land here too; the thinking ladder made it a rung of
+        // its own, so `ultracode` is the alias left to exercise.
+        assert_eq!(
+            profiles[0].profile.reasoning_effort.as_deref(),
+            Some("ultra")
+        );
+    }
+
+    #[test]
+    fn profile_loader_migrates_advisory_role_aliases_to_consultant() {
+        let dir = tempfile::tempdir().unwrap();
+        for alias in ["oracle", "advisor"] {
+            let path = dir.path().join(format!("{alias}.toml"));
+            std::fs::write(
+                &path,
+                format!("id = \"{alias}\"\nrole_hint = \"{alias}\"\n"),
+            )
+            .unwrap();
+            let loaded = load_agent_profile_file(&path).expect("load compatibility profile");
+            assert_eq!(loaded.id, alias, "saved identity remains addressable");
+            assert_eq!(loaded.profile.role.name, "consultant");
+            assert_eq!(loaded.profile.slot.as_str(), "consultant");
+        }
+    }
+
+    #[test]
+    fn model_draft_migrates_advisory_role_alias_to_consultant() {
+        let UntrustedProfileParse::Drafted(draft) = FleetProfileDraft::from_untrusted_json(
+            r#"{"id":"second-opinion","role_hint":"oracle","description":"Counsel."}"#,
+        ) else {
+            panic!("expected a drafted profile");
+        };
+        assert_eq!(draft.role_hint, "consultant");
+        assert!(draft.render_toml().contains("role_hint = \"consultant\""));
     }
 
     #[test]

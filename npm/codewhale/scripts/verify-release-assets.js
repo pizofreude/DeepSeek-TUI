@@ -1,16 +1,22 @@
 const https = require("https");
 const http = require("http");
 const {
-  allAssetNames,
   allReleaseAssetNames,
+  BUNDLE_ASSET_NAMES,
+  BUNDLE_CHECKSUM_MANIFEST,
+  checksummedReleaseAssetNames,
   checksumManifestUrl,
+  CNB_BINARY_ASSET_NAMES,
+  CNB_RELEASE_ASSET_NAMES,
   releaseAssetUrl,
+  usesCnbMirror,
 } = require("./artifacts");
 
 const pkg = require("../package.json");
 
 function resolveBinaryVersion() {
   const configuredVersion =
+    process.env.CODEWHALE_VERSION ||
     process.env.DEEPSEEK_TUI_VERSION ||
     process.env.DEEPSEEK_VERSION ||
     pkg.codewhaleBinaryVersion || pkg.deepseekBinaryVersion ||
@@ -19,7 +25,12 @@ function resolveBinaryVersion() {
 }
 
 function resolveRepo() {
-  return process.env.DEEPSEEK_TUI_GITHUB_REPO || process.env.DEEPSEEK_GITHUB_REPO || "Hmbown/CodeWhale";
+  return (
+    process.env.CODEWHALE_GITHUB_REPO ||
+    process.env.DEEPSEEK_TUI_GITHUB_REPO ||
+    process.env.DEEPSEEK_GITHUB_REPO ||
+    "Hmbown/CodeWhale"
+  );
 }
 
 function hasReleaseBaseOverride() {
@@ -203,22 +214,45 @@ async function resolveTagCommitSha(repo, tag) {
   return tagObject.object.sha;
 }
 
-async function findReleaseWorkflowRun(repo, tag, tagSha) {
-  const runs = await githubApi(repo, "/actions/workflows/release.yml/runs?per_page=100");
-  const matches = (runs.workflow_runs || [])
+async function findReleaseWorkflowRun(repo, tag, tagSha, api = githubApi) {
+  const runs = await api(repo, "/actions/workflows/release.yml/runs?per_page=100");
+  const candidates = (runs.workflow_runs || [])
     .filter((run) => run.head_sha === tagSha)
-    .filter((run) => run.conclusion === "success")
     .filter((run) => run.event === "push" || run.event === "workflow_dispatch")
     .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
-  const tagBranchMatch = matches.find((run) => run.head_branch === tag);
-  const match = tagBranchMatch || matches[0];
-  if (!match) {
+
+  const orderedCandidates = [
+    ...candidates.filter((run) => run.head_branch === tag),
+    ...candidates.filter((run) => run.head_branch !== tag),
+  ];
+  for (const candidate of orderedCandidates) {
+    const runId = candidate.database_id || candidate.id;
+    if (!runId) {
+      continue;
+    }
+    const jobs = await api(repo, `/actions/runs/${runId}/jobs?per_page=100`);
+    const releaseJob = (jobs.jobs || []).find(
+      (job) => job.name === "release" && job.conclusion === "success",
+    );
+    if (releaseJob) {
+      // #5429: pin asset freshness to the successful release job's own
+      // started_at, not the run-level run_started_at. A job-level rerun
+      // (`gh run rerun --failed`) bumps run_started_at past the asset upload
+      // timestamps even though this release job produced those assets.
+      return { ...candidate, release_job_started_at: releaseJob.started_at || null };
+    }
+  }
+
+  if (orderedCandidates.length === 0) {
     throw new Error(
-      `No successful release.yml workflow run found for ${tag} at ${tagSha}. ` +
+      `No release.yml workflow run found for ${tag} at ${tagSha}. ` +
         "Rerun the Release workflow before publishing npm, or increase the verifier's last-100-runs search window.",
     );
   }
-  return match;
+  throw new Error(
+    `No successful asset-publishing job found in release.yml workflow runs for ${tag} at ${tagSha}. ` +
+      "Repair the Release workflow before publishing npm.",
+  );
 }
 
 function parseGitHubTime(value, label) {
@@ -233,10 +267,15 @@ function assertReleaseAssetsFresh(release, expectedAssets, run) {
   const assetsByName = new Map((release.assets || []).map((asset) => [asset.name, asset]));
   const missing = expectedAssets.filter((asset) => !assetsByName.has(asset));
   if (missing.length > 0) {
-    throw new Error(`GitHub Release is missing required npm-facing asset(s): ${missing.join(", ")}`);
+    throw new Error(`GitHub Release is missing required release asset(s): ${missing.join(", ")}`);
   }
 
-  const runStartedAt = parseGitHubTime(run.run_started_at || run.created_at, "workflow run start");
+  // #5429: compare against the successful release job's started_at when the
+  // run record carries it; fall back to the run-level timestamp only when a
+  // job baseline is unavailable.
+  const baseline = run.release_job_started_at || run.run_started_at || run.created_at;
+  const baselineLabel = run.release_job_started_at ? "release job start" : "workflow run start";
+  const freshnessBaseline = parseGitHubTime(baseline, baselineLabel);
   const stale = [];
   for (const expected of expectedAssets) {
     const asset = assetsByName.get(expected);
@@ -245,7 +284,7 @@ function assertReleaseAssetsFresh(release, expectedAssets, run) {
       continue;
     }
     const updatedAt = parseGitHubTime(asset.updated_at || asset.created_at, `${expected} update`);
-    if (updatedAt < runStartedAt) {
+    if (updatedAt < freshnessBaseline) {
       stale.push(`${expected} updated at ${asset.updated_at || asset.created_at}`);
     }
   }
@@ -264,7 +303,7 @@ async function verifyGitHubReleaseFreshness(repo, version, expectedAssets) {
   const run = await findReleaseWorkflowRun(repo, tag, tagSha);
   assertReleaseAssetsFresh(release, expectedAssets, run);
   console.log(
-    `GitHub release asset freshness OK: ${expectedAssets.length} npm-facing assets for ${tag} were produced by run ${run.database_id || run.id} at ${tagSha.slice(0, 12)}.`,
+    `GitHub release asset freshness OK: ${expectedAssets.length} release assets for ${tag} were produced by run ${run.database_id || run.id} at ${tagSha.slice(0, 12)}.`,
   );
 }
 
@@ -284,10 +323,18 @@ function parseChecksumManifest(text) {
   return checksums;
 }
 
+function assertChecksumManifestIncludes(checksums, expectedAssets, label) {
+  const missing = expectedAssets.filter((asset) => !checksums.has(asset));
+  if (missing.length > 0) {
+    throw new Error(`${label} is missing ${missing.join(", ")}`);
+  }
+}
+
 async function run() {
   const version = resolveBinaryVersion();
   const repo = resolveRepo();
-  const assets = allReleaseAssetNames();
+  const cnbMirror = usesCnbMirror();
+  const assets = cnbMirror ? CNB_RELEASE_ASSET_NAMES : allReleaseAssetNames();
 
   assertPackageVersionMatchesBinaryVersion(version);
 
@@ -305,10 +352,20 @@ async function run() {
   const checksums = parseChecksumManifest(
     await downloadText(checksumManifestUrl(version, repo)),
   );
-  for (const asset of allAssetNames()) {
-    if (!checksums.has(asset)) {
-      throw new Error(`Checksum manifest is missing ${asset}`);
-    }
+  assertChecksumManifestIncludes(
+    checksums,
+    cnbMirror ? CNB_BINARY_ASSET_NAMES : checksummedReleaseAssetNames(),
+    "Canonical checksum manifest",
+  );
+  if (!cnbMirror) {
+    const bundleChecksums = parseChecksumManifest(
+      await downloadText(releaseAssetUrl(BUNDLE_CHECKSUM_MANIFEST, version, repo)),
+    );
+    assertChecksumManifestIncludes(
+      bundleChecksums,
+      BUNDLE_ASSET_NAMES,
+      "Bundle checksum manifest",
+    );
   }
   console.log("Release assets verified.");
 }
@@ -321,8 +378,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,
+  findReleaseWorkflowRun,
   hasReleaseBaseOverride,
   parseChecksumManifest,
 };

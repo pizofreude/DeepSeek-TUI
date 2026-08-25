@@ -392,7 +392,7 @@ fn render_preserved_output_mode(
                 lines.push(details_affordance_line(
                     &format!(
                         "{omitted} lines omitted; {}",
-                        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("full output")
+                        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
                     ),
                     Style::default().fg(palette::TEXT_MUTED),
                 ));
@@ -476,6 +476,19 @@ fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> 
         }
     }
 
+    // The importance pass only fires on lines that look like errors, warnings
+    // or paths. Plain output — a list of names, a table, a build log with
+    // nothing alarming in it — matches none of them, so the card used to show
+    // `head + tail` rows and silently forfeit the rest of its budget. A
+    // 20-line command then rendered 16 rows and claimed the other four were
+    // "omitted". Spend whatever is left by growing the head downward, which
+    // keeps the shown region contiguous and readable top-down.
+    let mut next = head;
+    while selected.len() < line_limit.min(total) && next < total {
+        selected.insert(next);
+        next += 1;
+    }
+
     selected.into_iter().collect()
 }
 
@@ -553,7 +566,7 @@ fn file_line_style(text: &str) -> Option<Style> {
 fn diff_line_style(text: &str) -> Option<Style> {
     let trimmed = text.trim_start();
     if trimmed.starts_with("@@") {
-        Some(Style::default().fg(palette::WHALE_ACCENT_PRIMARY))
+        Some(Style::default().fg(palette::WHALE_ACTION))
     } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
         Some(Style::default().fg(palette::DIFF_ADDED))
     } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {

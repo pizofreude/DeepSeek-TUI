@@ -1,5 +1,10 @@
 # Issue Triage
 
+Triage aims issues at the agent-ready standard defined in
+the agent-ready issue standard (`codewhale-ops`): bodies that a fresh agent
+can execute without extra context. This page covers the stale/`needs-info`
+lifecycle that runs alongside that standard.
+
 ## Stale `needs-info` cleanup
 
 The stale workflow only acts on issues that a maintainer has explicitly labeled

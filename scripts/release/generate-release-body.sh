@@ -18,55 +18,76 @@ section="$(awk -v version="${version}" '
   in_section { print }
 ' "${changelog}")"
 
+contributors="$(printf '%s\n' "${section}" | awk '
+  /^### Contributors[[:space:]]*$/ { in_contributors = 1; next }
+  in_contributors && /^### / { exit }
+  in_contributors { print }
+')"
+
+notes="$(printf '%s\n' "${section}" | awk '
+  /^### Contributors[[:space:]]*$/ { in_contributors = 1; next }
+  in_contributors && /^### / { in_contributors = 0 }
+  !in_contributors { print }
+')"
+
 cat <<EOF
-> **CodeWhale** is the canonical project, command, npm package, and
-> release-asset name. The legacy npm package \`deepseek-tui\` is
-> deprecated and receives no further releases. Users coming from
-> v0.8.x legacy \`deepseek\` / \`deepseek-tui\` names should migrate
-> with \`docs/REBRAND.md\`.
+> **Codewhale** is the public product from Shannon Labs. The \`codewhale\`
+> command, npm package, and release-asset names remain lowercase technical
+> identifiers. The legacy npm package \`deepseek-tui\` is deprecated and
+> receives no further releases. Users coming from v0.8.x legacy \`deepseek\` /
+> \`deepseek-tui\` names should migrate with \`docs/REBRAND.md\`.
 
 ## Install
 
-### Recommended — npm (one command, both binaries)
+### Recommended — npm (one command, both entrypoints)
 
 \`\`\`bash
 npm install -g codewhale
 \`\`\`
 
-The wrapper downloads the matched runtime binaries from this Release and places them in the same directory.
+The wrapper downloads the matched \`codewhale\` and \`codew\` command assets
+from this Release. Both contain the same compiled runtime.
 
 ### Docker / GHCR
 
 \`\`\`bash
 docker run --rm -it \\
   -e DEEPSEEK_API_KEY="\$DEEPSEEK_API_KEY" \\
-  -v ~/.deepseek:/home/codewhale/.deepseek \\
+  -v codewhale-home:/home/codewhale/.codewhale \\
   ghcr.io/hmbown/codewhale:${tag}
 \`\`\`
 
-The image ships the \`codewhale\` dispatcher, \`codew\` shim, and \`codewhale-tui\` runtime. The \`latest\` tag is also updated on release.
+The image exposes the same runtime as both \`codewhale\` and \`codew\`. The
+\`latest\` tag is also updated on release.
 
 ### Cargo (Linux / macOS)
 
 \`\`\`bash
-cargo install codewhale-cli codewhale-tui --locked
+cargo install codewhale-cli --locked
 \`\`\`
 
-Both crates are required — \`codewhale-cli\` produces the \`codewhale\` dispatcher and \`codew\` shim, while \`codewhale-tui\` produces the interactive runtime that the dispatcher delegates to. Installing only one crate will fail at runtime with a \`MISSING_COMPANION_BINARY\` error.
+The Cargo package installs \`codewhale\`. Cargo cannot create a second command
+alias from one binary target; users who want the shorter spelling can add a
+\`codew\` symlink to that installed executable. The npm, Homebrew, archive,
+shell-installer, and container channels install both command names directly.
 
 ### Manual download — platform archives (recommended)
 
-Each archive below contains the \`codewhale\` dispatcher, \`codew\` shim, and \`codewhale-tui\` runtime, plus an install script:
+Each archive below contains the same runtime under the \`codewhale\` and
+\`codew\` command names, plus an install script:
 
 | Platform | Archive | Install script |
 |---|---|---|
 | Linux x64 | \`codewhale-linux-x64.tar.gz\` | \`install.sh\` |
 | Linux ARM64 | \`codewhale-linux-arm64.tar.gz\` | \`install.sh\` |
+| Android ARM64 (Termux) | \`codewhale-android-arm64.tar.gz\` | \`install.sh\` |
 | macOS x64 | \`codewhale-macos-x64.tar.gz\` | \`install.sh\` |
 | macOS ARM | \`codewhale-macos-arm64.tar.gz\` | \`install.sh\` |
 | Windows x64 (installer) | \`CodeWhaleSetup.exe\` | NSIS setup |
 | Windows x64 | \`codewhale-windows-x64.zip\` | \`install.bat\` |
 | Windows x64 (portable) | \`codewhale-windows-x64-portable.zip\` | — |
+| Windows ARM64 | \`codewhale-windows-arm64.zip\` | \`install.bat\` |
+| Windows ARM64 (portable) | \`codewhale-windows-arm64-portable.zip\` | — |
 
 **Unix (Linux / macOS):**
 \`\`\`bash
@@ -76,14 +97,26 @@ cd codewhale-<platform>
 \`\`\`
 
 **Windows:**
-- For the installer path, run \`CodeWhaleSetup.exe\`; it installs \`codewhale.exe\`, \`codew.exe\`, and \`codewhale-tui.exe\` under \`%LOCALAPPDATA%\\Programs\\CodeWhale\\bin\` and adds that directory to the current-user PATH.
-- Extract \`codewhale-windows-x64.zip\`
-- Run \`install.bat\` (copies to \`%USERPROFILE%\\bin\`)
+- For the installer path, run \`CodeWhaleSetup.exe\`; it installs
+  \`codewhale.exe\`, \`codew.exe\`, and \`codewhale.bat\` under
+  \`%LOCALAPPDATA%\\Programs\\CodeWhale\\bin\`, adds that directory to the
+  current-user PATH, and creates a Start Menu shortcut that prefers
+  Windows Terminal (\`wt.exe\`) when it is installed.
+- Extract the archive for your machine: \`codewhale-windows-x64.zip\` or
+  \`codewhale-windows-arm64.zip\`
+- Double-click \`codewhale.bat\` (not the raw \`.exe\`) to launch
+- Run \`install.bat\` to copy the binaries and launcher to \`%USERPROFILE%\\bin\`
 - Add \`%USERPROFILE%\\bin\` to your PATH
 
-The **portable** Windows archive skips the install script — extract and run from any directory. The NSIS installer is currently unsigned and may trigger Windows SmartScreen until a signing certificate is wired into the release pipeline.
+The **portable** Windows archive skips the install script — extract and run \`codewhale.bat\` from any directory. The NSIS installer is currently unsigned and may trigger Windows SmartScreen until a signing certificate is wired into the release pipeline.
 
-Each platform also has **bare, unarchived** binaries attached below (\`codewhale-<platform>\`, \`codew-<platform>\`, and \`codewhale-tui-<platform>\`) — the npm wrapper and the in-app \`codewhale update\` download the matched runtime binaries, whereas the \`.tar.gz\` / \`.zip\` archives above are the recommended manual download and additionally bundle an install script. The legacy npm package \`deepseek-tui\` is deprecated and is not republished. For migration from v0.8.x legacy binary names, see \`docs/REBRAND.md\`.
+Each platform also has **bare, unarchived** \`codewhale-<platform>\` and
+\`codew-<platform>\` assets. The seven \`codewhale-tui-<platform>\` filenames
+attached to v0.9.5 are byte-identical compatibility copies used only to let
+already-installed v0.9.4 clients discover and cross this single-binary
+transition; current installers do not expose a third runtime. The legacy npm
+package \`deepseek-tui\` is deprecated and is not republished. For migration
+from v0.8.x legacy binary names, see \`docs/REBRAND.md\`.
 
 ### Verify (recommended)
 
@@ -91,29 +124,37 @@ Download the checksum manifests from this Release and verify:
 
 \`\`\`bash
 # Linux — archive bundles
-sha256sum -c codewhale-bundles-sha256.txt
+sha256sum -c codewhale-bundles-sha256.txt --ignore-missing
 
 # Linux — individual binaries
-sha256sum -c codewhale-artifacts-sha256.txt
+sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 
 # macOS
-shasum -a 256 -c codewhale-bundles-sha256.txt
-shasum -a 256 -c codewhale-artifacts-sha256.txt
+shasum -a 256 -c codewhale-bundles-sha256.txt --ignore-missing
+shasum -a 256 -c codewhale-artifacts-sha256.txt --ignore-missing
 \`\`\`
 
 ## What's in ${tag}
 EOF
 
-if [[ -n "${section}" ]]; then
-  printf '%s\n' "${section}"
+if [[ -n "${notes}" ]]; then
+  printf '%s\n' "${notes}"
 else
   printf '%s\n' "See the changelog link below for this release's notes."
 fi
 
 cat <<EOF
 
-Contributor credits for this release live in the changelog entry above —
-thank you to everyone whose reports, PRs, reviews, and reproductions shaped it.
+## Contributors
+EOF
+
+if [[ -n "${contributors}" ]]; then
+  printf '%s\n' "${contributors}"
+else
+  printf '%s\n' "Thank you to everyone whose reports, PRs, reviews, and reproductions shaped this release."
+fi
+
+cat <<EOF
 
 See [CHANGELOG.md](https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md) for full notes and [docs/CHANGELOG_ARCHIVE.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/CHANGELOG_ARCHIVE.md) for older releases.
 EOF

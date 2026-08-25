@@ -5,11 +5,12 @@
  *
  * Sources of truth:
  *   - <repo>/Cargo.toml                         → version, workspace crates
- *   - <repo>/crates/tui/src/sandbox/*.rs        → sandbox backends
+ *   - <repo>/crates/tui/src/sandbox/mod.rs      → enforced sandbox markers
  *   - <repo>/crates/tui/src/config.rs           → provider list (ApiProvider enum), DEFAULT_TEXT_MODEL
  *   - <repo>/npm/codewhale/package.json         → node engines
  *   - <repo>/crates/tui/src/tools/*.rs          → tool count (ToolSpec impls)
  *   - <repo>/LICENSE                            → license
+ *   - <repo>/web/data/latest-published-release.json → latest published release
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
@@ -41,15 +42,16 @@ export function deriveCrates() {
 }
 
 export function deriveSandboxBackends() {
-  const dir = join(REPO_ROOT, "crates/tui/src/sandbox");
-  if (!existsSync(dir)) return [];
-  const files = readdirSync(dir)
-    .filter((f) => f.endsWith(".rs"))
-    .map((f) => f.replace(/\.rs$/, ""))
-    .filter((f) => !["mod", "policy", "backend", "opensandbox", "windows"].includes(f))
-    .sort();
-  const map = { seatbelt: "seatbelt (macOS)", landlock: "landlock (Linux)" };
-  return files.map((f) => map[f] ?? f);
+  const source = read("crates/tui/src/sandbox/mod.rs");
+  return source ? deriveSandboxBackendsFromSource(source) : [];
+}
+
+export function deriveSandboxBackendsFromSource(source) {
+  const marker = source.match(
+    /pub const PUBLIC_SANDBOX_BACKENDS\s*:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/,
+  );
+  if (!marker) return [];
+  return [...marker[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 }
 
 /**
@@ -57,7 +59,10 @@ export function deriveSandboxBackends() {
  * display mapping. MUST be kept in sync with the copy in
  * web/lib/facts-drift.ts (for the runtime Cloudflare cron path).
  *
- * Excluded variants: DeepseekCN (not wired through shared ProviderKind, #1104).
+ * Excluded variants: DeepseekCN (not wired through shared ProviderKind,
+ * #1104), Custom (dynamic meta-provider, #1519), and Antigravity
+ * (kept off the website 44 until the cloud-code wire is a first-class
+ * advertised outbound route).
  */
 const PROVIDER_LABEL_MAP = {
   Deepseek: { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
@@ -68,6 +73,7 @@ const PROVIDER_LABEL_MAP = {
   WanjieArk: { id: "wanjie-ark", label: "Wanjie Ark", env: "WANJIE_ARK_API_KEY / WANJIE_API_KEY / WANJIE_MAAS_API_KEY" },
   Volcengine: { id: "volcengine", label: "Volcengine Ark", env: "VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY" },
   Openrouter: { id: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY" },
+  Orcarouter: { id: "orcarouter", label: "OrcaRouter", env: "ORCAROUTER_API_KEY" },
   XiaomiMimo: { id: "xiaomi-mimo", label: "Xiaomi MiMo", env: "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY" },
   Novita: { id: "novita", label: "Novita AI", env: "NOVITA_API_KEY" },
   Fireworks: { id: "fireworks", label: "Fireworks AI", env: "FIREWORKS_API_KEY" },
@@ -78,11 +84,14 @@ const PROVIDER_LABEL_MAP = {
   Sglang: { id: "sglang", label: "SGLang", env: "SGLANG_API_KEY" },
   Vllm: { id: "vllm", label: "vLLM", env: "VLLM_API_KEY" },
   Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
+  OllamaCloud: { id: "ollama-cloud", label: "Ollama Cloud", env: "OLLAMA_CLOUD_API_KEY / OLLAMA_API_KEY" },
   Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
   Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
   Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
   Qianfan: { id: "qianfan", label: "Baidu Qianfan", env: "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY" },
   OpenaiCodex: { id: "openai-codex", label: "OpenAI Codex", env: "ChatGPT/Codex OAuth via `codex login` (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)" },
+  OpencodeGo: { id: "opencode-go", label: "OpenCode Go", env: "OPENCODE_GO_API_KEY" },
+  OpencodeZen: { id: "opencode-zen", label: "OpenCode Zen", env: "OPENCODE_ZEN_API_KEY / OPENCODE_API_KEY" },
   Anthropic: { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
   Zai: { id: "zai", label: "Z.ai", env: "ZAI_API_KEY / Z_AI_API_KEY" },
   Stepfun: { id: "stepfun", label: "StepFun", env: "STEPFUN_API_KEY / STEP_API_KEY" },
@@ -92,13 +101,23 @@ const PROVIDER_LABEL_MAP = {
   Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
   LongCat: { id: "longcat", label: "Meituan LongCat", env: "LONGCAT_API_KEY" },
   Meta: { id: "meta", label: "Meta Model API", env: "META_MODEL_API_KEY / MODEL_API_KEY" },
+  Telecomjs: { id: "telecomjs", label: "TelecomJS TokenHub", env: "TELECOMJS_API_KEY" },
   Xai: { id: "xai", label: "xAI", env: "XAI_API_KEY" },
+  Mistral: { id: "mistral", label: "Mistral AI", env: "MISTRAL_API_KEY" },
+  Google: { id: "google", label: "Google Gemini", env: "GOOGLE_API_KEY / GEMINI_API_KEY" },
+  Edenai: { id: "edenai", label: "Eden AI", env: "EDENAI_API_KEY" },
+  ModelstudioTokenPlan: { id: "modelstudio-token-plan", label: "Model Studio Token Plan", env: "MODELSTUDIO_API_KEY" },
+  ModelstudioTokenPlanAnthropic: { id: "modelstudio-token-plan-anthropic", label: "Model Studio Token Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
+  ModelstudioCodingPlan: { id: "modelstudio-coding-plan", label: "Model Studio Coding Plan", env: "MODELSTUDIO_API_KEY" },
+  ModelstudioCodingPlanAnthropic: { id: "modelstudio-coding-plan-anthropic", label: "Model Studio Coding Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
 };
 
 // DeepseekCN: not wired through shared ProviderKind (#1104).
 // Custom: the dynamic OpenAI-compatible meta-provider (#1519) — a runtime
 // catch-all for user-defined endpoints, not a website-listable provider.
-const EXCLUDED_PROVIDERS = new Set(["DeepseekCN", "Custom"]);
+// Antigravity: credential-import + text-only cloud-code wire. Kept off the
+// website 44-count until it is a first-class advertised outbound route.
+const EXCLUDED_PROVIDERS = new Set(["DeepseekCN", "Custom", "Antigravity"]);
 
 function providerEnumVariants() {
   const cfg = read("crates/tui/src/config.rs");
@@ -180,6 +199,28 @@ export function deriveLicense() {
   return first.trim();
 }
 
+export function deriveLatestPublishedRelease() {
+  const raw = read("web/data/latest-published-release.json");
+  if (!raw) return null;
+  try {
+    const release = JSON.parse(raw);
+    if (
+      typeof release.tag !== "string" ||
+      typeof release.version !== "string" ||
+      release.tag !== `v${release.version}` ||
+      typeof release.publishedAt !== "string" ||
+      !Number.isFinite(Date.parse(release.publishedAt)) ||
+      typeof release.url !== "string" ||
+      release.url !== `https://github.com/Hmbown/CodeWhale/releases/tag/${release.tag}`
+    ) {
+      return null;
+    }
+    return release;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Re-derive all mechanical facts from the current workspace. The returned
  * object is the same shape as web/lib/facts.generated.ts → RepoFacts.
@@ -193,6 +234,11 @@ export function buildFacts() {
 
   const facts = {
     generatedAt: new Date().toISOString(),
+    // next.config.ts injects these from the exact checkout into the built
+    // artifact. They stay null in the tracked snapshot to avoid a
+    // self-referential generated-file diff after every commit.
+    sourceRevision: null,
+    sourceCommittedAt: null,
     version: deriveVersion(),
     crates: deriveCrates(),
     sandboxBackends: deriveSandboxBackends(),
@@ -201,7 +247,7 @@ export function buildFacts() {
     nodeEngines: deriveNodeEngines(),
     toolCount: deriveToolCount(),
     license: deriveLicense(),
-    latestRelease: null, // populated at runtime by facts-drift cron
+    latestPublishedRelease: deriveLatestPublishedRelease(),
   };
 
   return facts;
